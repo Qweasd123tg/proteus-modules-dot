@@ -34,3 +34,7 @@ Runner не устанавливает инструменты, не очищае
 Права, признание эффектов и результаты проверок нельзя делегировать свободному тексту модели или недоверенной metadata. При этом выбор алгоритмов, моделей, памяти и композиции может оставаться расширяемым. Подробные непроверенные security-сценарии не публикуются в этом общем каталоге.
 
 Основные проекты: [Proteus Core](https://github.com/Proteus-harness/Proteus-core), [Proteus Modules](https://github.com/Proteus-harness/Proteus-modules).
+
+## Проверка реальных границ Core
+
+[Отдельный scoped smoke](integration/core-smoke/) линкует неизменённый Core/SDK 3f36a003 и проверяет 21 сценарий: загрузку профилей и static assembly, фактический BoundTools/policy/tool путь, hook chain и context-provider callbacks. [Локальный результат](validation/core-host-smoke-local/evidence.json) прошёл; это не полный agent turn, не запуск reference pack, не model/journal/replay или OS sandbox проверка. Для smoke добавлен отдельный CI workflow.
