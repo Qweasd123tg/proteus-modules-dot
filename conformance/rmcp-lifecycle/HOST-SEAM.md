@@ -1,7 +1,7 @@
 # Proposed consumer seam: explicit host lifecycle selection
 
 This is a design proposal, **not implemented or valid current Proteus config**.
-Its justification is the pinned source and pending SDK probe; Core integration
+Its justification is the pinned source and passed scoped SDK probe; Core integration
 remains a distinct next gate. Do not install another extension process manager.
 
 ## Existing boundary
@@ -85,8 +85,8 @@ Codex's custom modern stdio transport into Proteus.
 
 ## Next acceptance gates
 
-1. Execute and independently review this exact locked probe in CI. Fix fixture or
-   API mismatches before converting expectations into runtime findings.
+1. The locked SDK probe passed all 33 authored cases; retain its exact source and
+   artifact receipts as a regression gate. This does not substitute for Core tests.
 2. Execute accepted portable-skills provider+tool against actual pinned Core;
    confirm separate-slot config, context-to-load identity and default output cap.
 3. If a Core lifecycle patch is separately authorized, test the actual custom

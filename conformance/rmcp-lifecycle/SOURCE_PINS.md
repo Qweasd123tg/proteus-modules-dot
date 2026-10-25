@@ -17,8 +17,8 @@ bytes; a repository commit alone is not a replacement for the published archive.
 Proteus Core: `3f36a003b4f3fde2242fc80f7aedac00dd127d1d`.
 Codex: `970111f6cb62cc02fe36a82ea7d71b37a2889c97`.
 Exact repository-relative files, immutable links and SHA256 values are in
-[SOURCES.json](SOURCES.json). Their statements remain source-derived until the
-independent authored runtime gate returns actual results.
+[SOURCES.json](SOURCES.json). Repository observations remain source-derived. Actual SDK behavior is supported
+only for the authored cases in the exact runtime receipt in VALIDATION.md.
 
 The proposed workflow reuses the exact official checkout/upload-artifact action
 pins from the already-reviewed parent publication workflow. This lane made no

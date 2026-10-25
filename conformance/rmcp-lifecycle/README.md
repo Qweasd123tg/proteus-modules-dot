@@ -5,8 +5,9 @@ separates raw JSON, the actual `rmcp = 3.3.0` typed boundary, and host-owned pol
 Consumers can reuse its authored fixtures as an SDK-upgrade gate before changing
 Proteus lifecycle selection or metadata projection.
 
-**Status:** 33 authored tests await execution. Lockfile generation and static
-review are not runtime proof. See [VALIDATION.md](VALIDATION.md).
+**Status:** all 33 authored Rust cases passed in the pinned Linux CI run, plus
+eight separate Python evidence controls. Exact tested commit, artifacts and scope
+are recorded in [VALIDATION.md](VALIDATION.md). This is not Core integration.
 
 ## What is exercised
 
