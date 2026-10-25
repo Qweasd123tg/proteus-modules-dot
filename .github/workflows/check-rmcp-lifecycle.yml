@@ -1,0 +1,44 @@
+# Root publication target: .github/workflows/check-rmcp-lifecycle.yml
+name: Check pinned rmcp lifecycle probes
+
+on:
+  push:
+    paths:
+      - "conformance/rmcp-lifecycle/**"
+      - ".github/workflows/check-rmcp-lifecycle.yml"
+  pull_request:
+    paths:
+      - "conformance/rmcp-lifecycle/**"
+      - ".github/workflows/check-rmcp-lifecycle.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the explicit official toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Run only authored SDK boundary probes
+        working-directory: conformance/rmcp-lifecycle
+        run: bash ci/run.sh
+      - name: Preserve exact evidence including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmcp-lifecycle-evidence
+          path: conformance/rmcp-lifecycle/ci-results/
+          if-no-files-found: error
+          retention-days: 14
