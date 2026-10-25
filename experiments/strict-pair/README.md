@@ -1,6 +1,6 @@
 # Strict JSON verification producer + Hermes-inspired gate
 
-**New isolated paired feature; validation pending.** This workspace changes our
+**Isolated paired feature; authored CI checks passed.** This workspace changes our
 examples, not Proteus Core or any immutable upstream source snapshot. Earlier
 v1 results are kept separately and are not evidence that this v2 code passed.
 
@@ -117,9 +117,10 @@ Example process exit code is not verification evidence.
 
 [profile.strict.fragment.toml](profile.strict.fragment.toml) and its
 [expected-policy fixture](fixtures/expected-policy.json) are prepared with the
-same five-check config. TOML/JSON equality and the earlier typed config digest
-were checked, but comparison against the newly compiled v2 Rust helper remains
-pending. The profile is **not yet described as runtime-verified**. It requires
+same five-check config. CI compared the compiled v2 Rust helper with both files
+using type-aware JSON/TOML equality, and checked the positive receipt against
+the authored bytes and all five assertion identities. This validates the supplied
+configuration semantics, **not an actual Core host deployment**. The profile requires
 the two binaries on PATH, a registered compatible read_file implementation and
 the producer crate directory as cwd for the supplied fixture. Preserve the
 existing registry, approval policy, hooks and permissions when merging it.
@@ -165,6 +166,7 @@ Strict consumer also rejects canceled/timed-out/truncated outer result flags.
 
 ## Validation status
 
-Source and authored tests are prepared; local Cargo validation is paused at the
-shared disk reserve. No v2 test pass is claimed yet. See [VALIDATION.md](VALIDATION.md)
-for actual runs as they become available, and [SOURCES.md](SOURCES.md) for pins.
+Remote CI passed 81 workspace tests plus eight independent pairing tests, with
+no failed or ignored tests, and the positive/negative/helper semantic controls.
+No local v2 build or actual Core run is claimed. See [VALIDATION.md](VALIDATION.md)
+for exact run evidence and limits, and [SOURCES.md](SOURCES.md) for pins.
