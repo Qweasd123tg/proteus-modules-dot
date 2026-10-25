@@ -1,0 +1,98 @@
+# Merge into an existing profile; preserve existing hooks/tools/policy/permissions.
+# PATH must contain the two built binaries (or replace command paths).
+# Run with the json-contracts crate directory as cwd for the supplied fixture.
+# Exact policy fixture is prepared; Rust helper comparison is pending validation.
+
+[modules]
+hooks = ["hermes.verify_evidence"]
+
+[tools]
+enabled = ["read_file", "verification.json_contracts"]
+
+[components.strict-json-producer]
+command = "proteus-example-json-contracts-strict"
+[components.strict-json-producer.exports.tool."verification.json_contracts"]
+timeout_ms = 120000
+
+[components.strict-json-gate]
+command = "proteus-example-hermes-verify-evidence-strict"
+[components.strict-json-gate.exports.hook."hermes.verify_evidence"]
+timeout_ms = 10000
+
+[module_config.tool."verification.json_contracts"]
+schema_version = 1
+suite_id = "draft-release-v1"
+
+[[module_config.tool."verification.json_contracts".documents]]
+id = "release"
+path = "fixtures/release.json"
+
+[[module_config.tool."verification.json_contracts".documents.assertions]]
+id = "version"
+pointer = "/schema_version"
+[module_config.tool."verification.json_contracts".documents.assertions.rule]
+kind = "equals"
+expected = 1
+
+[[module_config.tool."verification.json_contracts".documents.assertions]]
+id = "draft-only"
+pointer = "/release/channel"
+[module_config.tool."verification.json_contracts".documents.assertions.rule]
+kind = "equals"
+expected = "draft"
+
+[[module_config.tool."verification.json_contracts".documents.assertions]]
+id = "not-publishing"
+pointer = "/release/publish"
+[module_config.tool."verification.json_contracts".documents.assertions.rule]
+kind = "equals"
+expected = false
+
+[[module_config.tool."verification.json_contracts".documents.assertions]]
+id = "has-artifacts"
+pointer = "/artifacts"
+[module_config.tool."verification.json_contracts".documents.assertions.rule]
+kind = "non_empty"
+
+[[module_config.tool."verification.json_contracts".documents.assertions]]
+id = "owner-label"
+pointer = "/owner~1label/~0name"
+[module_config.tool."verification.json_contracts".documents.assertions.rule]
+kind = "type"
+expected = "string"
+
+[module_config.hook."hermes.verify_evidence"]
+mutating_tools = ["write_file", "apply_patch"]
+verification_tools = ["verification.json_contracts"]
+max_nudges = 2
+max_history_parts = 50000
+on_exhaustion = "error"
+[module_config.hook."hermes.verify_evidence".receipt_policy]
+mode = "strict_json_contracts"
+[module_config.hook."hermes.verify_evidence".receipt_policy.expected]
+expected_suite_id = "draft-release-v1"
+expected_config_sha256 = "655707ee037fdfbe6a15e3e59a78df809328b7229d2e5ec184c4055c2f2dfed3"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents]]
+document_id = "release"
+path = "fixtures/release.json"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents.assertions]]
+assertion_id = "version"
+pointer = "/schema_version"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents.assertions]]
+assertion_id = "draft-only"
+pointer = "/release/channel"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents.assertions]]
+assertion_id = "not-publishing"
+pointer = "/release/publish"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents.assertions]]
+assertion_id = "has-artifacts"
+pointer = "/artifacts"
+
+[[module_config.hook."hermes.verify_evidence".receipt_policy.expected.documents.assertions]]
+assertion_id = "owner-label"
+pointer = "/owner~1label/~0name"

@@ -1,0 +1,65 @@
+# Existing repository's pinned checkout/upload actions reused unchanged.
+name: Check authored strict verification pair
+on:
+  push:
+    paths:
+      - "experiments/strict-pair/**"
+      - "tests/strict-json-pairing/**"
+      - "scripts/check-strict-pair.sh"
+      - "scripts/verify_strict_artifacts.py"
+      - ".github/workflows/check-strict-pair.yml"
+  pull_request:
+    paths:
+      - "experiments/strict-pair/**"
+      - "tests/strict-json-pairing/**"
+      - "scripts/check-strict-pair.sh"
+      - "scripts/verify_strict_artifacts.py"
+      - ".github/workflows/check-strict-pair.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  strict-pair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      STRICT_PAIR_DIR: experiments/strict-pair
+      PAIRING_REVIEW_MANIFEST: tests/strict-json-pairing/Cargo.toml
+    steps:
+      - name: Check out reviewed source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          clean: false
+          fetch-depth: 1
+          submodules: false
+      - name: Install exact official toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Record immutable authored inputs
+        run: |
+          mkdir -p validation
+          find "$STRICT_PAIR_DIR" tests/strict-json-pairing scripts/check-strict-pair.sh scripts/verify_strict_artifacts.py .github/workflows/check-strict-pair.yml -type f -print0 |
+            sort -z | xargs -0 sha256sum > validation/strict-sources.sha256
+          rustc +1.95.0 --version > validation/toolchain.txt
+          cargo +1.95.0 --version >> validation/toolchain.txt
+      - name: Run only authored strict workspace and independent pairing cases
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/check-strict-pair.sh 2>&1 | tee validation/strict-pair.log
+      - name: Verify source bytes remained unchanged
+        if: always()
+        run: sha256sum -c validation/strict-sources.sha256 > validation/source-recheck.txt
+      - name: Preserve evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: strict-pair-validation
+          path: validation/
+          if-no-files-found: error
+          retention-days: 14
