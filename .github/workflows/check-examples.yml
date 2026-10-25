@@ -1,0 +1,56 @@
+name: Check authored Rust examples
+
+on:
+  push:
+    paths:
+      - "examples/hermes-verify-evidence/**"
+      - "examples/pi-ready-steps/**"
+      - "examples/letta-evidence-blocks/**"
+      - "scripts/**"
+      - ".github/workflows/check-examples.yml"
+  pull_request:
+    paths:
+      - "examples/hermes-verify-evidence/**"
+      - "examples/pi-ready-steps/**"
+      - "examples/letta-evidence-blocks/**"
+      - "scripts/**"
+      - ".github/workflows/check-examples.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TERM_COLOR: never
+    steps:
+      # Official action SHAs verified through GitHub read tools, 2026-10-25.
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          clean: false
+          fetch-depth: 1
+          submodules: false
+      - name: Install the explicit official toolchain in the ephemeral runner
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Test validation runner without invoking Rust
+        run: python3 -I scripts/test_check_examples.py
+      - name: Test, build, format-check and smoke only the authored examples
+        run: python3 -I scripts/check_examples.py
+      - name: Preserve validation evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: authored-examples-validation
+          path: |
+            validation/results.json
+            validation/logs/*.log
+          if-no-files-found: error
+          retention-days: 14

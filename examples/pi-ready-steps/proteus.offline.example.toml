@@ -1,0 +1,58 @@
+# Full profile for offline topology/list checks; replace both executable paths.
+# Reference exports require Proteus-modules 04114bbe85f179895e2b8553b6169a284caaeae3.
+# This profile does not prove the fake model will choose an arbitrary planning tool.
+active_provider = "fake"
+
+[profile]
+name = "pi-ready-steps-offline"
+
+[providers.fake]
+provider = "fake"
+model = "fake-tool-model"
+stream = true
+
+[modules]
+workflow = "coding.single_loop"
+context = "simple"
+policy = "ask_write"
+
+[components.reference]
+command = "/absolute/path/proteus-reference-module"
+
+[components.reference.exports.model.fake]
+
+[components.reference.exports.workflow."coding.single_loop"]
+
+[components.reference.exports.context.simple]
+
+[components.reference.exports.policy.ask_write]
+
+[components.ready_steps]
+command = "/absolute/path/proteus-pi-ready-steps"
+
+[components.ready_steps.exports.tool."planning.ready_steps"]
+timeout_ms = 10000
+
+[tools]
+enabled = ["planning.ready_steps"]
+
+[permissions]
+mode = "normal"
+
+[agent_control]
+surface = "none"
+
+[module_config.model.fake]
+implementation = "fake"
+
+[module_config.context.simple]
+
+[module_config.policy.ask_write]
+allow = ["planning.ready_steps"]
+
+[module_config.tool."planning.ready_steps"]
+
+[runtime]
+model_timeout_ms = 10000
+context_timeout_ms = 10000
+workflow_timeout_ms = 30000

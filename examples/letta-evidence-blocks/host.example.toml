@@ -1,0 +1,80 @@
+# Самостоятельная offline-конфигурация: ни API key, ни сетевой model provider.
+# Требует proteus-reference-module и этот example executable в PATH.
+active_provider = "fake"
+
+[profile]
+name = "letta-evidence-blocks-offline"
+
+[providers.fake]
+provider = "fake"
+model = "fake"
+stream = true
+
+[modules]
+workflow = "coding.single_loop"
+context = "repo_aware"
+policy = "codex_policy"
+hooks = []
+
+[tools]
+enabled = []
+
+[agent_control]
+surface = "none"
+
+[components.reference]
+command = "proteus-reference-module"
+env_allowlist = []
+
+[components.reference.exports.model.fake]
+[components.reference.exports.workflow."coding.single_loop"]
+[components.reference.exports.context.repo_aware]
+[components.reference.exports.policy.codex_policy]
+
+[module_config.model.fake]
+implementation = "fake"
+
+[module_config.policy.codex_policy]
+
+[module_config.workflow."coding.single_loop"]
+
+[module_config.context.repo_aware]
+providers = ["letta.evidence_blocks"]
+max_context_bytes = 65536
+max_search_results = 0
+
+[components.evidence]
+command = "proteus-example-letta-evidence-blocks"
+env_allowlist = []
+handshake_timeout_ms = 10000
+
+[components.evidence.exports.context_provider."letta.evidence_blocks"]
+timeout_ms = 2000
+
+[module_config.context_provider."letta.evidence_blocks"]
+scope = "project:demo"
+max_context_bytes = 8192
+max_results = 8
+
+[[module_config.context_provider."letta.evidence_blocks".blocks]]
+id = "storage-decision"
+revision = 1
+source = "owner supplied ADR-001"
+scope = "project:demo"
+content = "Storage uses SQLite in the local demo. This supplied note is not a verified runtime fact."
+labels = ["storage", "database"]
+
+[[module_config.context_provider."letta.evidence_blocks".blocks]]
+id = "obsolete-note"
+revision = 1
+source = "old supplied note"
+scope = "project:demo"
+content = "The old storage experiment used JSONL."
+
+[[module_config.context_provider."letta.evidence_blocks".blocks]]
+id = "obsolete-note"
+revision = 2
+source = "owner supplied withdrawal"
+scope = "project:demo"
+content = ""
+deleted = true
