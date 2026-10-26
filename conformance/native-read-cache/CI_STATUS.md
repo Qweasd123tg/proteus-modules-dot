@@ -32,3 +32,16 @@ child invocations are not a count of unique product guarantees. In particular,
 controller/verifier mock tests never execute Core or a tracer. Follow the exact
 commit's workflow results and PR validation description for execution outcomes;
 this file preserves the source-staging boundary rather than claiming a local run.
+
+## Artifact container
+
+Native session directory names contain vertical bars. Evidence is archived as
+`native-cache-evidence.tar.gz` so the upload service does not reject or rename
+those paths. The archive includes hidden native cache files; a complete per-file
+SHA256/byte-count manifest and archive digest accompany it. Four separate tiny
+packaging tests cover hidden/vertical-bar paths, symlink rejection, bounded size
+and non-overwrite controls; no Core or tracer executes in those tests. No evidence files are removed
+by packaging. The initial run40247889223 passed build/runtime/verifier steps but
+failed direct artifact upload; it is not a complete accepted evidence bundle.
+The tar container preserves the original Linux filenames; it fixes transport,
+not direct Windows filesystem restoration compatibility.

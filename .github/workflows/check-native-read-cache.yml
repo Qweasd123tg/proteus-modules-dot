@@ -57,12 +57,16 @@ jobs:
         run: |
           python3 -B -I "$PROBE/ci/test_verify_native_cache.py" -v \
             2>&1 | tee validation/native-cache/verifier-controls.log
+      - name: Test evidence packaging using tiny owned fixtures
+        run: |
+          python3 -B -I "$PROBE/ci/test_archive_evidence.py" -v \
+            2>&1 | tee validation/native-cache/archive-controls.log
       - name: Require complete controller and verifier mock suites
         run: |
           python3 -I - <<'PYCOUNTS'
           import re
           from pathlib import Path
-          for name, count in [('controller-mocks', 6), ('verifier-controls', 27)]:
+          for name, count in [('controller-mocks', 6), ('verifier-controls', 27), ('archive-controls', 4)]:
               text = (Path('validation/native-cache') / (name + '.log')).read_text()
               if len(re.findall(r'^test_.+ \.\.\. ok$', text, re.M)) != count:
                   raise ValueError(name + ': expected every named mock/control to pass')
@@ -104,11 +108,22 @@ jobs:
           if [ -f validation/native-cache/binary.sha256 ]; then
             sha256sum -c validation/native-cache/binary.sha256 > validation/native-cache/binary-recheck.txt
           fi
+      - name: Archive all owned evidence including native hidden cache files
+        if: always()
+        run: |
+          # Native session paths contain '|'; preserve them inside tar rather than
+          # renaming evidence or relying on the artifact service's path subset.
+          python3 -B -I "$PROBE/ci/archive_evidence.py" \
+            --source validation/native-cache \
+            --archive validation/native-cache-evidence.tar.gz \
+            --manifest validation/native-cache-archive.json
       - name: Preserve only this probe evidence including failures
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-read-cache-validation
-          path: validation/native-cache/
+          path: |
+            validation/native-cache-evidence.tar.gz
+            validation/native-cache-archive.json
           if-no-files-found: error
           retention-days: 14
