@@ -50,13 +50,18 @@ run toolchain rustup toolchain install 1.95.0 --profile minimal --component rust
 export RUSTUP_TOOLCHAIN=1.95.0
 run compiler rustc -Vv
 run cargo-version cargo -V
-run linker ld.lld --version
+# Use the named GNU-driver wrapper shipped in the exact Rust toolchain. No
+# system installation, arbitrary linker discovery or official source rewrite.
+lld_dir="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld"
+test -x "$lld_dir/ld.lld"
+run linker "$lld_dir/ld.lld" --version
+sha256sum "$lld_dir/ld.lld" "$lld_dir/../rust-lld" > "$out/linker-identities.txt"
 run official-init git -c core.hooksPath=/dev/null init "$official"
 run official-fetch git -C "$official" -c core.hooksPath=/dev/null fetch --depth 1 https://github.com/Proteus-harness/Proteus-modules.git 7fceaebc3bed8add9b0e3091110f59deca86ba46
 run official-checkout git -C "$official" -c core.hooksPath=/dev/null checkout --detach FETCH_HEAD
 test "$(git -C "$official" rev-parse HEAD)" = 7fceaebc3bed8add9b0e3091110f59deca86ba46
 git -C "$official" rev-parse HEAD HEAD^{tree} > "$out/official-identity.txt"
-printf '%s\n' 'CARGO_INCREMENTAL=0' 'CARGO_PROFILE_DEV_DEBUG=0' 'CARGO_PROFILE_TEST_DEBUG=0' '-j2' 'separate target dirs: host official strict' > "$out/build-profile.txt"
+printf '%s\n' 'CARGO_INCREMENTAL=0' 'CARGO_PROFILE_DEV_DEBUG=0' 'CARGO_PROFILE_TEST_DEBUG=0' '-j2' 'separate target dirs: host official strict' "official linker PATH prefix: $lld_dir; official .cargo/config.toml unchanged" > "$out/build-profile.txt"
 printf '%s  %s\n' e9b46590a2ff92ded4f0934a540bbdd0e9aee83c7ebad0ac6c3bd5089b4a0848 "$official/Cargo.lock" | sha256sum -c - > "$out/official-lock-before.txt"
 for graph in host fixture strict official; do
   case "$graph" in host) dir=$host;; fixture) dir=$fixture;; strict) dir=$strict;; official) dir=$official;; esac
@@ -70,7 +75,7 @@ verify tests "$out/fixture-tests.log" --kind fixture
 (cd "$fixture"; run fixture-build cargo build --locked --offline -j2 --bin proteus-strict-host-fixture)
 (cd "$host"; run host-build cargo build --locked --offline -j2 --bin proteus-strict-agent-host)
 export CARGO_TARGET_DIR="$targets/official"
-(cd "$official"; run official-build cargo build --locked --offline -j2 -p proteus-reference-module --bin proteus-reference-module)
+(cd "$official"; export PATH="$lld_dir:$PATH"; run official-build cargo build --locked --offline -j2 -p proteus-reference-module --bin proteus-reference-module)
 export CARGO_TARGET_DIR="$targets/strict"
 (cd "$strict"; run strict-build cargo build --locked --offline -j2 --bin proteus-example-json-contracts-strict --bin proteus-example-hermes-verify-evidence-strict --example strict_json_policy)
 run compiled-policy "$targets/strict/debug/examples/strict_json_policy" < "$host/fixtures/suite.json"
