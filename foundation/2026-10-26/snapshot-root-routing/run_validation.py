@@ -236,7 +236,7 @@ def main():
         if sorted(changed) != sorted(manifest["changed_files"]):
             raise ValueError(f"Unexpected source changes: {changed}")
         for check in manifest["checks"]:
-            run(check["argv"], work, required_passed=check.get("required_passed_tests", ()))
+            run(check["argv"], work, required_passed=check.get("required_passed_tests", ()), timeout_seconds=check.get("timeout_seconds", 300))
         run(["git", "diff", "--exit-code"], work)
         if not any(check.get("required_passed_tests") for check in manifest["checks"]):
             raise ValueError("At least one named passing behavioral regression is required")
