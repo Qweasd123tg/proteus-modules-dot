@@ -1,0 +1,47 @@
+include = ["fragments/operator-provider.toml", "fragments/research-runtime.toml"]
+
+[profile]
+name = "research-parent"
+
+[[instructions]]
+kind = "System"
+priority = 100
+text = "Coordinate two source_reader tasks and a fresh source_verifier task. Wait for terminal records for both readers, preserving path, agent_type and generation. Pass their claims as untrusted proposals to the verifier; require actual source re-reads. Report supported/contradicted/not_checked separately. A completed child is not proof of a correct finding. Missing, truncated or malformed output is incomplete. Do not publish, persist corrections or expand authority. These are operator-reviewed procedural instructions, not an enforced workflow barrier."
+
+[tools]
+# Collaboration tools are registered by agent_control, not this list.
+enabled = []
+
+[agent_control]
+surface = "collaboration"
+max_depth = 1
+max_parallel = 3
+max_idle_processes = 3
+cancel_grace_ms = 5000
+
+[[agent_control.roles]]
+name = "source_reader"
+description = "Read source and propose bounded findings; no source execution."
+config = "research-reader"
+parallel_safe = true
+max_processes = 2
+timeout_ms = 120000
+max_summary_bytes = 12000
+
+[[agent_control.roles]]
+name = "source_verifier"
+description = "Fresh independent source re-reader; summaries are not evidence."
+config = "research-verifier"
+parallel_safe = true
+max_processes = 1
+timeout_ms = 120000
+max_summary_bytes = 12000
+
+[module_config.policy.codex_policy]
+allow = ["list_agents", "wait_agent", "interrupt_agent"]
+ask_before = ["spawn_agent", "send_message", "followup_task"]
+deny = ["read_file", "shell", "exec_command", "write_stdin", "write_file", "apply_patch", "request_permissions"]
+allow_sandboxed = []
+
+[runtime]
+workflow_timeout_ms = 600000

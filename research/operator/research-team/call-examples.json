@@ -1,0 +1,95 @@
+{
+  "scope": "authored argument examples; not a workflow engine, RPC transcript or executed calls",
+  "core_pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+  "calls": [
+    {
+      "id": "reader_a",
+      "owner": "parent",
+      "gate": "Operator has reviewed final configs, source workspace and spawn approval.",
+      "tool": "spawn_agent",
+      "args": {
+        "task_name": "reader_a",
+        "agent_type": "source_reader",
+        "message": "Audit C1 at expected Core commit 1fc3ef223d10322815dd9290a50d045bc95402bb: child process receives its own --config, not the parent config. Read crates/proteus-core/src/core/agent_control/process/child.rs lines 30-56. Return exact source quote, scope and unknowns; do not execute source. Expected pin is operator-supplied, not independently authenticated by you."
+      }
+    },
+    {
+      "id": "reader_b",
+      "owner": "parent",
+      "gate": "Separate approved task, not a followup sharing reader_a history.",
+      "tool": "spawn_agent",
+      "args": {
+        "task_name": "reader_b",
+        "agent_type": "source_reader",
+        "message": "Audit C2 and C3 at expected Core commit 1fc3ef223d10322815dd9290a50d045bc95402bb. Read crates/proteus-core/src/core/agent_control/collaboration/mod.rs lines 125-147 and 264-307. C2: collaboration admits only parallel_safe roles with no worktree isolation. C3: wait timeout returns no completions and does not itself request child cancellation. Distinguish source observations from runtime proof; do not execute source."
+      }
+    },
+    {
+      "id": "collect_readers",
+      "owner": "parent",
+      "gate": "Repeat as necessary; this wait is not a join on named readers.",
+      "tool": "wait_agent",
+      "args": {"timeout_ms": 30000}
+    },
+    {
+      "id": "inspect_readers",
+      "owner": "parent",
+      "gate": "Match actual records by path, agent_type and generation; inspect retained payload from wait separately.",
+      "tool": "list_agents",
+      "args": {"path_prefix": "/root"}
+    },
+    {
+      "id": "verifier",
+      "owner": "parent",
+      "gate": "Manual barrier: both expected reader generations settled, outputs checked; replace the prose below with actual bounded claim proposals and their gaps before use.",
+      "tool": "spawn_agent",
+      "args": {
+        "task_name": "verifier",
+        "agent_type": "source_verifier",
+        "message": "Independently re-read Core source at the operator-supplied expected pin 1fc3ef223d10322815dd9290a50d045bc95402bb. Candidate C1: own --config in crates/proteus-core/src/core/agent_control/process/child.rs lines 30-56. Candidate C2: parallel_safe/no-worktree admission in crates/proteus-core/src/core/agent_control/collaboration/mod.rs lines 125-147. Candidate C3: timeout is not cancellation in the same file lines 264-307. These are static example proposals, not actual reader results. In an actual run include the readers' returned claims and gaps here. Read all cited source afresh. Return all three claim IDs with supported/contradicted/not_checked, observed paths/lines/quotes and limits. Do not execute source or infer authenticated origin."
+      }
+    },
+    {
+      "id": "collect_verifier",
+      "owner": "parent",
+      "gate": "Wait for actual verifier generation; unrelated completion does not satisfy the review barrier.",
+      "tool": "wait_agent",
+      "args": {"timeout_ms": 30000}
+    },
+    {
+      "id": "cancel_if_requested",
+      "owner": "parent",
+      "gate": "Optional cancellation branch only; then wait/list for terminal observation.",
+      "tool": "interrupt_agent",
+      "args": {"target": "/root/verifier"}
+    },
+    {
+      "id": "narrow_followup_if_retained",
+      "owner": "parent",
+      "gate": "Optional approved followup only if same-session peer/history is retained; not an automatic retry after unknown outcome.",
+      "tool": "followup_task",
+      "args": {"target": "/root/verifier", "message": "Re-read only C3. Return its explicit status and observed source span; do not treat a previous summary as a fresh source read."}
+    },
+    {
+      "id": "read_c1",
+      "owner": "child",
+      "gate": "Example read_file arguments inside the selected source workspace, not an enforced path allowlist.",
+      "tool": "read_file",
+      "args": {"path": "crates/proteus-core/src/core/agent_control/process/child.rs", "start_line": 30, "limit": 27, "line_numbers": true}
+    },
+    {
+      "id": "read_c2",
+      "owner": "child",
+      "gate": "Each verifier performs its own read; line-numbered output is not a whole-file hash witness.",
+      "tool": "read_file",
+      "args": {"path": "crates/proteus-core/src/core/agent_control/collaboration/mod.rs", "start_line": 125, "limit": 23, "line_numbers": true}
+    },
+    {
+      "id": "read_c3",
+      "owner": "child",
+      "gate": "Missing/partial output remains not_checked until independently inspected.",
+      "tool": "read_file",
+      "args": {"path": "crates/proteus-core/src/core/agent_control/collaboration/mod.rs", "start_line": 264, "limit": 44, "line_numbers": true}
+    }
+  ]
+}

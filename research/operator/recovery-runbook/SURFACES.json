@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "scope": "Source-checked shapes only; no invocation, permission grant or payload prescription",
+  "surfaces": [
+    {
+      "id": "A01",
+      "shape": "GET /health",
+      "meaning": "constant health response, not readiness",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/health\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A02",
+      "shape": "GET /bootstrap",
+      "meaning": "initial registered path/cwd lookup",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/bootstrap\" =>"
+        },
+        {
+          "source_id": "C09",
+          "lines": [
+            1,
+            30
+          ],
+          "literal": "pub(super) async fn bootstrap"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A03",
+      "shape": "GET /config/local?session_dir=S",
+      "meaning": "active local summary, no new model catalog discovery on this branch",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/config/local\""
+        },
+        {
+          "source_id": "C31",
+          "lines": [
+            148,
+            172
+          ],
+          "literal": "self.config_summary_with_catalog(false).await"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A04",
+      "shape": "GET /pending?session_dir=S",
+      "meaning": "live control-plane snapshot, not durable ACK history",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/pending\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A05",
+      "shape": "GET /analysis?session_dir=S&turn_id=T",
+      "meaning": "cold strict historical projection; presentation collapses effect/final",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/analysis\" =>"
+        },
+        {
+          "source_id": "C07",
+          "lines": [
+            47,
+            56
+          ],
+          "literal": "store.load_projection()?"
+        },
+        {
+          "source_id": "C07",
+          "lines": [
+            218,
+            225
+          ],
+          "literal": "JournalEntry::ToolEffectRecorded(tool) | JournalEntry::ToolResultRecorded(tool)"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A06",
+      "shape": "GET /history?session_dir=S",
+      "meaning": "live transcript or cold strict projection",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/history\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A07",
+      "shape": "GET /conversation?session_dir=S",
+      "meaning": "warm history/context or cold fresh disposable cache/fallback",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/conversation\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A08",
+      "shape": "GET /sessions ; GET /sessions/current?session_dir=S",
+      "meaning": "compatible catalog may return stale cache and schedule refresh",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/sessions\" =>"
+        },
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/sessions/current\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A09",
+      "shape": "GET /events?session_dir=S",
+      "meaning": "SSE setup may emit first SessionStarted through configured sinks",
+      "source_checks": [
+        {
+          "source_id": "C05",
+          "lines": [
+            32,
+            91
+          ],
+          "literal": "\"/events\" =>"
+        },
+        {
+          "source_id": "C11",
+          "lines": [
+            17,
+            35
+          ],
+          "literal": "server.start_session().await"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "A10",
+      "shape": "proteus eval report /absolute/session-or-journal-path",
+      "meaning": "early human report branch, no JSON or objective verdict",
+      "source_checks": [
+        {
+          "source_id": "C03",
+          "lines": [
+            14,
+            25
+          ],
+          "literal": "namespace == \"eval\" && command == \"report\""
+        },
+        {
+          "source_id": "C01",
+          "lines": [
+            102,
+            119
+          ],
+          "literal": "CliCommand::EvalReport"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "X01",
+      "shape": "proteus --config /absolute/profile.toml replay workflow /absolute/session-or-journal-path --turn-id T --json",
+      "meaning": "executes selected workflow/policy; not passive read",
+      "source_checks": [
+        {
+          "source_id": "C03",
+          "lines": [
+            106,
+            190
+          ],
+          "literal": "Some(\"workflow\") => {}"
+        },
+        {
+          "source_id": "C03",
+          "lines": [
+            106,
+            190
+          ],
+          "literal": "\"--turn-id\" =>"
+        },
+        {
+          "source_id": "C03",
+          "lines": [
+            106,
+            190
+          ],
+          "literal": "\"--json\" =>"
+        },
+        {
+          "source_id": "C01",
+          "lines": [
+            55,
+            82
+          ],
+          "literal": "config: Option<PathBuf>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "X02",
+      "shape": "proteus --config /absolute/profile.toml replay prompt /absolute/session-or-journal-path --exchange-id E --json",
+      "meaning": "creates model adapter and invokes request; hosted tools separate opt-in",
+      "source_checks": [
+        {
+          "source_id": "C03",
+          "lines": [
+            35,
+            102
+          ],
+          "literal": "Some(\"prompt\")"
+        },
+        {
+          "source_id": "C03",
+          "lines": [
+            35,
+            102
+          ],
+          "literal": "\"--exchange-id\" =>"
+        },
+        {
+          "source_id": "C03",
+          "lines": [
+            35,
+            102
+          ],
+          "literal": "\"--json\" =>"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "X03",
+      "shape": "POST /cancel?session_dir=S",
+      "meaning": "mutation, not terminal receipt",
+      "source_checks": [
+        {
+          "source_id": "C04",
+          "lines": [
+            280,
+            294
+          ],
+          "literal": "(Method::POST, \"/cancel\")"
+        }
+      ],
+      "runtime_status": "not_run"
+    },
+    {
+      "id": "X04",
+      "shape": "POST /resume",
+      "meaning": "lifecycle mutation, not cold history lookup",
+      "source_checks": [
+        {
+          "source_id": "C04",
+          "lines": [
+            382,
+            388
+          ],
+          "literal": "(Method::POST, \"/resume\")"
+        }
+      ],
+      "runtime_status": "not_run"
+    }
+  ]
+}

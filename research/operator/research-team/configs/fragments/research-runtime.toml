@@ -1,0 +1,61 @@
+# Authored source-shaped template, not a validated installed profile.
+# The separate operator-provider.toml prerequisite is intentionally not bundled.
+[modules]
+hooks = []
+workflow = "coding.codex_loop"
+context = "codex_context"
+policy = "codex_policy"
+
+[components.research-workflow]
+command = "proteus-reference-module"
+[components.research-workflow.exports.workflow."coding.codex_loop"]
+
+[components.research-context]
+command = "proteus-reference-module"
+[components.research-context.exports.context.codex_context]
+
+[components.research-policy]
+command = "proteus-reference-module"
+[components.research-policy.exports.policy.codex_policy]
+
+[components.research-files]
+command = "proteus-reference-module"
+[components.research-files.exports.tool.file_tools]
+
+[tools]
+enabled = ["read_file"]
+mcp_servers = []
+
+[addons]
+plugins = []
+
+[agent_control]
+surface = "none"
+roles = []
+
+[permissions]
+mode = "normal"
+
+[module_config.policy.codex_policy]
+allow = ["read_file"]
+ask_before = []
+deny = ["shell", "exec_command", "write_stdin", "write_file", "apply_patch", "request_permissions"]
+allow_sandboxed = []
+
+[module_config.context.codex_context]
+providers = []
+max_context_bytes = 16000
+max_bytes_per_file = 8000
+project_doc_max_bytes = 8000
+
+[module_config.workflow."coding.codex_loop"]
+# Workflow stream recovery only; not an HTTP/provider-attempt budget.
+stream_max_retries = 0
+
+[app_server]
+approval_timeout_ms = 60000
+
+[runtime]
+model_timeout_ms = 60000
+context_timeout_ms = 5000
+workflow_timeout_ms = 180000
