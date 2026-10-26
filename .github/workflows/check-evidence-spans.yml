@@ -1,0 +1,56 @@
+name: Check authored evidence spans (supervised v1)
+on:
+  push:
+    paths: ['examples/evidence-spans/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-evidence-spans.yml']
+  pull_request:
+    paths: ['examples/evidence-spans/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-evidence-spans.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  evidence-spans:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-evidence-spans
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 1
+      - name: Fresh invocation parent and initial headroom
+        id: destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -I -c 'import shutil; assert shutil.disk_usage(".").free >= 8*1024**3, "need 8 GiB; no deletion"'
+          test ! -e validation/evidence-spans
+          parent=$(mktemp -d "$RUNNER_TEMP/proteus-evidence-spans-XXXXXXXX")
+          printf 'root=%s\n' "$parent" >> "$GITHUB_OUTPUT"
+      - name: Supervise unchanged semantic gates
+        shell: bash
+        run: |
+          python3 -B -I ci/resource-envelope-v1/envelope.py --profile evidence-spans \
+            --cwd "$GITHUB_WORKSPACE" \
+            --target "$CARGO_TARGET_DIR" \
+            --output '${{ steps.destination.outputs.root }}/retained' \
+            --artifacts "$GITHUB_WORKSPACE/validation/evidence-spans" \
+            --input ci/resource-envelope-v1/envelope.py \
+            --input ci/resource-envelope-v1/test_envelope.py \
+            --input ci/resource-envelope-v1/evidence-spans-stage.sh \
+            --input .github/workflows/check-evidence-spans.yml \
+            --input examples/evidence-spans/ci/run.sh \
+            -- bash ci/resource-envelope-v1/evidence-spans-stage.sh
+      - name: Retain bounded invocation snapshot, including failures
+        if: always() && steps.destination.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: evidence-spans-supervised-${{ github.sha }}
+          path: ${{ steps.destination.outputs.root }}/retained/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
