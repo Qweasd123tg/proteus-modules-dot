@@ -1,0 +1,263 @@
+[
+  {
+    "id": "E01",
+    "priority_ru": "P1 — закрыть уже созданный consumer",
+    "category": "tools",
+    "name_ru": "evidence.verify_spans: точная цитата из разрешённого artifact",
+    "user_scenario_ru": "Исследователь прикладывает quote/span к выводу; reviewer независимо перечитывает настроенный локальный source и проверяет точные байты.",
+    "existing_proteus_ru": "Host-bound read_file, tool/v6, strict JSON producer и обычный ToolModuleHost callback уже есть.",
+    "smallest_missing_seam_ru": "Pure checked-read helper + span verifier, без Core change. Настроенный source ID/path; один host-returned buffer; exact whole SHA256, UTF-8 boundaries, bounded claims. Witness сохраняет origin_verified=false и semantic_entailment=not_evaluated.",
+    "owner_and_authority_ru": "Host владеет read authority и callback; модуль только проверяет возвращённые bytes. Neutral helper не исполняет FS и не импортирует чужую module implementation.",
+    "implementation_status_ru": "Source-ready R11;39 authored Rust cases uncompiled/unrun. Offline lock/metadata/fmt и source/23 Python packaging controls не заменяют runtime. Remote package отсутствует.",
+    "required_tests_ru": [
+      "39 точных Rust cases и positive/negative own-wire demonstration против неизменных source hashes.",
+      "Отдельно actual Core + выбранный registered reader: wrong path/call, truncation/redaction, UTF8 split, stale hash, cancellation и output cap.",
+      "Не считать host AfterTool transformation доказательством исходных disk bytes или freshness."
+    ],
+    "mechanism_ids": [
+      "CX-2",
+      "RC-1"
+    ],
+    "source_rounds": [
+      2,
+      3,
+      4,
+      5
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E02",
+    "priority_ru": "P1 — исправить compatibility и затем проверить storage",
+    "category": "memory",
+    "name_ru": "Correction memory: witness → proposal → conditional write",
+    "user_scenario_ru": "Исправить устаревший локальный факт только если source quote проверена и target revision не изменилась; повтор operation ID возвращает прежний durable outcome, не выполняя новую запись.",
+    "existing_proteus_ru": "Existing memory-pack read/append и evidence blocks selection не делают replace/retract CAS; Core checkpoints CAS относится к workflow history, не arbitrary memory DB.",
+    "smallest_missing_seam_ru": "Реальный configured SQLite store, expected-revision conditional update и отдельный exact-payload idempotency outcome. Consumer повторно вызывает зарегистрированный verifier, не принимает model-supplied receipt; свежая проверка до transaction, replay outcome явно исторический.",
+    "owner_and_authority_ru": "Host authority отдельно от database transaction; module store owner задаёт path/config/store identity. Никакой общей memory authority, hidden session read или magic host CAS.",
+    "implementation_status_ru": "Исторический R17:58 source-reviewed cases unrun, затем выявлена source-only valid raw-argument incompatibility. Отдельная raw-compat candidate69 cases authored, independent source review accepted; runtime pending; всё uncompiled/unrun, lock blocked missing rusqlite. Pairing4 и 3 wire-file cases (2 own-binary restart/cancellation +1pure framing helper) входят в58; все uncompiled/unrun.",
+    "required_tests_ru": [
+      "Исполнить accepted raw-compat revision с SDK normalization-order negatives; не оживлять frozen R17 молчаливой правкой.",
+      "Реальная SQLite conflict race, same-ID same-payload replay, changed payload rejection, response-loss after commit, store/config relocation mismatch и rollback/error cases.",
+      "Actual-module verifier pairing и restart fixtures отдельно от будущей Core approval/journal/official-reader интеграции."
+    ],
+    "mechanism_ids": [
+      "MM-1",
+      "MM-2",
+      "AP-1"
+    ],
+    "source_rounds": [
+      2,
+      3,
+      4,
+      6
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E03",
+    "priority_ru": "P1 — лёгкий read-only consumer, runtime ещё открыт",
+    "category": "observability",
+    "name_ru": "SessionUsageSnapshot summary",
+    "user_scenario_ru": "Оператор видит, сколько записанных Direct/Auxiliary exchanges имеют известные tokens, а где usage отсутствует; сравнивает запросившиеся модели и statuses.",
+    "existing_proteus_ru": "SessionUsageSnapshot и AppServer/stdio consumers уже существуют. Не требуется новый usage collector или journal.",
+    "smallest_missing_seam_ru": "Pure typed projection существующего snapshot: group by observed origin/requested model/status; checked sums; optional missing denominators — все exchanges группы; unavailable отличается от пустого snapshot.",
+    "owner_and_authority_ru": "Caller выбирает/экспортирует snapshot. Summarizer не имеет FS/network/tool authority, не читает hidden session paths.",
+    "implementation_status_ru": "R18 source-ready37 authored Rust cases uncompiled/unrun; offline lock/metadata/fmt passed. Static fixture arithmetic отдельно проверена:7 exchanges/6groups/1380known tokens, не Rust execution.",
+    "required_tests_ru": [
+      "37 exact tests, reachable2MiB/+1 output cap, duplicate/exchange consistency, overflow, optional missingness и unavailable-versus-empty.",
+      "Собственный stdin example под outer deadline; это не actual AppServer transport.",
+      "Owner, provider attempts/retry lineage/serving model/currency cost оставить unavailable, не выводить из текста."
+    ],
+    "mechanism_ids": [
+      "OB-1"
+    ],
+    "source_rounds": [
+      5,
+      6
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E04",
+    "priority_ru": "P2 — сначала host-side interface и fixtures",
+    "category": "recovery",
+    "name_ru": "Read-only recovery inspector",
+    "user_scenario_ru": "После прерывания показать effect recorded, final result recorded, checkpoint/interruption и unknown categories, чтобы оператор не повторил действие вслепую.",
+    "existing_proteus_ru": "Validated JournalProjection уже хранит records и interruption sets; eval/replay имеют реальные consumers. ConversationView намеренно уже по содержанию, чем полный journal.",
+    "smallest_missing_seam_ru": "App/host-side projection поверх разрешённой session/revision boundary. Для effect-without-final-result читать record phases, а не только unresolved_tool_calls.",
+    "owner_and_authority_ru": "Existing host/app reader выбирает scope и redaction; внешнему tool module не даётся direct access к session directory.",
+    "implementation_status_ru": "Только source-grounded proposal; reader authorization/export и UI consumer не реализованы. Не новый ledger и не resume grant.",
+    "required_tests_ru": [
+      "Producer-shaped fixtures: effect без final result, rejected call, canceled with settled effect, corrupt owner/sequence, stale revision.",
+      "Отчёт не запускает инструменты; отсутствующая запись остаётся unknown, а не no-effect.",
+      "Отдельно проверять actual authorized export и exact schema/pin, прежде чем называть Core integration."
+    ],
+    "mechanism_ids": [
+      "RC-1",
+      "RC-2"
+    ],
+    "source_rounds": [
+      3,
+      4,
+      6,
+      8
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E05",
+    "priority_ru": "P2 — composition, не новая crate",
+    "category": "planning",
+    "name_ru": "Два независимых reader → source reviewer → решение",
+    "user_scenario_ru": "Проверить research claim: один reader восстанавливает producer chain, второй failure/consumer chain; reviewer заново читает источник.",
+    "existing_proteus_ru": "Configured child profiles, task/collaboration, parallel_safe limits и plan_execute_review уже есть. Последняя безtools review-фаза не заменяет независимое чтение.",
+    "smallest_missing_seam_ru": "Operator-defined read-only profiles и договорённость вывода supported/contradicted/not_checked, связанная с source pin/span. Не новый enforced DTO и не majority vote.",
+    "owner_and_authority_ru": "Host владеет child admission/tool policy; оператор — allowed artifacts/configs. Tool allowlist не filesystem sandbox, parallel_safe — декларация.",
+    "implementation_status_ru": "Round7 COMPOSITION.md — design-only, TOML syntax checked, runtime integration не выполнена. Pi actual validated readiness остаётся advisory и доверяет supplied statuses.",
+    "required_tests_ru": [
+      "Профили не могут расширить tool surface через prompt/summary; reviewer реально перечитывает permitted artifact.",
+      "Lifecycle completed≠goal accepted; queued/parked/timeout/canceled/truncated summary имеют отдельные outcomes.",
+      "No retained peer → новый ограниченный read task, не обещание durable восстановления команды."
+    ],
+    "mechanism_ids": [
+      "PL-1",
+      "PL-2",
+      "AP-2"
+    ],
+    "source_rounds": [
+      1,
+      2,
+      7
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E06",
+    "priority_ru": "P2 — corpus до нового router",
+    "category": "context",
+    "name_ru": "Route/fallback/context consistency corpus",
+    "user_scenario_ru": "Сменить модель после overflow/failure, не потеряв инструментальные факты, output schema и terminal cancellation.",
+    "existing_proteus_ru": "BeforeModel request rebinding/shape/tool validation; context preparation/compaction и pair-aware recovery уже есть. Auxiliary path имеет отдельные semantics.",
+    "smallest_missing_seam_ru": "Не новый model router по умолчанию, а authored policy corpus, фиксирующий middleware order, selected model/tool/output capabilities и допустимые failure transitions.",
+    "owner_and_authority_ru": "Model/workflow extensions выбирают стратегию; host повторно проверяет shape/authority. Budget owner не подменяется hook-only counter.",
+    "implementation_status_ru": "Proposal only: corpus и actual pinned consumer integration ещё не написаны/не запущены. Источник показывает полезные cases, не production issue reproduction.",
+    "required_tests_ru": [
+      "Retry exhaustion as ordinary answer vs typed error; terminal cancel/TripWire не превращается в next provider attempt.",
+      "Fallback to smaller context, full system/tools framing, pair crossing summary boundary, stable IDs/provenance.",
+      "Eager tool completed before model failure сохраняется как факт; количество model nodes не выдаётся за provider attempts/currency cap."
+    ],
+    "mechanism_ids": [
+      "CX-1",
+      "OB-1",
+      "OB-2"
+    ],
+    "source_rounds": [
+      5,
+      6
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E07",
+    "priority_ru": "P3 — только с отдельным разрешённым browser consumer",
+    "category": "tools",
+    "name_ru": "Observation-bound browser recipe/driver",
+    "user_scenario_ru": "Наблюдать страницу и выполнить выбранное разрешённое действие лишь пока observation/resource generation ещё актуальны.",
+    "existing_proteus_ru": "Dynamic tool selection, registered tools и host approval уже есть; новый browser slot Core не требуется.",
+    "smallest_missing_seam_ru": "Реальный driver должен выдавать observation ID/epoch, resource owner, selector/action admissibility и stale rejection; recipe preview не исполняет effects.",
+    "owner_and_authority_ru": "App/environment owner владеет browser session; Core владеет invocation authorization. URL allowlist, approval и OS isolation различны.",
+    "implementation_status_ru": "Source-only proposal; ни driver/module implementation, ни browser automation, ни end-to-end runtime не выполнены.",
+    "required_tests_ru": [
+      "Навигация между двумя действиями, stale selector после свежего screenshot, timeout с новым session generation.",
+      "Denied approval → no action; rerun recipe требует новых permissions и observation, а не replay старого result.",
+      "Resource conflict key и close ownership проверяются настоящим driver, не именем tool."
+    ],
+    "mechanism_ids": [
+      "CX-2",
+      "TL-1",
+      "TL-2",
+      "AP-2"
+    ],
+    "source_rounds": [
+      1,
+      3
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E08",
+    "priority_ru": "P2 — text bridge; P3 для native realtime",
+    "category": "media",
+    "name_ru": "App-owned committed STT → Core text → TTS",
+    "user_scenario_ru": "Прочитать вслух результат разрешённого поиска, прервать звук и перечитать ответ без повторного tool effect.",
+    "existing_proteus_ru": "AppServer Send(text/images), message identity/completed item, active-run cancel и lag/snapshot resync уже есть.",
+    "smallest_missing_seam_ru": "Первый seam — app playback identity/status и committed transcript. Native speech-to-speech потребует bidirectional media/floor/truncation/history contracts отдельно.",
+    "owner_and_authority_ru": "Приложение владеет device consent, STT/TTS/RTC resources; Core — execution/approval/history. Playback interrupt не cancel effect.",
+    "implementation_status_ru": "Round8 design-only INTEGRATION-LIMITS;10 proposed gates unrun. Никаких устройств, recording, provider calls, серверов или нового crate.",
+    "required_tests_ru": [
+      "Queued Send не считать новым active run; Cancel ack не считать terminal settlement.",
+      "Late interrupt старого поколения не останавливает новый ответ; completed item не terminal turn и не heard acknowledgement.",
+      "Reconnect не читает snapshot вслух автоматически; partial/unknown delivery не повторяет effectful tool; close освобождает own media resources."
+    ],
+    "mechanism_ids": [
+      "MD-1",
+      "MD-2",
+      "TL-2"
+    ],
+    "source_rounds": [
+      8
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E09",
+    "priority_ru": "P3 — новый backend contract только при реальной долгой задаче",
+    "category": "approval",
+    "name_ru": "Durable review inbox",
+    "user_scenario_ru": "Correction proposal ждёт reviewer вне текущего turn/process, затем применяется только к исходной версии/операции после новой host проверки.",
+    "existing_proteus_ru": "Bounded in-turn Ask и same-root WorkflowContinuation уже есть; это не durable suspended task с persisted approver identity.",
+    "smallest_missing_seam_ru": "Authenticated decision + versioned pending proposal, expiry/cancel, transactional claim/attempt ownership, actual backend idempotency и reconciliation.",
+    "owner_and_authority_ru": "Host/backend владеет approval/resume authority. Module/model supplied bool или receipt hash не создаёт разрешение.",
+    "implementation_status_ru": "Proposal only; store/consumer/authentication/restart protocol не реализованы. До появления потребности предпочтительнее bounded approval/read-only report.",
+    "required_tests_ru": [
+      "Stale/expired/canceled decision, modified payload/revision, duplicate claim, crash around decision/write boundary.",
+      "Restart повторно связывает pending identity, current authority и target revision; no automatic repeat по отсутствию final text.",
+      "Actual backend crash/concurrency evidence, не DTO serialization tests."
+    ],
+    "mechanism_ids": [
+      "AP-1",
+      "RC-2",
+      "MM-2"
+    ],
+    "source_rounds": [
+      1,
+      4
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  },
+  {
+    "id": "E10",
+    "priority_ru": "P3 — только если narrow snapshot недостаточен",
+    "category": "observability",
+    "name_ru": "Owner-aware read-only journal export",
+    "user_scenario_ru": "Оператор хочет связать known usage конкретного tool/context/workflow с origin и owner, не угадывая по transcript.",
+    "existing_proteus_ru": "Journal ModelRequest/Response facts содержат больше attribution, чем SessionUsageSnapshot; validated projection/eval reader уже есть.",
+    "smallest_missing_seam_ru": "Host/app-authorized bounded export с revision/record boundary и explicit missing fields. Provider attempt lineage требует отдельного реального adapter producer; валютная оценка — operator-versioned price input.",
+    "owner_and_authority_ru": "Host export owner читает existing facts; parser/summarizer не получает hidden session FS. Pricing и budget enforcement не выводятся из отчёта.",
+    "implementation_status_ru": "Отдельное proposal, не minimum contract R18. Не новый ledger/универсальный budget hook и не обещание полной billing attribution.",
+    "required_tests_ru": [
+      "Known owner vs absent, Direct/Auxiliary, partial usage, failed/unfinished exchange, invalid cross-owner linkage.",
+      "Не называть exchange count попытками provider; unknown serving model/retries остаются unknown.",
+      "Любая future currency estimate маркируется estimated с price version; measured provider counters отдельно. Reserve/settle quota требует другого consumer/контракта."
+    ],
+    "mechanism_ids": [
+      "OB-1"
+    ],
+    "source_rounds": [
+      5,
+      6
+    ],
+    "execution_authorization": "Roadmap does not authorize new runs, devices, writes, builds, publication or deployment."
+  }
+]

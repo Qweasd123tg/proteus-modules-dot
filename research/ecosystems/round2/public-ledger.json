@@ -1,0 +1,775 @@
+{
+  "schema": "proteus.ecosystem.findings.v1",
+  "batch": "round2-letta-memory-and-strands",
+  "as_of_utc": "2026-10-25T23:24:00Z",
+  "source_pins": {
+    "letta_navigation": "8816d3a8516893bfdc0fa14bfb1235226012e295",
+    "letta_v1_archive": "56ba9c25552605eec89de8ed3dc6394b625c1993",
+    "letta_code": "1fb6ea4d30942ef9220b096ba7f4185f18184fc1",
+    "strands": "10b9393ef705ccf4b56e5fe0d81e0712c0d97efe",
+    "core": "3f36a003b4f3fde2242fc80f7aedac00dd127d1d",
+    "modules": "04114bbe85f179895e2b8553b6169a284caaeae3"
+  },
+  "source_scope": "46 targeted files; source read only; archive and active Letta kept distinct",
+  "findings": [
+    {
+      "id": "ECO2-01",
+      "title": "Текущий Letta — не прежний V1, Strands сменил канонический репозиторий",
+      "observation": "Текущий letta-ai/letta main является навигационной страницей: активный код в letta-code, V1 обозначен retired/archive. GitHub metadata для sdk-python возвращает strands-agents/harness-sdk; Python исходники теперь в strands-py/.",
+      "transfer": "Отдельно закреплять active и historical source. Не выдавать старые block APIs за современную MemFS архитектуру и не обещать совместимость по названию бренда.",
+      "limits": "Переименование подтверждено metadata; описание Letta migration — pinned README. Это не полноценный migration guide.",
+      "sources": [
+        {
+          "repository_prefix": "N",
+          "path": "README.md",
+          "url": "https://github.com/letta-ai/letta/blob/8816d3a8516893bfdc0fa14bfb1235226012e295/README.md"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L01",
+      "title": "История block — отдельная сущность от API revision и trusted evidence",
+      "observation": "V1 ORM Block имеет version_id_col для optimistic locking; BlockHistory содержит sequence_number и checkpoint snapshots. После undo новый checkpoint удаляет будущую redo-ветвь. Public Block/BlockUpdate не передают этот ORM version как expected revision.",
+      "transfer": "Memory correction consumer должен явно требовать expected revision/content digest. Нельзя считать supplied revision старого evidence-blocks примером реальной optimistic concurrency или неизменяемым audit log.",
+      "limits": "Только archived V1. Полный ORM/session transaction backend не запускался; наличие version column не доказывает клиентский compare-and-set.",
+      "sources": [
+        {
+          "repository_prefix": "L",
+          "path": "letta/orm/block.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/orm/block.py#L55-L69"
+        },
+        {
+          "repository_prefix": "L",
+          "path": "letta/services/block_manager.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/block_manager.py#L842-L912"
+        },
+        {
+          "repository_prefix": "L",
+          "path": "letta/schemas/block.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/schemas/block.py#L67-L145"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/lib.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/lib.rs#L84-L158"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/src/lib.rs",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/src/lib.rs#L31-L151"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L02",
+      "title": "Attach/detach меняет участие памяти, а не существование всех её копий",
+      "observation": "V1 attach связывает agent с существующим Block и может прикрепить его sleeptime peer; detach удаляет связь только выбранного agent. Текущий shared-memory attach отдельно ждёт видимость API, создаёт local mount и перекомпилирует prompt; detach явно оставляет mount на диске.",
+      "transfer": "Для memory scope/attachment хранить membership отдельно от content revision. UI должен раздельно сообщать detached, локальные bytes остались и projection refresh не удался.",
+      "limits": "Не обещать erase/forget-all по detach или tombstone. Современный cloud server ACL/attachment transaction не покрыт.",
+      "sources": [
+        {
+          "repository_prefix": "L",
+          "path": "letta/services/agent_manager.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/agent_manager.py#L2162-L2231"
+        },
+        {
+          "repository_prefix": "L",
+          "path": "letta/orm/blocks_agents.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/orm/blocks_agents.py"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/cli/subcommands/shared-memory.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/cli/subcommands/shared-memory.ts#L304-L407"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/README.md",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/README.md"
+        },
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/lib.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/lib.rs#L84-L158"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L03",
+      "title": "Изменённая память и обновлённый prompt — разные outcomes",
+      "observation": "V1 block update затем перестраивает prompts подключённых agents; ошибки rebuild логируются. Текущий memory worker после merge/sync вызывает recompile, но ошибка recompile не отменяет committed memory; shared-memory command сообщает recompile_failed отдельно.",
+      "transfer": "У module store разделять committed_revision и projected_revision/refresh status. Повторять projection refresh, а не повторно применять уже записанное изменение.",
+      "limits": "Это наблюдаемый lifecycle split, не доказанная рассинхронизация в live deployment. Не менять host effect outcome из-за косметического refresh.",
+      "sources": [
+        {
+          "repository_prefix": "L",
+          "path": "letta/services/block_manager.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/block_manager.py#L61-L68"
+        },
+        {
+          "repository_prefix": "L",
+          "path": "letta/services/block_manager.py",
+          "url": "https://github.com/letta-ai/letta/blob/56ba9c25552605eec89de8ed3dc6394b625c1993/letta/services/block_manager.py#L211-L270"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/subagents/memory-worker.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/subagents/memory-worker.ts#L88-L111"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/cli/subcommands/shared-memory.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/cli/subcommands/shared-memory.ts#L194-L210"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/workflow_failure.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_failure.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L04",
+      "title": "Прогрессивная память: индекс в контексте, детали по запросу",
+      "observation": "Текущий MemFS v2 compiler включает root memory и ссылки на child MEMORY.md; Memory tool читает deferred directory/file, показывает listing/description и явные truncation notices. Root files отклоняются этим tool как уже включённые в prompt.",
+      "transfer": "Для большой проверяемой базы знаний — маленький context_provider индекс и read tool для конкретного документа. Budget и completeness должны входить в результат; retrieved content не становится system policy.",
+      "limits": "Это не новая категория Core slot и не измеренное снижение токенов. Existing evidence-blocks уже умеет bounded lexical selection, но не является persistent lazy store.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/system-prompt-compilation.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/system-prompt-compilation.ts#L81-L143"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/system-prompt-compilation.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/system-prompt-compilation.ts#L154-L199"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/tools/impl/memory.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/tools/impl/memory.ts#L133-L177"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/tools/impl/memory.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/tools/impl/memory.ts#L243-L422"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/provider.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/provider.rs"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/src/lib.rs",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/src/lib.rs#L189-L248"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L05",
+      "title": "Рабочая память, committed memory и процитированный источник — разные представления",
+      "observation": "Local prompt compiler читает committed Git contents и возвращает memfsRevision; Memory tool читает рабочую файловую проекцию и может обрезать вывод. Присутствие revision/source строки само по себе не связывает любую цитату с конкретными immutable bytes.",
+      "transfer": "Quote verifier должен проверять hash именно прочитанных bytes, точные UTF-8 spans и выбранную projection. Для committed view все reads должны быть на закреплённой revision, а не на подвижном имени.",
+      "limits": "Никакой цитатный hash не подтверждает истинность текста. Точная snapshot-consistency текущего Letta при concurrent writers не проверялась и остаётся непроверенным вопросом.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/system-prompt-compilation.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/system-prompt-compilation.ts#L65-L143"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/tools/impl/memory.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/tools/impl/memory.ts#L330-L422"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation/view.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L06",
+      "title": "Memory worker изолирует предложение до интеграции, но не маскирует поздний результат",
+      "observation": "Update worker создаёт private worktree, запускает worker, интегрирует commits и sync. Cancelled update discard не переносит его edits в parent; exception после commit сохраняет commits для интеграции, сохраняя failed task result. Merge conflict удерживает branch; repair worker работает непосредственно на parent checkout.",
+      "transfer": "Для memory correction полезны proposal→validate→CAS apply→projection, а не автоматическое изменение global memory из контекста. Failure задачи не должен стирать факты уже совершённой записи; cancel и repair имеют разные гарантии.",
+      "limits": "Гарантия discard относится к этому локальному worktree пути, не к произвольным внешним эффектам child. Shared Git common dir и process tools не являются сами по себе sandbox.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/subagents/memory-worker.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/subagents/memory-worker.ts#L174-L255"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/memory-worktree.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-worktree.ts#L125-L211"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/memory-worktree.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-worktree.ts#L668-L748"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L07",
+      "title": "Ownership token защищает cleanup от устаревшего worker",
+      "observation": "Memory operation lock сериализует harness writers; primary edits явно не используют этот lock. Repair marker имеет signature/token/state и переходы сравнивают token; dead-owner detection отличает живой paused процесс от умершего. Shutdown ожидает teardown tracked memory tasks.",
+      "transfer": "В background producer нужен единый owner, generation/token на transition и drain/settlement. Не превращать истечение времени в доказательство, что writer умер, и не освобождать чужую новую lease.",
+      "limits": "Файловая lock/liveness реализация только прочитана частично; не доказан distributed lock. Core cancellation/settlement остаются host-owned; module lock не расширяет authority.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/memory-operation.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-operation.ts"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/memory-conflict-repair.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-conflict-repair.ts#L107-L235"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/utils/file-lock.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/utils/file-lock.ts#L66-L139"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/tools/impl/memory-task-lifecycle.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/tools/impl/memory-task-lifecycle.ts#L172-L233"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/agent_control.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/agent_control.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L08",
+      "title": "Валидация committed memory должна повторяться после объединения",
+      "observation": "Memory tree validator проверяет обязательные индексы, regular files, глубину, per-file/core character budgets и readOnlyFiles относительно accepted tree. Post-turn sync различает dirty/conflict/invalid/push_failed и повторяет validation после rebase.",
+      "transfer": "Memory storage module должен проверять итог объединения/CAS commit, а не только каждое предложение отдельно. Лимиты не разрешаются моделью; read-only данные сравниваются с accepted revision.",
+      "limits": "Проверки characters не равны token budget. Предлагается собственный ограниченный memory backend, не выполнение Git hooks/upstream scripts.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/memory-constraints.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/memory-constraints.ts#L39-L187"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/memory-git.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/memory-git.ts#L1837-L1982"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/lib.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/lib.rs#L84-L158"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/src/lib.rs",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/src/lib.rs#L84-L151"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L09",
+      "title": "Handoff как read-only evidence, не копия всех инструкций",
+      "observation": "Memory handoff постранично экспортирует parent transcript, исключает reasoning/system messages, создаёт отдельный read-only файл и удаляет его после child lifetime. Prompt просит использовать transcript только для конкретной неопределённости; repair-only worker обходится без transcript.",
+      "transfer": "Использовать уже существующий conversation snapshot для scoped evidence extraction; передавать selected facts/locators, не runtime authority. Imported role/system text не должен становиться executable history.",
+      "limits": "Фильтрация roles и chmod не доказывают защиту от смысловой prompt injection. Полный export может быть крупным; в consumer нужны собственные лимиты, revision и completeness.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/agent/subagents/memory-handoff.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/agent/subagents/memory-handoff.ts"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/runtime/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/conversation.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-L10",
+      "title": "Context pressure требует проверки прогресса и безопасной границы",
+      "observation": "Local Letta compaction имеет guard уменьшения message count или estimated tokens, сохраняет pending tool-call tail в all mode и выбирает допустимый cutoff в sliding mode. Compaction представлена отдельной transcript entry с firstKeptEntryId, а не только заменённым текстом.",
+      "transfer": "Сохранять host preparation/compaction и canonical execution facts. Module-memory limits и conversation compaction — разные бюджеты; fallback summary не превращается в receipt.",
+      "limits": "Token counts оценочные; нет benchmark. Полная crash durability LocalStore и model compaction quality не проверены.",
+      "sources": [
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/compaction.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/compaction.ts#L62-L94"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/compaction.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/compaction.ts#L598-L709"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/local-store.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/local-store.ts#L1143-L1224"
+        },
+        {
+          "repository_prefix": "T",
+          "path": "src/backend/local/local-store.ts",
+          "url": "https://github.com/letta-ai/letta-code/blob/1fb6ea4d30942ef9220b096ba7f4185f18184fc1/src/backend/local/local-store.ts#L3001-L3029"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/runtime/checkpoint.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/checkpoint.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S01",
+      "title": "Accepted и stored различены; flush не универсальный commit ACK",
+      "observation": "Strands add_memory с wait_for_writes=false возвращает accepted и запускает tracked background writes, по умолчанию ожидает и возвращает stored. MemoryManager.flush обслуживает automatic extraction, но явно не ждёт fire-and-forget add. Sync Agent entrypoint вызывает flush в finally; async caller должен выбрать shutdown boundary.",
+      "transfer": "Для durable memory mutation через Proteus tool возвращать actual write outcome/receipt, не accepted как успешную запись. Если нужен accepted job — отдельный статус и наблюдаемый terminal settlement.",
+      "limits": "Flush swallowing failures не даёт verified success. Это осознанная best-effort memory policy, не подтверждённая уязвимость.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/memory/memory_manager.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/memory/memory_manager.py#L512-L605"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/memory/memory_manager.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/memory/memory_manager.py#L767-L775"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/agent/agent.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/agent/agent.py#L1008-L1020"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/tools.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/tools.rs#L40-L100"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S02",
+      "title": "Extraction pipeline — producer с watermark, retries и частичными внешними writes",
+      "observation": "Coordinator сериализует saves каждого store, хранит in-memory message sequence/watermarks, rollback mark при обычной ошибке, backoff/probe и trim по минимальному mark. Extracted entries пишутся параллельно; при частичной ошибке весь batch повторяется, исходник прямо требует ожидать duplicates.",
+      "transfer": "Новый memory distiller должен иметь persisted source revision/range, idempotency key и явный ledger accepted/applied/unknown; failed store не должен удерживать неограниченно все messages без quota.",
+      "limits": "Не обещать global at-most-once или crash recovery по process-local marks. Полная семантика cancellation и cross-process recovery требует отдельной проверки.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/memory/extraction/coordinator.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/memory/extraction/coordinator.py#L59-L266"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/memory/extraction/coordinator.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/memory/extraction/coordinator.py#L269-L366"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/lib.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/lib.rs#L84-L158"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S03",
+      "title": "Snapshot, checkpoint marker и journal дают разные гарантии",
+      "observation": "Strands checkpoint содержит position/cycle/schema, а не conversation state. Snapshot сохраняет выбранные поля messages/state/conversation manager/interrupt/model state; session manager добавляет system prompt. RepositorySessionManager отдельно ведёт messages и agent state.",
+      "transfer": "Не импортировать чужой snapshot как host admission или approval. Для read research использовать canonical snapshot/view; pause marker не выдавать за durable effect journal.",
+      "limits": "Storage/schema validation не удостоверяет источник. Snapshot не сохраняет произвольные tools/callbacks/OS effects; full graph scheduler не исследован.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/experimental/checkpoint/checkpoint.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/experimental/checkpoint/checkpoint.py"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/types/_snapshot.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/types/_snapshot.py"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/agent/agent.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/agent/agent.py#L2230-L2320"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/session/repository_session_manager.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/session/repository_session_manager.py#L83-L196"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation/view.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/workflow_replay/mod.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/workflow_replay/mod.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S04",
+      "title": "Один capture, immutable history перед latest, но не единая внешняя транзакция",
+      "observation": "SnapshotSessionManager при trigger захватывает state один раз и сначала записывает immutable snapshot, затем latest. Save идёт также после invocation management; ошибка custom trigger не отменяет latest save. LocalFileStorage делает temp→replace; indexing может завершиться ошибкой после успешной записи bytes.",
+      "transfer": "Кэш/индекс/проекция должны восстанавливаться из committed data; surfaced error не равен отсутствию write. Не копировать snapshot whole-state вместо существующего canonical journal Proteus.",
+      "limits": "Atomic rename не доказывает power-loss durability или cross-process CAS. Backend implementations/конкурентные writers не тестировались.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/session/snapshot_session_manager.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/session/snapshot_session_manager.py#L596-L692"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/storage/local_file_storage.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/storage/local_file_storage.py#L114-L157"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/runtime/checkpoint.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/checkpoint.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S05",
+      "title": "Ссылка на offloaded content требует availability/completeness",
+      "observation": "Snapshot save включает ephemeral stash inline или external reference для durable stash; ошибку snapshotting stash не скрывает. Restore stash, напротив, предупреждает и продолжает, если payload недоступен/несовместим.",
+      "transfer": "Evidence consumer обязан отличать ref-present от bytes-resolved. Missing reference делает соответствующую проверку unsupported/incomplete, а не successful empty proof.",
+      "limits": "Это явный tradeoff availability против полноты. Не требуется новый всеобщий Conversation DTO; нужен узкий resolver, если concrete source использует external payload.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/session/snapshot_session_manager.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/session/snapshot_session_manager.py#L694-L760"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation/view.rs"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/README.md",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/README.md"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-S06",
+      "title": "Resume фильтрует уже полученные results, hooks остаются доверенными",
+      "observation": "Interrupt state сохраняет assistant request и completed_tool_results; при resume исполняются только IDs без результата. Executor поддерживает replace/short-circuit/retry callbacks; cancel прекращает retry, concurrent executor отменяет и ожидает принадлежащие tasks.",
+      "transfer": "Effect facts хранить независимо от mutable hook projection и aggregate completion. Любой retry мутации требует consumer-specific доказательства допустимости; сохранить имеющиеся raw-effect и cancellation гарантии Core.",
+      "limits": "Наличие completed result не означает внешнюю exactly-once транзакцию. Полный background-task runtime и универсальная approval policy Strands здесь не покрыты.",
+      "sources": [
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/event_loop/event_loop.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/event_loop/event_loop.py#L817-L1030"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/tools/executors/_executor.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/tools/executors/_executor.py#L212-L433"
+        },
+        {
+          "repository_prefix": "S",
+          "path": "strands-py/src/strands/tools/executors/concurrent.py",
+          "url": "https://github.com/strands-agents/harness-sdk/blob/10b9393ef705ccf4b56e5fe0d81e0712c0d97efe/strands-py/src/strands/tools/executors/concurrent.py"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-P01",
+      "title": "Актуальный Proteus уже имеет ConversationView поверх canonical snapshot",
+      "observation": "В Core pin 3f36a… есть ConversationView schema1 с source harness/version/session/revision, projection=Conversation и полным ConversationSnapshot. Snapshot текущего root читается в checkpoint lock order; tool owner разрешается однозначно по call ID.",
+      "transfer": "Старый readcompat proof использовать как ограниченный reporting-only mapping пример, не как актуальное доказательство отсутствия view. Новый research consumer читает существующие типы и добавляет только предметные evidence locators.",
+      "limits": "View исключает заменённую compaction history и uncheckpointed streaming; revision не SSE cursor и не доказательство внешнего состояния. Старый proof pin другой и не был перезапущен.",
+      "sources": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation/view.rs"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-core/src/core/runtime/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/conversation.rs"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO2-P02",
+      "title": "Настоящий пробел — correction/retraction consumer, не ещё один блоковый selector",
+      "observation": "Memory-pack append-only remember/substring recall не даёт object-level replace/retract/CAS; evidence-blocks выбирает supplied immutable config revisions, ничего не пишет и provenance_verified=false. Новый json_contracts producer уже умеет strict full-read/hash/actual assertions, но не quote spans.",
+      "transfer": "Пара реальных потребителей: evidence.verify_spans (точные bytes/hash/span, не truth) и memory.correct_fact (прочитать prior revision→проверить source quote→показать proposal→host-authorized CAS update→прочитать новый current view). Начать с single-owner local store и deterministic fixtures.",
+      "limits": "В этом исследовательском раунде только design. Ни новый модуль, ни quote-verification tests, ни durable store implementation не созданы. Существующий producer нельзя объявлять криптографически аутентифицированным raw filesystem snapshot.",
+      "sources": [
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/lib.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/lib.rs#L84-L158"
+        },
+        {
+          "repository_prefix": "M",
+          "path": "context_provider/memory-pack/src/tools.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/tools.rs"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/src/lib.rs",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/src/lib.rs#L31-L151"
+        },
+        {
+          "repository_prefix": "E",
+          "path": "examples/letta-evidence-blocks/src/lib.rs",
+          "url": "https://github.com/Qweasd123tg/proteus-modules-dot/blob/29d31fb36397008b7677cd5df4943031e24e8fdf/examples/letta-evidence-blocks/src/lib.rs#L189-L248"
+        }
+      ],
+      "proteus": [
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/conversation.rs#L16-L70"
+        },
+        {
+          "repository_prefix": "C",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation": "not_implemented_in_this_round",
+      "public_classification": "safe_architecture_pattern"
+    }
+  ]
+}

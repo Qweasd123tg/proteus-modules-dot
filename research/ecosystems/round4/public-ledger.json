@@ -1,0 +1,625 @@
+[
+  {
+    "id": "PY01",
+    "title_ru": "Deferred approval ≠ durable workflow",
+    "finding_ru": "DeferredToolRequests разделяет внешнее исполнение и approvals; build_results проверяет принадлежность IDs категории, approve_all является явной политикой caller. Сам объект не сохраняет ожидание, не аутентифицирует approver и не создаёт exactly-once execution.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_deferred.py",
+        "start_line": 29,
+        "end_line": 105,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_deferred.py#L29-L105"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_deferred.py",
+        "start_line": 162,
+        "end_line": 223,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_deferred.py#L162-L223"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/capabilities/deferred_tool_handler.py",
+        "start_line": 13,
+        "end_line": 75,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/capabilities/deferred_tool_handler.py#L13-L75"
+      }
+    ],
+    "proteus_mapping_ru": "Core уже владеет admission/approval, а WorkflowContinuation — host-reviewed продолжение того же root turn, не durable human inbox.",
+    "practical_consequence_ru": "Долгоживущее human review потребует настоящего inbox/backend, ownership и повторной host admission, а не переноса approved=true.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-contracts/src/contracts/workflow.rs",
+        "start_line": 84,
+        "end_line": 103,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/workflow.rs#L84-L103"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY02",
+    "title_ru": "Resume повторно связывает pending call и аргументы",
+    "finding_ru": "При resume уже возвращённый tool result нельзя подменить; дубли tool_call_id отклоняются перед исполнением batch. ToolApproved.override_args проходит повторную validation через тот же manager с approved=true.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_agent_graph.py",
+        "start_line": 805,
+        "end_line": 857,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_agent_graph.py#L805-L857"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_tool_execution.py",
+        "start_line": 674,
+        "end_line": 718,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_tool_execution.py#L674-L718"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/tool_manager.py",
+        "start_line": 578,
+        "end_line": 643,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/tool_manager.py#L578-L643"
+      }
+    ],
+    "proteus_mapping_ru": "Core journal уже проверяет неизменность call и lifecycle owner между requested/approval/resolution; этого нельзя заменить чужим approval DTO.",
+    "practical_consequence_ru": "При импорте чужого review хранить предложение/decision как данные, но host должен заново связать exact call/current policy.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/session_journal/projection.rs",
+        "start_line": 266,
+        "end_line": 341,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_journal/projection.rs#L266-L341"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY03",
+    "title_ru": "Inline resolution — одно прохождение, не скрытый scheduler",
+    "finding_ru": "Deferred handler вызывается one-shot; ответы идут обратно через существующий tool execution path. Если утверждённый call снова defer-ится, остаток попадает в terminal pending batch, без бесконечного внутреннего approval loop.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_tool_execution.py",
+        "start_line": 1094,
+        "end_line": 1180,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_tool_execution.py#L1094-L1180"
+      }
+    ],
+    "proteus_mapping_ru": "Host-reviewed workflow continuation и обычные tool callbacks уже позволяют bounded same-turn control; durable scheduler не следует из них.",
+    "practical_consequence_ru": "Полезен explicit pending/remaining UX, но не новый Core execution owner.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-contracts/src/contracts/workflow.rs",
+        "start_line": 84,
+        "end_line": 110,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/workflow.rs#L84-L110"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY04",
+    "title_ru": "Events, snapshots и effect ledger — разные факты",
+    "finding_ru": "StepEvent не несёт recoverable state; ContinuableSnapshot хранит history; ToolEffectRecord отдельно описывает started/completed/failed. RecoveryInspection не разрешает replay: completed не доказывает checkpoint результата, failed не доказывает отсутствие effect.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_types.py",
+        "start_line": 29,
+        "end_line": 128,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_types.py#L29-L128"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/recovery.py",
+        "start_line": 1,
+        "end_line": 35,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/recovery.py#L1-L35"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py",
+        "start_line": 611,
+        "end_line": 666,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py#L611-L666"
+      }
+    ],
+    "proteus_mapping_ru": "Core уже разделяет ToolCallRecorded, ToolEffectRecorded, ToolResultRecorded и валидирует owner/order; AfterTool failure сохраняет raw settled result.",
+    "practical_consequence_ru": "Не создавать второй ledger в модуле. Forensic consumer должен читать существующие host facts и явно различать неизвестный effect/непринятый result.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/session_journal/projection.rs",
+        "start_line": 343,
+        "end_line": 395,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_journal/projection.rs#L343-L395"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+        "start_line": 92,
+        "end_line": 130,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/hooks.rs#L92-L130"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY05",
+    "title_ru": "Interrupted history не означает безопасно повторить tool",
+    "finding_ru": "Успешный CallTools boundary сохраняет settled snapshot; error-path захватывает live history и классифицирует complete/interrupted. continue_run по умолчанию берёт complete; include_interrupted — отдельный opt-in, а fork_run на data layer тот же history load.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py",
+        "start_line": 487,
+        "end_line": 566,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py#L487-L566"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py",
+        "start_line": 668,
+        "end_line": 726,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py#L668-L726"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_helpers.py",
+        "start_line": 61,
+        "end_line": 95,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_helpers.py#L61-L95"
+      }
+    ],
+    "proteus_mapping_ru": "Core хранит interruption facts и отдельно получает writer-authorized resume. ConversationView показывает canonical projection, не полный journal.",
+    "practical_consequence_ru": "Нельзя выводить resume safety из provider-valid pairing или read-only ConversationView; нужен host-owned recovery review.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/runtime/resume.rs",
+        "start_line": 8,
+        "end_line": 33,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/runtime/resume.rs#L8-L33"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+        "start_line": 18,
+        "end_line": 34,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/conversation/view.rs#L18-L34"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY06",
+    "title_ru": "Retention не должна стирать idempotency identity",
+    "finding_ru": "Snapshot key привязан к run-local sequence/step/state; last-snapshot comparison восстанавливается из replayed local state, не внешнего read. PostgreSQL отдельно хранит consumed keys и claims key+snapshot в одной transaction; retention сохраняет newest и newest complete.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py",
+        "start_line": 331,
+        "end_line": 389,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_capability.py#L331-L389"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_postgres.py",
+        "start_line": 337,
+        "end_line": 377,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_postgres.py#L337-L377"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py",
+        "start_line": 133,
+        "end_line": 152,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py#L133-L152"
+      }
+    ],
+    "proteus_mapping_ru": "Core уже имеет own session sequence/revision/writer ownership; их нельзя заменить переносимой строкой key.",
+    "practical_consequence_ru": "Для будущего memory correction backend сохранить independent idempotency lifetime и atomic conditional write; evidence_spans этого не реализует.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/session_journal/projection.rs",
+        "start_line": 554,
+        "end_line": 585,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_journal/projection.rs#L554-L585"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY07",
+    "title_ru": "Название store не равно одной durability guarantee",
+    "finding_ru": "FileStepStore делает отдельные snapshot replace и append key log; helper обеспечивает visible atomic replacement, но в прочитанном helper нет fsync. PostgreSQL transaction объединяет key, messages и snapshot; SQLite uses transaction for snapshot/messages. Backend guarantees надо квалифицировать отдельно.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py",
+        "start_line": 51,
+        "end_line": 68,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py#L51-L68"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py",
+        "start_line": 694,
+        "end_line": 731,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py#L694-L731"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py",
+        "start_line": 1361,
+        "end_line": 1394,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_store.py#L1361-L1394"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_postgres.py",
+        "start_line": 349,
+        "end_line": 377,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/src/pydantic_ai_harness/pydantic_ai_harness/step_persistence/_postgres.py#L349-L377"
+      }
+    ],
+    "proteus_mapping_ru": "Core own journal/writer protocol уже существует; модулю не следует изобретать вторую filesystem persistence схему.",
+    "practical_consequence_ru": "Это source-level design contrast, не воспроизведённый crash bug. Нет утверждения о полной durability PostgreSQL configuration/OS/DB.",
+    "proteus_evidence": [],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY08",
+    "title_ru": "Durable extension имеет реальный execution backend",
+    "finding_ru": "DurableOperationBackend связывает typed operation, transport/codec, name/config и backend primitive. Temporal backend регистрирует worker activities, сериализует параметры и вызывает activity handler; это реальный producer/consumer boundary, не только новые data types.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_operation_backend.py",
+        "start_line": 74,
+        "end_line": 193,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_operation_backend.py#L74-L193"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_operation_backend.py",
+        "start_line": 248,
+        "end_line": 297,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_operation_backend.py#L248-L297"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_operation_backend.py",
+        "start_line": 96,
+        "end_line": 224,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_operation_backend.py#L96-L224"
+      }
+    ],
+    "proteus_mapping_ru": "Proteus SDK host bridge уже даёт tool execution boundary. Generic Temporal adapter поверх него ещё не доказывает host authorization/persistence/reconciliation.",
+    "practical_consequence_ru": "Если нужен external durable worker, сначала определить host-issued work identity и admission/commit protocol; не делать mirror operation registry как самоцель.",
+    "proteus_evidence": [],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY09",
+    "title_ru": "Динамичность ограничена границей replay",
+    "finding_ru": "Executing toolsets/capabilities, добавленные per-run после registration, отклоняются в durable context. Discovery/validation/execution dynamic tools проходят отдельные units; real tool args повторно валидируются worker-side. Для Temporal dynamic/MCP tool нельзя отключить activity wrapping.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_base.py",
+        "start_line": 784,
+        "end_line": 842,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_base.py#L784-L842"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py",
+        "start_line": 219,
+        "end_line": 305,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py#L219-L305"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py",
+        "start_line": 894,
+        "end_line": 943,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py#L894-L943"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py",
+        "start_line": 401,
+        "end_line": 432,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py#L401-L432"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_base.py",
+        "start_line": 1302,
+        "end_line": 1397,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_base.py#L1302-L1397"
+      }
+    ],
+    "proteus_mapping_ru": "Core уже разрешает выбор только зарегистрированных tools и host admission; model-visible schema не является новой authority.",
+    "practical_consequence_ru": "Для переносимой динамики сохранить host registration и schema/config identity; lazy discovery само по себе не даёт право выполнить.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+        "start_line": 8,
+        "end_line": 62,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/invocation.rs#L8-L62"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY10",
+    "title_ru": "Resource ownership зависит от размещения worker",
+    "finding_ru": "RunHeldToolset lock/lazy enter делит ресурс между units одного процесса и закрывает его при run exit; failed enter не помечается успешным. При недоступности run-held object unit самостоятельно resolves/enters toolset. Serialized remote boundary не сохраняет in-process connection/session.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py",
+        "start_line": 128,
+        "end_line": 216,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py#L128-L216"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py",
+        "start_line": 845,
+        "end_line": 874,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_toolset.py#L845-L874"
+      }
+    ],
+    "proteus_mapping_ru": "Core process component lifecycle и remote/browser resource ownership — разные уровни, как уже показал OpenHands source pass.",
+    "practical_consequence_ru": "Любому browser/MCP adapter нужны explicit owned/borrowed session, close owner, restart identity; не обещать продолжение opaque session после replay.",
+    "proteus_evidence": [],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY11",
+    "title_ru": "Cancellation drain и settlement имеют разную цену",
+    "finding_ru": "Обычный tool batch cancel-ит и shield-drain-ит tasks, затем сохраняет уже completed returns. Temporal executor shield-ит activity handle, пересылает один cancel и ждёт configured cancellation resolution перед re-raise. В данных wrappers нет собственного фиксированного общего drain timeout.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_tool_execution.py",
+        "start_line": 886,
+        "end_line": 978,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_tool_execution.py#L886-L978"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_utils.py",
+        "start_line": 312,
+        "end_line": 329,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_utils.py#L312-L329"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_activity_execution.py",
+        "start_line": 38,
+        "end_line": 53,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_activity_execution.py#L38-L53"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_toolset.py",
+        "start_line": 61,
+        "end_line": 101,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_toolset.py#L61-L101"
+      }
+    ],
+    "proteus_mapping_ru": "Core имеет собственное cooperative cancellation/settlement; копирование Python shield-wait не улучшает автоматически host deadline semantics.",
+    "practical_consequence_ru": "При адаптации выбирать явную политику wait/abandon/reconcile и не считать cancel proof физической остановки внешнего effect.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+        "start_line": 8,
+        "end_line": 122,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/invocation.rs#L8-L122"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY12",
+    "title_ru": "Порядок event presentation не равен serial effects",
+    "finding_ru": "Non-barrier calls параллельны внутри segments; sequential tools образуют barriers. parallel_ordered_events ждёт segment и выдаёт results в emission order, включая deterministic choice propagating exception; surviving completed results попадают в partial history даже без отдельного result event.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/_tool_execution.py",
+        "start_line": 886,
+        "end_line": 978,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/_tool_execution.py#L886-L978"
+      }
+    ],
+    "proteus_mapping_ru": "Proteus host scheduling/parallel opt-in и causal effect identity уже существуют; ordering of displayed records не следует использовать как safety barrier.",
+    "practical_consequence_ru": "Для workflows specify effect concurrency отдельно от deterministic result order, а benchmark должен измерять реальный workload, не читать название режима.",
+    "proteus_evidence": [],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY13",
+    "title_ru": "Replay-safe clock/identity не обычный UUID плюс timestamp",
+    "finding_ru": "TemporalDurability использует workflow time/uuid и patch marker для истории старого поведения; same-process CancellationToken запрещён внутри durable context. Continue-as-new вызывается opt-in handler перед model request, а данные следующего run определяет handler.",
+    "evidence": [
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py",
+        "start_line": 458,
+        "end_line": 493,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py#L458-L493"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py",
+        "start_line": 608,
+        "end_line": 620,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_durability.py#L608-L620"
+      },
+      {
+        "repository": "pydantic/pydantic-ai",
+        "pin": "715651ef7fd3994395e85070ba3d6096c5b211c9",
+        "path": "pydantic_ai_slim/pydantic_ai/durable_exec/_base.py",
+        "start_line": 844,
+        "end_line": 856,
+        "url": "https://github.com/pydantic/pydantic-ai/blob/715651ef7fd3994395e85070ba3d6096c5b211c9/pydantic_ai_slim/pydantic_ai/durable_exec/_base.py#L844-L856"
+      }
+    ],
+    "proteus_mapping_ru": "Core WorkflowContinuation anchored same root/user — иной контракт, не Temporal continue-as-new и не перенос долговременного scheduler.",
+    "practical_consequence_ru": "Новый durable consumer потребует versioned resume payload, cancellation authority и migration policy; не объявлять existing DTO эквивалентом.",
+    "proteus_evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-contracts/src/contracts/workflow.rs",
+        "start_line": 84,
+        "end_line": 103,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/workflow.rs#L84-L103"
+      }
+    ],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  },
+  {
+    "id": "PY14",
+    "title_ru": "У Proteus уже есть journal consumers; gap — конкретная forensic projection",
+    "finding_ru": "Current Core JournalProjection содержит записи, interruptions и unresolved calls. unresolved_tool_calls включает только !result && effect.is_none(), поэтому effect-without-final-result виден через records, но не этот count. EvalReport уже агрегирует effects/results; replay fixture хранит raw_result отдельно. ConversationView intentionally excludes full journal.",
+    "evidence": [
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/session_journal/projection.rs",
+        "start_line": 544,
+        "end_line": 620,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_journal/projection.rs#L544-L620"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/eval_report.rs",
+        "start_line": 75,
+        "end_line": 89,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/eval_report.rs#L75-L89"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/eval_report.rs",
+        "start_line": 130,
+        "end_line": 160,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/eval_report.rs#L130-L160"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-core/src/core/workflow_replay/fixture.rs",
+        "start_line": 65,
+        "end_line": 105,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/workflow_replay/fixture.rs#L65-L105"
+      },
+      {
+        "repository": "Proteus-harness/Proteus-core",
+        "pin": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+        "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+        "start_line": 18,
+        "end_line": 34,
+        "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/conversation/view.rs#L18-L34"
+      }
+    ],
+    "proteus_mapping_ru": "Не нужен новый ledger или универсальный mutation API. Возможный consumer — authorized read-only recovery inspector над existing validated JournalProjection; tool-level journal visibility требует отдельного host contract/review.",
+    "practical_consequence_ru": "До такого host API внешний модуль не должен читать скрытую session FS или угадывать effect facts из conversation messages. Это предложение, не implementation/runtime evidence.",
+    "proteus_evidence": [],
+    "evidence_level": "source_read_only",
+    "upstream_runtime_tested": false,
+    "confirmed_vulnerability": false
+  }
+]

@@ -1,0 +1,635 @@
+{
+  "schema": "proteus.ecosystem.findings.v1",
+  "batch": "browser-use-and-adk-source-pass-1",
+  "as_of_utc": "2026-10-25T23:08:00Z",
+  "scope": "Targeted source review; not full repository audit or empirical compatibility/performance testing",
+  "source_pins": {
+    "browser_use": "3df5806a0d097a1546d92c49bcf1b28c9972c3bd",
+    "google_adk_python": "bf6739723c1b8b03bff8bb1e6ffada4d88098fcf",
+    "proteus_core": "3f36a003b4f3fde2242fc80f7aedac00dd127d1d",
+    "proteus_modules": "04114bbe85f179895e2b8553b6169a284caaeae3"
+  },
+  "findings": [
+    {
+      "id": "ECO-B01",
+      "title": "Единое наблюдение для контекста и экспонирования действий",
+      "observation": "Browser Use перед шагом получает browser state, обновляет схемы доступных действий для текущего URL и собирает model input. Выбор инструментов согласован с текущей страницей, но само экспонирование не является разрешением эффекта.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L1088-L1161",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/tools/registry/service.py#L519-L582",
+          "path": "browser_use/tools/registry/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/tool_selection.rs",
+          "path": "crates/proteus-contracts/src/contracts/tool_selection.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/hook/tool-selection-hook/src/lib.rs#L26-L190",
+          "path": "hook/tool-selection-hook/src/lib.rs"
+        }
+      ],
+      "transfer": "Расширять существующий фазовый tool-selection hook и связывать browser action с observation ID; не создавать новый Core slot для браузера.",
+      "caveat": "Уже есть narrow-only selection. Новизна — предметный токен наблюдения и его проверка browser driver, а не ещё один selector.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B02",
+      "title": "Остановка хвоста серии после смены страницы",
+      "observation": "multi_act исполняет действия последовательно; done/error/терминатор останавливают хвост, также сравниваются URL и focused target до и после действия.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L2755-L2874",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/tools/registry/service.py#L291-L327",
+          "path": "browser_use/tools/registry/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools.rs",
+          "path": "crates/proteus-core/src/core/bound_tools.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow.rs#L30-L37",
+          "path": "crates/proteus-contracts/src/contracts/workflow.rs"
+        }
+      ],
+      "transfer": "Browser workflow после потенциально меняющего страницу действия получает новое наблюдение; driver атомарно проверяет expected observation/target перед dispatch.",
+      "caveat": "URL/focus — не доказательство неизменности DOM. Ошибка не доказывает отсутствия уже выполненного префикса. Поведение внутренних DOM-драйверов здесь не покрыто.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B03",
+      "title": "Повтор браузерной истории — повтор эффектов, не диагностический replay",
+      "observation": "rerun_history снова выполняет действия, обновляет ссылки на элементы и имеет retry/recovery. Extraction и итоговый summary могут обращаться к модели.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L3128-L3308",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L3423-L3553",
+          "path": "browser_use/agent/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/workflow_replay/mod.rs#L1-L100",
+          "path": "crates/proteus-core/src/core/workflow_replay/mod.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_failure.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_failure.rs"
+        }
+      ],
+      "transfer": "Разделять inspect replay, recipe rerun и resume незавершённого выполнения. Для мутаций recipe требует operation identity, receipt и reconciliation неизвестного исхода.",
+      "caveat": "Нельзя назвать такой rerun offline/exactly-once. Proteus уже имеет read-only replay без конструирования реальных tools/providers; его нельзя незаметно превратить в повтор действий.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B04",
+      "title": "Pause/stop и timeout — разные границы управления",
+      "observation": "Pause/stop меняют состояние и проверяются между стадиями/действиями; act применяет wait_for и превращает многие ошибки в ActionResult. Это не откат серверного действия и не физическая остановка произвольного sync callback.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L1014-L1087",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L3942-L4029",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/tools/service.py#L2178-L2266",
+          "path": "browser_use/tools/service.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/tools/registry/service.py#L232-L259",
+          "path": "browser_use/tools/registry/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs#L1-L135",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/tool.rs#L1-L158",
+          "path": "crates/proteus-contracts/src/contracts/tool.rs"
+        }
+      ],
+      "transfer": "Сохранять Core cancellation/settlement. В browser result различать not_performed/performed/unknown; проверять поздний результат, не заявлять успех по одному cancel ACK.",
+      "caveat": "Ни один инструмент или браузер не запускался; здесь только границы, видимые в исходниках.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B05",
+      "title": "Watchdog lifecycle отдельно от обычного data plane",
+      "observation": "Базовый watchdog пропускает lifecycle события независимо от disconnected circuit breaker. Crash watchdog отслеживает свои фоновые задачи и отменяет их при остановке; reconnect ожидание ограничено.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/browser/watchdog_base.py#L24-L190",
+          "path": "browser_use/browser/watchdog_base.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/browser/watchdogs/crash_watchdog.py#L1-L336",
+          "path": "browser_use/browser/watchdogs/crash_watchdog.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L1245-L1318",
+          "path": "browser_use/agent/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-module-protocol/src/authority.rs#L1-L180",
+          "path": "crates/proteus-module-protocol/src/authority.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs"
+        }
+      ],
+      "transfer": "Browser adapter должен владеть своим session supervisor, lifecycle control и tracked tasks; recovery не должен произвольно перезапускать пользовательские мутации.",
+      "caveat": "Полный BrowserSession recovery не проверен. LISTENS_TO/EMITS в watchdog — описательная, не принудительная capability граница.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B06",
+      "title": "Навигационная политика, approval и sandbox — не одно",
+      "observation": "Security watchdog имеет pre-navigation check и post-navigation/new-tab обработчики; registry допускает обычные Python callbacks с injected browser/session context. Эти механизмы полезны, но не составляют отдельной изоляции callback.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/browser/watchdogs/security_watchdog.py#L35-L92",
+          "path": "browser_use/browser/watchdogs/security_watchdog.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/browser/watchdog_base.py#L24-L77",
+          "path": "browser_use/browser/watchdog_base.py"
+        },
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/tools/registry/service.py#L331-L435",
+          "path": "browser_use/tools/registry/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools.rs",
+          "path": "crates/proteus-core/src/core/bound_tools.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-module-protocol/src/authority.rs#L1-L180",
+          "path": "crates/proteus-module-protocol/src/authority.rs"
+        }
+      ],
+      "transfer": "Отдельно задавать URL/navigation policy, разрешение конкретного эффекта и доверие к процессу/driver. Browser workflow выполняет каждый эффект через host-bound tools.",
+      "caveat": "Не заявление об уязвимости upstream. Restricted export и отдельный процесс Proteus также нельзя называть полным OS sandbox.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-B07",
+      "title": "Сжатая память шага не заменяет журнал эффектов",
+      "observation": "MessageManager запускает compaction по периодичности и порогу символов; сохраняет ограниченную историю и summary. Ошибка суммаризации не должна стирать предыдущую память.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/message_manager/service.py#L199-L306",
+          "path": "browser_use/agent/message_manager/service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/checkpoint.rs",
+          "path": "crates/proteus-core/src/core/runtime/checkpoint.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/provider.rs",
+          "path": "context_provider/memory-pack/src/provider.rs"
+        }
+      ],
+      "transfer": "Оставлять summary производной модельной проекцией, а tool receipts, source revisions и approval facts — в canonical host history.",
+      "caveat": "Символы не равны точным токенам. Не предлагается новая память с нуля: Proteus уже имеет context preparation и memory provider.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A01",
+      "title": "Новый Workflow — предметный граф, не только SequentialAgent",
+      "observation": "В закреплённом ADK уже есть Workflow с RUNNING/WAITING/COMPLETED, run IDs и replay индексацией. Старые SequentialAgent/ParallelAgent помечены deprecated в пользу Workflow, но остаются отдельные ограничения интеграции.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/agents/sequential_agent.py#L20-L95",
+          "path": "src/google/adk/agents/sequential_agent.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/agents/parallel_agent.py#L170-L253",
+          "path": "src/google/adk/agents/parallel_agent.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_workflow.py#L240-L425",
+          "path": "src/google/adk/workflow/_workflow.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_node_status.py",
+          "path": "src/google/adk/workflow/_node_status.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow.rs#L41-L125",
+          "path": "crates/proteus-contracts/src/contracts/workflow.rs"
+        }
+      ],
+      "transfer": "Иметь модульный phased research workflow на существующем workflow/v20; отдельную durable suspension семантику обсуждать лишь для реального потребителя.",
+      "caveat": "Наличие checkpoint events не означает checkpoint-native recovery: _workflow.py содержит TODO resume from checkpoint; runtime state восстанавливается из событий.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A02",
+      "title": "Persist-before-deliver и backpressure на событиях",
+      "observation": "Runner обрабатывает и сохраняет nonpartial event до передачи потребителю; processed_signal освобождает producer после возобновления consumer. ParallelAgent также ждёт подтверждения потребления каждого события.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/runners.py#L767-L837",
+          "path": "src/google/adk/runners.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/runners.py#L1512-L1542",
+          "path": "src/google/adk/runners.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/agents/parallel_agent.py#L45-L169",
+          "path": "src/google/adk/agents/parallel_agent.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/checkpoint.rs",
+          "path": "crates/proteus-core/src/core/runtime/checkpoint.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        }
+      ],
+      "transfer": "Для research workflow завершать фазу только после host checkpoint ACK и точного tool-result binding. UI/progress event и устойчивое доказательство результата различать.",
+      "caveat": "Долговечность append зависит от выбранного SessionService; in-memory backend не доказывает crash durability. В Proteus commit-before-ACK уже есть.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A03",
+      "title": "Conversation branch isolation не означает state isolation",
+      "observation": "ParallelAgent разделяет branch/history, но использует общий session state. Tool batch отдельно собирает локальные deltas и merge изменённых контейнеров. Scoped app/user/session state и temporary state имеют разную persistence.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/agents/parallel_agent.py#L20-L253",
+          "path": "src/google/adk/agents/parallel_agent.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/flows/llm_flows/tools/_batch_executor.py#L20-L240",
+          "path": "src/google/adk/flows/llm_flows/tools/_batch_executor.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/sessions/state.py#L20-L190",
+          "path": "src/google/adk/sessions/state.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/sessions/base_session_service.py#L130-L230",
+          "path": "src/google/adk/sessions/base_session_service.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/agent_control.rs#L1-L180",
+          "path": "crates/proteus-contracts/src/contracts/agent_control.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        }
+      ],
+      "transfer": "У параллельных исследовательских веток отдельные immutable input/evidence namespaces; reducer делает явный детерминированный merge с conflict records.",
+      "caveat": "Не переносить shared mutable dictionary как неявный контракт Core и не обещать transaction isolation на основании одного branch ID.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A04",
+      "title": "Approval связан с исходным вызовом, а не свободным текстом",
+      "observation": "Confirmation parser связывает ответ с историческим function call, его ID/name/args, автором агента и current branch; повторно потреблённые подтверждения отфильтровываются до загрузки каталога. Shared caller применяет confirmation gate перед реальным tool_runner, если callback не дал ответ.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/flows/llm_flows/tools/_confirmation.py#L25-L406",
+          "path": "src/google/adk/flows/llm_flows/tools/_confirmation.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/flows/llm_flows/tools/_caller.py#L418-L650",
+          "path": "src/google/adk/flows/llm_flows/tools/_caller.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/utils/_workflow_hitl_utils.py#L20-L150",
+          "path": "src/google/adk/workflow/utils/_workflow_hitl_utils.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools.rs",
+          "path": "crates/proteus-core/src/core/bound_tools.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/domain/tool.rs",
+          "path": "crates/proteus-contracts/src/domain/tool.rs"
+        }
+      ],
+      "transfer": "Сохранять host-owned Allow/Ask/Deny и recorded resolution Proteus; pending human decision содержит строгую response schema, call identity и ревизию аргументов.",
+      "caveat": "Trusted plugin callback может дать substitute response; это extension policy, не внешний receipt и не новая authority. Отдельный durable pending механизм не реализован в этом исследовательском раунде.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A05",
+      "title": "Abort sealing закрывает dangling calls, но не откатывает эффект",
+      "observation": "Runner cleanup отменяет и ожидает root task; synthesizer добавляет error responses к незавершённым вызовам текущей invocation и aborted marker, включая confirmation calls. В node runner уже полученное событие ставится в очередь до проверки abort.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/runners.py#L839-L896",
+          "path": "src/google/adk/runners.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/events/_abort_events.py#L20-L143",
+          "path": "src/google/adk/events/_abort_events.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_node_runner.py#L378-L459",
+          "path": "src/google/adk/workflow/_node_runner.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_failure.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_failure.rs"
+        }
+      ],
+      "transfer": "Разделять lifecycle terminal marker и фактический исход эффекта. После abort не возобновлять mechanically старые unresolved calls; unknown outcome передавать на reconciliation.",
+      "caveat": "Synthetic aborted response не доказывает not_performed. ADK async cancellation не останавливает уже работающий произвольный sync callable в thread pool.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A06",
+      "title": "Replay-граф требует стабильной идентичности и бюджета повторов",
+      "observation": "Workflow восстанавливает run IDs и порядок завершения из событий, fast-forwards завершённые outputs, reruns неуспешные ветки. Node runner явно предупреждает, что attempt count не сохраняется между resumes. Retry utils предотвращают умножение item retry budget повтором всего worker.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_workflow.py#L305-L425",
+          "path": "src/google/adk/workflow/_workflow.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_workflow.py#L640-L770",
+          "path": "src/google/adk/workflow/_workflow.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/utils/_replay_interceptor.py#L20-L220",
+          "path": "src/google/adk/workflow/utils/_replay_interceptor.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_node_runner.py#L144-L267",
+          "path": "src/google/adk/workflow/_node_runner.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/utils/_retry_utils.py#L27-L127",
+          "path": "src/google/adk/workflow/utils/_retry_utils.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow.rs#L87-L125",
+          "path": "crates/proteus-contracts/src/contracts/workflow.rs"
+        }
+      ],
+      "transfer": "Consumer-local graph digest, node input digest, durable attempt budget и receipt binding; граф не должен считать supplied status=completed доказательством.",
+      "caveat": "Это проектные требования нового модуля, не заявление, что существующий Proteus continuation уже является durable графом или что обнаружен подтверждённый upstream exploit.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A07",
+      "title": "Invocation cache каталога полезен только с явной freshness семантикой",
+      "observation": "BaseToolset по умолчанию кэширует prefixed tool list на invocation_id; get_tools может фильтровать по контексту. Поэтому state-sensitive набор в течение invocation требует продуманного отключения/инвалидации кэша.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/tools/base_toolset.py#L30-L220",
+          "path": "src/google/adk/tools/base_toolset.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/tool_selection.rs",
+          "path": "crates/proteus-contracts/src/contracts/tool_selection.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools.rs",
+          "path": "crates/proteus-core/src/core/bound_tools.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/hook/tool-selection-hook/src/lib.rs#L26-L190",
+          "path": "hook/tool-selection-hook/src/lib.rs"
+        }
+      ],
+      "transfer": "Разделять стабильный registered catalog, narrow exposure выбранной фазы и execution-time authority. Не обновлять permission semantics сменой красивой tool description.",
+      "caveat": "Кэш — оптимизация, не capability grant. Benchmarks/catalog churn не запускались.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A08",
+      "title": "Инкрементальный event index вместо повторного полного анализа",
+      "observation": "Replay manager поддерживает индекс событий и дополняет его при сохранении prefix; при rewind/compaction строит заново. Есть связи parent/descendant и function-call ID для сопоставления ответов.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/utils/_replay_manager.py#L35-L186",
+          "path": "src/google/adk/workflow/utils/_replay_manager.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/utils/_replay_manager.py#L247-L368",
+          "path": "src/google/adk/workflow/utils/_replay_manager.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/workflow_replay/mod.rs",
+          "path": "crates/proteus-core/src/core/workflow_replay/mod.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/runtime/checkpoint.rs",
+          "path": "crates/proteus-core/src/core/runtime/checkpoint.rs"
+        }
+      ],
+      "transfer": "Если профилирование нового evidence workflow обнаружит repeated scans, хранить revision-keyed derived index, инвалидируемый на compaction/rewrite. Источником истины остаётся журнал.",
+      "caveat": "Это алгоритмический паттерн, не измеренное ускорение Proteus. Нельзя копировать проверку prefix без учёта собственной revision/CAS модели.",
+      "priority": "P2",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-A09",
+      "title": "Raw result и callback projection надо хранить раздельно",
+      "observation": "ADK before callbacks могут отвечать без tool run, after callbacks могут заменить ответ, затем строится FunctionResponse event. Proteus уже сохраняет raw effect перед AfterTool и отделяет projected result.",
+      "sources": [
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/flows/llm_flows/tools/_caller.py#L508-L650",
+          "path": "src/google/adk/flows/llm_flows/tools/_caller.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_tool_node.py#L100-L290",
+          "path": "src/google/adk/workflow/_tool_node.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs"
+        }
+      ],
+      "transfer": "Evidence producer принимает только host recorded raw result binding; косметическое преобразование и summary не могут повышать verified/committed статус.",
+      "caveat": "Не требуется убрать гибкие hooks. Требуется сохранить различие authority, observed effect и presentation.",
+      "priority": "P0",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    },
+    {
+      "id": "ECO-X01",
+      "title": "Нужен реальный research consumer, а не ещё один advisory planner",
+      "observation": "Исследованные browser и workflow системы дают реальные lifecycle паттерны для исследования документов и подготовки веб-форм; в Proteus уже есть workflow host methods, narrow selection, memory provider, checkpoints, read-only replay.",
+      "sources": [
+        {
+          "url": "https://github.com/browser-use/browser-use/blob/3df5806a0d097a1546d92c49bcf1b28c9972c3bd/browser_use/agent/service.py#L1088-L1161",
+          "path": "browser_use/agent/service.py"
+        },
+        {
+          "url": "https://github.com/google/adk-python/blob/bf6739723c1b8b03bff8bb1e6ffada4d88098fcf/src/google/adk/workflow/_workflow.py#L240-L425",
+          "path": "src/google/adk/workflow/_workflow.py"
+        }
+      ],
+      "proteus": [
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/3f36a003b4f3fde2242fc80f7aedac00dd127d1d/crates/proteus-contracts/src/contracts/workflow_checkpoint.rs",
+          "path": "crates/proteus-contracts/src/contracts/workflow_checkpoint.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/provider.rs",
+          "path": "context_provider/memory-pack/src/provider.rs"
+        },
+        {
+          "url": "https://github.com/Proteus-harness/Proteus-modules/blob/04114bbe85f179895e2b8553b6169a284caaeae3/context_provider/memory-pack/src/tools.rs",
+          "path": "context_provider/memory-pack/src/tools.rs"
+        }
+      ],
+      "transfer": "Первый приоритет research.evidence_map: host read tools → source digest/ranges → claims → deterministic ref validation → checkpoint → output с пробелами/противоречиями. Browser recipe и durable HITL — отдельные потребители/контракты.",
+      "caveat": "Новые модули в этом исследовательском раунде не реализованы. Existing pi-ready-steps анализирует caller statuses, не является durable executor. Memory remember_fact не следует использовать для transient workflow control.",
+      "priority": "P1",
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "implementation_status": "proposal_or_existing_equivalent",
+      "security_class": "safe_public_architecture"
+    }
+  ]
+}
