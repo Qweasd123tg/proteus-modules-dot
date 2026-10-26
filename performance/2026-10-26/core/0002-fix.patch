@@ -1,0 +1,190 @@
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -45,6 +45,76 @@
+     }
+ }
+ 
++/// Read a complete named display revision. A disposable cache miss must not
++/// make the canonical history unreadable, but a newer source is not that revision.
++#[cfg(unix)]
++pub(super) fn transcript_at_revision(
++    store: &SessionStore,
++    revision: &str,
++) -> anyhow::Result<Vec<AppTranscriptMessage>> {
++    if let Some(messages) = store.saved_transcript(revision) {
++        return Ok(messages);
++    }
++    Ok(rebuild_transcript(store, Some(revision))?.1)
++}
++
++/// Read a bounded page, repairing a missing/corrupt index at most once.
++#[cfg(unix)]
++pub(super) fn transcript_page(
++    store: &SessionStore,
++    before: Option<usize>,
++    expected: Option<&str>,
++) -> anyhow::Result<proteus_contracts::app_protocol::AppTranscriptPage> {
++    if let Some(page) = store.saved_transcript_page(before, expected) {
++        return Ok(page);
++    }
++    let (revision, messages) = rebuild_transcript(store, expected)?;
++    let total = messages.len();
++    let end = before.unwrap_or(total);
++    anyhow::ensure!(
++        end <= total,
++        "history position is outside the requested revision"
++    );
++    let start = end.saturating_sub(50);
++    Ok(proteus_contracts::app_protocol::AppTranscriptPage {
++        revision,
++        start,
++        total,
++        messages: messages.into_iter().skip(start).take(end - start).collect(),
++        // Rebuilding cannot prove a relationship to a lost display projection.
++        base: None,
++    })
++}
++
++#[cfg(unix)]
++fn rebuild_transcript(
++    store: &SessionStore,
++    expected: Option<&str>,
++) -> anyhow::Result<(String, Vec<AppTranscriptMessage>)> {
++    use crate::core::session_read_cache::SourceFingerprint;
++
++    let source = SourceFingerprint::read(store.session_dir(), 8192)
++        .ok_or_else(|| anyhow::anyhow!("history source cannot be fingerprinted"))?;
++    let revision = source
++        .revision()
++        .ok_or_else(|| anyhow::anyhow!("history source revision is unavailable"))?;
++    anyhow::ensure!(
++        expected.is_none_or(|expected| expected == revision),
++        "history revision changed; refresh the session snapshot"
++    );
++    // Strict journal validation is mandatory; cached conversation state is not
++    // an authority. project_read_model saves the index only on a stable source.
++    let model =
++        store.project_read_model(|projection| journal_transcript_messages(projection, None))?;
++    anyhow::ensure!(
++        SourceFingerprint::read(store.session_dir(), 8192).as_ref() == Some(&source),
++        "history source changed during recovery; refresh the session snapshot"
++    );
++    // Cache writes are best effort (e.g. disk full). The verified in-memory
++    // result remains usable without retrying indefinitely or requiring a writer lease.
++    Ok((revision, model.transcript))
++}
++
+ /// Cold HTTP reads share the same current projection without opening a runtime.
+ pub(super) fn current_read_model(store: &SessionStore) -> anyhow::Result<SessionReadModel> {
+     match store.fresh_read_model() {
+@@ -133,3 +203,6 @@
+         }
+     });
+ }
++
++#[cfg(all(test, unix))]
++mod tests;
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -278,10 +278,10 @@
+                 .cloned()
+                 .ok_or_else(|| anyhow!("paged history has no session store"))?;
+             let revision = cursor.revision.clone();
+-            let mut history =
+-                tokio::task::spawn_blocking(move || store.saved_transcript(&revision))
+-                    .await?
+-                    .ok_or_else(|| anyhow!("history revision changed; retry reading history"))?;
++            let mut history = tokio::task::spawn_blocking(move || {
++                read_model::transcript_at_revision(&store, &revision)
++            })
++            .await??;
+             history.extend(snapshot.transcript.into_iter().skip(50));
+             return Ok(history);
+         }
+@@ -459,24 +459,31 @@
+             .with_user_input(Arc::new(user_input_transport));
+         let mut refresh_stale_view = false;
+         let initial_transcript = if let Some(prepared) = resumed_session {
+-            let (session_store, model, deferred, stale) = tokio::task::spawn_blocking(move || {
+-                prepared.into_read_model(|projection| journal_transcript_messages(projection, None))
+-            })
+-            .await
+-            .map_err(|error| anyhow!("session transcript task failed: {error}"))??;
++            let (session_store, conversation, transcript, deferred, stale) =
++                tokio::task::spawn_blocking(move || {
++                    let (store, model, deferred, stale) =
++                        prepared.into_read_model(|projection| {
++                            journal_transcript_messages(projection, None)
++                        })?;
++                    // The tail read also opens SQLite and fingerprints source files.
++                    // Keep it on this blocking worker together with the full read model.
++                    let transcript = read_model::CompletedTranscript::from_model(
++                        &store,
++                        model.transcript,
++                        stale,
++                    );
++                    Ok::<_, anyhow::Error>((store, model.conversation, transcript, deferred, stale))
++                })
++                .await
++                .map_err(|error| anyhow!("session transcript task failed: {error}"))??;
+             refresh_stale_view = stale;
+-            let display_store = session_store.clone();
+             builder = builder.resume_from_session_snapshot(
+                 session_store,
+-                model.conversation,
++                conversation,
+                 new_thread_id(),
+                 deferred,
+             );
+-            Some(read_model::CompletedTranscript::from_model(
+-                &display_store,
+-                model.transcript,
+-                stale,
+-            ))
++            Some(transcript)
+         } else {
+             None
+         };
+diff --git a/crates/proteus-core/src/app_server/http/sessions.rs b/crates/proteus-core/src/app_server/http/sessions.rs
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -236,17 +236,7 @@
+         let store = SessionStore::open(dir)?;
+         #[cfg(unix)]
+         {
+-            if let Some(page) = store.saved_transcript_page(before, revision.as_deref()) {
+-                return Ok(page);
+-            }
+-            anyhow::ensure!(
+-                revision.is_none(),
+-                "history revision changed; refresh the session snapshot"
+-            );
+-            let _ = crate::app_server::read_model::current_read_model(&store)?;
+-            return store
+-                .saved_transcript_page(before, None)
+-                .ok_or_else(|| anyhow!("history index changed during reading"));
++            crate::app_server::read_model::transcript_page(&store, before, revision.as_deref())
+         }
+         #[cfg(not(unix))]
+         {
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1311,7 +1311,14 @@
+ `before=<start>&revision=<revision>`. Позиции относятся только к указанной
+ ревизии: сервер отвергает несовпадение вместо смешивания страниц. Известная
+ клиенту завершённая ревизия остаётся пригодной для просмотра во время нового
+-turn, пока её индекс не заменён. Полный `/history` сохраняет прежнюю семантику.
++turn, пока её индекс не заменён. При утрате или повреждении индекса полный
++`/history` и страничное чтение делают одну попытку строгой проекции.
++Явно запрошенную ревизию разрешено восстановить только при совпадении
++fingerprint канонического источника до и после чтения; новые строки не
++выдаются под старой ревизией. При невозможности сохранить производный индекс
++проверенный результат возвращается из памяти, без цикла повторов.
++Чтение startup-хвоста SQLite выполняется на blocking worker вместе с
++подготовкой read model. Полный `/history` сохраняет прежнюю семантику.
+ Клиент догружает страницы при прокрутке вверх, а уже открытые строки удерживает
+ до замены неподтверждённой проекции или закрытия вкладки. Поэтому это ограничение
+ начальной загрузки, а не постоянный лимит RAM после просмотра всей истории.

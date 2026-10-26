@@ -1,0 +1,71 @@
+name: Isolated speed patch regressions
+
+# Only this experimental branch in the modules repository. Upstream manual CI
+# policies, PR #21 and every existing module workflow remain untouched.
+on:
+  push:
+    branches: [ci/speed-patch-validation-20261026]
+    paths:
+      - 'performance/2026-10-26/**/*.patch'
+      - 'performance/2026-10-26/**/*.rs'
+      - 'performance/2026-10-26/**/*.py'
+      - 'performance/2026-10-26/manifest.json'
+      - '.github/workflows/speed-patch-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speed-patches-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '4'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  regression:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/speed-patch-validation-20261026'
+    name: ${{ matrix.target }} pinned patch regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [core, desktop]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, upstream Core pin
+        with:
+          persist-credentials: false
+      - name: Install compiler dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep
+      - name: Install native Desktop compile dependencies
+        if: matrix.target == 'desktop'
+        run: |
+          sudo apt-get install --no-install-recommends -y libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev
+      - name: Install official pinned Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Verify bundle identities, apply patches and run targeted checks
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 performance/2026-10-26/run_validation.py "$TARGET" \
+            --work-dir "$RUNNER_TEMP/proteus-speed-$TARGET" \
+            --evidence-dir "$RUNNER_TEMP/speed-evidence-$TARGET"
+      - name: Retain bounded, non-sensitive evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: speed-patches-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/speed-evidence-${{ matrix.target }}/result.json
+          if-no-files-found: warn
+          retention-days: 7
