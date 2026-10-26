@@ -95,20 +95,20 @@ class Files(unittest.TestCase):
     def test_low_disk_never_spawns(self):
         with patch.object(e.shutil, 'disk_usage', return_value=SimpleNamespace(free=e.INITIAL_FREE-1)), patch.object(e.subprocess, 'Popen') as spawn:
             with self.assertRaisesRegex(ValueError, 'below 8 GiB'):
-                e.execute('cas-lock-resolution', self.root, self.root/'output', self.root/'future', [], ['authored-mock'])
+                e.execute('cas-runtime', self.root, self.root/'output', self.root/'future', [], ['authored-mock'])
             spawn.assert_not_called()
             self.assertFalse((self.root/'output').exists())
 
     def test_old_output_never_spawns(self):
         with patch.object(e.subprocess, 'Popen') as spawn:
             with self.assertRaisesRegex(ValueError, 'must both be fresh'):
-                e.execute('cas-lock-resolution', self.root, self.source, self.root/'future', [], ['authored-mock'])
+                e.execute('cas-runtime', self.root, self.source, self.root/'future', [], ['authored-mock'])
             spawn.assert_not_called()
 
     def test_nested_output_never_spawns(self):
         with patch.object(e.subprocess, 'Popen') as spawn:
             with self.assertRaisesRegex(ValueError, 'must be disjoint'):
-                e.execute('cas-lock-resolution', self.root, self.root/'future', self.root/'future/child', [], ['authored-mock'])
+                e.execute('cas-runtime', self.root, self.root/'future', self.root/'future/child', [], ['authored-mock'])
             spawn.assert_not_called()
 
     def test_input_count_bounded(self):
@@ -117,7 +117,7 @@ class Files(unittest.TestCase):
 
     def test_spawn_error_has_receipt(self):
         with patch.object(e.shutil, 'disk_usage', return_value=SimpleNamespace(free=e.INITIAL_FREE)), patch.object(e.subprocess, 'Popen', side_effect=OSError('authored')):
-            result = e.execute('cas-lock-resolution', self.root, self.root/'out', self.root/'future', [], ['authored-mock'])
+            result = e.execute('cas-runtime', self.root, self.root/'out', self.root/'future', [], ['authored-mock'])
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(result['reason'], 'OSError')
         self.assertTrue((self.root/'out/result.json').is_file())
@@ -127,7 +127,7 @@ class Files(unittest.TestCase):
             artifact_root.mkdir(); (artifact_root/'status.txt').write_text('passed\n')
             return {'status': 'passed', 'returncode': 0, 'all_descendant_termination': 'unproven'}
         with patch.object(e.shutil, 'disk_usage', return_value=SimpleNamespace(free=e.INITIAL_FREE)), patch.object(e.subprocess, 'Popen', return_value=Mock()), patch.object(e, 'supervise', side_effect=supervised):
-            result=e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+            result=e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
         import json
         marker=json.loads((self.root/'out/invocation.json').read_text())
         self.assertEqual(marker['invocation_id'],result['invocation_id'])
@@ -141,7 +141,7 @@ class Files(unittest.TestCase):
             artifact_root.mkdir(); (artifact_root/'status.txt').write_text('passed\n')
             return {'status':'passed','returncode':0}
         with patch.object(e.shutil,'disk_usage',return_value=SimpleNamespace(free=e.INITIAL_FREE)), patch.object(e.subprocess,'Popen',return_value=Mock()), patch.object(e,'supervise',side_effect=supervised), patch.object(e,'input_hashes',side_effect=[{'a':'old'},{'a':'new'}]):
-            result=e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+            result=e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
         self.assertEqual(result['status'],'failed');self.assertEqual(result['source_error'],'controller_inputs_changed');self.assertEqual(result['returncode'],0)
 
     def test_partial_archive_enumerates_retained_only(self):
@@ -159,14 +159,14 @@ class Files(unittest.TestCase):
 
     def test_snapshot_low_headroom_is_failed_not_success(self):
         with patch.object(e.shutil,'disk_usage',side_effect=[SimpleNamespace(free=e.INITIAL_FREE),SimpleNamespace(free=e.STOP_FREE-1)]),patch.object(e.subprocess,'Popen',return_value=Mock()),patch.object(e,'supervise',return_value={'status':'passed','returncode':0}):
-            result=e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+            result=e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
         self.assertEqual(result['status'],'failed');self.assertEqual(result['snapshot_status'],'failed_or_partial')
         self.assertIn('insufficient snapshot headroom',result['snapshot_error'])
 
     def test_different_filesystem_refused_before_spawn(self):
         with patch.object(e,'device',side_effect=[1,2,1]),patch.object(e.subprocess,'Popen') as spawn:
             with self.assertRaisesRegex(ValueError,'must share the monitored filesystem'):
-                e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+                e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
             spawn.assert_not_called()
 
     def test_primary_deadline_survives_source_mismatch(self):
@@ -174,7 +174,7 @@ class Files(unittest.TestCase):
             artifact_root.mkdir()
             return {'status':'failed','reason':'stopped_deadline','returncode':-9}
         with patch.object(e.shutil,'disk_usage',return_value=SimpleNamespace(free=e.INITIAL_FREE)),patch.object(e.subprocess,'Popen',return_value=Mock()),patch.object(e,'supervise',side_effect=supervised),patch.object(e,'input_hashes',side_effect=[{'a':'old'},{'a':'new'}]):
-            result=e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+            result=e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
         self.assertEqual(result['reason'],'stopped_deadline');self.assertEqual(result['source_error'],'controller_inputs_changed')
 
     def test_final_receipt_failure_gets_explicit_partial_fallback(self):
@@ -183,7 +183,7 @@ class Files(unittest.TestCase):
             if path.name=='result.json': raise OSError('authored write failure')
             original(path,value)
         with patch.object(e.shutil,'disk_usage',return_value=SimpleNamespace(free=e.INITIAL_FREE)),patch.object(e.subprocess,'Popen',side_effect=OSError('authored spawn failure')),patch.object(e,'save',side_effect=save):
-            result=e.execute('cas-lock-resolution',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+            result=e.execute('cas-runtime',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
         self.assertEqual(result['status'],'failed');self.assertEqual(result['receipt_error'],'OSError')
         self.assertTrue((self.root/'out/incomplete-result.json').exists())
 

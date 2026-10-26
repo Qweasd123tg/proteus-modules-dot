@@ -32,7 +32,7 @@ MAX_PATH_BYTES = 512
 MAX_DEPTH = 16
 MAX_PIPE = 4 * MIB
 MAX_INPUTS = 16
-DEADLINES = {"cas-lock-resolution": 1200}
+DEADLINES = {"cas-runtime": 1800}
 
 
 def save(path, value):
