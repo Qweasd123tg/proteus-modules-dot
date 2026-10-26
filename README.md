@@ -34,3 +34,7 @@ Runner не устанавливает инструменты, не очищае
 Права, признание эффектов и результаты проверок нельзя делегировать свободному тексту модели или недоверенной metadata. При этом выбор алгоритмов, моделей, памяти и композиции может оставаться расширяемым. Подробные непроверенные security-сценарии не публикуются в этом общем каталоге.
 
 Основные проекты: [Proteus Core](https://github.com/Proteus-harness/Proteus-core), [Proteus Modules](https://github.com/Proteus-harness/Proteus-modules).
+
+## Переносимый каталог skills
+
+[portable-skill-catalog](examples/portable-skill-catalog/) добавляет context provider и read-only refresh/load tools: явно указанные корни, ранние лимиты, изоляция ошибок и проверка пути/хеша перед загрузкой. Hooks/scripts не запускаются, allowed-tools не выдаёт прав. Локально пройдены 29 behavior + 1 executable-wire test; настоящая Core-интеграция этого нового модуля пока не заявляется. Для него предусмотрен отдельный CI; общий runner выше относится только к первоначальным трём примерам. Прочитайте ограничение поддержки YAML parser в README модуля перед применением.
