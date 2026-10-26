@@ -1,0 +1,272 @@
+{
+  "schema": 1,
+  "publication_repository": "Qweasd123tg/proteus-modules-dot",
+  "publication_base": "a0c1716756f8d5950dbf92638951f676bf8d2803",
+  "publication_branch": "ci/admission-guard-20261026",
+  "source_repository": "https://github.com/Proteus-harness/Proteus-core.git",
+  "source_commit": "7435f2a6d90e532665ebed4da67526b609158fc8",
+  "toolchain": "1.95.0",
+  "dependency_source_pins": {
+    "reference_modules": "7fceaebc3bed8add9b0e3091110f59deca86ba46",
+    "reference_modules_core_graph": "bee0e409e746e2df9db32748d4f8ea02201bd4af"
+  },
+  "baseline_definition": "Pinned Core 7435f2a6d90e532665ebed4da67526b609158fc8 plus tests-only runtime module and opt-in generation-2 handshake fixture barrier; production logic remains upstream.",
+  "test_patches": [
+    "foundation/2026-10-26/admission-guard/01-admission-tests.patch"
+  ],
+  "fix_patches": [
+    "foundation/2026-10-26/admission-guard/02-admission-fix.patch"
+  ],
+  "stage_git_blobs": {
+    "upstream": {
+      "crates/proteus-module-protocol/src/v3/runtime.rs": "cf42e43cb81b8ea3220b6c950ea891441e2397dd",
+      "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "c12f745f5dd2e4b7c45643bedb0c8350ee2fdad8",
+      "crates/proteus-module-protocol/src/v3/runtime_tests.rs": null,
+      "crates/proteus-module-protocol/src/v3/broker.rs": "562688894867ac73f74de0c84464bcbb943274ea",
+      "crates/proteus-module-protocol/src/v3/failure.rs": "4d330713129b761d62200304ec6f07e4ffe9da21",
+      "docs/architecture/process-module-architecture.md": "03212ee0056134553e99baba7ee20dc22d960c51"
+    },
+    "baseline_tests": {
+      "crates/proteus-module-protocol/src/v3/runtime.rs": "25e9f619f43631177aa6bd917ff2eebe911d2841",
+      "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+      "crates/proteus-module-protocol/src/v3/broker.rs": "562688894867ac73f74de0c84464bcbb943274ea",
+      "crates/proteus-module-protocol/src/v3/failure.rs": "4d330713129b761d62200304ec6f07e4ffe9da21",
+      "docs/architecture/process-module-architecture.md": "03212ee0056134553e99baba7ee20dc22d960c51",
+      "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "85d30ca91158d15eda78e6fb610aefbe83b6ba0f"
+    },
+    "fixed": {
+      "crates/proteus-module-protocol/src/v3/runtime.rs": "bb7018140a7d5587c114198957b0d6e067a05ce2",
+      "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+      "crates/proteus-module-protocol/src/v3/broker.rs": "3ae9ded93f251af82b1060ec971e7aff63c23cef",
+      "crates/proteus-module-protocol/src/v3/failure.rs": "98790ffb7159010f35ef6035e97d4b64b59f89e8",
+      "docs/architecture/process-module-architecture.md": "be6e103f5f2876d9cd0eb22eff51d54d813142a7",
+      "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "85d30ca91158d15eda78e6fb610aefbe83b6ba0f"
+    }
+  },
+  "changed_files": [
+    "crates/proteus-module-protocol/src/v3/broker.rs",
+    "crates/proteus-module-protocol/src/v3/failure.rs",
+    "crates/proteus-module-protocol/src/v3/runtime.rs",
+    "crates/proteus-module-protocol/src/v3/runtime_tests.rs",
+    "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py",
+    "docs/architecture/process-module-architecture.md"
+  ],
+  "baselines": [
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--lib",
+        "v3::runtime::tests::abandoned_start_during_restart_is_not_dispatched",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "expected_failed_tests": [
+        "v3::runtime::tests::abandoned_start_during_restart_is_not_dispatched"
+      ],
+      "assertion_markers": [
+        "abandoned restart admission reached the frame writer"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--lib",
+        "v3::runtime::tests::undeliverable_blocking_start_ack_never_dispatches",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "expected_failed_tests": [
+        "v3::runtime::tests::undeliverable_blocking_start_ack_never_dispatches"
+      ],
+      "assertion_markers": [
+        "undeliverable start ACK reached the frame writer (async=false)"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--lib",
+        "v3::runtime::tests::undeliverable_async_start_ack_never_dispatches",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "expected_failed_tests": [
+        "v3::runtime::tests::undeliverable_async_start_ack_never_dispatches"
+      ],
+      "assertion_markers": [
+        "undeliverable start ACK reached the frame writer (async=true)"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--lib",
+        "v3::runtime::tests::queued_abandonment_cancels_nested_work_and_promotes_live_follower",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "expected_failed_tests": [
+        "v3::runtime::tests::queued_abandonment_cancels_nested_work_and_promotes_live_follower"
+      ],
+      "assertion_markers": [
+        "rejected queued parent reached activation (abandoned=true)"
+      ],
+      "timeout_seconds": 900
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--lib",
+        "v3::runtime::tests::queued_expiry_cancels_nested_work_and_promotes_live_follower",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ],
+      "expected_failed_tests": [
+        "v3::runtime::tests::queued_expiry_cancels_nested_work_and_promotes_live_follower"
+      ],
+      "assertion_markers": [
+        "rejected queued parent orphaned its active child (abandoned=false)"
+      ],
+      "timeout_seconds": 900
+    }
+  ],
+  "checks": [
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-module-protocol",
+        "--",
+        "--test-threads=1"
+      ],
+      "required_passed_tests": [
+        "v3::runtime::tests::abandoned_start_during_restart_is_not_dispatched",
+        "v3::runtime::tests::undeliverable_blocking_start_ack_never_dispatches",
+        "v3::runtime::tests::undeliverable_async_start_ack_never_dispatches",
+        "v3::runtime::tests::queued_abandonment_cancels_nested_work_and_promotes_live_follower",
+        "v3::runtime::tests::queued_expiry_cancels_nested_work_and_promotes_live_follower",
+        "v3::failure::tests::cancel_tree_defers_admission_failure_and_next_generation_remains_usable",
+        "configuration_metadata_is_validated_and_read_without_invocation",
+        "concurrent_exports_and_same_component_reentrancy",
+        "overlapping_callbacks_keep_parent_authority",
+        "sibling_parent_is_a_documented_trusted_component_boundary",
+        "targeted_cancel_keeps_sibling_and_generation",
+        "dropped_terminal_receiver_cancels_owned_work",
+        "deadline_cancel_is_targeted",
+        "queued_admission_is_bounded_and_cancellable",
+        "parent_cancel_cascades_during_callback",
+        "uncooperative_cancel_resets_failure_domain",
+        "stopped_worker_reader_cannot_block_cancel_grace",
+        "live_notifications_are_routed_by_invocation",
+        "notification_overflow_does_not_block_terminal",
+        "nested_reserve_survives_saturated_roots",
+        "callback_depth_and_pending_count_are_bounded",
+        "long_workflow_releases_each_completed_callback_budget",
+        "protocol_faults_fail_closed_and_restart_lazily",
+        "queued_invocations_are_not_worker_addressable",
+        "crash_and_resource_fault_fan_out",
+        "bootstrap_closes_after_runtime_traffic",
+        "strict_handshake_and_out_of_order_responses"
+      ],
+      "timeout_seconds": 1800
+    }
+  ],
+  "module_checks": [
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "-p",
+        "proteus-core",
+        "--test",
+        "module_swap",
+        "--",
+        "--test-threads=1"
+      ],
+      "required_passed_tests": [
+        "search_tool_swaps_component_exports_without_changing_canonical_contract",
+        "assembly_plan_requires_an_exact_registered_selection",
+        "duplicate_component_export_identity_is_rejected_before_runtime_build",
+        "callback_dependency_cycle_no_longer_requires_component_splitting",
+        "handshake_mismatch_is_a_snapshot_build_error",
+        "selected_process_failure_never_falls_back_to_absence",
+        "invalid_tool_response_is_rejected_without_legacy_shape",
+        "process_handshake_does_not_block_the_async_runtime",
+        "dead_process_is_restarted_lazily_for_the_same_selected_module",
+        "multiple_exports_share_one_component_process_and_lifecycle",
+        "patch::patch_tool_workdir_is_invocation_scoped_across_process_modules",
+        "tool_selection::external_selector_can_only_return_unchanged_unique_candidates",
+        "tool_selection::dynamic_selection_is_replaceable_and_ordered_hooks_only_narrow",
+        "workflow_checkpoint::rust_and_python_workflows_share_the_checkpoint_contract",
+        "workflow_checkpoint::preparation_checkpoint_rejects_stale_revision_and_unbound_tool_does_not_advance_it",
+        "workflow_checkpoint::lost_preparation_acknowledgement_cannot_roll_back_committed_history"
+      ],
+      "timeout_seconds": 3600
+    }
+  ],
+  "validation_at_publication": {
+    "patch_bytes": "Independently SHA256-matched by author and integration preparer; every unified hunk/count matched pinned source in memory; stage Git blob identities computed in memory and original blobs matched connector tree.",
+    "independent_source_review": "STATIC PASS for complete production/regression changes and subsequent formatting-only test delta; runtime/compiler tests NOT_RUN.",
+    "local_writes": "None: disk below protected floor; no local clone/download/build/cache or fetched-code execution. Only read-only binary discovery, installed formatter pipes, and Python -B AST parsing.",
+    "rust_tests": "not run",
+    "rustfmt": "Installed official Rust 1.95 rustfmt stdin-to-stdout with skip_children=true on the four changed Rust files; no files written. Production files unchanged; new test file formatted. Full cargo fmt gate remains remote/pending.",
+    "git_apply": "not run (in-memory hunk verification only)",
+    "full_workspace": "not run",
+    "native_gui": "not run",
+    "portable": "not built",
+    "performance": "not measured",
+    "watchdog_scope": "Command process-group deadlines bound CI observation. In-test watchdog bounds waiting, not proof of wedged admission-thread reclamation.",
+    "effect_scope": "Guarding observed cancellation/deadline before dispatch cannot remove later races or roll back already-dispatched effects.",
+    "python_syntax": "Runner and modified Python fixture AST parsed in memory with Python -B; neither executed.",
+    "formatting_provenance": {
+      "authored_test_patch_sha256": "a7bb21dc8a96c57cf08f16506a1a73ad3ec5c7c91ffb57c7a5f519a8fb242461",
+      "formatted_test_patch_sha256": "2184bbd6cf5d0af439a751c0259dd8ea586434c1b59466ed3d64dbfdf15e8ffc",
+      "formatted_test_file_sha256": "4ec3e4a057d1287c788640f75b1e76e46a9298227692699934651bc2d3b7e1a3",
+      "source_reviewer": "Formatting-only delta STATIC PASS from independent reviewer and semantic APPROVAL from original author; integrator reapplied all hunks and matched formatted bytes."
+    },
+    "runner_review": "Full runner STATIC PASS; final mandatory fmt-last order separately reviewed; execution pending."
+  },
+  "sha256": {
+    "foundation/2026-10-26/admission-guard/01-admission-tests.patch": "2184bbd6cf5d0af439a751c0259dd8ea586434c1b59466ed3d64dbfdf15e8ffc",
+    "foundation/2026-10-26/admission-guard/02-admission-fix.patch": "cf4ccdac27b3ef43ccaf644d9804266e8daffbef868fe8fd12a2a7cca2b60f8a",
+    "foundation/2026-10-26/admission-guard/run_validation.py": "768e151fe7656a335fd752c2f9cd8014ecda54bd5e70ce55cc3fc26307713eea",
+    "foundation/2026-10-26/admission-guard/README.md": "df054f42f34dd4d95a7db9927491ac53e3cb2bc3e6d2d717ee1439de82b35f43",
+    ".github/workflows/admission-guard-validation.yml": "1f6fb7c612a398c75dad903690e0f6e60abe0c62b029b53bd64e7f8e03a9b81f"
+  },
+  "final_checks": [
+    {
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "timeout_seconds": 300
+    }
+  ]
+}

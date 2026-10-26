@@ -1,0 +1,180 @@
+diff --git a/crates/proteus-module-protocol/src/v3/broker.rs b/crates/proteus-module-protocol/src/v3/broker.rs
+--- a/crates/proteus-module-protocol/src/v3/broker.rs
++++ b/crates/proteus-module-protocol/src/v3/broker.rs
+@@ -49,14 +49,10 @@
+ }
+ 
+ impl StartAck {
+-    pub(super) fn send(self, result: Result<StartMeta, ComponentBrokerError>) {
++    pub(super) fn send(self, result: Result<StartMeta, ComponentBrokerError>) -> bool {
+         match self {
+-            Self::Async(sender) => {
+-                let _ = sender.send(result);
+-            }
+-            Self::Blocking(sender) => {
+-                let _ = sender.send(result);
+-            }
++            Self::Async(sender) => sender.send(result).is_ok(),
++            Self::Blocking(sender) => sender.send(result).is_ok(),
+         }
+     }
+ }
+diff --git a/crates/proteus-module-protocol/src/v3/failure.rs b/crates/proteus-module-protocol/src/v3/failure.rs
+--- a/crates/proteus-module-protocol/src/v3/failure.rs
++++ b/crates/proteus-module-protocol/src/v3/failure.rs
+@@ -20,7 +20,11 @@
+         }
+     }
+ 
+-    fn finish_without_admission(&mut self, id: &str, terminal: InvocationTerminal) -> bool {
++    pub(super) fn finish_without_admission(
++        &mut self,
++        id: &str,
++        terminal: InvocationTerminal,
++    ) -> bool {
+         let Some(mut pending) = self.pending.remove(id) else {
+             return false;
+         };
+@@ -47,11 +51,7 @@
+             let Some(id) = self.queued_roots.pop_front() else {
+                 break;
+             };
+-            let Some(pending) = self.pending.get(&id) else {
+-                continue;
+-            };
+-            if pending.invocation.deadline <= Instant::now() {
+-                self.finish(&id, InvocationTerminal::TimedOut);
++            if !self.pending.contains_key(&id) {
+                 continue;
+             }
+             self.activate(&id);
+@@ -108,6 +108,17 @@
+         generation: u64,
+         cause: CancelCause,
+     ) -> Result<(), ComponentBrokerError> {
++        self.cancel_without_admission(id, generation, cause)?;
++        self.admit_queued_roots();
++        Ok(())
++    }
++
++    pub(super) fn cancel_without_admission(
++        &mut self,
++        id: &str,
++        generation: u64,
++        cause: CancelCause,
++    ) -> Result<(), ComponentBrokerError> {
+         if generation != self.generation {
+             return Err(ComponentBrokerError::new(
+                 ComponentBrokerErrorKind::ParentInactive,
+@@ -175,7 +186,6 @@
+                 break;
+             }
+         }
+-        self.admit_queued_roots();
+         Ok(())
+     }
+ 
+diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-module-protocol/src/v3/runtime.rs
+--- a/crates/proteus-module-protocol/src/v3/runtime.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime.rs
+@@ -11,8 +11,8 @@
+     broker::{ComponentBrokerSnapshot, ControlCommand, StartRequest},
+     handshake::initialize_transport,
+     invocation::{
+-        ComponentBrokerError, ComponentBrokerErrorKind, ComponentFailure, InvocationRef,
+-        InvocationTerminal, StartMeta,
++        CancelCause, ComponentBrokerError, ComponentBrokerErrorKind, ComponentFailure,
++        InvocationRef, InvocationTerminal, StartMeta,
+     },
+     pending::{LoopState, PendingInvocation, WorkerGeneration},
+     wire,
+@@ -312,6 +312,10 @@
+                 return;
+             }
+         };
++        // Initialization may block while the caller abandons admission.
++        if request.terminal.receiver_dropped() {
++            return;
++        }
+         let id = wire::host_id(self.generation, self.next_host_sequence);
+         self.next_host_sequence = self.next_host_sequence.saturating_add(1);
+         let root_id = if root_id.is_empty() {
+@@ -354,7 +358,11 @@
+         if !request.bootstrap {
+             self.runtime_started = true;
+         }
+-        request.ack.send(Ok(meta));
++        if !request.ack.send(Ok(meta)) {
++            // No caller can own this invocation, and it has not been queued.
++            self.finish_without_admission(&id, InvocationTerminal::Canceled);
++            return;
++        }
+ 
+         if effective_deadline <= Instant::now() {
+             self.finish(&id, InvocationTerminal::TimedOut);
+@@ -372,6 +380,36 @@
+     }
+ 
+     pub(super) fn activate(&mut self, id: &str) {
++        let pending = self
++            .pending
++            .get(id)
++            .expect("pending invocation disappeared before activation");
++        assert!(!pending.active, "invocation activated twice");
++        if let Some(cause) = pending.cancel {
++            // Cancellation already visited the tree; inactive records normally
++            // settle immediately. Preserve its recorded cause if one remains.
++            self.finish_without_admission(id, InvocationTerminal::canceled(cause));
++            return;
++        }
++        let cause = if pending
++            .terminal
++            .as_ref()
++            .is_some_and(|sender| sender.receiver_dropped())
++        {
++            Some(CancelCause::User)
++        } else if pending.invocation.deadline <= Instant::now() {
++            Some(CancelCause::Timeout)
++        } else {
++            None
++        };
++        if let Some(cause) = cause {
++            // Queued parents can already own nested invocations. Cancel the
++            // whole tree before the caller continues iterative admission.
++            let generation = pending.invocation.generation;
++            let _ = self.cancel_without_admission(id, generation, cause);
++            return;
++        }
++
+         let frame = {
+             let pending = self
+                 .pending
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -702,9 +702,22 @@
+ сохраняют `anyhow::Result`, но Core может различить module failure, cancel,
+ timeout и конкретный класс component loss без парсинга display text.
+ 
+-При cancel/timeout host отправляет `$/cancelRequest` и ждёт bounded grace
+-period. Cooperative terminal завершает только target invocation (и её nested
+-descendants). Если grace истёк, reset-ится **весь component**, потому что
++До постановки invocation в writer host повторно проверяет наблюдаемые
++отмену, потерю async terminal receiver и deadline; эта проверка действует
++также при продвижении queued roots. После блокирующего handshake потеря
++receiver проверяется повторно, а недоставленный admission ACK не допускает
++invocation к dispatch. Отмена queued parent сохраняет отмену её nested tree.
++Успешная отправка ACK не доказывает, что caller уже получил handle.
++
++Проверка до dispatch не устраняет гонку с более поздней отменой. Если writer
++ещё не забрал request, `cancel_before_write` может атомарно отменить запись.
++После начала записи cancel/timeout не гарантирует отсутствие или rollback
++эффектов module.
++
++При cancel/timeout уже отправленной invocation host отправляет
++`$/cancelRequest` и ждёт bounded grace period. Cooperative terminal завершает
++только target invocation (и её nested descendants). Если grace истёк,
++reset-ится **весь component**, потому что
+ неотвечающий trusted process является общим failure domain. Transport,
+ protocol и resource failure делают то же.
+ Следующая invocation любого export lazily запускает новый child и повторяет
