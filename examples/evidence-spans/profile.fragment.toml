@@ -1,0 +1,18 @@
+# Merge into an existing profile; preserve its ordinary policy and reader.
+# Paths are relative to invocation cwd, not executable directory.
+[components.evidence-spans]
+command = "/absolute/path/to/proteus-example-evidence-spans"
+
+[components.evidence-spans.exports.tool."evidence.verify_spans"]
+timeout_ms = 60000
+
+[module_config.tool."evidence.verify_spans"]
+schema_version = 1
+
+[[module_config.tool."evidence.verify_spans".sources]]
+id = "research-artifact"
+path = "fixtures/source.txt"
+
+# Add read_file and evidence.verify_spans to the existing tools.enabled list.
+# This fragment grants no permissions and registers no implicit reader.
+# No Hermes verification hook is required: this is quote evidence, not a test gate.

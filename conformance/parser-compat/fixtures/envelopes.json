@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate frozen module envelope/body controls, not candidate YAML parser cases",
+  "cases": [
+    {
+      "id": "lf_trim_body",
+      "document": "---\nname: review\ndescription: Envelope control\n---\n  First line.\n\nSecond line.  \n",
+      "directory": "review",
+      "document_utf8_bytes": 81,
+      "document_sha256": "7f73b87256f5b10848302e65a5e80426fa7410c07d8238ee756fb7f446195f8f",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "accepted",
+        "body": "First line.\n\nSecond line."
+      }
+    },
+    {
+      "id": "crlf_trim_body",
+      "document": "---\r\nname: review\r\ndescription: Envelope control\r\n---\r\n  First line.\r\n\r\nSecond line.  \r\n",
+      "directory": "review",
+      "document_utf8_bytes": 88,
+      "document_sha256": "06d99a66c9b67cb31f9b06ef966a748e981c2c76b6b2d1149823ad1527ba2239",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "accepted",
+        "body": "First line.\r\n\r\nSecond line."
+      }
+    },
+    {
+      "id": "closing_marker_at_eof",
+      "document": "---\nname: review\ndescription: Envelope control\n---",
+      "directory": "review",
+      "document_utf8_bytes": 50,
+      "document_sha256": "014c18e937350b9b599f43ef318f6eb356056ca4c5ba12864ea665c1fbce9e6f",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "accepted",
+        "body": ""
+      }
+    },
+    {
+      "id": "body_marker_is_data",
+      "document": "---\nname: review\ndescription: Envelope control\n---\nFirst.\n---\nLast.\n",
+      "directory": "review",
+      "document_utf8_bytes": 68,
+      "document_sha256": "46d14346fd3da94b459ed9d36e122e49353bcc14f9fa71a8e86869b5839d650d",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "accepted",
+        "body": "First.\n---\nLast."
+      }
+    },
+    {
+      "id": "missing_opening",
+      "document": "name: review\ndescription: Envelope control\n---\nBody.\n",
+      "directory": "review",
+      "document_utf8_bytes": 53,
+      "document_sha256": "16e5b79a848a5778e491895f142b693e13343c67d20062998d2e8be66e93cd96",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "rejected",
+        "error_contains": "missing opening YAML marker on its own line"
+      }
+    },
+    {
+      "id": "missing_closing",
+      "document": "---\nname: review\ndescription: Envelope control\nBody.\n",
+      "directory": "review",
+      "document_utf8_bytes": 53,
+      "document_sha256": "4af964b712af3e30efd24f0a29cec4274d44fcaf2e8385a12033f0fee6920090",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "rejected",
+        "error_contains": "missing closing YAML marker on its own line"
+      }
+    },
+    {
+      "id": "bom_before_opening",
+      "document": "﻿---\nname: review\ndescription: Envelope control\n---\nBody.\n",
+      "directory": "review",
+      "document_utf8_bytes": 60,
+      "document_sha256": "21fd47542d7da5cfb1104faba311f9a2108fa28f6b2d98105684f1465c25c123",
+      "runtime_status": "not_run",
+      "expected": {
+        "status": "rejected",
+        "error_contains": "missing opening YAML marker on its own line"
+      }
+    }
+  ]
+}

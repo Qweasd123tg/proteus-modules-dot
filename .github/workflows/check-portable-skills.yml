@@ -1,0 +1,66 @@
+name: Check portable skills example
+
+on:
+  push:
+    paths:
+      - "examples/portable-skill-catalog/**"
+      - ".github/workflows/check-portable-skills.yml"
+  pull_request:
+    paths:
+      - "examples/portable-skill-catalog/**"
+      - ".github/workflows/check-portable-skills.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install explicit official Rust components
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt clippy --toolchain 1.95.0
+      - name: Check frozen inputs, lint and execute every authored case
+        working-directory: examples/portable-skill-catalog
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/validation/portable-skills-ci"
+          git ls-files -z . | xargs -0 sha256sum > "$GITHUB_WORKSPACE/validation/portable-skills-ci/inputs.sha256"
+          sha256sum --check CODE.sha256
+          cargo +1.95.0 fmt --check
+          cargo +1.95.0 clippy --locked --all-targets -- -D warnings
+          cargo +1.95.0 test --locked 2>&1 | tee "$GITHUB_WORKSPACE/validation/portable-skills-ci/tests.txt"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          out = Path(os.environ['GITHUB_WORKSPACE']) / 'validation/portable-skills-ci'
+          text = (out / 'tests.txt').read_text()
+          rows = re.findall(r'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out', text)
+          assert rows and all(r[0] == 'ok' and all(int(x) == 0 for x in r[2:]) for r in rows), rows
+          assert sum(int(r[1]) for r in rows) == 30, rows
+          expected = []
+          for path in ['tests/behavior.rs', 'tests/wire.rs']:
+              expected += re.findall(r'#\[test\]\s*fn\s+(\w+)', Path(path).read_text())
+          actual = re.findall(r'^test (\S+) \.\.\. ok$', text, re.M)
+          assert len(expected) == len(actual) == 30 and set(expected) == set(actual), (expected, actual)
+          (out / 'result.json').write_text(json.dumps({'status':'passed','rust_tests':30,'failed':0,'ignored':0,'filtered':0,'cases':sorted(actual),'scope':'authored behavior and synthetic-host executable wire only'}, indent=2))
+          PY
+          sha256sum --check "$GITHUB_WORKSPACE/validation/portable-skills-ci/inputs.sha256" > "$GITHUB_WORKSPACE/validation/portable-skills-ci/source-recheck.txt"
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: portable-skills-validation
+          path: validation/portable-skills-ci/
+          if-no-files-found: error
+          retention-days: 14

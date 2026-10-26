@@ -1,0 +1,562 @@
+{
+  "schema": "proteus.ecosystem.public-ledger.v1",
+  "batch": "round3-openhands",
+  "as_of_utc": "2026-10-25T23:50:00Z",
+  "source_pin": "ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50",
+  "source_tree": "5e0d3f571c7be2bfd8ecc8b3fce08e23626065b6",
+  "current_core_source": "1fc3ef223d10322815dd9290a50d045bc95402bb",
+  "published_sdk": "3f36a003b4f3fde2242fc80f7aedac00dd127d1d",
+  "findings": [
+    {
+      "id": "ECO3-01",
+      "title": "Action, observation и model-view — разные объекты",
+      "observation": "ActionEvent отдельно хранит event.id, tool_call_id, llm_response_id, исходный tool_call и parsed action; ObservationEvent связывается с action_id. Parsed action может отличаться от исходных arguments (например, вынесенная risk annotation).",
+      "transfer": "Для аудита использовать отдельные correlation IDs и точные bytes нужного слоя, а не строковый transcript. В Proteus уже есть canonical ToolCall/ToolResult и owner attribution; новый универсальный foreign-event DTO не нужен.",
+      "limits": "Внешняя risk annotation и тип события не доказывают авторизацию либо реальный effect.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/event/llm_convertible/action.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/event/llm_convertible/action.py#L39-L85"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/event/llm_convertible/observation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/event/llm_convertible/observation.py#L17-L72"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/domain/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/domain/tool.rs#L86-L135"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-02",
+      "title": "Повтор run — implicit approval в SDK, не универсальная host admission",
+      "observation": "Agent._step/_astep выполняют unmatched actions до новой model sampling. run() очищает WAITING_FOR_CONFIRMATION; rejection добавляет отдельное observation. Публичный LocalConversation.execute_tool прямо обходит confirmation/security analysis.",
+      "transfer": "При адаптации не превращать generic resume в разрешение эффекта. Proteus BoundTools уже проводит nested/tool execution через validation, policy и approval; сохранить этот единственный путь.",
+      "limits": "Это задокументированная граница library API, не подтвержденная уязвимость server API; server authorization целиком не исследован.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/agent.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/agent.py#L703-L719"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/agent.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/agent.py#L1127-L1198"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L1959-L1969"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2706-L2744"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L3183-L3224"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools.rs#L294-L432"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-03",
+      "title": "Полный event log, активная ветка и подготовленный context не взаимозаменяемы",
+      "observation": "EventLog хранит parent_id дерево; active_branch исключает abandoned branches. View применяет condensation, исключает non-LLM events и удаляет незавершённые pairs/batches либо поздние duplicate observations при enforcement.",
+      "transfer": "Research citation должен указывать слой и immutable artifact hash. Не использовать очищенный model-view как доказательство отсутствия действия. Core ConversationView уже явно ограничен current canonical history после compaction.",
+      "limits": "Инкрементальная обработка хвоста описана кодом; latency/speedup не измерялись.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/event_store.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/event_store.py#L95-L130"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/state.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/state.py#L295-L405"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/context/view/view.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/context/view/view.py#L74-L160"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/context/view/properties/observation_uniqueness.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/context/view/properties/observation_uniqueness.py#L18-L52"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/context/view/properties/batch_atomicity.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/context/view/properties/batch_atomicity.py#L10-L47"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/conversation/view.rs#L1-L55"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-04",
+      "title": "Durability состоит из нескольких отдельных операций",
+      "observation": "EventLog append держит file lock, пишет событие и затем обновляет length marker; marker удаляется прежде нового, чтобы interrupted update давал fallback count. Base state сохраняется отдельно. atomic_write_text делает temp+flush+fsync(file)+replace.",
+      "transfer": "Разделять durable event, base projection и cache; recovery должен учитывать lag HEAD. Не объявлять file fsync общей multi-file transaction или гарантией power-loss durability каталога.",
+      "limits": "LocalFileStore cache требует exclusive file ownership; NFS caveat явно указан EventLog. Полная crash matrix не исполнялась.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/event_store.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/event_store.py#L188-L271"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/state.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/state.py#L315-L337"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/state.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/state.py#L430-L451"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/utils/files.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/utils/files.py#L21-L50"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/runtime/conversation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/runtime/conversation.rs#L33-L47"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-05",
+      "title": "Lease generation ограждает записи, а не внешние эффекты",
+      "observation": "ConversationLease.claim увеличивает generation при takeover; guarded_write проверяет owner+generation под lock. EventService устанавливает этот guard на ConversationState/EventLog после загрузки и обновляет lease. TTL=0 явно отключает leasing.",
+      "transfer": "Для environment driver различать writer ownership и реальную остановку browser/command operation. Любое CAS-предложение Proteus должно назвать настоящий backend, owner и transaction boundary; host.read_file/write_file сами не создают CAS.",
+      "limits": "Не заявляется global fencing tool effects; lease-файлы и state writes не являются browser transaction.",
+      "sources": [
+        {
+          "path": "openhands-agent-server/openhands/agent_server/conversation_lease.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/conversation_lease.py#L122-L164"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/conversation_lease.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/conversation_lease.py#L187-L232"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L495-L529"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L1237-L1252"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L1388-L1407"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/invocation.rs#L30-L62"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-06",
+      "title": "Cancel, PAUSED и завершение worker различны",
+      "observation": "interrupt сначала отменяет thread-safe token, затем async task; sync run получает pause. _arun ловит CancelledError, добавляет synthetic error для orphan tool calls и становится PAUSED. ToolExecutor.interrupt по умолчанию no-op; работа thread может пережить async waiter.",
+      "transfer": "Сохранять canceled/unknown outcome, не обещать rollback. Core уже даёт child cancellation, 500ms settlement grace и metadata canceled/timed_out; модуль проверяет host cancellation, но не выдаёт себя за OS supervisor.",
+      "limits": "Synthetic tool error обеспечивает формат conversation, не подтверждает отсутствие внешнего эффекта.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/cancellation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/cancellation.py#L1-L43"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2588-L2623"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2666-L2672"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2801-L2834"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/parallel_executor.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/parallel_executor.py#L193-L253"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/tool/tool.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/tool/tool.py#L308-L327"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/contracts/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/tool.rs#L54-L114"
+        },
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/invocation.rs#L79-L122"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-07",
+      "title": "Capacity permit принадлежит цепочке работ",
+      "observation": "RunSlot refcount удерживает один semaphore permit между chained runs, goal loop и internal rerun. settle не освобождает handle живого sync worker; interrupt ждёт shielded run до5s и не очищает unfinished task.",
+      "transfer": "Полезный pattern для будущего long-running driver: request acknowledgment, admission capacity, work lifetime и cleanup acknowledgment отдельно. Не освобождать capacity только потому, что waiter canceled.",
+      "limits": "Это source pattern, не готовая замена Proteus admission; полный scheduling/goal-loop не покрыт.",
+      "sources": [
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L112-L181"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L1477-L1521"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L1577-L1615"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L2115-L2141"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/invocation.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/invocation.rs#L79-L113"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-08",
+      "title": "Crash recovery чинит transcript, не восстанавливает environment",
+      "observation": "Server startup гидратирует RUNNING records, не все idle conversations. EventService переводит stale RUNNING в ERROR, сканирует full log (HEAD может отставать), добавляет error для первого unmatched action и parent-ит его к action.",
+      "transfer": "Unknown operation outcome требует отдельного reconciliation с реальным target. Нельзя принимать recovery error за доказательство 'ничего не записано' и автоматически повторять side effect.",
+      "limits": "Не исследованы все multiple-unmatched/remote branch случаи; источник сам отмечает отсутствие remote branching в этом пути.",
+      "sources": [
+        {
+          "path": "openhands-agent-server/openhands/agent_server/conversation_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/conversation_service.py#L2218-L2258"
+        },
+        {
+          "path": "openhands-agent-server/openhands/agent_server/event_service.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-agent-server/openhands/agent_server/event_service.py#L1421-L1472"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/state.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/state.py#L677-L716"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/hooks.rs#L92-L130"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-09",
+      "title": "Parallel safety требует resource key, а не только имени tool",
+      "observation": "DeclaredResources различает unknown и explicit empty. Необъявленный resource сериализуется per tool:name; declared keys берутся в sorted order и освобождаются обратно, timeout/refcount обслуживаются отдельно. Каждый ParallelToolExecutor имеет собственный lock manager.",
+      "transfer": "Для общего browser/session хранилища lock key должен выражать сам ресурс и owner scope. В Proteus уже есть opt-in supports_parallel_tool_calls=false по умолчанию; сначала conservative module setting, не новый глобальный scheduler.",
+      "limits": "Заявление tool о shared resource — доверенное описание, не OS isolation; межпроцессная сериализация этим классом не установлена.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/tool/tool.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/tool/tool.py#L251-L280"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/tool/tool.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/tool/tool.py#L529-L537"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/parallel_executor.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/parallel_executor.py#L51-L65"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/parallel_executor.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/parallel_executor.py#L275-L357"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/resource_lock_manager.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/resource_lock_manager.py#L84-L117"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/domain/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/domain/tool.rs#L283-L325"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-10",
+      "title": "Browser resource живёт шире отдельного tool",
+      "observation": "BrowserToolSet переиспользует class-level executor между parent/subagents, повторную executor_config логирует как ignored. Все browser tools используют один executor. close отделяет shared reference и очищает executor; BrowserToolSet.create при startup error возвращает пустой список.",
+      "transfer": "Будущий Proteus browser adapter должен явно различать owned/borrowed session, effective config и unavailable capability; логическое tool listing не должно обещать отдельный browser каждой conversation.",
+      "limits": "Это исследование ownership pattern, не вывод о безопасности многопользовательского deployment; реальный browser не запускался.",
+      "sources": [
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/definition.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/definition.py#L804-L892"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/impl.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/impl.py#L689-L753"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-module-sdk/src/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-module-sdk/src/tool.rs#L35-L61"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-11",
+      "title": "Свежесть browser observation не равна актуальности selector",
+      "observation": "BrowserClickAction принимает index, описание требует актуальный get_state. Prompt guidance требует get_state перед каждым click/type; wrapper передаёт index напрямую browser-use. Observation хранит текст+screenshot, output может truncatе и сохраняться отдельно.",
+      "transfer": "Для детерминированного driver контракта нужны session generation и observation handle, а не только integer selector. exact quote/span из локального artifact реализуется сейчас без browser automation и не делает живую DOM state достоверной.",
+      "limits": "Browser-use downstream здесь не переаудирован; отсутствие проверки observation revision установлено лишь в прочитанном SDK wrapper/schema.",
+      "sources": [
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/definition.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/definition.py#L61-L135"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/definition.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/definition.py#L202-L244"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/definition.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/definition.py#L778-L787"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/impl.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/impl.py#L563-L606"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/domain/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/domain/tool.rs#L86-L135"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-12",
+      "title": "Browser timeout recovery создаёт новую session, не replay старого результата",
+      "observation": "Executor считает последовательные timeout failures, использует shortened timeout перед третьим failure, затем best-effort cleanup/reset и lazy restart на следующем action. Обычные action errors не считаются browser crash. AsyncExecutor.close явно bounded best-effort, может оставить ресурсы до process exit.",
+      "transfer": "Любой recovery tool должен вернуть session changed/cleanup uncertainty; retry submit/click нельзя обосновать одним timeout. В Proteus cancellation metadata и raw effect recording уже есть, exact-once при внешнем browser transport отсутствует без driver reconciliation.",
+      "limits": "Не подтверждается исчезновение Chromium/process descendants или успешность reset; это намеренная best-effort граница источника.",
+      "sources": [
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/impl.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/impl.py#L388-L461"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/impl.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/impl.py#L538-L546"
+        },
+        {
+          "path": "openhands-tools/openhands/tools/browser_use/impl.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-tools/openhands/tools/browser_use/impl.py#L673-L719"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/utils/async_executor.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/utils/async_executor.py#L117-L220"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/hooks.rs#L92-L130"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-13",
+      "title": "Workspace pause, conversation close и OS isolation имеют разных владельцев",
+      "observation": "LocalWorkspace исполняет на host filesystem; pause/resume no-op. DockerWorkspace владеет созданным --rm контейнером, pause/unpause freezing отдельно от cleanup docker stop. LocalConversation.close освобождает agent/tools, а workspace lifecycle управляется своим context manager.",
+      "transfer": "Не называть remote/local abstraction sandbox. Proteus process boundary тоже не OS sandbox; использовать существующий explicit restricted launch, не расширять tool authority из-за browser/module бренда.",
+      "limits": "Container isolation/security config целиком не проверен; cleanup command request не подтверждает externally observed removal.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/workspace/local.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/workspace/local.py#L17-L80"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/workspace/local.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/workspace/local.py#L202-L216"
+        },
+        {
+          "path": "openhands-workspace/openhands/workspace/docker/workspace.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-workspace/openhands/workspace/docker/workspace.py#L234-L258"
+        },
+        {
+          "path": "openhands-workspace/openhands/workspace/docker/workspace.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-workspace/openhands/workspace/docker/workspace.py#L353-L430"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L2860-L2910"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-contracts/src/contracts/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/tool.rs#L20-L50"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-14",
+      "title": "Dynamic MCP catalog — scoped reconciliation, не безусловная регистрация",
+      "observation": "AgentBase.add_runtime_tools проверяет duplicate/conflict names; same-client updates разрешены. Reconciliation удаляет прежние tools только данного client и copy-on-write заменяет map; tools_map возвращает копию под lock. Restore verify проверяет class и отсутствие removed configured names, а не полную семантику schema/executor.",
+      "transfer": "Сохранить ownership каталога и execution snapshot. В Proteus model tool spec сверяется с registered spec и policy visibility; не добавлять module-specific обход или автоматический импорт чужой history.",
+      "limits": "Runtime MCP updates и persisted explicit tools — разные пути. Full external MCP client/notification order не трассирован.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/base.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/base.py#L684-L750"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/base.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/base.py#L831-L901"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/agent/base.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/agent/base.py#L973-L1023"
+        },
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L1400-L1449"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools.rs#L168-L243"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-15",
+      "title": "rerun_actions повторно производит реальные эффекты",
+      "observation": "LocalConversation.rerun_actions берёт ActionEvents из полного state.events и заново вызывает tools; источник предупреждает non-idempotence и reset workspace. Это не event projection и не read-only verification.",
+      "transfer": "Proteus workflow replay и citation verification не должны исполнять историю. Нужное reuse — explicit отдельный operation mode с host authorization, а не случайный fallback replay.",
+      "limits": "В этом пакете rerun не исполнялся. Паритет с OpenHands как совместимый runtime не заявляется.",
+      "sources": [
+        {
+          "path": "openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py",
+          "url": "https://github.com/OpenHands/software-agent-sdk/blob/ce5716a3c0a955a85bb0cc4dcfaa94d5fefcda50/openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py#L3078-L3181"
+        }
+      ],
+      "proteus": [
+        {
+          "path": "crates/proteus-core/src/core/bound_tools/hooks.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/bound_tools/hooks.rs#L125-L129"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    },
+    {
+      "id": "ECO3-16",
+      "title": "Current Core1fc и published SDK3f различены, новый evidence DTO Core не требуется",
+      "observation": "Девять релевантных файлов contracts/SDK/BoundTools/conversation read побайтно одинаковы между 3f36a003 и1fc3ef2 и локальным baseline. Во всём contracts+SDK diff лишь AppServerEvent::SessionCatalogUpdated (3 строки). ConversationView schema1 и tool host callbacks уже существуют.",
+      "transfer": "evidence.verify_spans — ordinary ReadOnly tool/v6 с nested host read. Shared checked-read support — pure validation библиотека, не связь implementations и не новый slot. Коррекция memory/CAS остаётся отдельным не реализованным consumer.",
+      "limits": "Source compatibility этого среза не заменяет реальные protocol/Core invocation tests. Implementation отдельно, после predesign review.",
+      "sources": [],
+      "proteus": [
+        {
+          "path": "crates/proteus-module-sdk/src/tool.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-module-sdk/src/tool.rs#L20-L32"
+        },
+        {
+          "path": "crates/proteus-module-sdk/src/hosts.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-module-sdk/src/hosts.rs#L82-L123"
+        },
+        {
+          "path": "crates/proteus-contracts/src/contracts/conversation/view.rs",
+          "url": "https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-contracts/src/contracts/conversation/view.rs#L1-L55"
+        }
+      ],
+      "evidence_level": "source_inspection",
+      "tests_run": [],
+      "upstream_execution": false,
+      "public_classification": "safe_architecture_pattern"
+    }
+  ]
+}

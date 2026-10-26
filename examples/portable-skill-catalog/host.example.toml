@@ -1,0 +1,65 @@
+# Offline host template. Replace BOTH absolute roots before use.
+# Default launch is trusted; separate processes do not themselves create a sandbox.
+active_provider = "fake"
+[profile]
+name = "portable-skills-offline"
+[providers.fake]
+provider = "fake"
+model = "fake"
+stream = true
+[modules]
+workflow = "coding.single_loop"
+context = "repo_aware"
+policy = "codex_policy"
+hooks = []
+[tools]
+enabled = ["portable_skill_catalog", "portable_skill_load"]
+[agent_control]
+surface = "none"
+[components.reference]
+command = "proteus-reference-module"
+env_allowlist = []
+[components.reference.exports.model.fake]
+[components.reference.exports.workflow."coding.single_loop"]
+[components.reference.exports.context.repo_aware]
+[components.reference.exports.policy.codex_policy]
+[module_config.model.fake]
+implementation = "fake"
+[module_config.policy.codex_policy]
+[module_config.workflow."coding.single_loop"]
+[module_config.context.repo_aware]
+providers = ["portable.skills"]
+max_context_bytes = 65536
+max_search_results = 0
+
+# One executable can supply two slots. Here each process has ONE export, so a
+# separately configured restricted launch need not union slot authority.
+[components.portable-catalog]
+command = "proteus-example-portable-skill-catalog"
+env_allowlist = []
+handshake_timeout_ms = 10000
+[components.portable-catalog.exports.context_provider."portable.skills"]
+timeout_ms = 5000
+[components.portable-tools]
+command = "proteus-example-portable-skill-catalog"
+env_allowlist = []
+handshake_timeout_ms = 10000
+[components.portable-tools.exports.tool."portable.skills"]
+timeout_ms = 5000
+
+[module_config.context_provider."portable.skills"]
+roots = [{ id = "project-agents", path = "/ABSOLUTE/PATH/TO/portable-skill-catalog/fixtures/skills" }]
+disabled = []
+strict = false
+max_entries = 128
+max_skills = 32
+max_total_bytes = 1048576
+max_context_bytes = 32768
+[module_config.tool."portable.skills"]
+roots = [{ id = "project-agents", path = "/ABSOLUTE/PATH/TO/portable-skill-catalog/fixtures/skills" }]
+disabled = []
+strict = false
+max_entries = 128
+max_skills = 32
+max_total_bytes = 1048576
+max_context_bytes = 32768

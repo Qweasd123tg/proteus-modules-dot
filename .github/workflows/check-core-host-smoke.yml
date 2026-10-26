@@ -1,0 +1,57 @@
+name: Check scoped real Core integration
+
+on:
+  push:
+    paths:
+      - "integration/core-smoke/**"
+      - "examples/**"
+      - ".github/workflows/check-core-host-smoke.yml"
+  pull_request:
+    paths:
+      - "integration/core-smoke/**"
+      - "examples/**"
+      - ".github/workflows/check-core-host-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install the pinned official toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Build pinned examples and the authored Core harness
+        shell: bash
+        run: |
+          for name in pi-ready-steps hermes-verify-evidence letta-evidence-blocks; do
+            cargo +1.95.0 build --locked --manifest-path "examples/$name/Cargo.toml"
+          done
+          cargo +1.95.0 fmt --check --manifest-path integration/core-smoke/Cargo.toml
+          cargo +1.95.0 build --locked --manifest-path integration/core-smoke/Cargo.toml
+      - name: Check actual Core boundaries without a model or reference pack
+        run: |
+          python3 -I integration/core-smoke/run_smoke.py \
+            --binary "$CARGO_TARGET_DIR/debug/proteus-examples-host-smoke" \
+            --example-bin-dir "$CARGO_TARGET_DIR/debug" \
+            --examples-dir "$PWD/examples" \
+            --output "$PWD/validation/core-smoke-ci"
+      - name: Preserve exact evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scoped-core-integration-evidence
+          path: validation/core-smoke-ci/
+          if-no-files-found: error
+          retention-days: 14

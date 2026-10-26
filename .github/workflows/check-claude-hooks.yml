@@ -1,0 +1,57 @@
+name: Check standalone Claude hooks adapter
+
+on:
+  push:
+    paths:
+      - "hook/claude-command-hooks/**"
+      - ".github/workflows/check-claude-hooks.yml"
+  pull_request:
+    paths:
+      - "hook/claude-command-hooks/**"
+      - ".github/workflows/check-claude-hooks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check out the exact external SDK
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Proteus-harness/Proteus-core
+          ref: bee0e409e746e2df9db32748d4f8ea02201bd4af
+          path: .sdk/proteus-core
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.19.0"
+      - name: Test authored fixtures without skipped SDK checks
+        shell: bash
+        env:
+          PROTEUS_HOOK_SDK_ROOT: ${{ github.workspace }}/.sdk/proteus-core/examples/modules/hook-process
+        run: |
+          mkdir -p validation/ci
+          node --test --test-reporter=tap hook/claude-command-hooks/tests/*.test.mjs | tee validation/ci/claude-hooks.tap
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const text = fs.readFileSync("validation/ci/claude-hooks.tap", "utf8");
+            const count = name => { const m = text.match(new RegExp("^# " + name + " (\\d+)$", "m")); if (!m) throw new Error("missing " + name); return Number(m[1]); };
+            const result = { tests: count("tests"), passed: count("pass"), failed: count("fail"), cancelled: count("cancelled"), skipped: count("skipped"), todo: count("todo") };
+            if (result.tests < 33 || result.passed !== result.tests || result.failed || result.cancelled || result.skipped || result.todo) throw new Error(JSON.stringify(result));
+            fs.writeFileSync("validation/ci/claude-hooks.json", JSON.stringify({status:"passed", ...result}, null, 2));
+          '
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: claude-hooks-validation
+          path: validation/ci/
+          if-no-files-found: error
+          retention-days: 14
