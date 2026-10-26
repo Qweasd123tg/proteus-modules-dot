@@ -4,14 +4,14 @@
   "publication_base": "a0c1716756f8d5950dbf92638951f676bf8d2803",
   "publication_branch": "ci/snapshot-root-routing-20261026",
   "source_repository": "https://github.com/Proteus-harness/Proteus-desktop.git",
-  "source_commit": "5748ac04f78eaffa1f4ea6102bd349ca61412e8d",
+  "source_commit": "2bf38f67055f10f5ed0fd225399ba77d84756ba1",
   "upstream_agents_git_blob": "e96f239f79cfa14720aeb9b6e643265736b1793c",
   "toolchain": "1.95.0",
   "dependency_source_pins": {
     "contracts": "f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60",
     "extensions": "3361fc1650c4ac6f167c3e48a0fba8980a5c9038"
   },
-  "baseline_definition": "Desktop 5748ac04f78eaffa1f4ea6102bd349ca61412e8d + verified existing desktop-pagination-retry.patch + behavior-preserving Session snapshot extraction and new regression tests; not pristine upstream.",
+  "baseline_definition": "Desktop 2bf38f67055f10f5ed0fd225399ba77d84756ba1 + verified existing desktop-pagination-retry.patch + behavior-preserving Session snapshot extraction and new regression tests; not pristine upstream.",
   "prerequisite_patches": [
     "performance/2026-10-26/desktop/desktop-pagination-retry.patch"
   ],
@@ -87,7 +87,7 @@
     {
       "argv": [
         "python3",
-        "{repo}/performance/2026-10-26/desktop/tests/run_flow_tests.py",
+        "{bundle}/run_flow_tests.py",
         "{source}"
       ],
       "required_passed_tests": [
@@ -181,27 +181,84 @@
         "ui::chat::snapshot_tests::unchanged_snapshot_updates_root_while_history_retains_verified_prefix"
       ],
       "timeout_seconds": 1800
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/test.py",
+        "ui::extensions::declarative::view::preparation",
+        "--",
+        "--test-threads=1"
+      ],
+      "required_passed_tests": [
+        "ui::extensions::declarative::view::preparation::tests::repeated_redraws_reuse_controls_and_rasters_until_new_process_data",
+        "ui::extensions::declarative::view::preparation::tests::zoom_or_monitor_changes_rerasterize_without_repreparing_controls",
+        "ui::extensions::declarative::view::preparation::tests::restarted_or_wrapped_tree_prepares_again"
+      ],
+      "timeout_seconds": 900
     }
   ],
   "validation_at_publication": {
-    "source_composition": "Exact unified hunk application checked in memory by author; independent static review passed for both complete Rust patches and integration pipeline. No local compilation, git apply, formatting or Rust test execution.",
-    "patch_hashes": "independently matched by author and integration preparer using separate in-memory SHA256 implementations",
+    "source_composition": "All actual current-base target bytes fetched through GitHub; every unified hunk/context/count in all three unchanged patches checked in memory; all stage Git blobs match; full Git trees reconstructed from all 618 source blobs and raw Git tree serialization.",
+    "independent_review": "Current-base full-tree reconstruction, source pins, exact main-runner delta, complete new flow helper and three named upstream Preparation tests independently reviewed; static PASS, fresh current-base CI still required.",
+    "runtime_current_base": "not run",
     "local_git_apply": "not run: local disk below protected free-space floor",
-    "rustfmt": "not run",
-    "rust_tests": "not run",
+    "rustfmt_current_base": "not run",
+    "rust_tests_current_base": "not run",
     "native_window": "not run",
     "portable_delivery": "not built",
     "performance": "not measured",
-    "independent_review": "Reviewer inspected full Rust patches and runner core/pipeline plus final parser/deadline deltas; reviewer did not execute or independently rehash final runner."
+    "historical_old_base": "Desktop5748ac at bundle da410570/run40415824766 verified5routingFAIL+1controlPASS,6fixedPASS,32nativechatPASS,4helperPASS,fmtPASS; this does not prove current2bf38f6 base.",
+    "python_syntax_and_config_parse": "Both new runner scripts ast.parse passed without executing them; actual current Cargo.toml and repositories.json parsed and matched in memory; no file writes."
   },
   "sha256": {
     ".github/workflows/snapshot-root-routing-validation.yml": "8f3f7c591a9aa5b92cc6074f81cb7f53dad70c60f529c372ddea8a07eb72141f",
     "foundation/2026-10-26/snapshot-root-routing/0001-snapshot-routing-tests.patch": "5b8c943f3de4d72ef13fe256f6f1d4b9ef9af83d39e009f2d05be7bfd34e9a0c",
     "foundation/2026-10-26/snapshot-root-routing/0002-snapshot-routing-fix.patch": "9b150b9ef439ecfd633192459361911f524e8ce18b41826caf47913a3b503084",
-    "foundation/2026-10-26/snapshot-root-routing/run_validation.py": "ac028a5e37d4cc582c67b0b18aa02076f5d858a425423acaf7fb3b5cea4ba1ae",
-    "foundation/2026-10-26/snapshot-root-routing/README.md": "4b4e244679f1ccca4e6ee0d53f86b9cf70f937b51f0aa3f20668dc83269eaf26",
+    "foundation/2026-10-26/snapshot-root-routing/run_validation.py": "5acc0509673c6a8cac86cd4027285dd4edf341ef869c9ce2df29be767e7fde47",
+    "foundation/2026-10-26/snapshot-root-routing/README.md": "bc08d7b2cc64d5c55211f261c42137418d5f99c763452b6d9795fb1015d32b48",
     "performance/2026-10-26/desktop/desktop-pagination-retry.patch": "02c535b4ceb3431a7b2ee957dbb2d003cdf1fb6a8884c3c7c0c7387ecbe9ce98",
     "performance/2026-10-26/desktop/provenance.json": "6be2c460f3c60cc6a5d96481261eaf2be21bf26434c5777476b0cd986a666973",
-    "performance/2026-10-26/desktop/tests/run_flow_tests.py": "edffe643654152aef9d99d064636115af1b96ee6b96faf6b98e59182c5e01756"
-  }
+    "performance/2026-10-26/desktop/tests/run_flow_tests.py": "edffe643654152aef9d99d064636115af1b96ee6b96faf6b98e59182c5e01756",
+    "foundation/2026-10-26/snapshot-root-routing/run_flow_tests.py": "93481e9c33a6132d7a1652db861cf2f06a44a2e23cd937c00ad4e2926f6de691",
+    "foundation/2026-10-26/snapshot-root-routing/historical/desktop-5748ac-evidence.json": "712f604a9ad66d90c63870710d72384fcb233bbecc90fcb18e10021468408172"
+  },
+  "source_update_parent_bundle_commit": "da41057093250447af3c8dde7ce0846fb110399b",
+  "expected_stage_git_trees": {
+    "upstream": "a3f43472fb25c1d760210f320fa847d3d77f0a95",
+    "pagination_prerequisite": "3a4eb4c331c0b704c746e8cda5d2ea649c757ccd",
+    "baseline_test_refactor": "fedf7e1678095e33ad18d768cf9b93da7d76b291",
+    "fixed_composition": "09b082d4c76ecc88603d9b8e13f6d61578a8ec77"
+  },
+  "source_control_git_blobs": {
+    "Cargo.toml": "f3752b533bd4357302abff0c05e3f7c60dc526c9",
+    "Cargo.lock": "ad9b02de5cb21401742ef7a28147b178f49f76fa",
+    "repositories.json": "c82390e679b8c26bc4e7ab9b5cde7afa197d2314",
+    "scripts/test.py": "d419e2a2f823b67395f60ad9e763396edc38d2d0",
+    "scripts/sources.py": "0316108c8ad4d190683995495c698334d2b8721f",
+    "rust-toolchain.toml": "f25b5b1407b3a7a24ac034cde5e07149854f20e2",
+    "AGENTS.md": "e96f239f79cfa14720aeb9b6e643265736b1793c",
+    "src/ui/extensions/declarative/view.rs": "a32167347e951bad0b627a6a5ac966a131528660",
+    "src/ui/extensions/declarative/view/preparation.rs": "865f976ac1b9d6407268cc60879e947730d97b33"
+  },
+  "repositories_source_pins": {
+    "harness": {
+      "url": "https://github.com/Proteus-harness/Proteus-core.git",
+      "rev": "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
+    },
+    "modules": {
+      "url": "https://github.com/Proteus-harness/Proteus-modules.git",
+      "rev": "0d9c5fd18f04e6e3a083351678065c5f72966792"
+    },
+    "extensions": {
+      "url": "https://github.com/Proteus-harness/Proteus-desktop-extensions.git",
+      "rev": "3361fc1650c4ac6f167c3e48a0fba8980a5c9038"
+    }
+  },
+  "contracts_dependency": {
+    "git": "https://github.com/Proteus-harness/Proteus-core.git",
+    "rev": "f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60"
+  },
+  "contracts_lock_source": "git+https://github.com/Proteus-harness/Proteus-core.git?rev=f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60#f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60",
+  "historical_evidence": "foundation/2026-10-26/snapshot-root-routing/historical/desktop-5748ac-evidence.json"
 }

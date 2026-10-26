@@ -11,11 +11,12 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[2]
 SOURCE_REPOSITORY = "https://github.com/Proteus-harness/Proteus-desktop.git"
-SOURCE_COMMIT = "5748ac04f78eaffa1f4ea6102bd349ca61412e8d"
+SOURCE_COMMIT = "2bf38f67055f10f5ed0fd225399ba77d84756ba1"
 EXTENSIONS_REPOSITORY = "https://github.com/Proteus-harness/Proteus-desktop-extensions.git"
 EXTENSIONS_COMMIT = "3361fc1650c4ac6f167c3e48a0fba8980a5c9038"
 
@@ -188,8 +189,11 @@ def main():
         return observed
 
     def stage(name, expected):
+        tree = run(["git", "write-tree"], work)
+        if tree != manifest["expected_stage_git_trees"][name]:
+            raise ValueError(f"Unexpected full source tree at stage: {name}")
         result["stages"][name] = {
-            "tree": run(["git", "write-tree"], work),
+            "tree": tree,
             "git_blobs": verify_blobs(expected),
         }
         save()
@@ -210,6 +214,24 @@ def main():
         run(["python3", "--version"])
         run(["git", "--version"])
         fetch(SOURCE_REPOSITORY, SOURCE_COMMIT, work)
+        result["source_control_git_blobs"] = verify_blobs(manifest["source_control_git_blobs"])
+        repository_specs = json.loads((work / "repositories.json").read_text())
+        observed_repositories = {
+            name: {"url": spec["url"], "rev": spec["rev"]}
+            for name, spec in repository_specs.items()
+        }
+        if observed_repositories != manifest["repositories_source_pins"]:
+            raise ValueError("Unexpected current-base repository pins")
+        contracts = tomllib.loads((work / "Cargo.toml").read_text())["dependencies"]["proteus-contracts"]
+        if contracts != manifest["contracts_dependency"]:
+            raise ValueError("Unexpected current-base Cargo contracts dependency")
+        lock = tomllib.loads((work / "Cargo.lock").read_text())
+        contract_sources = [package.get("source") for package in lock["package"] if package["name"] == "proteus-contracts"]
+        if contract_sources != [manifest["contracts_lock_source"]]:
+            raise ValueError("Unexpected locked contracts source")
+        result["repositories_source_pins"] = observed_repositories
+        result["contracts_dependency"] = contracts
+        result["contracts_lock_source"] = contract_sources[0]
         stage("upstream", manifest["stage_git_blobs"]["upstream"])
         apply(manifest["prerequisite_patches"])
         stage("pagination_prerequisite", manifest["stage_git_blobs"]["pagination_prerequisite"])
