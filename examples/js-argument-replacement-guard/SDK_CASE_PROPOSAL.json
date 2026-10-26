@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "state": "case_inventory_for_public_candidate",
+  "initialize_id": "h:7:0",
+  "protocol_version": "v3",
+  "component_id": "authored.argument-guard",
+  "contract": {
+    "slot": "hook",
+    "contract_version": "v6",
+    "composition": "ordered_many",
+    "config_schema": null
+  },
+  "exports": [
+    {
+      "module_id": "argument.guard.continue",
+      "settings": {
+        "mode": "continue"
+      }
+    },
+    {
+      "module_id": "argument.guard.guarded",
+      "settings": {
+        "mode": "guarded"
+      }
+    },
+    {
+      "module_id": "argument.guard.computed_safe",
+      "settings": {
+        "mode": "computed_safe"
+      }
+    },
+    {
+      "module_id": "argument.guard.unguarded_later",
+      "settings": {
+        "mode": "unguarded_later"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "guarded_safe_positive",
+      "mode": "guarded",
+      "wire_id": "h:7:1",
+      "input_args_json": "{\"value\":9007199254740991}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":9007199254740991}"
+    },
+    {
+      "name": "guarded_exact_boundary_positive_refused",
+      "mode": "guarded",
+      "wire_id": "h:7:2",
+      "input_args_json": "{\"value\":9007199254740992}",
+      "expected_kind": "error",
+      "expected_error_code": -32000,
+      "expected_error_message": "argument replacement refused: unsafe_integer",
+      "expected_error_data_present": false
+    },
+    {
+      "name": "guarded_safe_after_refusal",
+      "mode": "guarded",
+      "wire_id": "h:7:3",
+      "input_args_json": "{\"value\":42}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":42}"
+    },
+    {
+      "name": "guarded_safe_negative",
+      "mode": "guarded",
+      "wire_id": "h:7:4",
+      "input_args_json": "{\"value\":-9007199254740991}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":-9007199254740991}"
+    },
+    {
+      "name": "guarded_exact_boundary_negative_refused",
+      "mode": "guarded",
+      "wire_id": "h:7:5",
+      "input_args_json": "{\"value\":-9007199254740992}",
+      "expected_kind": "error",
+      "expected_error_code": -32000,
+      "expected_error_message": "argument replacement refused: unsafe_integer",
+      "expected_error_data_present": false
+    },
+    {
+      "name": "guarded_nonrepresentable_positive_refused",
+      "mode": "guarded",
+      "wire_id": "h:7:6",
+      "input_args_json": "{\"value\":9007199254740993}",
+      "expected_kind": "error",
+      "expected_error_code": -32000,
+      "expected_error_message": "argument replacement refused: unsafe_integer",
+      "expected_error_data_present": false
+    },
+    {
+      "name": "guarded_nonrepresentable_negative_refused",
+      "mode": "guarded",
+      "wire_id": "h:7:7",
+      "input_args_json": "{\"value\":-9007199254740993}",
+      "expected_kind": "error",
+      "expected_error_code": -32000,
+      "expected_error_message": "argument replacement refused: unsafe_integer",
+      "expected_error_data_present": false
+    },
+    {
+      "name": "guarded_string_positive",
+      "mode": "guarded",
+      "wire_id": "h:7:8",
+      "input_args_json": "{\"value\":\"9007199254740993\"}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":\"9007199254740993\"}"
+    },
+    {
+      "name": "guarded_string_negative",
+      "mode": "guarded",
+      "wire_id": "h:7:9",
+      "input_args_json": "{\"value\":\"-9007199254740993\"}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":\"-9007199254740993\"}"
+    },
+    {
+      "name": "continue_unsafe_positive",
+      "mode": "continue",
+      "wire_id": "h:7:10",
+      "input_args_json": "{\"value\":9007199254740993}",
+      "expected_kind": "continue"
+    },
+    {
+      "name": "continue_unsafe_negative",
+      "mode": "continue",
+      "wire_id": "h:7:11",
+      "input_args_json": "{\"value\":-9007199254740993}",
+      "expected_kind": "continue"
+    },
+    {
+      "name": "computed_safe_limitation",
+      "mode": "computed_safe",
+      "wire_id": "h:7:12",
+      "input_args_json": "{\"value\":9007199254740993}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":0}"
+    },
+    {
+      "name": "unguarded_later_producer_limitation",
+      "mode": "unguarded_later",
+      "wire_id": "h:7:13",
+      "input_args_json": "{\"value\":0}",
+      "expected_kind": "tool_arguments",
+      "expected_args_json": "{\"value\":9007199254740992}"
+    }
+  ],
+  "counts": {
+    "initialize": 1,
+    "hook_invocations": 13,
+    "rpc_exchanges": 14,
+    "expected_errors": 4,
+    "continue": 2,
+    "successful_replacements": 7
+  },
+  "oracle": "Independent exact integer/type decoder over retained raw requests and responses; no JS Number comparison as the wire oracle. Require exact intended errors and no error.data; no callbacks."
+}
