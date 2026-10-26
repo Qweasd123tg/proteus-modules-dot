@@ -30,7 +30,6 @@ jobs:
       RUST_TEST_THREADS: "4"
       PYTHONDONTWRITEBYTECODE: "1"
       RUSTUP_TOOLCHAIN: "1.95.0"
-      CARGO_HOME: ${{ runner.temp }}/tool-catalog-cargo
       GIT_TERMINAL_PROMPT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +53,8 @@ jobs:
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
       - name: Validate actual baseline and candidate
+        env:
+          CARGO_HOME: ${{ runner.temp }}/tool-catalog-cargo
         run: |
           python3 -B foundation/2026-10-26/tool-catalog-cache/validate.py \
             "${{ matrix.scope }}" \
