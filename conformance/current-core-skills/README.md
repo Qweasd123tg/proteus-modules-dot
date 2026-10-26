@@ -21,10 +21,14 @@ assertions (`scenarios.json`; описание в `../core-skills/README.md`). �
 Первая экспериментальная CI-фаза делает только resolution/fetch/metadata,
 без компиляции и запуска Rust. Исходный host lockfile используется как seed;
 `cargo update --workspace` не является доказательством минимального diff.
-Полные lock/metadata и delta должны пройти независимый review **до** подключения
-runtime CI. Пока `Cargo.lock` здесь — старый seed, не разрешённый граф Core1fc.
+Lock-only CI40300268434 завершён успешно на commit `f0260bc8a84c4e77e8494475a659c50e0c3c0724`.
+Новый `Cargo.lock` содержит только замену Git source identity у пяти Proteus
+crates с3f на1fc; остальные bytes/versions/checksums/dependencies сохранены.
+Host граф:246packages; portable:144packages. См. `LOCK-DELTA.json`.
+Независимый review полного lock/metadata и runtime-source composition обязателен
+**до** публикации commit, включающего runtime workflow.
 
-Затем отдельный commit закрепляет проверенный новый lockfile и переключает
+Этот отдельный commit закрепляет новый lockfile и переключает
 тот же workflow на исходный authored gate `ci/run.sh`: 11 Core checks,
 11 отдельных verifier controls, 4 capture controls, неизменённый внешний
 resource envelope с 35 mock controls. Сборка — только hosted, минимум 8 GiB
@@ -36,7 +40,10 @@ resource envelope с 35 mock controls. Сборка — только hosted, м�
 полный agent turn, reference assembly, provider eval, sandbox, TOCTOU защита
 или доказательство завершения всех descendants. Старое runtime acceptance
 PR10 не распространяется на этот вариант. Binary bytes не публикуются;
-неизменность executable до/после проверяет source-reviewed capture.
+неизменность одного executable до/после внутри текущего run проверяет
+source-reviewed capture. Portable пересобирается из неизменённых source/lock/SDK3f
+в отдельном графе; побитное равенство бинарнику старого PR10 между runs не
+заявляется, поскольку старые binary bytes не опубликованы.
 
 Frozen portable сохраняет deprecated serde_yaml/unsafe-libyaml; миграции
 парсера и полного dependency-security audit здесь нет.

@@ -1,4 +1,4 @@
-name: "Current Core mixed-pin skills: lock-only review phase"
+name: Current Core mixed-pin portable skills (supervised v1)
 on:
   push:
     paths: ['conformance/current-core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
@@ -23,7 +23,7 @@ jobs:
           python3 -B -I -c 'import shutil; assert shutil.disk_usage(".").free >= 8*1024**3, "need 8 GiB; no deletion"'
           parent=$(mktemp -d "$RUNNER_TEMP/proteus-current-core-skills-XXXXXXXX")
           printf 'root=%s\n' "$parent" >> "$GITHUB_OUTPUT"
-      - name: Resolve only; no compile or runtime before independent graph review
+      - name: Supervise unchanged authored gate
         env:
           RUSTUP_TOOLCHAIN: 1.95.0
           PROTEUS_ENVELOPE_PACKAGE: ${{ github.workspace }}/ci/resource-envelope-v1
@@ -39,16 +39,15 @@ jobs:
             --artifacts '${{ steps.destination.outputs.root }}/child' \
             --input ci/resource-envelope-v1/envelope.py \
             --input ci/resource-envelope-v1/test_envelope.py \
+            --input ci/resource-envelope-v1/core-skills-stage.sh \
             --input .github/workflows/check-current-core-skills.yml \
-            --input conformance/current-core-skills/ci/lock_only.sh \
-            --input conformance/current-core-skills/Cargo.toml \
-            --input conformance/current-core-skills/CODE.sha256 \
-            -- bash "$GITHUB_WORKSPACE/conformance/current-core-skills/ci/lock_only.sh"
+            --input conformance/current-core-skills/ci/run.sh \
+            -- bash "$GITHUB_WORKSPACE/ci/resource-envelope-v1/core-skills-stage.sh"
       - name: Retain bounded invocation snapshot, never original live directory
         if: always() && steps.destination.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: current-core-skills-lock-only-${{ github.sha }}
+          name: current-core-skills-supervised-${{ github.sha }}
           path: ${{ steps.destination.outputs.root }}/retained/
           if-no-files-found: error
           include-hidden-files: true
