@@ -226,7 +226,7 @@ impl ToolModule for SkillTools {
             .err()
             .is_some_and(|error| error.is::<catalog::CancellationFailure>())
         {
-            return Err(operation.err().expect("checked cancellation failure"));
+            return Err(operation.expect_err("checked cancellation failure"));
         }
         ensure!(!cancelled()?, "skill operation canceled");
         let result = match operation {

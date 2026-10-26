@@ -1,8 +1,10 @@
 # Validation — 2026-10-25 UTC
 
-## Итог текущего исходного кода
+## Сохранённый локальный результат до CI lint adjustment
 
-**29 behavior tests + 1 actual-binary wire test passed; 0 failed/ignored.**
+**29 behavior tests + 1 actual-binary wire test passed; 0 failed/ignored** для исходного R5 snapshot.
+
+CI [40248929831](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40248929831) остановился до tests на двух Clippy err_expect warnings. Следующий source revision заменяет только `.err().expect(...)` на `.expect_err(...)` в двух cancellation-error branches; новый полный CI требуется, исторический локальный receipt не считается прогоном изменённых bytes.
 Команда локального прогона:
 
 ```sh
@@ -15,9 +17,8 @@ cargo test --offline --locked -j2 --manifest-path Cargo.toml
 
 - Rust 1.95.0; exact Proteus SDK Git pin `3f36a003b4f3fde2242fc80f7aedac00dd127d1d`.
 - Хеши сохранены в [`validation/source-hashes.json`](validation/source-hashes.json)
-  сразу после прогона. Перед запуском исходники были заморожены; после receipt
-  менялась только документация/evidence, не Rust source, fixtures или lockfile.
-- `CODE.sha256` — current source/manifest hash snapshot, сверенный с build receipt.
+  сразу после локального прогона R5. Этот snapshot сохранён; текущие два lint-only изменения перечислены выше. Fixtures и lockfile не менялись.
+- `CODE.sha256` — current source/manifest hash snapshot; после lint adjustment два Rust file hashes отличаются от исторического build receipt.
 - Этот локальный прогон использовал cache/shared target и ограничение `-j2`.
   Minimal observed free bytes в receipt: 1230782464; reserve 1073741824 соблюдён.
   Эти числа — operational guard, не benchmark/измеренное ускорение модуля.

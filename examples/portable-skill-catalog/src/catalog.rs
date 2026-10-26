@@ -277,7 +277,7 @@ pub fn discover(
                 .err()
                 .is_some_and(|error| error.is::<CancellationFailure>())
             {
-                return Err(result.err().expect("checked cancellation failure"));
+                return Err(result.expect_err("checked cancellation failure"));
             }
             ensure!(
                 snapshot.read_bytes <= config.max_total_bytes,
