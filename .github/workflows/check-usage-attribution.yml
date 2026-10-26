@@ -1,0 +1,60 @@
+name: Experimental supplied usage attribution
+on:
+  push:
+    branches: ['ci/usage-attribution-20261026']
+    paths: ['consumers/usage-attribution/**', '.github/workflows/check-usage-attribution.yml']
+  pull_request:
+    paths: ['consumers/usage-attribution/**', '.github/workflows/check-usage-attribution.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  usage-attribution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-usage-attribution
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 1
+      - name: Fresh invocation and initial 8 GiB headroom
+        id: destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -I -c 'import shutil; assert shutil.disk_usage(".").free >= 8*1024**3, "need 8 GiB; no deletion"'
+          test ! -e validation/usage-attribution
+          parent=$(mktemp -d "$RUNNER_TEMP/proteus-usage-XXXXXXXX")
+          printf 'root=%s\n' "$parent" >> "$GITHUB_OUTPUT"
+      - name: Supervised controls, locked build and exact 37 named tests
+        shell: bash
+        run: |
+          python3 -B -I consumers/usage-attribution/ci/envelope.py --profile usage-attribution \
+            --cwd "$GITHUB_WORKSPACE" --target "$CARGO_TARGET_DIR" \
+            --output '${{ steps.destination.outputs.root }}/retained' \
+            --artifacts "$GITHUB_WORKSPACE/validation/usage-attribution" \
+            --input consumers/usage-attribution/ci/envelope.py \
+            --input consumers/usage-attribution/ci/stage.py \
+            --input consumers/usage-attribution/ci/contract.py \
+            --input consumers/usage-attribution/ci/live_controls.py \
+            --input consumers/usage-attribution/ci/live_fixture.py \
+            --input consumers/usage-attribution/ci/verify.py \
+            --input consumers/usage-attribution/ci/test_verify.py \
+            --input consumers/usage-attribution/ci/test_envelope.py \
+            --input .github/workflows/check-usage-attribution.yml \
+            -- python3 -B -I consumers/usage-attribution/ci/stage.py
+      - name: Retain bounded invocation evidence including failures
+        if: always() && steps.destination.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: usage-attribution-${{ github.sha }}
+          path: ${{ steps.destination.outputs.root }}/retained/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
