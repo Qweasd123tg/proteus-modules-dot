@@ -1,0 +1,51 @@
+# Реальные поверхности: чтение, cache, инициализация и исполнение
+
+Core pin **1fc3ef223d10322815dd9290a50d045bc95402bb**. Формы проверены по исходникам, не вызваны. `S` означает URL-encoded абсолютный session path; query допускает один `session_dir`, duplicate/missing/relative отвергаются. `T` — точный turn UUID. Доверенный существующий сервер, соответствующая auth и разрешение чтения — обязательные внешние предпосылки. «Read-only» ниже означает отсутствие намеренной записи/запуска модулей **в выбранной ветке**, не OS sandbox, запрет atime, гарантию отсутствия concurrent background work или атомарного snapshot всех файлов.
+
+## Первичные диагностические поверхности
+
+| ID | Реальная форма | Что читается | Побочные действия / предел |
+|---|---|---|---|
+| A01 | `GET /health` | Constant `{"ok":true}` | Не проверяет готовность сессии, admission или objective. |
+| A02 | `GET /bootstrap` | Исходный active session path (если ещё зарегистрирован), cwd | Lookup в уже созданном state; не список всех сессий и не cold resume. |
+| A03 | `GET /config/local?session_dir=S` | Captured active config summary + live activity, including running IDs | Не запускает model-catalog discovery этой веткой. Active session обязательна; не lossless config. Внешний runtime уже работает. |
+| A04 | `GET /pending?session_dir=S` | Live approvals, user inputs, queue message IDs | Нет durable прошлых ACK; queue items не содержат request ID. Active session обязательна. |
+| A05 | `GET /analysis?session_dir=S&turn_id=T` | Strict projection из journal; exact turn details; без T выбирается последний | Не resume и не module execution. Полный journal read/validation, no general byte/time bound here; включает содержимое task/model/tool/hooks. Tool effect/final объединены в result slot. |
+| A06 | `GET /history?session_dir=S` | Live transcript либо cold strict projection → transcript | Cold path не auto-resume; live path не равен новому strict audit. Presentation может использовать effect fallback. |
+| A07 | `GET /conversation?session_dir=S` | Canonical conversation view | Cold: может читать fresh disposable view cache, иначе projection; **не** все journal facts/effects. В traced cold ветке cache save не вызывается; warm reader клонирует history/context под locks и читает revision, не start/resume. Это не обещание отсутствия concurrent runtime work. |
+| A08 | `GET /sessions` / `GET /sessions/current?session_dir=S` | Stored compatible catalog + live activity; current ограничивает workspace | На Unix может вернуть stale display placeholder и запланировать refresh/записать `.read-summary.json`; unusable entries могут скрываться. Не strict audit и не гарантированно write-free. `current` требует active session. |
+| A09 | `GET /events?session_dir=S` | SSE `output` frames, initial pending/session snapshot и дальнейшие события | Только active session; вызывает `start_session`, способный впервые emit SessionStarted в configured event sinks. Инициализация event stream, не чистое чтение. `EventStreamLagged` → новый baseline; не durable delivery log. |
+| A10 | `proteus eval report /absolute/session-or-journal-path` | Strict journal → session lifecycle aggregate | Main dispatch до config/runtime load. Human report, **нет `--json`**. Prints failed тоже с нормальным return; не objective/effect inspector. |
+
+Происхождение A01–09: [GET dispatcher](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http.rs#L144-L178), [routes](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/reads.rs#L32-L91), [active/absolute addressing](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/sessions.rs#L215-L261), [history/conversation](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/sessions.rs#L127-L198).
+
+A05: [strict analysis read](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/analysis.rs#L1-L56). A07: [cold snapshot cache/fallback](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store.rs#L119-L157). Warm A07: [existing reader](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/runtime/conversation.rs#L12-L48). A08: [compatible mode](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store/catalog.rs#L138-L154), [cache/refresh](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store/catalog/cache.rs#L67-L174), [actual cache write](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store/read_cache.rs#L188-L231). A09: [SSE](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/sse.rs#L17-L35), [start-session event](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/runtime.rs#L285-L317). A10: [exact parser](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/cli_commands.rs#L14-L25), [early branch](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/main.rs#L102-L119).
+
+### Existing read library API — не новая CLI
+
+`SessionStore::open(...).load_projection()` делает strict source parse/linkage validation и возвращает `JournalProjection.records`. В selected chain open создаёт/находит только in-process writer-state handle, **не** writer lease или новый файл; load_records читает полный journal и hydrated payloads. Незавершённый tail после последнего newline не интерпретируется как complete record. Это не атомарный snapshot нескольких файлов и не общий ограничитель памяти/времени. Контролируемая maintainer-инспекция может различить effect/final record variants; обычные `/analysis`, transcript и eval агрегаты этого различия не сохраняют. [Store](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store.rs#L83-L157), [writer handle](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_store.rs#L308-L318), [record read](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/session_journal/storage.rs#L172-L260).
+
+Никакого `proteus session inspect`, `/journal`, `/runs/<id>` или command export в runbook нет: такие поверхности не установлены в исследованном dispatcher. Слово, не являющееся reserved namespace, может стать task input, а не ошибкой CLI. Не проверять догадки на живом агенте. [Dispatch](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/cli_commands/dispatch.rs#L23-L65).
+
+## Существующие, но НЕ пассивные альтернативы
+
+| ID | Форма, подтверждённая исходником | Почему не применять автоматически |
+|---|---|---|
+| X01 | `proteus --config /absolute/profile.toml replay workflow /absolute/session-or-journal-path --turn-id T --json` | Выполняет выбранный workflow/policy код из supplied catalog; recorded model/tools заменены replay adapters, но это не запрет direct effects внутри trusted native module. Source/config/module identity нужны отдельно. |
+| X02 | `proteus --config /absolute/profile.toml replay prompt /absolute/session-or-journal-path --exchange-id E --json` | Создаёт model adapter и invokes request. `--allow-hosted-tools` существует, но намеренно **не** включён в пример: отдельный opt-in потенциальных provider effects. |
+| X03 | `POST /cancel?session_dir=S` | Мутация cancellation token/status; не terminal settlement receipt. Payload здесь не предлагается, операция не выполняется. |
+| X04 | `POST /resume` | Существующая session lifecycle mutation; cold session launch/resume, не harmless history lookup. Payload/запуск здесь не предлагается. |
+
+[Replay parser](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/cli_commands.rs#L27-L192), [workflow construction](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/core/workflow_replay/mod.rs#L120-L165), [prompt adapter](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/cli_prompt_replay.rs#L11-L28), [resume](https://github.com/Proteus-harness/Proteus-core/blob/1fc3ef223d10322815dd9290a50d045bc95402bb/crates/proteus-core/src/app_server/http/lifecycle.rs#L124-L144).
+
+`doctor`, operational tool/topology discovery, module/schema connection и config mutation не являются запасным «безопасным read». Их реальные эффекты уже классифицированы в [R40](../EVIDENCE.md#e12); здесь нет ещё одного запуска/аудита этих путей.
+
+## Локальный classifier уже имеющегося отчёта
+
+R39 — отдельный стандартно-библиотечный Python consumer, не Core command; **он не включён и не установлен этим пакетом**. Только для отдельно полученного и проверенного artifact, из **его** каталога documented shape:
+
+```text
+python3 -B -I classify_report.py --format core-workflow-replay --source-pin 1fc3ef223d10322815dd9290a50d045bc95402bb --input /absolute/selected-report.json
+```
+
+Читает только явно выбранный regular file в своих bounds; не следует путям внутри JSON и не выполняет replay. Caller pin не authenticated origin; `exit 0` означает доставленную classification, включая unsupported/invalid. В этом новом runbook ни classifier, ни его tests не запускались. Его прежние **54 pure controls + 3 synthetic CLI** проверяют сам consumer, не настоящий Core report producer. [Exact source/documentation](../EVIDENCE.md#r39).

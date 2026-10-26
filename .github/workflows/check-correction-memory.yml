@@ -1,0 +1,65 @@
+name: Experimental CAS raw-compatible SQLite runtime
+on:
+  push:
+    branches: ['ci/correction-memory-cas-20261026']
+    paths: ['examples/correction-memory/**', '.github/workflows/check-correction-memory.yml']
+  pull_request:
+    paths: ['examples/correction-memory/**', '.github/workflows/check-correction-memory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correction-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-correction-memory
+      TMPDIR: ${{ github.workspace }}/tmp-correction-memory
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 2
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 1
+      - name: Fresh invocation and initial 8 GiB headroom
+        id: destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -I -c 'import shutil; assert shutil.disk_usage(".").free >= 8*1024**3, "need 8 GiB; no deletion"'
+          test ! -e validation/correction-memory
+          test ! -e "$TMPDIR"
+          mkdir "$TMPDIR"
+          parent=$(mktemp -d "$RUNNER_TEMP/proteus-cas-XXXXXXXX")
+          printf 'root=%s\n' "$parent" >> "$GITHUB_OUTPUT"
+      - name: Supervised controls, locked build and exact 69 named tests
+        shell: bash
+        run: |
+          python3 -B -I examples/correction-memory/ci/envelope.py --profile cas-runtime \
+            --cwd "$GITHUB_WORKSPACE" --target "$CARGO_TARGET_DIR" \
+            --output '${{ steps.destination.outputs.root }}/retained' \
+            --artifacts "$GITHUB_WORKSPACE/validation/correction-memory" \
+            --input examples/correction-memory/ci/envelope.py \
+            --input examples/correction-memory/ci/runtime_stage.py \
+            --input examples/correction-memory/ci/contract.py \
+            --input examples/correction-memory/ci/gate_common.py \
+            --input examples/correction-memory/ci/verify_example.py \
+            --input examples/correction-memory/ci/live_controls.py \
+            --input examples/correction-memory/ci/live_fixture.py \
+            --input examples/correction-memory/ci/verify_runtime.py \
+            --input examples/correction-memory/ci/test_runtime.py \
+            --input examples/correction-memory/ci/test_envelope.py \
+            --input .github/workflows/check-correction-memory.yml \
+            -- python3 -B -I examples/correction-memory/ci/runtime_stage.py
+      - name: Retain bounded invocation evidence including failures
+        if: always() && steps.destination.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: correction-memory-${{ github.sha }}
+          path: ${{ steps.destination.outputs.root }}/retained/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

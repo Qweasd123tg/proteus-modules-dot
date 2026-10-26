@@ -1,0 +1,120 @@
+# SOURCE-ONLY PROPOSAL: no remote publication/execution until root delegates.
+name: Check authored atomic append-group probe
+on:
+  push:
+    paths:
+      - 'conformance/append-groups/**'
+      - '.github/workflows/check-append-groups.yml'
+  pull_request:
+    paths:
+      - 'conformance/append-groups/**'
+      - '.github/workflows/check-append-groups.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  append-groups:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-append-groups
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: never
+      RUSTUP_TOOLCHAIN: 1.95.0
+      PROBE: conformance/append-groups
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out reviewed source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          clean: false
+          fetch-depth: 1
+          submodules: false
+      - name: Install exact official toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Record immutable authored inputs
+        id: inputs
+        run: |
+          mkdir -p validation
+          mkdir validation/append-groups
+          find "$PROBE" .github/workflows/check-append-groups.yml -type f -print0 |
+            sort -z | xargs -0 sha256sum > validation/append-groups/sources.sha256
+          rustc +1.95.0 --version > validation/append-groups/toolchain.txt
+          cargo +1.95.0 --version >> validation/append-groups/toolchain.txt
+          printf 'profile.dev debug=line-tables-only; jobs=2; no custom RUSTFLAGS/link strip\n' > validation/append-groups/build-profile.txt
+      - name: Run only authored controller and synthetic artifact controls
+        run: |
+          python3 -B -I "$PROBE/test_group_controls.py" -v 2>&1 | tee validation/append-groups/controller-controls.log
+          python3 -B -I "$PROBE/ci/test_verify_group_artifacts.py" -v 2>&1 | tee validation/append-groups/verifier-controls.log
+          python3 -B -I "$PROBE/ci/test_archive_evidence.py" -v 2>&1 | tee validation/append-groups/archive-controls.log
+          python3 -B -I - <<'PYCOUNTS'
+          import importlib.util, json, os
+          from pathlib import Path
+          package=Path(os.environ['PROBE'])
+          spec=importlib.util.spec_from_file_location('gate',package/'ci/verify_group_artifacts.py')
+          gate=importlib.util.module_from_spec(spec);spec.loader.exec_module(gate)
+          expected=json.loads((package/'ci/expected_control_names.json').read_text())
+          for name,names in expected.items():
+              gate.verify_control_log((Path('validation/append-groups')/(name+'.log')).read_text(),names)
+          PYCOUNTS
+      - name: Require ample build headroom and resolve only the locked package
+        run: |
+          python3 -B -I - <<'PYDISK'
+          import shutil
+          free=shutil.disk_usage('.').free
+          if free < 8*1024**3:
+              raise RuntimeError('Insufficient CI build headroom; no cleanup or retry')
+          print('free bytes before locked fetch:',free)
+          PYDISK
+          cargo +1.95.0 fmt --all --check --manifest-path "$PROBE/Cargo.toml"
+          cargo +1.95.0 fetch --locked --manifest-path "$PROBE/Cargo.toml" 2>&1 | tee validation/append-groups/fetch.log
+      - name: Guarded offline build of only our pinned public-Core probe
+        run: |
+          python3 -B -I "$PROBE/ci/guarded_build.py" \
+            --manifest "$PROBE/Cargo.toml" --binary proteus-append-group-probe \
+            --output validation/append-groups/build \
+            2>&1 | tee validation/append-groups/build-controller.log
+          sha256sum "$CARGO_TARGET_DIR/debug/proteus-append-group-probe" > validation/append-groups/binary.sha256
+      - name: Run bounded fixed-history groups and rollback controls
+        run: |
+          python3 -B -I "$PROBE/run_group_probe.py" \
+            --binary "$CARGO_TARGET_DIR/debug/proteus-append-group-probe" \
+            --output validation/append-groups/run \
+            2>&1 | tee validation/append-groups/run.log
+      - name: Verify exact values, journal groups, rollback bytes and coverage
+        run: |
+          python3 -B -I "$PROBE/ci/verify_group_artifacts.py" \
+            --package "$PROBE" --binary "$CARGO_TARGET_DIR/debug/proteus-append-group-probe" \
+            --directory validation/append-groups/run \
+            --expected-receipt 41b81c86c1701077146760cd522ca5b60f44fcd83b52c823bf7a28b73b0fcdab \
+            > validation/append-groups/verification.json
+      - name: Verify source and binary remained unchanged
+        if: ${{ always() && steps.inputs.outcome == 'success' }}
+        run: |
+          sha256sum -c validation/append-groups/sources.sha256 > validation/append-groups/source-recheck.txt
+          if [ -f validation/append-groups/binary.sha256 ]; then
+            sha256sum -c validation/append-groups/binary.sha256 > validation/append-groups/binary-recheck.txt
+          fi
+      - name: Archive only this owned evidence, preserving pipe-containing paths
+        id: archive
+        if: ${{ always() && steps.inputs.outcome == 'success' }}
+        run: |
+          python3 -B -I "$PROBE/ci/archive_evidence.py" \
+            --source validation/append-groups \
+            --archive validation/append-groups-evidence.tar.gz \
+            --manifest validation/append-groups-archive.json
+      - name: Preserve verified payloads and failures
+        if: ${{ always() && steps.inputs.outcome == 'success' && steps.archive.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: append-group-validation
+          path: |
+            validation/append-groups-evidence.tar.gz
+            validation/append-groups-archive.json
+          if-no-files-found: error
+          retention-days: 14

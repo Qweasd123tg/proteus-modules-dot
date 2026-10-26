@@ -1,0 +1,21 @@
+# Template ONLY. No real verifier is supplied by this package.
+# Merge arrays/tables into an existing profile; do not replace other hooks.
+[modules]
+hooks = ["hermes.verify_evidence"]
+
+[components.hermes-evidence]
+command = "/absolute/path/to/proteus-example-hermes-verify-evidence"
+
+[components.hermes-evidence.exports.hook."hermes.verify_evidence"]
+timeout_ms = 10000
+
+[module_config.hook."hermes.verify_evidence"]
+# Replace with the exact published ToolRegistry names of your selected tools.
+mutating_tools = ["write_file", "apply_patch"]
+# Placeholder: this verifier must be implemented/configured separately.
+verification_tools = ["your_receipt_emitting_verifier"]
+max_nudges = 2
+max_history_parts = 50000
+# Explicit fail-closed choice: a hook error fails the workflow, it is not Stop.
+# "continue" is advisory release at exhaustion, never a passing verdict.
+on_exhaustion = "error"

@@ -1,0 +1,54 @@
+name: Pinned Core portable skills pair (supervised v1)
+on:
+  push:
+    paths: ['conformance/core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-core-skills.yml']
+  pull_request:
+    paths: ['conformance/core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-core-skills.yml']
+permissions:
+  contents: read
+jobs:
+  core-skills:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Fresh invocation parent and initial headroom
+        id: destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -I -c 'import shutil; assert shutil.disk_usage(".").free >= 8*1024**3, "need 8 GiB; no deletion"'
+          parent=$(mktemp -d "$RUNNER_TEMP/proteus-core-skills-XXXXXXXX")
+          printf 'root=%s\n' "$parent" >> "$GITHUB_OUTPUT"
+      - name: Supervise unchanged authored gate
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+          PROTEUS_ENVELOPE_PACKAGE: ${{ github.workspace }}/ci/resource-envelope-v1
+          PORTABLE_SKILLS_PACKAGE: ${{ github.workspace }}/examples/portable-skill-catalog
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-core-skills
+          PROBE_RESULTS_DIR: ${{ steps.destination.outputs.root }}/child
+        shell: bash
+        run: |
+          python3 -B -I ci/resource-envelope-v1/envelope.py --profile core-skills \
+            --cwd "$GITHUB_WORKSPACE/conformance/core-skills" \
+            --target "$CARGO_TARGET_DIR" \
+            --output '${{ steps.destination.outputs.root }}/retained' \
+            --artifacts '${{ steps.destination.outputs.root }}/child' \
+            --input ci/resource-envelope-v1/envelope.py \
+            --input ci/resource-envelope-v1/test_envelope.py \
+            --input ci/resource-envelope-v1/core-skills-stage.sh \
+            --input .github/workflows/check-core-skills.yml \
+            --input conformance/core-skills/ci/run.sh \
+            -- bash "$GITHUB_WORKSPACE/ci/resource-envelope-v1/core-skills-stage.sh"
+      - name: Retain bounded invocation snapshot, never original live directory
+        if: always() && steps.destination.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-skills-supervised-${{ github.sha }}
+          path: ${{ steps.destination.outputs.root }}/retained/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
