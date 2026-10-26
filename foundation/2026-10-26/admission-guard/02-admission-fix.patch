@@ -1,7 +1,7 @@
 diff --git a/crates/proteus-module-protocol/src/v3/broker.rs b/crates/proteus-module-protocol/src/v3/broker.rs
 --- a/crates/proteus-module-protocol/src/v3/broker.rs
 +++ b/crates/proteus-module-protocol/src/v3/broker.rs
-@@ -49,14 +49,10 @@
+@@ -50,14 +50,10 @@
  }
  
  impl StartAck {
@@ -77,7 +77,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/failure.rs b/crates/proteus-m
 diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-module-protocol/src/v3/runtime.rs
 --- a/crates/proteus-module-protocol/src/v3/runtime.rs
 +++ b/crates/proteus-module-protocol/src/v3/runtime.rs
-@@ -11,8 +11,8 @@
+@@ -10,8 +10,8 @@
      broker::{ComponentBrokerSnapshot, ControlCommand, StartRequest},
      handshake::initialize_transport,
      invocation::{
@@ -88,7 +88,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-m
      },
      pending::{LoopState, PendingInvocation, WorkerGeneration},
      wire,
-@@ -312,6 +312,10 @@
+@@ -324,6 +324,10 @@
                  return;
              }
          };
@@ -99,7 +99,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-m
          let id = wire::host_id(self.generation, self.next_host_sequence);
          self.next_host_sequence = self.next_host_sequence.saturating_add(1);
          let root_id = if root_id.is_empty() {
-@@ -354,7 +358,11 @@
+@@ -366,7 +370,11 @@
          if !request.bootstrap {
              self.runtime_started = true;
          }
@@ -112,7 +112,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-m
  
          if effective_deadline <= Instant::now() {
              self.finish(&id, InvocationTerminal::TimedOut);
-@@ -372,6 +380,36 @@
+@@ -384,6 +392,36 @@
      }
  
      pub(super) fn activate(&mut self, id: &str) {
@@ -152,7 +152,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-m
 diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
 --- a/docs/architecture/process-module-architecture.md
 +++ b/docs/architecture/process-module-architecture.md
-@@ -702,9 +702,22 @@
+@@ -710,9 +710,22 @@
  сохраняют `anyhow::Result`, но Core может различить module failure, cancel,
  timeout и конкретный класс component loss без парсинга display text.
  

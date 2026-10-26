@@ -15,7 +15,7 @@ import time
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[2]
 SOURCE_REPOSITORY = "https://github.com/Proteus-harness/Proteus-core.git"
-SOURCE_COMMIT = "7435f2a6d90e532665ebed4da67526b609158fc8"
+SOURCE_COMMIT = "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
 MODULES_REPOSITORY = "https://github.com/Proteus-harness/Proteus-modules.git"
 MODULES_COMMIT = "7fceaebc3bed8add9b0e3091110f59deca86ba46"
 

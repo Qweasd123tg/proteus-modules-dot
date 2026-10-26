@@ -1,7 +1,7 @@
 diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-module-protocol/src/v3/runtime.rs
 --- a/crates/proteus-module-protocol/src/v3/runtime.rs
 +++ b/crates/proteus-module-protocol/src/v3/runtime.rs
-@@ -424,3 +424,7 @@
+@@ -436,3 +436,7 @@
          }
      }
  }
@@ -37,7 +37,7 @@ diff --git a/crates/proteus-module-protocol/src/v3/runtime_tests.rs b/crates/pro
 new file mode 100644
 --- /dev/null
 +++ b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,352 @@
 +use std::{
 +    io::{Read, Write},
 +    net::{TcpListener, TcpStream},
@@ -83,8 +83,9 @@ new file mode 100644
 +        ..ComponentBrokerOptions::default()
 +    };
 +    options.validate()?;
-+    let (control_tx, _) = mpsc::sync_channel(options.control_command_capacity);
-+    Ok(LoopState::new(spec, binding, options, control_tx))
++    let wake = proteus_process_host::ProcessWake::default();
++    let (control_tx, _) = crate::v3::signal::channel(options.control_command_capacity, &wake);
++    Ok(LoopState::new(spec, binding, options, control_tx, wake))
 +}
 +
 +fn fixture() -> ProcessSpec {
