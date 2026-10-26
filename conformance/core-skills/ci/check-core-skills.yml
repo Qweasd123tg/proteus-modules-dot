@@ -1,0 +1,38 @@
+name: Pinned Core portable skills pair
+on:
+  push:
+    paths:
+      - 'conformance/core-skills/**'
+      - 'examples/portable-skill-catalog/**'
+      - '.github/workflows/check-core-skills.yml'
+  pull_request:
+    paths:
+      - 'conformance/core-skills/**'
+      - 'examples/portable-skill-catalog/**'
+      - '.github/workflows/check-core-skills.yml'
+permissions:
+  contents: read
+jobs:
+  core-skills:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Authored Core pair and evidence gate
+        working-directory: conformance/core-skills
+        env:
+          PORTABLE_SKILLS_PACKAGE: ${{ github.workspace }}/examples/portable-skill-catalog
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-core-skills
+        run: bash ci/run.sh
+      - name: Retain evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-skills-${{ github.sha }}
+          path: conformance/core-skills/ci-results/
+          if-no-files-found: error
+          retention-days: 14
