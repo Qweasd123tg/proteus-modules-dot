@@ -1,0 +1,37 @@
+name: Typed Frontmatter parser observations
+on:
+  push:
+    paths:
+      - 'conformance/parser-compat/**'
+      - '.github/workflows/check-parser-compat.yml'
+  pull_request:
+    paths:
+      - 'conformance/parser-compat/**'
+      - '.github/workflows/check-parser-compat.yml'
+permissions:
+  contents: read
+jobs:
+  parser-observations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Authored typed parser observation and control gate
+        id: gate
+        working-directory: conformance/parser-compat
+        env:
+          PROBE_RESULTS_DIR: ${{ github.workspace }}/conformance/parser-compat/ci-results
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-parser-compat
+        run: bash ci/run.sh
+      - name: Retain evidence including incompatibilities and failures
+        if: ${{ always() && steps.gate.outputs.fresh_results == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: parser-observations-${{ github.sha }}
+          path: conformance/parser-compat/ci-results/
+          if-no-files-found: error
+          retention-days: 14
