@@ -1,0 +1,114 @@
+name: Check authored native read-cache probe
+on:
+  push:
+    paths:
+      - 'conformance/native-read-cache/**'
+      - '.github/workflows/check-native-read-cache.yml'
+  pull_request:
+    paths:
+      - 'conformance/native-read-cache/**'
+      - '.github/workflows/check-native-read-cache.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-read-cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-native-cache
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: never
+      PROBE: conformance/native-read-cache
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out reviewed source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          clean: false
+          fetch-depth: 1
+          submodules: false
+      - name: Install exact official toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup component add rustfmt --toolchain 1.95.0
+      - name: Record immutable inputs and tracer availability
+        run: |
+          mkdir -p validation
+          mkdir validation/native-cache
+          find "$PROBE" .github/workflows/check-native-read-cache.yml -type f -print0 |
+            sort -z | xargs -0 sha256sum > validation/native-cache/sources.sha256
+          rustc +1.95.0 --version > validation/native-cache/toolchain.txt
+          cargo +1.95.0 --version >> validation/native-cache/toolchain.txt
+          printf 'profile.dev debug=line-tables-only; jobs=2; no custom RUSTFLAGS/link strip\n' > validation/native-cache/build-profile.txt
+          if [ -x /usr/bin/strace ]; then
+            /usr/bin/strace --version > validation/native-cache/tracer-availability.txt
+          else
+            printf 'NOT RUN: /usr/bin/strace unavailable; no installation or workaround attempted\n' > validation/native-cache/tracer-availability.txt
+          fi
+      - name: Run only authored controller mocks
+        run: |
+          python3 -B -I "$PROBE/test_runner_control.py" validation/native-cache/controller-mocks -v \
+            2>&1 | tee validation/native-cache/controller-mocks.log
+      - name: Test the artifact verifier with synthetic records only
+        run: |
+          python3 -B -I "$PROBE/ci/test_verify_native_cache.py" -v \
+            2>&1 | tee validation/native-cache/verifier-controls.log
+      - name: Require complete controller and verifier mock suites
+        run: |
+          python3 -I - <<'PYCOUNTS'
+          import re
+          from pathlib import Path
+          for name, count in [('controller-mocks', 6), ('verifier-controls', 27)]:
+              text = (Path('validation/native-cache') / (name + '.log')).read_text()
+              if len(re.findall(r'^test_.+ \.\.\. ok$', text, re.M)) != count:
+                  raise ValueError(name + ': expected every named mock/control to pass')
+              if not re.search(r'^Ran ' + str(count) + r' tests in ', text, re.M) or '\nOK\n' not in text:
+                  raise ValueError(name + ': missing exact successful suite summary')
+          PYCOUNTS
+      - name: Format and build only the authored public-Core probe
+        run: |
+          cargo +1.95.0 fmt --all --check --manifest-path "$PROBE/Cargo.toml"
+          cargo +1.95.0 build --locked --manifest-path "$PROBE/Cargo.toml" --bin proteus-read-cache-probe -j 2 \
+            2>&1 | tee validation/native-cache/build.log
+          sha256sum "$CARGO_TARGET_DIR/debug/proteus-read-cache-probe" > validation/native-cache/binary.sha256
+      - name: Run scoped functional cases and owned-child openat diagnostics
+        run: |
+          python3 -B -I "$PROBE/run_cache_probe.py" \
+            --binary "$CARGO_TARGET_DIR/debug/proteus-read-cache-probe" \
+            --output validation/native-cache/functional --stage functional --trace \
+            2>&1 | tee validation/native-cache/functional.log
+      - name: Run untraced bounded measurements separately
+        run: |
+          python3 -B -I "$PROBE/run_cache_probe.py" \
+            --binary "$CARGO_TARGET_DIR/debug/proteus-read-cache-probe" \
+            --output validation/native-cache/measurements --stage measurements \
+            2>&1 | tee validation/native-cache/measurements.log
+      - name: Verify exact cases, provenance, bounds and observed trace controls
+        run: |
+          python3 -B -I "$PROBE/ci/verify_native_cache.py" \
+            --package "$PROBE" --binary "$CARGO_TARGET_DIR/debug/proteus-read-cache-probe" \
+            --directory validation/native-cache/functional --stage functional --require-traces \
+            > validation/native-cache/functional-verification.json
+          python3 -B -I "$PROBE/ci/verify_native_cache.py" \
+            --package "$PROBE" --binary "$CARGO_TARGET_DIR/debug/proteus-read-cache-probe" \
+            --directory validation/native-cache/measurements --stage measurements \
+            > validation/native-cache/measurement-verification.json
+      - name: Verify source and binary remained unchanged
+        if: always()
+        run: |
+          sha256sum -c validation/native-cache/sources.sha256 > validation/native-cache/source-recheck.txt
+          if [ -f validation/native-cache/binary.sha256 ]; then
+            sha256sum -c validation/native-cache/binary.sha256 > validation/native-cache/binary-recheck.txt
+          fi
+      - name: Preserve only this probe evidence including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-read-cache-validation
+          path: validation/native-cache/
+          if-no-files-found: error
+          retention-days: 14
