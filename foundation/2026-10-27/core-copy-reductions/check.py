@@ -591,24 +591,24 @@ def aggregate(h, recipe, manifest, manifest_hash, args):
                     parsed = h.require_passes(output("focused-parallel-unit",
                         [sys.executable, "scripts/test.py", "-p", "proteus-core", "--lib"])["output"],
                         manifest["focused_core_required"], allowed_ignored=ignored)
-                    if parsed != receipt["parallel_unit"] or set(parsed["ignored"]) != set(ignored):
+                    if not same_json_evidence(parsed, receipt["parallel_unit"]) or set(parsed["ignored"]) != set(ignored):
                         raise h.GateRejected("focused parallel unit evidence mismatch")
                     parsed = h.require_passes(output("focused-protocol",
                         [sys.executable, "scripts/test.py", "-p", "proteus-module-protocol", "--", "--test-threads=1"])["output"],
                         recipe["tests"]["protocol_required"] +
                         [case["name"] for case in manifest["cases"] if case["library"] == "protocol"])
-                    if parsed != receipt["protocol"]:
+                    if not same_json_evidence(parsed, receipt["protocol"]):
                         raise h.GateRejected("focused protocol evidence mismatch")
             else:
                 parsed = h.require_passes(output("production-protocol",
                     [sys.executable, "scripts/test.py", "-p", "proteus-module-protocol", "--", "--test-threads=1"])["output"],
                     recipe["tests"]["protocol_required"])
-                if parsed != receipt["protocol"]:
+                if not same_json_evidence(parsed, receipt["protocol"]):
                     raise h.GateRejected("production protocol evidence mismatch")
                 parsed = h.require_passes(output("production-module-swap",
                     [sys.executable, "scripts/test.py", "-p", "proteus-core", "--test", "module_swap", "--", "--test-threads=1"])["output"],
                     recipe["tests"]["module_swap_required"], exact_inventory=True)
-                if parsed != receipt["module_swap"]:
+                if not same_json_evidence(parsed, receipt["module_swap"]):
                     raise h.GateRejected("module-swap evidence mismatch")
                 binaries = h.canonical_targets(output("canonical-compile",
                     [sys.executable, *recipe["canonical_harness"]["compile_arguments"]])["output"],
@@ -622,7 +622,7 @@ def aggregate(h, recipe, manifest, manifest_hash, args):
                 parsed = h.require_canonical_passes(output("canonical-full",
                     [sys.executable, "scripts/test.py", "full"])["output"], manifest["production_required_full"],
                     recipe["canonical_harness"], binaries, recipe["tests"]["full_allowed_ignored"])
-                if parsed != receipt["canonical_full"] or set(parsed["ignored"]) != set(recipe["tests"]["full_allowed_ignored"]):
+                if not same_json_evidence(parsed, receipt["canonical_full"]) or set(parsed["ignored"]) != set(recipe["tests"]["full_allowed_ignored"]):
                     raise h.GateRejected("canonical full evidence mismatch")
             if phase != "baseline":
                 fixture_root = str(source.parent / "canonical-modules")
@@ -651,6 +651,12 @@ def aggregate(h, recipe, manifest, manifest_hash, args):
         raise
     finally:
         (evidence / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+def same_json_evidence(parsed, recorded):
+    """Compare complete JSON evidence without tuple/list or bool/int ambiguity."""
+    options = {"sort_keys": True, "separators": (",", ":"), "allow_nan": False}
+    return json.dumps(parsed, **options) == json.dumps(recorded, **options)
 
 
 def self_test(h, recipe, manifest):
@@ -719,6 +725,29 @@ def self_test(h, recipe, manifest):
             pass
         else:
             raise h.GateRejected("aggregate accepted an unsuccessful GitHub job")
+    sample = ("running 1 test\ntest exact_json_control ... ok\n\n"
+              "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n")
+    parsed = h.require_passes(sample, ["exact_json_control"], exact_inventory=True)
+    recorded = json.loads(json.dumps(parsed))
+    # The inherited parser intentionally returns tuple rows; receipts contain JSON arrays.
+    assert parsed != recorded
+    assert same_json_evidence(parsed, recorded)
+    for key, value in (
+        ("passed", ["foreign_test"]),
+        ("ignored", ["exact_json_control"]),
+        ("libtest_passed_count", 2),
+        ("libtest_passed_count", True),
+        ("summaries", [["ok", "2", "0", "0", "0", "0"]]),
+        ("summaries", list(reversed(recorded["summaries"][0]))),
+    ):
+        altered = dict(recorded, **{key: value})
+        assert not same_json_evidence(parsed, altered)
+    altered = dict(recorded, extra_unexpected_field=True)
+    assert not same_json_evidence(parsed, altered)
+    altered = dict(recorded)
+    altered.pop("summaries")
+    assert not same_json_evidence(parsed, altered)
+    print("JSON receipt roundtrip and eight evidence-mutation rejection controls PASS")
     print("Aggregate identity, early-infrastructure and job-result controls PASS")
     print("Pinned helper and six strict frame-negative rejection controls PASS")
 

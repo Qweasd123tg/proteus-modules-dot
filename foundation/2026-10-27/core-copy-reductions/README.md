@@ -23,6 +23,14 @@ The original failure log suggests, but does not by itself prove, the inherited-d
 
 This correctness prerequisite is explicitly separate from the four copy reductions. The combined baseline intentionally includes its additional red; this is not a performance experiment. Any later allocation/latency/RSS comparison must apply the same qualified ownership prerequisite to both benchmark arms.
 
+## Retained aggregate failure and serialization correction
+
+Run 40480504769 at 2e93dc9d3b0da720829479ccec22cd63aca21ff7 also remains FAILED. Baseline, pure-production and focused jobs passed, and independent raw-artifact audits agreed with their source/test evidence. The aggregate rejected production protocol evidence because the pinned parser returns tuple summary rows while persisted JSON contains array rows. Python object equality treated those representations as different despite identical serialized content.
+
+The only controller amendment compares complete parser and receipt objects as canonical JSON strings, with sorted object keys, fixed separators and nonfinite numbers rejected. It retains all fields, array ordering and scalar types, so true cannot stand in for 1. Five affected comparisons use this function. A genuine tuple/JSON roundtrip positive and eight altered-evidence rejection controls cover names, counts, ignored cases, summary contents, malformed structure, extra/missing fields and boolean-for-integer substitution. No source, required test, provenance check or resource policy is relaxed.
+
+All source trees remain identical to that failed predecessor, but its logs cannot satisfy this new head's gates. A fresh complete hosted run is required; neither failed run is retroactively accepted.
+
 ## Immutable baseline and artifact layout
 
 The baseline is the already-qualified Core composition tree 7dec0c811a514adf32a70907635939547e0a57cf. Its source recipe and controller are pinned to personal-repository PR 35 head 72aeaa37b1f81baf105a0ec09f337237dc0b2a7f. The upstream starting commit is 63454d4e8b1e4e6b26d088fce2a17d46f30390ae. Prior run 40459018866 is provenance only; no old log can satisfy a gate in this new run.
@@ -52,7 +60,7 @@ Each phase verifies source/index integrity after execution, current binary ident
 
 ## Reused support and resource policy
 
-The unchanged reviewed controller imports only the SHA-256-verified PR 35 support module. Its top-level source contains standard imports, constants, classes, functions and a guarded main; the old qualification/aggregation entry points are never called. Reviewed source-recipe, bounded-runner and canonical-parser helpers are reused rather than copied into a second framework. New orchestration and assertion classifiers still require independent review.
+The minimally amended reviewed controller imports only the SHA-256-verified PR 35 support module. Its top-level source contains standard imports, constants, classes, functions and a guarded main; the old qualification/aggregation entry points are never called. Reviewed source-recipe, bounded-runner and canonical-parser helpers are reused rather than copied into a second framework. New orchestration and assertion classifiers still require independent review.
 
 Only standard ubuntu-22.04 ephemeral runners are selected, at most two phases concurrently. Initial admission is eight GiB free; Runner-managed commands stop below two GiB. Each controller has a 110-minute deadline and each phase job a 150-minute bound; aggregate is ten minutes. Runner-managed source/build output and logs are bounded. Official setup steps have step/job timeouts and the initial admission check, not the same continuous disk/output sampling; the controller rechecks admission after setup. Resource exhaustion, deadlines and process/output limits are infrastructure failures, never successful negative controls. No manual deletion, target cleanup, paid runner or larger runner is used.
 
