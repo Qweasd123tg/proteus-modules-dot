@@ -14,6 +14,13 @@ not Retired, and that assertion lacked the required marker. This version marks
 the actual retirement-contract assertion without changing its condition or the
 classifier. Candidate library/full gates remain **not run at authoring**. Each later receipt applies only to its exact commit and hashes.
 
+The marker-only retry then proved the direct baseline failure, both unchanged
+HTTP baseline controls and the candidate canceled-delete lease control. It stopped
+on a positive-control fixture that reused a message ID in a second append.
+This version creates a fresh message for that append; production code, all
+assertion conditions and the classifier remain unchanged. Later candidate
+library cases and the full gate still require execution.
+
 ## What this slice changes
 
 - The permanent writer lease file is a sibling of the removable session

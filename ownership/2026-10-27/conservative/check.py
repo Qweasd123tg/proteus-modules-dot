@@ -19,7 +19,7 @@ import time
 
 CORE_PIN = "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
 MODULES_PIN = "7fceaebc3bed8add9b0e3091110f59deca86ba46"
-BUNDLE_SHA256 = "a54986d27e7f005e2d285765988830aa56a94e45b84c84f4bc2a870d1953f310"
+BUNDLE_SHA256 = "a3a2fa1818cbfa724c0b01c87d4079b359bd1c3dbd373c770dd8abef5077d0b6"
 TEST_PATH = "crates/proteus-core/tests/session_ownership_slice.rs"
 TARGET = "session_ownership_slice"
 MAX_TOTAL_OUTPUT = 80 * 1024 * 1024
