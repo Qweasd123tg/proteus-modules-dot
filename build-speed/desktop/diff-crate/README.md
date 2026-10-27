@@ -1,5 +1,7 @@
 # Desktop: отдельная тестовая граница для diff-парсера
 
+> В новой tabs-ветке runner вынесен в `../pure_crate.py`, а `qualify_diff.py` — фиксированный wrapper. Ни branch/head [исходного PR41](https://github.com/Qweasd123tg/proteus-modules-dot/pull/41), ни его результат не изменены. Ниже сохранено описание diff-only границы; новый composed tabs gate и ограничения — в [tabs README](../tabs-crate/README.md). Schema 2 сохраняет прежние source/files/registry/8 test identities; новый shared runner не наследует прежний hosted PASS автоматически.
+
 Статус на момент подготовки: extraction прошёл независимый source review; 14 AST-extracted synthetic parser cases прошли в памяти; полный controller и все product-команды ещё NOT_RUN. Актуальный результат будущего hosted запуска определяется только его receipt для точного commit. Цель — проверять чистый парсер отдельно от GPUI, не подменять измерения shipping-клиента dev-сборкой.
 
 ## Что меняется
@@ -102,7 +104,7 @@ NOT_RUN: git apply, TOML/Cargo validation, rustfmt, Cargo metadata/tree/check/bu
 
 ## Узкая hosted qualification: что делает controller
 
-`qualify_diff.py` предназначен только для отдельного одноразового checkout, а не рабочей копии пользователя. Он **изменяет index и working tree этого checkout**, применяя один проверенный patch; не создаёт commit, не делает push и не меняет upstream. Не запускайте его без отдельного разрешения на этот этап.
+`qualify_diff.py` через общий `../pure_crate.py` предназначен только для отдельного одноразового checkout, а не рабочей копии пользователя. Он **изменяет index и working tree этого checkout**, применяя один проверенный patch; не создаёт commit, не делает push и не меняет upstream. Не запускайте его без отдельного разрешения на этот этап.
 
 1. Проверяет exact Desktop commit и original tree, чистый checkout, SHA256 patch.
 2. Выполняет `git apply --check`, затем `git apply --index`; `git write-tree` должен дать reviewed candidate tree `c8f4f639f5d355c4c165086f68ace743ac49b84c`. Проверяет working tree против index, SHA256 всех 8 overlay файлов, удаление трёх старых путей, настоящий GPL symlink, manifest/default-members/release.
@@ -128,11 +130,11 @@ Artifacts с `fresh: true` тоже учитываются. Проверяетс
 
 `result.json` имеет PASS только после всех source/graph/test/post-source проверок. На ошибке сохраняет FAIL, stage, error type, Cargo exit code/timeout при наличии и captured log. Отсутствующий receipt, прерванный job или провал setup не являются PASS. Несовпадение source/tree/package/test identity — qualification failure, а не разрешение ослабить gate или повторить denied native route. Никакого автоматического retry, удаления данных или fallback на полный runner.
 
-`test_qualify_diff.py` содержит 14 авторских synthetic transcript tests; они не исполняют upstream код, Cargo или subprocess. Их 14 test bodies прошли AST-extracted проверку в памяти. Оба полных Python source прошли ast.parse; выполнены только package_key/inspect_output, synthetic helpers и тела case methods. Controller import/top-level, setUp subprocess guard, file-based CLI, bounded runner, filesystem/network/product code не исполнялись. Вместо Path.resolve в parser используются pure lexical paths; реальная symlink normalization и containment выполняются позже controller и пока NOT_RUN. Они проверяют позитивный complete/fresh transcript и reject случаев чужого package/source/version/target, неполных или дублированных tests/artifacts, ignored/filtered/failure, отсутствующего build-finished и неизвестного JSON. Дополнительно отклоняются отсутствующий/чужой execution header, неправильный count header и избыток artifacts. Эти parser tests не подменяют реальные 8 Rust-тестов.
+`test_qualify_diff.py` содержит 14 авторских synthetic transcript tests; они не исполняют upstream код, Cargo или subprocess. Их 14 test bodies прошли AST-extracted проверку в памяти. Оба полных Python source прошли ast.parse; выполнены только package_key/inspect_output, synthetic helpers и тела case methods. В текущей tabs-ветке setUp проверяет только pure configuration; mock/global substitution не используется. Controller import/top-level, file-based CLI, bounded runner, filesystem/network/product code не исполнялись при private AST-проверке. Вместо Path.resolve в parser используются pure lexical paths; реальная symlink normalization и containment выполняются позже controller и пока NOT_RUN. Они проверяют позитивный complete/fresh transcript и reject случаев чужого package/source/version/target, неполных или дублированных tests/artifacts, ignored/filtered/failure, отсутствующего build-finished и неизвестного JSON. Дополнительно отклоняются отсутствующий/чужой execution header, неправильный count header и избыток artifacts. Эти parser tests не подменяют реальные 8 Rust-тестов.
 
 ## Публикация и запуск — отдельный допуск
 
-Ровно 6 additive файлов: этот README, extraction patch, expected.json, controller, synthetic tests и `.github/workflows/check-desktop-diff-crate.yml`.
+Исходный PR41 содержал ровно 6 additive файлов: этот README, extraction patch, expected.json, controller, synthetic tests и `.github/workflows/check-desktop-diff-crate.yml`. Это исторический состав PR41, не состав новой tabs-ветки с общим runner.
 
 Предложенная ветка — `ci/desktop-diff-crate-20261027` в личном `Qweasd123tg/proteus-modules-dot`. Workflow запускается **только push на эту точную ветку** при изменении своей папки/файла workflow; job повторяет repository/ref/event guards. Нет pull_request trigger, матрицы или изменения существующих workflows. Публикация этой ветки запрашивает hosted выполнение, поэтому source-only разрешения на публикацию документации недостаточно: root отдельно проверяет final independent review и активные jobs перед разрешённым push.
 

@@ -1,0 +1,155 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,7 +1,7 @@
+ [workspace]
+ resolver = "2"
+-members = ["crates/client-common", "crates/diff"]
+-default-members = [".", "crates/diff"]
++members = ["crates/client-common", "crates/diff", "crates/tabs"]
++default-members = [".", "crates/diff", "crates/tabs"]
+ exclude = ["vendor/gpui-fast-wgpu", "vendor/gpui-component"]
+ 
+ [patch.crates-io]
+@@ -37,6 +37,7 @@
+ ] }
+ proteus-client-common = { path = "crates/client-common" }
+ proteus-diff = { path = "crates/diff" }
++proteus-tabs = { path = "crates/tabs" }
+ proteus-contracts = { git = "https://github.com/Proteus-harness/Proteus-core.git", rev = "f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60" }
+ anyhow = "1"
+ async-channel = "2"
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5351,6 +5351,7 @@
+  "proteus-client-common",
+  "proteus-contracts",
+  "proteus-diff",
++ "proteus-tabs",
+  "roxmltree 0.21.1",
+  "serde",
+  "serde_json",
+@@ -5359,6 +5360,14 @@
+  "url",
+  "uuid",
+  "zip",
++]
++
++[[package]]
++name = "proteus-tabs"
++version = "0.1.0-alpha.3"
++dependencies = [
++ "serde",
++ "serde_json",
+ ]
+ 
+ [[package]]
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -15,7 +15,6 @@
+ mod settings;
+ mod shortcuts;
+ mod startup_trace;
+-mod tabs;
+ mod terminal;
+ mod tool_display;
+ mod transcript;
+@@ -24,6 +23,7 @@
+ 
+ use gpui_kit::*;
+ use proteus_diff as diff;
++use proteus_tabs as tabs;
+ 
+ use launch::Launch;
+ use ui::Launcher;
+diff --git a/crates/tabs/Cargo.toml b/crates/tabs/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/crates/tabs/Cargo.toml
+@@ -0,0 +1,13 @@
++[package]
++name = "proteus-tabs"
++version = "0.1.0-alpha.3"
++edition = "2024"
++publish = false
++license = "GPL-3.0-or-later"
++description = "Headless tab, pane and split-layout state for Proteus Desktop"
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
++
++[dev-dependencies]
++serde_json = "1"
+diff --git a/crates/tabs/LICENSE-GPL b/crates/tabs/LICENSE-GPL
+new file mode 120000
+--- /dev/null
++++ b/crates/tabs/LICENSE-GPL
+@@ -0,0 +1,1 @@
++../../LICENSE-GPL
+\ No newline at end of file
+diff --git a/src/tabs/geometry.rs b/crates/tabs/src/geometry.rs
+similarity index 100%
+rename from src/tabs/geometry.rs
+rename to crates/tabs/src/geometry.rs
+diff --git a/src/tabs/history.rs b/crates/tabs/src/history.rs
+similarity index 100%
+rename from src/tabs/history.rs
+rename to crates/tabs/src/history.rs
+diff --git a/src/tabs/layout.rs b/crates/tabs/src/layout.rs
+similarity index 100%
+rename from src/tabs/layout.rs
+rename to crates/tabs/src/layout.rs
+diff --git a/src/tabs/lock.rs b/crates/tabs/src/lock.rs
+similarity index 100%
+rename from src/tabs/lock.rs
+rename to crates/tabs/src/lock.rs
+diff --git a/src/tabs/mod.rs b/crates/tabs/src/lib.rs
+similarity index 100%
+rename from src/tabs/mod.rs
+rename to crates/tabs/src/lib.rs
+diff --git a/src/tabs/open.rs b/crates/tabs/src/open.rs
+similarity index 100%
+rename from src/tabs/open.rs
+rename to crates/tabs/src/open.rs
+diff --git a/src/tabs/ops.rs b/crates/tabs/src/ops.rs
+similarity index 100%
+rename from src/tabs/ops.rs
+rename to crates/tabs/src/ops.rs
+diff --git a/src/tabs/pane.rs b/crates/tabs/src/pane.rs
+similarity index 100%
+rename from src/tabs/pane.rs
+rename to crates/tabs/src/pane.rs
+diff --git a/src/tabs/pins.rs b/crates/tabs/src/pins.rs
+similarity index 100%
+rename from src/tabs/pins.rs
+rename to crates/tabs/src/pins.rs
+diff --git a/src/tabs/size.rs b/crates/tabs/src/size.rs
+similarity index 100%
+rename from src/tabs/size.rs
+rename to crates/tabs/src/size.rs
+diff --git a/src/tabs/tests/history.rs b/crates/tabs/src/tests/history.rs
+similarity index 100%
+rename from src/tabs/tests/history.rs
+rename to crates/tabs/src/tests/history.rs
+diff --git a/src/tabs/tests/mod.rs b/crates/tabs/src/tests/mod.rs
+similarity index 100%
+rename from src/tabs/tests/mod.rs
+rename to crates/tabs/src/tests/mod.rs
+diff --git a/src/tabs/tests/pins.rs b/crates/tabs/src/tests/pins.rs
+similarity index 100%
+rename from src/tabs/tests/pins.rs
+rename to crates/tabs/src/tests/pins.rs
+diff --git a/src/tabs/tests/sizes.rs b/crates/tabs/src/tests/sizes.rs
+similarity index 100%
+rename from src/tabs/tests/sizes.rs
+rename to crates/tabs/src/tests/sizes.rs
+diff --git a/src/tabs/tests/tree.rs b/crates/tabs/src/tests/tree.rs
+similarity index 100%
+rename from src/tabs/tests/tree.rs
+rename to crates/tabs/src/tests/tree.rs
+diff --git a/src/tabs/tree.rs b/crates/tabs/src/tree.rs
+similarity index 100%
+rename from src/tabs/tree.rs
+rename to crates/tabs/src/tree.rs

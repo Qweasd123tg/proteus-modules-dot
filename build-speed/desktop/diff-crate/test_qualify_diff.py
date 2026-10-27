@@ -3,9 +3,8 @@ import copy
 import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 
-from qualify_diff import HERE, inspect_output
+from qualify_diff import HERE, inspect_output, validate_expected
 
 SOURCE = Path("/qualification/source")
 TARGET = Path("/qualification/evidence/target")
@@ -55,9 +54,7 @@ def transcript(records=None, names=None, summary=None):
 
 class TranscriptTests(unittest.TestCase):
     def setUp(self):
-        guard = patch("qualify_diff.command", side_effect=AssertionError("No subprocess in parser tests"))
-        guard.start()
-        self.addCleanup(guard.stop)
+        validate_expected(EXPECTED)
 
     def inspect(self, **kwargs):
         return inspect_output(transcript(**kwargs), SOURCE, TARGET, EXPECTED)
