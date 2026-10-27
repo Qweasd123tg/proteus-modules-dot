@@ -1,0 +1,107 @@
+diff --git a/crates/proteus-core/src/core/session_journal/storage/ownership.rs b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+--- a/crates/proteus-core/src/core/session_journal/storage/ownership.rs
++++ b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+@@ -101,10 +101,103 @@
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn owner_drop_releases_lease_while_duplicate_descriptor_remains_open() {
++        let root = tempfile::tempdir().expect("test root");
++        let session = root.path().join("1234567890");
++        fs::create_dir(&session).expect("session directory");
++        let id = proteus_contracts::domain::new_session_id();
++        let owner = SessionWriteOwnership::acquire(&session, id).expect("first owner");
++        // dup has the same open-file-description lifetime semantics as an
++        // inherited descriptor. Keep this copy open across the owner drop.
++        let duplicate = owner._file.try_clone().expect("duplicate lease descriptor");
++        let path = ownership_path(&session).expect("lock path");
++        let contender = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&path)
++            .expect("independent contender");
++        assert!(
++            matches!(contender.try_lock(), Err(TryLockError::WouldBlock)),
++            "a live owner must retain its lease"
++        );
++        drop(owner);
++        match contender.try_lock() {
++            Ok(()) => {}
++            Err(TryLockError::WouldBlock) => panic!(
++                "OWNERSHIP_DROP_DUPLICATE: owner drop must release its lease while a duplicate remains open"
++            ),
++            Err(error) => panic!("unexpected replacement lock error: {error:?}"),
++        }
++        duplicate.metadata().expect("duplicate still remains open");
++        let observer = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(&path)
++            .expect("independent observer");
++        assert!(matches!(observer.try_lock(), Err(TryLockError::WouldBlock)));
++        drop(duplicate);
++        assert!(
++            matches!(observer.try_lock(), Err(TryLockError::WouldBlock)),
++            "closing an old duplicate must not release the replacement owner"
++        );
++        contender.unlock().expect("explicit replacement release");
++        drop(contender);
++        observer.try_lock().expect("released replacement lease");
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn fork_child_drop_does_not_unlock_the_live_parent_owner() {
++        use std::os::unix::process::CommandExt;
++        use std::process::{Command, Stdio};
++
++        let root = tempfile::tempdir().expect("test root");
++        let session = root.path().join("1234567890");
++        fs::create_dir(&session).expect("session directory");
++        let id = proteus_contracts::domain::new_session_id();
++        let owner = SessionWriteOwnership::acquire(&session, id).expect("parent owner");
++        let mut inherited = Some(owner);
++        let path = ownership_path(&session).expect("lock path");
++        let mut command = Command::new(std::env::current_exe().expect("test executable"));
++        command
++            .arg("--list")
++            .stdin(Stdio::null())
++            .stdout(Stdio::null())
++            .stderr(Stdio::null());
++        // SAFETY: The guard contains only File + u32, with no heap-backed
++        // fields. The child callback only drops that inherited File guard
++        // (getpid/close; explicit unlock is forbidden for a foreign PID)
++        // and returns Ok. It does not allocate, log or acquire a Rust mutex.
++        // The parent's private callback copy retains its original live guard.
++        unsafe {
++            command.pre_exec(move || {
++                drop(inherited.take());
++                Ok(())
++            });
++        }
++        let mut child = command.spawn().expect("spawn fork/drop control");
++        assert!(child.wait().expect("wait for list-only child").success());
++        let contender = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(path)
++            .expect("independent contender");
++        assert!(
++            matches!(contender.try_lock(), Err(TryLockError::WouldBlock)),
++            "OWNERSHIP_FORK_CHILD: child drop must not unlock its live parent's lease"
++        );
++        drop(command);
++        contender
++            .try_lock()
++            .expect("parent callback drop releases the lease");
++    }
++
+     #[test]
+     fn lock_file_is_persistent_but_unlocked_after_owner_drop() {
+         let root = tempfile::tempdir().expect("test root");
+         let session_dir = root.path().join("1234567890");
+         fs::create_dir(&session_dir).expect("session dir");
