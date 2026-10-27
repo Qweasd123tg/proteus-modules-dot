@@ -1,0 +1,133 @@
+name: Broker callback fixture amendment
+on:
+  push:
+    branches: [ci/core-broker-fixture-20261027]
+    paths:
+      - 'foundation/2026-10-27/broker-v3-fixture/**'
+      - '.github/workflows/core-broker-fixture.yml'
+permissions:
+  contents: read
+concurrency:
+  group: core-broker-fixture-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  RUST_TEST_THREADS: '4'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: '0'
+  GIT_TERMINAL_PROMPT: '0'
+jobs:
+  qualify:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/core-broker-fixture-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require initial hosted disk reserve
+        run: python3 -c 'import os, shutil; assert shutil.disk_usage(os.environ["RUNNER_TEMP"]).free >= 8 * 1024 ** 3'
+      - name: Install official compile prerequisites
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev curl
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Fetch immutable helper and recipe without execution
+        timeout-minutes: 3
+        run: |
+          mkdir "$RUNNER_TEMP/core-broker-fixture-support"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 109703 \
+            --output "$RUNNER_TEMP/core-broker-fixture-support/check.py" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/check.py
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 23264 \
+            --output "$RUNNER_TEMP/core-broker-fixture-support/manifest.json" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/manifest.json
+      - name: Verify all immutable executable inputs
+        run: |
+          echo 'de1b07f0cccd652bc0db12a0ce320b5dd04ce7a9dd49d190b9c493cf5039aaf4  foundation/2026-10-27/broker-v3-fixture/manifest.json' | sha256sum --check
+          echo 'c086b952f2812949fcee5dde65ada0f11c5b597ca87fc553cadbcbe0da264929  foundation/2026-10-27/broker-v3-fixture/check.py' | sha256sum --check
+          echo '84e01c0e60b8936054cd1f6e91b7a1bc2bc500b7583160953e1976e9e1e75622  foundation/2026-10-27/core-compact-validation/manifest.json' | sha256sum --check
+          echo '33c8ec75122e71db5d034410144bac273a4606dbda59ac8e63a205905bcc2c8d  foundation/2026-10-27/core-compact-validation/check.py' | sha256sum --check
+          echo 'dca653f3eda6ece4e9f339f531669a14e249e7a0cf151dd77a58b9fea5eef603  foundation/2026-10-27/core-current-graph/manifest.json' | sha256sum --check
+          echo '4cf85d5124f7d39cb38a3444287bf43254d74f1053a70fee926c6515ca3c6b3b  foundation/2026-10-27/core-current-graph/check.py' | sha256sum --check
+          echo '2f917a4ca4dc71a3dfa8cf2dc376991a7ddf1580cd347aaff8cb6ccc50568147  '"$RUNNER_TEMP/core-broker-fixture-support/check.py" | sha256sum --check
+          echo '0a6b5a4aba9112abe866fa5131d7f0f58a771f3542ec891af51f96d9bd7dae82  '"$RUNNER_TEMP/core-broker-fixture-support/manifest.json" | sha256sum --check
+      - name: Exercise bounded controller and complete-target self-controls
+        timeout-minutes: 2
+        run: |
+          set -o pipefail
+          mkdir "$RUNNER_TEMP/core-broker-fixture-self-test"
+          python3 -B foundation/2026-10-27/broker-v3-fixture/check.py \
+            --manifest foundation/2026-10-27/broker-v3-fixture/manifest.json \
+            --compact-controller foundation/2026-10-27/core-compact-validation/check.py \
+            --compact-manifest foundation/2026-10-27/core-compact-validation/manifest.json \
+            --qualified-controller foundation/2026-10-27/core-current-graph/check.py \
+            --qualified-manifest foundation/2026-10-27/core-current-graph/manifest.json \
+            --helper "$RUNNER_TEMP/core-broker-fixture-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-broker-fixture-support/manifest.json" --self-test 2>&1 | head -c 1048576 | tee "$RUNNER_TEMP/core-broker-fixture-self-test/output.log"
+      - name: Compile and run only the complete affected target
+        run: |
+          python3 -B foundation/2026-10-27/broker-v3-fixture/check.py \
+            --manifest foundation/2026-10-27/broker-v3-fixture/manifest.json \
+            --compact-controller foundation/2026-10-27/core-compact-validation/check.py \
+            --compact-manifest foundation/2026-10-27/core-compact-validation/manifest.json \
+            --qualified-controller foundation/2026-10-27/core-current-graph/check.py \
+            --qualified-manifest foundation/2026-10-27/core-current-graph/manifest.json \
+            --helper "$RUNNER_TEMP/core-broker-fixture-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-broker-fixture-support/manifest.json" --run \
+            --work "$RUNNER_TEMP/core-broker-fixture-work" \
+            --evidence "$RUNNER_TEMP/core-broker-fixture-evidence"
+      - name: Independently reparse exact current-run raw target evidence
+        if: always()
+        timeout-minutes: 3
+        run: |
+          echo 'de1b07f0cccd652bc0db12a0ce320b5dd04ce7a9dd49d190b9c493cf5039aaf4  foundation/2026-10-27/broker-v3-fixture/manifest.json' | sha256sum --check
+          echo 'c086b952f2812949fcee5dde65ada0f11c5b597ca87fc553cadbcbe0da264929  foundation/2026-10-27/broker-v3-fixture/check.py' | sha256sum --check
+          echo '84e01c0e60b8936054cd1f6e91b7a1bc2bc500b7583160953e1976e9e1e75622  foundation/2026-10-27/core-compact-validation/manifest.json' | sha256sum --check
+          echo '33c8ec75122e71db5d034410144bac273a4606dbda59ac8e63a205905bcc2c8d  foundation/2026-10-27/core-compact-validation/check.py' | sha256sum --check
+          echo 'dca653f3eda6ece4e9f339f531669a14e249e7a0cf151dd77a58b9fea5eef603  foundation/2026-10-27/core-current-graph/manifest.json' | sha256sum --check
+          echo '4cf85d5124f7d39cb38a3444287bf43254d74f1053a70fee926c6515ca3c6b3b  foundation/2026-10-27/core-current-graph/check.py' | sha256sum --check
+          echo '2f917a4ca4dc71a3dfa8cf2dc376991a7ddf1580cd347aaff8cb6ccc50568147  '"$RUNNER_TEMP/core-broker-fixture-support/check.py" | sha256sum --check
+          echo '0a6b5a4aba9112abe866fa5131d7f0f58a771f3542ec891af51f96d9bd7dae82  '"$RUNNER_TEMP/core-broker-fixture-support/manifest.json" | sha256sum --check
+          python3 -B foundation/2026-10-27/broker-v3-fixture/check.py \
+            --manifest foundation/2026-10-27/broker-v3-fixture/manifest.json \
+            --compact-controller foundation/2026-10-27/core-compact-validation/check.py \
+            --compact-manifest foundation/2026-10-27/core-compact-validation/manifest.json \
+            --qualified-controller foundation/2026-10-27/core-current-graph/check.py \
+            --qualified-manifest foundation/2026-10-27/core-current-graph/manifest.json \
+            --helper "$RUNNER_TEMP/core-broker-fixture-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-broker-fixture-support/manifest.json" --audit \
+            --evidence "$RUNNER_TEMP/core-broker-fixture-evidence" \
+            --audit-evidence "$RUNNER_TEMP/core-broker-fixture-audit"
+      - name: Retain bounded target source evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-broker-fixture-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-source
+          path: |
+            ${{ runner.temp }}/core-broker-fixture-evidence/result.json
+            ${{ runner.temp }}/core-broker-fixture-evidence/*.log
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Retain bounded audit receipt and raw binding logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-broker-fixture-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-audit
+          path: |
+            ${{ runner.temp }}/core-broker-fixture-audit/result.json
+            ${{ runner.temp }}/core-broker-fixture-audit/*.log
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Retain bounded self-controls even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-broker-fixture-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-self-test
+          path: ${{ runner.temp }}/core-broker-fixture-self-test/output.log
+          retention-days: 7
+          if-no-files-found: warn
