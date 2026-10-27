@@ -8,8 +8,11 @@ compiled and passed its 11 focused cases, but the
 [canonical full gate failed](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40438671031)
 on two existing HTTP deletion tests: local Busy broke the established lifecycle.
 This correction preserves those tests and adds explicit local-owner coordination.
-Its new code has been parsed/formatted only; its hosted qualification is **not run
-at authoring**. Each later receipt applies only to its exact commit and hashes.
+The first correction retry passed the original 22 integration outcomes but stopped
+at the direct baseline control: the stale write errored with missing journal,
+not Retired, and that assertion lacked the required marker. This version marks
+the actual retirement-contract assertion without changing its condition or the
+classifier. Candidate library/full gates remain **not run at authoring**. Each later receipt applies only to its exact commit and hashes.
 
 ## What this slice changes
 
