@@ -1,19 +1,7 @@
-name: Native cold recovery qualification
+name: Native cold recovery paired measurement
 on:
   push:
     branches: [ci/native-cold-recovery-20261027]
-  workflow_dispatch:
-    inputs:
-      measure:
-        description: Run paired measurements after qualification is reviewed
-        type: boolean
-        default: false
-        required: true
-      expected_head:
-        description: Exact reviewed bundle commit SHA; mandatory when measure is true
-        type: string
-        default: ''
-        required: false
 permissions:
   contents: read
 concurrency:
@@ -32,6 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: bundle
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -51,6 +40,14 @@ jobs:
           ref: 7fceaebc3bed8add9b0e3091110f59deca86ba46
           path: modules
           persist-credentials: false
+      - name: Require the exact qualified source parent
+        env:
+          QUALIFIED_HEAD: 32a9d1c4ac6eb7b70437025b3346a6f01b3630f4
+          QUALIFIED_TREE: 85b6fe4e69dfce771b4bf56cad930198b08fe607
+        run: |
+          test "$(git -C bundle rev-parse HEAD^)" = "$QUALIFIED_HEAD"
+          test "$(git -C bundle rev-parse "$QUALIFIED_HEAD^{tree}")" = "$QUALIFIED_TREE"
+          test "$(git -C bundle diff --name-only "$QUALIFIED_HEAD" HEAD)" = ".github/workflows/native-cold-recovery.yml"
       - name: Build dependencies and pinned compiler
         run: |
           sudo apt-get update
@@ -65,12 +62,12 @@ jobs:
           python3 -B bundle/performance/2026-10-27/native-cold/prepare.py \
             "$GITHUB_WORKSPACE/core-a" "$GITHUB_WORKSPACE/core-b" \
             "$GITHUB_WORKSPACE/modules" "$BUILD"
-      - name: Calibrate RSS and qualify exact fixtures
+      - name: Requalify controls and run paired measurements
         env:
           BUILD: ${{ runner.temp }}/native-cold-build
           RESULT: ${{ runner.temp }}/native-cold-result
-          EXPECTED_HEAD: ${{ inputs.expected_head }}
-          MEASURE: ${{ github.event_name == 'workflow_dispatch' && inputs.measure || false }}
+          EXPECTED_HEAD: ${{ github.sha }}
+          MEASURE: 'true'
         run: |
           python3 -B - <<'PY'
           import json, os, subprocess
