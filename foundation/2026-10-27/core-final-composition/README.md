@@ -78,3 +78,20 @@ Bounded setup/self-control/source/audit evidence is retained even on failure.
 
 Publication is additive on a separately guarded personal-repository draft branch.
 All inherited files remain unchanged; parent PRs and main are not mutated.
+
+## Preserved first final-gate failure and controller repair
+
+Run 40598382535 attempt 1 on head `e6815165ccec144ce177bd9aaa5e5610126a8d7d`
+remains **failed**. Canonical compilation exited zero, but the wrapper rejected the legitimate
+contracts integration target named `execution_boundary` while selecting the same-named Core
+target. The canonical full command and all final postflights were **not reached**; this is not
+reported as a product-test failure or a product-test pass.
+
+The controller now partitions the two exact source paths and positively validates both
+package/source/kind/default-feature/profile/executable identities with the unchanged helper.
+It retains the Core binding for the same 13 required cases. Raw section selection is unchanged
+and remains compiler-executable-qualified, not filename-qualified. Missing, duplicate, foreign
+and malformed records/sections have explicit data-only rejection controls, including replay
+of authenticated current compiler records and historical raw sections. Product/test source,
+source tree, fixture recipe, resource bounds and the 177/92/15 required inventories are unchanged.
+A fresh exact-head full invocation and its postflights are still required.

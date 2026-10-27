@@ -108,10 +108,34 @@ def identity(manifest, manifest_hash, ctx):
         "recipe_sha256": q.RECIPE_SHA256, "plan": manifest["plan"],
         "resource_policy": manifest["resources"]}
 
+
+def execution_boundary_bindings(h, output, root, target_root):
+    # Both workspace packages legitimately export this integration-target name.
+    # Partition only by exact source, then positively validate both identities.
+    specs = (
+        ("execution_boundary", EXECUTION_SOURCE, "proteus-core"),
+        ("contracts_execution_boundary", "crates/proteus-contracts/tests/execution_boundary.rs", "proteus-contracts"),
+    )
+    groups = {str(root / source): [] for _, source, _ in specs}
+    for line in output.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = value.get("target", {})
+        if value.get("reason") != "compiler-artifact" or not value.get("executable") or item.get("name") != "execution_boundary":
+            continue
+        source = item.get("src_path")
+        if source not in groups:
+            raise h.GateRejected("unexpected execution_boundary compiler source")
+        groups[source].append(line)
+    return {key: q.default_integration(h, "\n".join(groups[str(root / source)]),
+                root, target_root, "execution_boundary", source, package)
+            for key, source, package in specs}
+
 def canonical_bindings(h, output, root, target_root, foundation):
     custom, bindings = c.canonical_bindings(h, output, root, target_root, foundation)
-    bindings["execution_boundary"] = q.default_integration(
-        h, output, root, target_root, "execution_boundary", EXECUTION_SOURCE, "proteus-core")
+    bindings["execution_boundary"] = execution_boundary_bindings(h, output, root, target_root)["execution_boundary"]
     return custom, bindings
 
 def boundaries(h, output, manifest, foundation, bindings):
@@ -370,7 +394,58 @@ def self_test(h, manifest, old):
             pass
         else:
             raise h.GateRejected("target-bound raw parser accepted a mutation")
-    print("Final 177-name inventory, execution-boundary section and inherited bounded self-controls PASS")
+
+    root, target_root = Path("/self/source"), Path("/self/target")
+    artifacts = []
+    for package, source, suffix in (
+        ("proteus-core", EXECUTION_SOURCE, "core"),
+        ("proteus-contracts", "crates/proteus-contracts/tests/execution_boundary.rs", "contracts"),
+    ):
+        artifacts.append({"reason": "compiler-artifact", "package_id": "path+" + (root / "crates" / package).as_uri() + "#0.1.0",
+            "target": {"name": "execution_boundary", "kind": ["test"], "src_path": str(root / source)},
+            "features": [], "profile": {"test": True}, "executable": str(target_root / ("execution_boundary-" + suffix))})
+    def bound(values):
+        return execution_boundary_bindings(h, "\n".join(json.dumps(value) for value in values), root, target_root)
+    actual = bound(artifacts)
+    assert actual["execution_boundary"]["package"] == "proteus-core"
+    assert actual["contracts_execution_boundary"]["package"] == "proteus-contracts"
+    compiler_mutations = [artifacts[1:], artifacts[:1], artifacts + [artifacts[0]], artifacts + [artifacts[1]]]
+    for index, key, value in (
+        (0, "features", ["unexpected"]), (1, "features", ["unexpected"]),
+        (0, "package_id", artifacts[1]["package_id"]), (1, "package_id", artifacts[0]["package_id"]),
+        (0, "executable", "/foreign/execution_boundary"), (0, "profile", {"test": False}),
+        (1, "executable", "/foreign/execution_boundary"), (1, "profile", {"test": False}),
+    ):
+        bad = json.loads(json.dumps(artifacts)); bad[index][key] = value; compiler_mutations.append(bad)
+    for key, value in (("src_path", "/foreign/execution_boundary.rs"), ("kind", ["lib"])):
+        bad = json.loads(json.dumps(artifacts)); bad[0]["target"][key] = value; compiler_mutations.append(bad)
+    for bad in compiler_mutations:
+        try:
+            bound(bad)
+        except h.GateRejected:
+            pass
+        else:
+            raise h.GateRejected("same-name compiler selector accepted a malformed or duplicate identity")
+    contracts_name = "child_cancellation_scope_preserves_execution_identity"
+    twin = "     Running tests/execution_boundary.rs (" + actual["contracts_execution_boundary"]["executable"] + ")\n"
+    twin += "test " + contracts_name + " ... ok\n"
+    twin += "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    twin += "     Running tests/execution_boundary.rs (" + actual["execution_boundary"]["executable"] + ")\n" + body
+    split = q.sections(h, twin, actual)
+    h.require_passes(split["execution_boundary"], names, exact_inventory=True)
+    h.require_passes(split["contracts_execution_boundary"], [contracts_name], exact_inventory=True)
+    for bad in (twin.replace(actual["execution_boundary"]["executable"], "/foreign/core"),
+                twin + twin, twin.replace("test " + names[0] + " ... ok\n", "")):
+        try:
+            split = q.sections(h, bad, actual)
+            h.require_passes(split["execution_boundary"], names, exact_inventory=True)
+            h.require_passes(split["contracts_execution_boundary"], [contracts_name], exact_inventory=True)
+        except h.GateRejected:
+            pass
+        else:
+            raise h.GateRejected("same-label raw sections accepted foreign, duplicate or missing Core evidence")
+
+    print("Final 177-name inventory, package-qualified compiler collision, executable-qualified raw sections and inherited bounded self-controls PASS")
 
 def main():
     parser = argparse.ArgumentParser()
