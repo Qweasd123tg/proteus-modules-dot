@@ -1,0 +1,138 @@
+name: Config and image ownership qualification
+
+# Isolated experimental lane only; upstream manual workflows are untouched.
+on:
+  push:
+    branches: [ci/session-sidecar-fencing-20261027]
+    paths:
+      - 'ownership/2026-10-27/config-image-fencing/candidate.json'
+      - 'ownership/2026-10-27/config-image-fencing/check.py'
+      - '.github/workflows/session-sidecar-fencing.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: session-sidecar-fencing-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  RUST_TEST_THREADS: '4'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: '0'
+  GIT_TERMINAL_PROMPT: '0'
+  npm_config_audit: 'false'
+
+jobs:
+  qualify:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/session-sidecar-fencing-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Read immutable PR 31 prerequisite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Qweasd123tg/proteus-modules-dot
+          ref: d92dc1b1b9ed6e95f58439e486aed94e234cc2b5
+          path: prerequisite
+          persist-credentials: false
+      - name: Install Linux compile dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev ripgrep meson ninja-build libcap-dev libcap2-bin libselinux1-dev curl xz-utils
+      - name: Build and install the verified unprivileged sandbox dependency
+        timeout-minutes: 10
+        run: |
+          test "$(id -u)" -ne 0
+          build_root="$RUNNER_TEMP/ownership-bubblewrap-0.13.1"
+          mkdir "$build_root"
+          cd "$build_root"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 129472 \
+            --output bubblewrap-0.13.1.tar.xz \
+            https://github.com/containers/bubblewrap/releases/download/v0.13.1/bubblewrap-0.13.1.tar.xz
+          test "$(stat -c '%s' bubblewrap-0.13.1.tar.xz)" -eq 129472
+          echo '0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d  bubblewrap-0.13.1.tar.xz' | sha256sum --check
+          tar --extract --xz --file bubblewrap-0.13.1.tar.xz
+          cd bubblewrap-0.13.1
+          meson setup out --buildtype=release --wrap-mode=nodownload \
+            -Dman=disabled -Dbash_completion=disabled -Dzsh_completion=disabled \
+            -Dselinux=enabled -Dtests=false
+          meson compile -C out -j2
+          # Only this ordinary dependency binary is installed in the ephemeral
+          # VM. No setuid, file capabilities, or security-policy changes.
+          sudo install -o root -g root -m0755 out/bwrap /usr/bin/bwrap
+          cmp --silent out/bwrap /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test "$(stat -c '%a:%u:%g' /usr/bin/bwrap)" = '755:0:0'
+          test -z "$(getcap /usr/bin/bwrap)"
+          test "$(/usr/bin/bwrap --version)" = 'bubblewrap 0.13.1'
+      - name: Require real default-policy namespace and FD capabilities
+        timeout-minutes: 2
+        run: |
+          test "$(id -u)" -ne 0
+          help_text=$(/usr/bin/bwrap --help)
+          for flag in --disable-userns --bind-fd --ro-bind-fd --argv0; do
+            grep -Fq -- "$flag" <<<"$help_text"
+          done
+          probe_root="$RUNNER_TEMP/ownership-bwrap-probe"
+          mkdir "$probe_root"
+          exec 3</usr
+          exec 4<"$probe_root"
+          /usr/bin/bwrap --unshare-all --unshare-user --disable-userns \
+            --cap-drop ALL --die-with-parent --new-session --clearenv \
+            --ro-bind / / --ro-bind-fd 3 /usr --bind-fd 4 /tmp \
+            --proc /proc --dev /dev --remount-ro / \
+            --argv0 ownership-namespace-probe -- /usr/bin/true
+          {
+            echo 'source_release=v0.13.1'
+            echo 'source_sha256=0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d'
+            echo 'vendor_selftests=NOT_RUN; canonical_Core_sandbox_tests=REQUIRED'
+            echo 'security_policy_changes=NONE'
+            /usr/bin/bwrap --version
+            sha256sum /usr/bin/bwrap
+            stat -c 'mode_uid_gid=%a:%u:%g' /usr/bin/bwrap
+            echo 'file_capabilities=NONE'
+            uname -a
+            cat /etc/os-release
+            echo 'unprivileged_namespace_and_fd_probe=PASS'
+          } > "$RUNNER_TEMP/ownership-bwrap-evidence.txt"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.18.0'
+      - name: Install exact official Rust
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+          node --version
+          npm --version
+      - name: Verify authored package identities
+        run: |
+          echo '5850266d7ba5abf60c086b1a53435811785610663b9a88483403044bcaa4333c  ownership/2026-10-27/config-image-fencing/candidate.json' | sha256sum --check
+          echo '776454fbdea0f3550ff1a15c6d14ea1b9af727c4a3a5fb3f61a77f3d8cdd9ed9  ownership/2026-10-27/config-image-fencing/check.py' | sha256sum --check
+      - name: Qualify exact baseline and candidate
+        run: |
+          python3 ownership/2026-10-27/config-image-fencing/check.py \
+            --bundle ownership/2026-10-27/config-image-fencing/candidate.json \
+            --prerequisite-root "$GITHUB_WORKSPACE/prerequisite" \
+            --work "$RUNNER_TEMP/sidecar-work" \
+            --evidence "$RUNNER_TEMP/sidecar-evidence"
+      - name: Retain bounded qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: session-sidecar-fencing-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/sidecar-evidence/result.json
+            ${{ runner.temp }}/sidecar-evidence/*.log
+            ${{ runner.temp }}/ownership-bwrap-evidence.txt
+          if-no-files-found: warn
+          retention-days: 7
