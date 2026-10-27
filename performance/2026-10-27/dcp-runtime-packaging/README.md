@@ -32,7 +32,7 @@ hash, каждый original Git blob, UTF-8 byte count и SHA-256 новых ф�
 python3 -B -I apply.py \
   --source /clean/Proteus-modules \
   --bundle source-bundle.json \
-  --sha256 143f65cb76dabef191f99eb3163bfad9572a3e65f417740d6b91efe86a692bf6 \
+  --sha256 605e302fcf0cd734b0213ae1638aadc75b432e4ea6b2760f23c026e90267831c \
   --output /new/output
 ```
 

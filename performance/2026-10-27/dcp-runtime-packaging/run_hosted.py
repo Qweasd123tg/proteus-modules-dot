@@ -16,7 +16,7 @@ import time
 MODULES = "0d9c5fd18f04e6e3a083351678065c5f72966792"
 HARNESS = "f3d01053dff6113c31afbd885ef1ab1a8d931d53"
 SHIPPING_HARNESS = "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
-BUNDLE_SHA256 = "143f65cb76dabef191f99eb3163bfad9572a3e65f417740d6b91efe86a692bf6"
+BUNDLE_SHA256 = "605e302fcf0cd734b0213ae1638aadc75b432e4ea6b2760f23c026e90267831c"
 HERE = Path(__file__).resolve().parent
 REPORT = {"schema": 1, "status": "running", "commands": [], "claims": {
     "scope": "Linux x64 Node.js packaging only; no portable consumer or full Rust workspace proof.",
