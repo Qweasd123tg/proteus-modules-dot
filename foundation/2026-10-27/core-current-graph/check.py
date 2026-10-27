@@ -212,14 +212,14 @@ def validate_manifest(h, manifest):
                 "total": count, "red": red, "green": count - red}:
             raise h.GateRejected("actual arm counts disagree with exact selections")
     for key in ("production_required_full", "focused_core_required", "focused_protocol_required",
-                "existing_cache_required", "upstream_required", "protocol_required", "module_swap_required"):
+                "existing_cache_required", "upstream_required", "protocol_required", "module_swap_required", "model_process_required"):
         names = manifest[key]
         if not isinstance(names, list) or not names or len(names) != len(set(names)):
             raise h.GateRejected("empty or duplicated mandatory inventory: " + key)
     if (len(manifest["existing_cache_required"]) != 6 or len(manifest["upstream_required"]) < 4 or
             not set(manifest["existing_cache_required"] + manifest["upstream_required"]).issubset(manifest["focused_core_required"]) or
             not set(manifest["existing_cache_required"] + manifest["upstream_required"] +
-                    manifest["protocol_required"] + manifest["module_swap_required"] +
+                    manifest["protocol_required"] + manifest["module_swap_required"] + manifest["model_process_required"] +
                     [manifest["next_model"]["test"]]).issubset(manifest["production_required_full"])):
         raise h.GateRejected("current boundary witnesses missing")
     for key, required in (("core", manifest["focused_core_required"]), ("protocol", manifest["focused_protocol_required"])):
@@ -294,6 +294,7 @@ def canonical_boundary(h, output, manifest, bindings):
         "protocol_integration": h.require_passes(body["protocol_integration"], [name for name in manifest["protocol_required"] if not name.startswith("v3::")]),
         "module_swap": h.require_passes(body["module_swap"], manifest["module_swap_required"], exact_inventory=True),
         "hook_runtime": h.require_passes(body["hook_runtime"], manifest["hook_required"]),
+        "model_process": h.require_passes(body["model_process"], manifest["model_process_required"]),
     }
 
 
@@ -700,6 +701,7 @@ def run_phase(h, manifest, manifest_hash, args):
                 for key, name, source, package in (
                     ("hook_runtime", "hook_runtime", "crates/proteus-core/tests/hook_runtime.rs", "proteus-core"),
                     ("module_swap", "module_swap", "crates/proteus-core/tests/module_swap.rs", "proteus-core"),
+                    ("model_process", "model_process", "crates/proteus-core/tests/model_process.rs", "proteus-core"),
                     ("protocol_integration", manifest["protocol_integration"]["name"], manifest["protocol_integration"]["source"], "proteus-module-protocol"),
                 ):
                     bindings[key] = default_integration(h, output, root, target, name, source, package)
@@ -952,6 +954,7 @@ def aggregate(h, manifest, manifest_hash, args):
                     for key, name, path, package in (
                         ("hook_runtime", "hook_runtime", "crates/proteus-core/tests/hook_runtime.rs", "proteus-core"),
                         ("module_swap", "module_swap", "crates/proteus-core/tests/module_swap.rs", "proteus-core"),
+                        ("model_process", "model_process", "crates/proteus-core/tests/model_process.rs", "proteus-core"),
                         ("protocol_integration", manifest["protocol_integration"]["name"], manifest["protocol_integration"]["source"], "proteus-module-protocol"),
                     ):
                         bindings[key] = default_integration(h, compile_log, source, target, name, path, package)
@@ -1132,13 +1135,14 @@ def self_test(h, recipe, manifest):
             "".join(f"test {name} ... ignored\n" for name in ignored) +
             f"test result: ok. {len(names)} passed; 0 failed; {len(ignored)} ignored; 0 measured; 0 filtered out; finished in 0.00s\n")
     bindings = {key: {"executable": "/target/" + key, "cargo_label": "tests/" + key + ".rs"}
-                for key in ("core", "protocol", "protocol_integration", "module_swap", "hook_runtime")}
+                for key in ("core", "protocol", "protocol_integration", "module_swap", "hook_runtime", "model_process")}
     bodies = {
         "core": synthetic(manifest["canonical_core_required"], [name for name in manifest["allowed_ignored"] if name.startswith("core::")]),
         "protocol": synthetic([name for name in manifest["protocol_required"] if name.startswith("v3::")]),
         "protocol_integration": synthetic([name for name in manifest["protocol_required"] if not name.startswith("v3::")]),
         "module_swap": synthetic(manifest["module_swap_required"]),
         "hook_runtime": synthetic(manifest["hook_required"]),
+        "model_process": synthetic(manifest["model_process_required"]),
     }
     log = "".join("     Running " + bindings[key]["cargo_label"] + " (" + bindings[key]["executable"] + ")\n" + body
                   for key, body in bodies.items())
@@ -1146,6 +1150,8 @@ def self_test(h, recipe, manifest):
     for bad in (log + log, log.replace("/target/hook_runtime", "/foreign"),
                 log.replace(manifest["hook_required"][0] + " ... ok", "foreign ... ok"),
                 log.replace(manifest["module_swap_required"][0] + " ... ok", "foreign ... ok"),
+                log.replace("/target/model_process", "/foreign"),
+                log.replace(manifest["model_process_required"][0] + " ... ok", "foreign ... ok"),
                 log.replace(" ... ok", " ... FAILED", 1)):
         rejected(lambda bad=bad: canonical_boundary(h, bad, manifest, bindings))
     for item in manifest["modules_tests"]["targets"]:
