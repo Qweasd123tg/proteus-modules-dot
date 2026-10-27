@@ -1,0 +1,17 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch.rs b/crates/proteus-core/src/app_server/profile_watch.rs
+--- a/crates/proteus-core/src/app_server/profile_watch.rs
++++ b/crates/proteus-core/src/app_server/profile_watch.rs
+@@ -19,10 +19,9 @@
+     now: Instant,
+     inputs_current: impl FnOnce() -> bool,
+ ) -> bool {
+-    !pending
+-        && last_scan_started
+-            .is_some_and(|last| now.saturating_duration_since(last) < MAX_SEMANTIC_SCAN_AGE)
+-        && inputs_current()
++    // Negative control: preserve the old unlimited metadata-only skip policy.
++    let _ = (last_scan_started, now);
++    !pending && inputs_current()
+ }
+ 
+ #[cfg(test)]

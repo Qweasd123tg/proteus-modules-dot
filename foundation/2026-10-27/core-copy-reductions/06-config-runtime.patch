@@ -1,0 +1,373 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch.rs b/crates/proteus-core/src/app_server/profile_watch.rs
+--- a/crates/proteus-core/src/app_server/profile_watch.rs
++++ b/crates/proteus-core/src/app_server/profile_watch.rs
+@@ -1,109 +1,147 @@
+-//! Metadata polling invalidates semantic reloads without reparsing idle profiles.
++//! Cheap metadata polling with bounded-age semantic revalidation.
+ use super::{AppServerHandle, prepare_assembly};
+ use crate::core::{AppConfig, ConfigInputs};
+ use anyhow::Result;
+-use std::{path::Path, time::Duration};
++use std::{
++    path::{Path, PathBuf},
++    time::{Duration, Instant},
++};
++
++mod polling;
++use polling::Polling;
++
++// Provisional idle-cost/latency tradeoff; this is not a scheduler deadline.
++const MAX_SEMANTIC_SCAN_AGE: Duration = Duration::from_secs(3);
++
++fn metadata_allows_skip(
++    pending: bool,
++    last_scan_started: Option<Instant>,
++    now: Instant,
++    inputs_current: impl FnOnce() -> bool,
++) -> bool {
++    !pending
++        && last_scan_started
++            .is_some_and(|last| now.saturating_duration_since(last) < MAX_SEMANTIC_SCAN_AGE)
++        && inputs_current()
++}
++
+ #[cfg(test)]
+ mod tests;
+ 
+ #[derive(Clone, PartialEq, Eq)]
+ struct Fingerprint {
+     config: Vec<u8>,
+     packages: Vec<u8>,
+ }
+ 
+ impl Fingerprint {
+     fn new(config: &AppConfig, cwd: &Path) -> Result<Self> {
+         Ok(Self {
+             config: serde_json::to_vec(config)?,
+             packages: crate::core::agent_plugins::fingerprint(&config.addons, cwd),
+         })
+     }
+ }
+ 
+ #[derive(Clone, PartialEq, Eq)]
+ enum Input {
+     Valid(Fingerprint),
+     Invalid(String),
+ }
+ 
+ pub(super) async fn start(handle: &AppServerHandle) {
+     let Some(path) = handle.config_path.clone() else {
+         return;
+     };
++    start_with_polling(handle, path, Polling::new()).await;
++}
++
++async fn start_with_polling(handle: &AppServerHandle, path: PathBuf, mut polling: Polling) {
+     let config = handle.config.read().await.clone();
+     let Ok(mut applied) = Fingerprint::new(&config, &handle.cwd) else {
+         return;
+     };
+     let owner = std::sync::Arc::downgrade(&handle.inner);
+     let stop = handle.profile_stop.clone();
+     tokio::spawn(async move {
+-        let mut interval = tokio::time::interval(Duration::from_millis(300));
+-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        let mut last_scan_started = None;
+         let mut seen = None;
+         let mut failed = None;
+         let mut inputs: Option<ConfigInputs> = None;
+         let mut pending = false;
+         let mut addons = config.addons.clone();
+         let mut source_seen = path.exists();
+         loop {
+-            tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
++            let mut poll = tokio::select! {
++                _ = stop.cancelled() => break,
++                poll = polling.next() => match poll {
++                    Some(poll) => poll,
++                    None => break,
++                },
++            };
+             let Some(inner) = owner.upgrade() else { break };
+             let handle = AppServerHandle { inner };
+             if !source_seen && !path.exists() {
+                 continue;
+             };
+             source_seen = true;
+-            if !pending && inputs.as_ref().is_some_and(ConfigInputs::is_current) {
++            if metadata_allows_skip(pending, last_scan_started, poll.now, || {
++                poll.inputs_current(inputs.as_ref())
++            }) {
+                 continue;
+             }
++            // Only actual semantic attempts advance the age, including failures.
++            // A slow attempt does not earn another full interval after finishing.
++            last_scan_started = Some(poll.now);
++            poll.record_scan();
+             let mut observed = ConfigInputs::watching();
+             let input = match AppConfig::load_observed(Some(&path), &mut observed).await {
+                 Ok(config) => {
+                     addons = config.addons.clone();
+                     observed.observe_plugins(&addons, &handle.cwd);
+                     match Fingerprint::new(&config, &handle.cwd) {
+                         Ok(value) => Input::Valid(value),
+                         Err(error) => Input::Invalid(format!("{error:#}")),
+                     }
+                 }
+                 Err(error) => Input::Invalid(format!("{error:#}")),
+             };
+             observed.observe_plugins(&addons, &handle.cwd);
+             inputs = Some(observed);
+             // Editors may temporarily write an incomplete file. A stable failure
+             // is reported once; it never replaces the last validated assembly.
+             if seen.as_ref() != Some(&input) {
+                 seen = Some(input.clone());
+                 pending = true;
+                 continue;
+             }
+             pending = false;
+             let expected = match input {
+                 Input::Invalid(error) => {
+                     handle.set_profile_error(Some(error)).await;
+                     continue;
+                 }
+                 Input::Valid(value) => value,
+             };
+             if expected == applied {
+                 handle.set_profile_error(None).await;
+                 failed = None;
+                 continue;
+             }
+             if failed.as_ref() == Some(&expected) {
+                 continue;
+             };
+             let current = handle.config.read().await.clone();
+             if expected.config == serde_json::to_vec(&current).unwrap_or_default()
+                 && expected.packages == applied.packages
+             {
+                 // A UI save has already published this session; other sessions
+                 // still detect the file and go through normal preparation.
+                 applied = expected;
+                 handle.set_profile_error(None).await;
+                 continue;
+             }
++            poll.record_refresh();
+             let result = tokio::select! {
+                 _ = stop.cancelled() => break,
+                 result = refresh(&handle,&path,&expected) => result,
+diff --git a/crates/proteus-core/src/app_server/profile_watch/polling.rs b/crates/proteus-core/src/app_server/profile_watch/polling.rs
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/profile_watch/polling.rs
+@@ -0,0 +1,111 @@
++//! Production timing and a test-only, allocation-free-on-idle control seam.
++use super::{ConfigInputs, Instant};
++use std::time::Duration;
++
++pub(super) struct Polling {
++    interval: tokio::time::Interval,
++    #[cfg(test)]
++    requests: Option<tokio::sync::mpsc::UnboundedReceiver<Poll>>,
++}
++
++impl Polling {
++    pub(super) fn new() -> Self {
++        let mut interval = tokio::time::interval(Duration::from_millis(300));
++        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        Self {
++            interval,
++            #[cfg(test)]
++            requests: None,
++        }
++    }
++
++    pub(super) async fn next(&mut self) -> Option<Poll> {
++        #[cfg(test)]
++        if let Some(requests) = &mut self.requests {
++            return requests.recv().await;
++        }
++        self.interval.tick().await;
++        Some(Poll {
++            now: Instant::now(),
++            #[cfg(test)]
++            force_current: false,
++            #[cfg(test)]
++            report: PollReport::default(),
++            #[cfg(test)]
++            completed: None,
++        })
++    }
++
++    #[cfg(test)]
++    pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
++        let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
++        let mut polling = Self::new();
++        polling.requests = Some(requests);
++        (polling, sender)
++    }
++}
++
++pub(super) struct Poll {
++    pub(super) now: Instant,
++    #[cfg(test)]
++    force_current: bool,
++    #[cfg(test)]
++    report: PollReport,
++    #[cfg(test)]
++    completed: Option<tokio::sync::oneshot::Sender<PollReport>>,
++}
++
++impl Poll {
++    pub(super) fn inputs_current(&self, inputs: Option<&ConfigInputs>) -> bool {
++        inputs.is_some_and(|inputs| {
++            #[cfg(test)]
++            if self.force_current {
++                return true;
++            }
++            inputs.is_current()
++        })
++    }
++
++    pub(super) fn record_scan(&mut self) {
++        #[cfg(test)]
++        {
++            self.report.scanned = true;
++        }
++    }
++
++    pub(super) fn record_refresh(&mut self) {
++        #[cfg(test)]
++        {
++            self.report.refresh_attempted = true;
++        }
++    }
++
++    #[cfg(test)]
++    pub(super) fn controlled(
++        now: Instant,
++        completed: tokio::sync::oneshot::Sender<PollReport>,
++    ) -> Self {
++        Self {
++            now,
++            force_current: true,
++            report: PollReport::default(),
++            completed: Some(completed),
++        }
++    }
++}
++
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, Default)]
++pub(super) struct PollReport {
++    pub(super) scanned: bool,
++    pub(super) refresh_attempted: bool,
++}
++
++#[cfg(test)]
++impl Drop for Poll {
++    fn drop(&mut self) {
++        if let Some(completed) = self.completed.take() {
++            let _ = completed.send(self.report);
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/config/inputs.rs b/crates/proteus-core/src/core/config/inputs.rs
+--- a/crates/proteus-core/src/core/config/inputs.rs
++++ b/crates/proteus-core/src/core/config/inputs.rs
+@@ -7,70 +7,73 @@
+ };
+ 
+ #[derive(Debug, PartialEq, Eq)]
++#[cfg_attr(test, derive(Clone))]
+ enum Stamp {
+     Unavailable(ErrorKind),
+     Present {
+         len: u64,
+         modified: Option<SystemTime>,
+         directory: bool,
+         #[cfg(unix)]
+         identity: (u64, u64, i64, i64, u32),
+     },
+ }
+ 
+ impl Stamp {
+     fn read(path: &Path) -> Self {
+         match std::fs::metadata(path) {
+             Err(error) => Self::Unavailable(error.kind()),
+             Ok(metadata) => Self::Present {
+                 len: metadata.len(),
+                 modified: metadata.modified().ok(),
+                 directory: metadata.is_dir(),
+                 #[cfg(unix)]
+                 identity: {
+                     use std::os::unix::fs::MetadataExt;
+                     (
+                         metadata.dev(),
+                         metadata.ino(),
+                         metadata.ctime(),
+                         metadata.ctime_nsec(),
+                         metadata.mode(),
+                     )
+                 },
+             },
+         }
+     }
+ }
+ 
+ /// Disabled for ordinary loads; watchers opt in without a second parser.
+ #[derive(Default)]
+ pub(crate) struct ConfigInputs {
+     files: Option<BTreeMap<PathBuf, Stamp>>,
+ }
+ 
+ impl ConfigInputs {
+     pub(crate) fn watching() -> Self {
+         Self {
+             files: Some(BTreeMap::new()),
+         }
+     }
+ 
+     pub(crate) fn observe(&mut self, path: &Path) {
+         if let Some(files) = &mut self.files {
+             // Capture before reading and keep the first observation: a write
+             // during parsing must invalidate the next poll, not be swallowed.
+             if !files.contains_key(path) {
+                 files.insert(path.to_path_buf(), Stamp::read(path));
+             }
+         }
+     }
+ 
+     pub(crate) fn is_current(&self) -> bool {
+-        self.files.as_ref().is_some_and(|files| {
+-            files
+-                .iter()
+-                .all(|(path, stamp)| Stamp::read(path) == *stamp)
+-        })
++        self.is_current_with(Stamp::read)
+     }
+ 
++    fn is_current_with(&self, mut read: impl FnMut(&Path) -> Stamp) -> bool {
++        self.files
++            .as_ref()
++            .is_some_and(|files| files.iter().all(|(path, stamp)| read(path) == *stamp))
++    }
++
+     pub(crate) fn observe_plugins(&mut self, config: &crate::domain::AddonConfig, cwd: &Path) {
+diff --git a/docs/guides/configuration.md b/docs/guides/configuration.md
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -1412,8 +1412,13 @@
+ 
+ App-server автоматически перечитывает профиль через обычный reader: includes,
+ directory overlay, instructions и fixed metadata подключённых Agent Plugins.
+-Semantic polling выполняется каждые 300 ms; для внешней правки нужны два одинаковых
+-чтения и успешная подготовка сборки. Открытые сессии одного профиля подхватывают
++Metadata проверяется каждые 300 ms. Даже при неизменившихся metadata обычный
++reader повторно проверяет семантику после 3 s от начала предыдущего чтения:
++metadata — быстрый сигнал, а не бессрочное подтверждение неизменности файла.
++3 s — предварительный баланс idle-cost и задержки, который требует измерения;
++это не жёсткий deadline планировщика. Для внешней правки нужны два одинаковых
++чтения и успешная подготовка сборки, поэтому к интервалу добавляются следующий
++poll, время чтения и подготовки. Открытые сессии одного профиля подхватывают
+ и ручные правки файла, и сохранение из другой сессии. Изменения относятся ко всему
+ профилю, включая component launch/config, но не заменяют код worker-а на месте.
+ Текущий ход сохраняет snapshot; следующий использует новый epoch. При ошибке

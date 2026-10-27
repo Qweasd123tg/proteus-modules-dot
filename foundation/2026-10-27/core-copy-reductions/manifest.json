@@ -19,10 +19,14 @@
     "foundation/2026-10-27/core-copy-reductions/04-frame-tests.patch",
     "foundation/2026-10-27/core-copy-reductions/recovery-owned-delete-control.patch",
     "foundation/2026-10-27/core-copy-reductions/05-ownership-production.patch",
-    "foundation/2026-10-27/core-copy-reductions/05-ownership-tests.patch"
+    "foundation/2026-10-27/core-copy-reductions/05-ownership-tests.patch",
+    "foundation/2026-10-27/core-copy-reductions/06-config-runtime.patch",
+    "foundation/2026-10-27/core-copy-reductions/06-config-fixture.patch",
+    "foundation/2026-10-27/core-copy-reductions/06-config-tests.patch",
+    "foundation/2026-10-27/core-copy-reductions/06-config-legacy-control.patch"
   ],
   "baseline_tree": "7dec0c811a514adf32a70907635939547e0a57cf",
-  "controller_sha256": "92b58b439ea94d1ca39f5707ecd622333a1669750210aed89b59d74df863e88f",
+  "controller_sha256": "8312a3b2b17d6a6b9d999fd2f4bbaa09e6852887af64fcf5b5ee669fc99d790a",
   "support": {
     "repository": "Qweasd123tg/proteus-modules-dot",
     "commit": "72aeaa37b1f81baf105a0ec09f337237dc0b2a7f",
@@ -149,14 +153,38 @@
       "bytes": 4851,
       "sha256": "3f881f9b63952a36179bf0fee9436d66a785842da713b7b14c0b335b45c7807b",
       "git_blob": "3d11bac75f93d96ffd521774800b8528c9cceec6"
+    },
+    {
+      "path": "foundation/2026-10-27/core-copy-reductions/06-config-runtime.patch",
+      "bytes": 13936,
+      "sha256": "a3be46e46ac320e28272d213f2804186d70fea45bb365e199fcd8e32e2122a13",
+      "git_blob": "5a9d06cd295b457af94c7ad79290e42cf5e58684"
+    },
+    {
+      "path": "foundation/2026-10-27/core-copy-reductions/06-config-fixture.patch",
+      "bytes": 2751,
+      "sha256": "dae67ea6f4dfce0bb91b22a8d5e9c49893e9465301c9bd4b3c08bfc67660f00a",
+      "git_blob": "bc31b2de0738cc8b17cf8254b915e101f044df49"
+    },
+    {
+      "path": "foundation/2026-10-27/core-copy-reductions/06-config-tests.patch",
+      "bytes": 13933,
+      "sha256": "58a8e396f7d872c332a934cd11b042dda267ef12d65a7580101d6e3c0b58500c",
+      "git_blob": "ba3ab2483ab566d59a2d631ad7b1218c5913e4a4"
+    },
+    {
+      "path": "foundation/2026-10-27/core-copy-reductions/06-config-legacy-control.patch",
+      "bytes": 669,
+      "sha256": "346fba4e0bd6fcb6fdecbf9c49f2a519c08023eb4674eeda3fceb42033046c15",
+      "git_blob": "76a10e65383adbd7373c3a6df776db38ab497c5a"
     }
   ],
   "documents": [
     {
       "path": "foundation/2026-10-27/core-copy-reductions/README.md",
-      "bytes": 11914,
-      "sha256": "728ac0c7c9991b2da868a048a59856bf34439f8b63ab60d6a6f54c409ddc6da1",
-      "git_blob": "c4d9afc33f9b516bd14de731ea62ee0c010cba8c"
+      "bytes": 13427,
+      "sha256": "dc5b5eb10478c7a4b942b6e5b6dd7a5b6f980eeb2388b3756f750f534d5be853",
+      "git_blob": "4ab6679cf65227c4379583fccef4c627ea7b893f"
     }
   ],
   "preimages": {
@@ -173,7 +201,15 @@
     "crates/proteus-core/src/core/session_store/read_model.rs": "1e237947c8c7274ca06e9b30779fbe4ad32b3d34",
     "crates/proteus-core/src/core/session_store/deletion.rs": "648f2f4ea225cd409675be4883a28195a7fe8e65",
     "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
-    "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa"
+    "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa",
+    "crates/proteus-core/src/app_server/profile_watch.rs": "68aa66cc830dd5fbf7cca043ea66379dada48489",
+    "crates/proteus-core/src/app_server/profile_watch/polling.rs": null,
+    "crates/proteus-core/src/app_server/profile_watch/tests.rs": "5d3e583f3c1ebe4629520413ee75b8b1cd592c19",
+    "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": null,
+    "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": null,
+    "crates/proteus-core/src/core/config/inputs.rs": "58dc63738654e81268bd0551caf906c9612df4bd",
+    "crates/proteus-core/src/core/config/inputs/tests.rs": "f07550c784b80f43ac02f54fa0cf1ff3c680597c",
+    "docs/guides/configuration.md": "9ae6a6662c97ce20798ffb5180c46b1fb1e8a83b"
   },
   "plans": {
     "history-production": {
@@ -633,17 +669,162 @@
         "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
       }
     },
-    "production": {
-      "tree": "00ae23c47a5c59d11d1a9494485169e17b637f66",
+    "config-runtime": {
+      "tree": "d48d9800824109b7a4ecb1ef18c6cd4183f34391",
       "changed_blobs": {
         "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
         "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
         "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
         "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
         "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
+        "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/session_journal/mod.rs": "527beb7715cd53be797b4cc01faaf35c8c4b5142",
+        "crates/proteus-core/src/core/session_journal/storage.rs": "2bf89ea637c919ab80c660ec6d1940760fb5f74a",
+        "crates/proteus-core/src/core/session_journal/storage/initialize.rs": "2d051f2fcc58cdbf27839e75a276d33d585e4472",
+        "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa",
+        "crates/proteus-core/src/core/session_store.rs": "049640d81eba5fd687a98cc7182f456a213c9975",
+        "crates/proteus-core/src/core/session_store/deletion.rs": "648f2f4ea225cd409675be4883a28195a7fe8e65",
+        "crates/proteus-core/src/core/session_store/identity.rs": "cef4f2854e75c83cd5f809ec32a8cf8dd718d69b",
+        "crates/proteus-core/src/core/session_store/lifecycle_tests.rs": "1a9f65bafec7032a3a10b29d19c9d61bd0cb2a89",
+        "crates/proteus-core/src/core/session_store/writer.rs": "65301fdf352ca2adafa8ec08ca4153d4aca78361",
+        "crates/proteus-core/tests/session_ownership_slice.rs": "f9b12a1ffbb8872a32da8d5578337a456094fd58",
+        "crates/proteus-module-protocol/src/v3/broker.rs": "5c2ec1c71e8e85eeb781dc569e0b40f9c7e3ab87",
+        "crates/proteus-module-protocol/src/v3/failure.rs": "98790ffb7159010f35ef6035e97d4b64b59f89e8",
+        "crates/proteus-module-protocol/src/v3/runtime.rs": "e9854011e6370c9047b63d3585eadc720e2416c4",
+        "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
+        "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+        "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
+        "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
+      }
+    },
+    "config-production": {
+      "tree": "ace9006e0effe574e76f54b9ee6459078824663d",
+      "changed_blobs": {
+        "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
+        "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
+        "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
+        "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
+        "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
+        "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
+        "crates/proteus-core/src/core/session_journal/mod.rs": "527beb7715cd53be797b4cc01faaf35c8c4b5142",
+        "crates/proteus-core/src/core/session_journal/storage.rs": "2bf89ea637c919ab80c660ec6d1940760fb5f74a",
+        "crates/proteus-core/src/core/session_journal/storage/initialize.rs": "2d051f2fcc58cdbf27839e75a276d33d585e4472",
+        "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa",
+        "crates/proteus-core/src/core/session_store.rs": "049640d81eba5fd687a98cc7182f456a213c9975",
+        "crates/proteus-core/src/core/session_store/deletion.rs": "648f2f4ea225cd409675be4883a28195a7fe8e65",
+        "crates/proteus-core/src/core/session_store/identity.rs": "cef4f2854e75c83cd5f809ec32a8cf8dd718d69b",
+        "crates/proteus-core/src/core/session_store/lifecycle_tests.rs": "1a9f65bafec7032a3a10b29d19c9d61bd0cb2a89",
+        "crates/proteus-core/src/core/session_store/writer.rs": "65301fdf352ca2adafa8ec08ca4153d4aca78361",
+        "crates/proteus-core/tests/session_ownership_slice.rs": "f9b12a1ffbb8872a32da8d5578337a456094fd58",
+        "crates/proteus-module-protocol/src/v3/broker.rs": "5c2ec1c71e8e85eeb781dc569e0b40f9c7e3ab87",
+        "crates/proteus-module-protocol/src/v3/failure.rs": "98790ffb7159010f35ef6035e97d4b64b59f89e8",
+        "crates/proteus-module-protocol/src/v3/runtime.rs": "e9854011e6370c9047b63d3585eadc720e2416c4",
+        "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
+        "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+        "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
+        "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
+      }
+    },
+    "config-candidate-tests": {
+      "tree": "51316af28a7f2832017d4c742dee0da5075f620a",
+      "changed_blobs": {
+        "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
+        "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
+        "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
+        "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
+        "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs": "016f0c084d47c385f032efc0f42bce4618a37553",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": "59b7e61532e0e4ae52ca489a606b83a45595f69d",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": "56f1109667558fa83e788f049a98b7915d459cb2",
+        "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
+        "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
+        "crates/proteus-core/src/core/session_journal/mod.rs": "527beb7715cd53be797b4cc01faaf35c8c4b5142",
+        "crates/proteus-core/src/core/session_journal/storage.rs": "2bf89ea637c919ab80c660ec6d1940760fb5f74a",
+        "crates/proteus-core/src/core/session_journal/storage/initialize.rs": "2d051f2fcc58cdbf27839e75a276d33d585e4472",
+        "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa",
+        "crates/proteus-core/src/core/session_store.rs": "049640d81eba5fd687a98cc7182f456a213c9975",
+        "crates/proteus-core/src/core/session_store/deletion.rs": "648f2f4ea225cd409675be4883a28195a7fe8e65",
+        "crates/proteus-core/src/core/session_store/identity.rs": "cef4f2854e75c83cd5f809ec32a8cf8dd718d69b",
+        "crates/proteus-core/src/core/session_store/lifecycle_tests.rs": "1a9f65bafec7032a3a10b29d19c9d61bd0cb2a89",
+        "crates/proteus-core/src/core/session_store/writer.rs": "65301fdf352ca2adafa8ec08ca4153d4aca78361",
+        "crates/proteus-core/tests/session_ownership_slice.rs": "f9b12a1ffbb8872a32da8d5578337a456094fd58",
+        "crates/proteus-module-protocol/src/v3/broker.rs": "5c2ec1c71e8e85eeb781dc569e0b40f9c7e3ab87",
+        "crates/proteus-module-protocol/src/v3/failure.rs": "98790ffb7159010f35ef6035e97d4b64b59f89e8",
+        "crates/proteus-module-protocol/src/v3/runtime.rs": "e9854011e6370c9047b63d3585eadc720e2416c4",
+        "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
+        "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+        "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
+        "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
+      }
+    },
+    "config-legacy-tests": {
+      "tree": "24158e654f9e6779900e1d4e6f4bf09c86d228ac",
+      "changed_blobs": {
+        "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
+        "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
+        "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
+        "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
+        "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "ad39325352213341012775b5fecdb831ed66d487",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs": "016f0c084d47c385f032efc0f42bce4618a37553",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": "59b7e61532e0e4ae52ca489a606b83a45595f69d",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": "56f1109667558fa83e788f049a98b7915d459cb2",
+        "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
+        "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
+        "crates/proteus-core/src/core/session_journal/mod.rs": "527beb7715cd53be797b4cc01faaf35c8c4b5142",
+        "crates/proteus-core/src/core/session_journal/storage.rs": "2bf89ea637c919ab80c660ec6d1940760fb5f74a",
+        "crates/proteus-core/src/core/session_journal/storage/initialize.rs": "2d051f2fcc58cdbf27839e75a276d33d585e4472",
+        "crates/proteus-core/src/core/session_journal/storage/ownership.rs": "ac8010edef9826beac0a8ea64b95dd8594ab37aa",
+        "crates/proteus-core/src/core/session_store.rs": "049640d81eba5fd687a98cc7182f456a213c9975",
+        "crates/proteus-core/src/core/session_store/deletion.rs": "648f2f4ea225cd409675be4883a28195a7fe8e65",
+        "crates/proteus-core/src/core/session_store/identity.rs": "cef4f2854e75c83cd5f809ec32a8cf8dd718d69b",
+        "crates/proteus-core/src/core/session_store/lifecycle_tests.rs": "1a9f65bafec7032a3a10b29d19c9d61bd0cb2a89",
+        "crates/proteus-core/src/core/session_store/writer.rs": "65301fdf352ca2adafa8ec08ca4153d4aca78361",
+        "crates/proteus-core/tests/session_ownership_slice.rs": "f9b12a1ffbb8872a32da8d5578337a456094fd58",
+        "crates/proteus-module-protocol/src/v3/broker.rs": "5c2ec1c71e8e85eeb781dc569e0b40f9c7e3ab87",
+        "crates/proteus-module-protocol/src/v3/failure.rs": "98790ffb7159010f35ef6035e97d4b64b59f89e8",
+        "crates/proteus-module-protocol/src/v3/runtime.rs": "e9854011e6370c9047b63d3585eadc720e2416c4",
+        "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
+        "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
+        "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
+        "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
+      }
+    },
+    "production": {
+      "tree": "fc0ba40cccf23c5d12a349a1a34ec6470c2eddb4",
+      "changed_blobs": {
+        "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
+        "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
+        "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
+        "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
+        "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
         "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
         "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
         "crates/proteus-core/src/core/bound_model/progress.rs": "6937a3e0c5987e122524981b3556e4d3fff26139",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
         "crates/proteus-core/src/core/execution_hooks.rs": "64da6c4b2814e05958cee35aad69c34be2c76ea4",
         "crates/proteus-core/src/core/runtime/checkpoint.rs": "714e28ec0272b412fad2b98337d5b188ebdb9561",
         "crates/proteus-core/src/core/session_journal/mod.rs": "527beb7715cd53be797b4cc01faaf35c8c4b5142",
@@ -663,20 +844,28 @@
         "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
         "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
         "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
         "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
       }
     },
     "baseline": {
-      "tree": "5e022a2c1deb94cffa911a259173f010ffa2f6a1",
+      "tree": "a1a128f5f42c5b87c14e064e2c097cad00095ca8",
       "changed_blobs": {
         "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
         "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
         "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
         "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
         "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "ad39325352213341012775b5fecdb831ed66d487",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs": "016f0c084d47c385f032efc0f42bce4618a37553",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": "59b7e61532e0e4ae52ca489a606b83a45595f69d",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": "56f1109667558fa83e788f049a98b7915d459cb2",
         "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
         "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
         "crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs": "53792452ae5666d994b7764b6a2c7645d6f0e238",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
         "crates/proteus-core/src/core/execution_hooks_tests.rs": "dd562d5b3529c7fbef4e213cd6942187010806c5",
         "crates/proteus-core/src/core/runtime/checkpoint.rs": "0bb40607ccbf22ca18831308a16a743e0812ae16",
         "crates/proteus-core/src/core/runtime/checkpoint/tests.rs": "4a4f1366f4b52b4d0fb91eed0006ae9c5a9d701d",
@@ -700,21 +889,29 @@
         "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
         "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
         "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
         "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
       }
     },
     "candidate-tests": {
-      "tree": "ffc107268b4ed2f8685f02d318f92f25e1ab9a21",
+      "tree": "ac3e653f0fa02b48815542a94ac5d8394b2fe509",
       "changed_blobs": {
         "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
         "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
         "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
         "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
         "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs": "016f0c084d47c385f032efc0f42bce4618a37553",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": "59b7e61532e0e4ae52ca489a606b83a45595f69d",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": "56f1109667558fa83e788f049a98b7915d459cb2",
         "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
         "crates/proteus-core/src/app_server/read_model/tests.rs": "abdc2959163c17bb04539d3c3afe87a5debfc328",
         "crates/proteus-core/src/core/bound_model/progress.rs": "6937a3e0c5987e122524981b3556e4d3fff26139",
         "crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs": "53792452ae5666d994b7764b6a2c7645d6f0e238",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
         "crates/proteus-core/src/core/execution_hooks.rs": "64da6c4b2814e05958cee35aad69c34be2c76ea4",
         "crates/proteus-core/src/core/execution_hooks_tests.rs": "dd562d5b3529c7fbef4e213cd6942187010806c5",
         "crates/proteus-core/src/core/runtime/checkpoint.rs": "b57c0e6a454e37a0a5eb233ccf4d13ea90d2fdd2",
@@ -739,21 +936,29 @@
         "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
         "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
         "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
         "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
       }
     },
     "focused": {
-      "tree": "8c2ba00fa800d2c987c7dffbb2d0486eb8f1baa9",
+      "tree": "71b3ae5effb9df6faaeb4846c3a4733b3e8ddd44",
       "changed_blobs": {
         "crates/proteus-core/src/app_server.rs": "2f90d9d7f010d5bc77d1151498a38fd3fe2d5668",
         "crates/proteus-core/src/app_server/http/lifecycle.rs": "36876f48d0ca2c01d703961ac078203639a169f1",
         "crates/proteus-core/src/app_server/http/sessions.rs": "a3e73fa03a8813735d2629f3d3a8583730d71db4",
         "crates/proteus-core/src/app_server/http/tests/session_reads.rs": "ffc6a1c98f8c79c249e1ec74fa9c607add76fb75",
         "crates/proteus-core/src/app_server/ownership_tests.rs": "4523cde90aa1884abaeedb8d6e2dd205b005adc3",
+        "crates/proteus-core/src/app_server/profile_watch.rs": "0da01ebfe8a2d23bb931098161509d9391c1b290",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs": "49858c727372b6d0dda1efbd649d924add55a259",
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs": "016f0c084d47c385f032efc0f42bce4618a37553",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs": "59b7e61532e0e4ae52ca489a606b83a45595f69d",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs": "56f1109667558fa83e788f049a98b7915d459cb2",
         "crates/proteus-core/src/app_server/read_model.rs": "b4474a0f33c33dcd575b9fc42846b68a77a59039",
         "crates/proteus-core/src/app_server/read_model/tests.rs": "006bb1f4f2df611cef92679b3e8581fc8e48fa0d",
         "crates/proteus-core/src/core/bound_model/progress.rs": "6937a3e0c5987e122524981b3556e4d3fff26139",
         "crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs": "53792452ae5666d994b7764b6a2c7645d6f0e238",
+        "crates/proteus-core/src/core/config/inputs.rs": "78a2fc480c67602af331c86b4eb8a9718898fc2d",
+        "crates/proteus-core/src/core/config/inputs/tests.rs": "0e2c53345db8b6832f6e09eb6424a16f54f0fde7",
         "crates/proteus-core/src/core/execution_hooks.rs": "64da6c4b2814e05958cee35aad69c34be2c76ea4",
         "crates/proteus-core/src/core/execution_hooks_tests.rs": "dd562d5b3529c7fbef4e213cd6942187010806c5",
         "crates/proteus-core/src/core/runtime/checkpoint.rs": "b57c0e6a454e37a0a5eb233ccf4d13ea90d2fdd2",
@@ -779,6 +984,7 @@
         "crates/proteus-module-protocol/src/v3/runtime_tests.rs": "043c2e76ec480f0460c1f4ded3117cf4de47daaa",
         "crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py": "69b05dc70b95a6878631a5ee490cdde045a65441",
         "docs/architecture/process-module-architecture.md": "b79aa1f435fa01f3f318c1bf8278bb5cd6a63457",
+        "docs/guides/configuration.md": "10337d82cb791709cbb266a405e25e2c3187da56",
         "docs/guides/runtime-and-events.md": "470c08d97bf34ba24e8477b362b70d83672f265f"
       }
     }
@@ -873,11 +1079,47 @@
     {
       "library": "core",
       "name": "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::gate::metadata_gate_bounds_scan_age_without_poll_reads_or_deadline_sliding"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_instruction_edit_reloads_after_bounded_age",
+      "baseline_red": {
+        "kind": "message",
+        "marker": "assertion `left == right` failed: persistent_same_stamp_edit_must_reload\n  left: Some(\"first\")\n right: Some(\"other\")"
+      }
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_directory_member_is_discovered"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_read_failure_preserves_last_good_and_recovers"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::bounded_revalidation_preserves_failed_fingerprint_suppression"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::controlled_watcher_cancels_pending_and_releases_owner"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::closed_poll_driver_does_not_keep_a_handle_alive"
+    },
+    {
+      "library": "core",
+      "name": "app_server::profile_watch::tests::bounded_age::unchanged_semantic_revalidation_advances_age_without_rebuilding"
     }
   ],
-  "baseline_red_count": 4,
+  "baseline_red_count": 5,
   "baseline_equivalence_count": 14,
-  "new_unique_test_count": 17,
+  "new_unique_test_count": 25,
   "expanded_existing_test_count": 1,
   "production_required_full": [
     "foreign_live_writer_blocks_deletion",
@@ -951,7 +1193,11 @@
     "tool_selection::dynamic_selection_is_replaceable_and_ordered_hooks_only_narrow",
     "workflow_checkpoint::rust_and_python_workflows_share_the_checkpoint_contract",
     "workflow_checkpoint::preparation_checkpoint_rejects_stale_revision_and_unbound_tool_does_not_advance_it",
-    "workflow_checkpoint::lost_preparation_acknowledgement_cannot_roll_back_committed_history"
+    "workflow_checkpoint::lost_preparation_acknowledgement_cannot_roll_back_committed_history",
+    "core::config::inputs::tests::watches_directory_members_external_includes_and_instruction_files",
+    "app_server::profile_watch::tests::file_and_ui_updates_reach_other_open_sessions_and_bad_source_preserves_the_epoch",
+    "app_server::profile_watch::tests::instruction_file_edits_reload_without_touching_the_profile",
+    "app_server::profile_watch::tests::watcher_does_not_keep_a_dropped_handle_alive"
   ],
   "focused_core_required": [
     "core::session_journal::storage::ownership::tests::tentative_panic_releases_only_new_lease",
@@ -986,7 +1232,19 @@
     "core::execution_hooks::tests::actionable_failure_records_no_output_and_stops_later_handlers",
     "app_server::read_model::tests::history_recovery_overlaps_owned_deletion_without_mutation_or_recreation",
     "core::session_journal::storage::ownership::tests::owner_drop_releases_lease_while_duplicate_descriptor_remains_open",
-    "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner"
+    "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner",
+    "app_server::profile_watch::tests::gate::metadata_gate_bounds_scan_age_without_poll_reads_or_deadline_sliding",
+    "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_instruction_edit_reloads_after_bounded_age",
+    "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_directory_member_is_discovered",
+    "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_read_failure_preserves_last_good_and_recovers",
+    "app_server::profile_watch::tests::bounded_age::bounded_revalidation_preserves_failed_fingerprint_suppression",
+    "app_server::profile_watch::tests::bounded_age::controlled_watcher_cancels_pending_and_releases_owner",
+    "app_server::profile_watch::tests::bounded_age::closed_poll_driver_does_not_keep_a_handle_alive",
+    "app_server::profile_watch::tests::bounded_age::unchanged_semantic_revalidation_advances_age_without_rebuilding",
+    "core::config::inputs::tests::watches_directory_members_external_includes_and_instruction_files",
+    "app_server::profile_watch::tests::file_and_ui_updates_reach_other_open_sessions_and_bad_source_preserves_the_epoch",
+    "app_server::profile_watch::tests::instruction_file_edits_reload_without_touching_the_profile",
+    "app_server::profile_watch::tests::watcher_does_not_keep_a_dropped_handle_alive"
   ],
   "overlap": {
     "path": "foundation/2026-10-27/core-copy-reductions/recovery-owned-delete-control.patch",
@@ -1014,7 +1272,8 @@
     "suffix": "971605d7049a41a913a5386e1771a732554043b8f021fe02ce985452c344e830",
     "hook": "3c54a47c9e2c9546f270973cb8b5a4ec05878a371806c1461db42264394a1777",
     "frame": "6dbba58fef9ddc31a96c60c755280f90c6c003517ba67111b1d6d360a932effc",
-    "ownership": "350e495b7e1a73e3d02dde60addf8f3cd3023340973643e9864965e9d300744e"
+    "ownership": "350e495b7e1a73e3d02dde60addf8f3cd3023340973643e9864965e9d300744e",
+    "configuration": "0b1ec0094e7fd7c8525d307d022ca4c7827cdd8847397ce0c3977eed03f6aaf3"
   },
   "validation": {
     "source_hashes": "PASS_IN_MEMORY",
@@ -1033,7 +1292,7 @@
     "publication": "NOT_PUBLISHED",
     "preparation_note": "All source identities and exact hunk replay are source-manipulation checks only. The predecessor run remains failed; every successor runtime gate is NOT_RUN."
   },
-  "scope": "Four default-Core copy reductions plus a separately identified ownership-release correctness prerequisite. No descriptor/schema/queue behavior/dependency/public API changes. Retained fixture-only DCP is not DCP development.",
+  "scope": "Four default-Core copy reductions, separately identified ownership-release and bounded-age configuration-revalidation correctness prerequisites, and an explicitly amended canonical metadata test fixture. No dependency/public API changes or DCP development.",
   "failed_predecessor": {
     "run_id": 40476346049,
     "run_attempt": 1,
@@ -1053,7 +1312,6 @@
     "fork_preservation_control": "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner",
     "mechanism_tests_platform": "Linux",
     "future_benchmark_requirement": "Apply this qualified ownership prerequisite identically to baseline and candidate benchmark arms.",
-    "source_artifact": "ownership-explicit-unlock-candidate-v6.json",
     "qualification": "Separate ownership correctness control within the combined gate, not a copy-performance A/B. Baseline: 14 greens plus four intended reds. Candidate: all 18 controls green. The historical holder remains unknown."
   },
   "failed_predecessors": [
@@ -1078,6 +1336,18 @@
       "error": "production protocol evidence mismatch",
       "cause": "Python tuple summary rows differ from their serialized JSON list rows.",
       "no_retroactive_reclassification": true
+    },
+    {
+      "run_id": 40483121449,
+      "run_attempt": 1,
+      "head": "7633a90dc9694d75767c1b77d68815f9c10132dc",
+      "status": "FAILED",
+      "test": "core::config::inputs::tests::watches_directory_members_external_includes_and_instruction_files",
+      "source": "crates/proteus-core/src/core/config/inputs/tests.rs:32:5",
+      "assertion": "assertion failed: !inputs.is_current()",
+      "focused": "NOT_RUN",
+      "historical_metadata": "Not recorded; exact collision not proven.",
+      "no_retroactive_reclassification": true
     }
   ],
   "aggregation_correction": {
@@ -1092,5 +1362,108 @@
     "self_controls": "One genuine tuple-to-JSON roundtrip positive and eight evidence-mutation negatives, including bool-for-count.",
     "source_plans": "All 19 source trees and changed-blob maps unchanged.",
     "fresh_run_required": true
+  },
+  "phase_cases": {
+    "baseline": [
+      "core::runtime::checkpoint::tests::root_results_preserve_bound_unbound_order_duplicate_and_revision_behavior",
+      "core::runtime::checkpoint::tests::recorder_error_and_foreign_attribution_do_not_mutate_root_history",
+      "core::runtime::checkpoint::tests::lost_capture_suffix_errors_before_retiring_effect_or_advancing_revision",
+      "core::runtime::checkpoint::tests::storeless_non_reflexive_history_keeps_existing_equality_revision_semantics",
+      "core::runtime::checkpoint::tests::persisted_result_avoids_full_history_allocation_with_legacy_negative_control",
+      "core::bound_model::tests::failure_progress::terminal_suffix::valid_terminal_suffix_preserves_ids_without_extra_completions",
+      "core::bound_model::tests::failure_progress::terminal_suffix::empty_terminal_suffix_still_validates_response_envelope",
+      "core::execution_hooks::tests::completed_hook_trace_returns_the_recorded_output_allocation",
+      "core::execution_hooks::tests::completed_hook_trace_recorder_failure_does_not_return_output",
+      "core::execution_hooks::tests::empty_selection_chain_still_records_complete_boundary",
+      "core::execution_hooks::tests::notification_failure_records_later_handler_and_completed_output",
+      "core::execution_hooks::tests::actionable_failure_records_no_output_and_stops_later_handlers",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_envelope_shapes",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_ids_methods_and_payload_values",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_error_bodies_and_error_precedence",
+      "v3::frame::owned_tests::owned_parser_moves_nonempty_strings_instead_of_deep_cloning_payloads",
+      "core::session_journal::storage::ownership::tests::owner_drop_releases_lease_while_duplicate_descriptor_remains_open",
+      "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner",
+      "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_instruction_edit_reloads_after_bounded_age"
+    ],
+    "focused": [
+      "core::runtime::checkpoint::tests::root_results_preserve_bound_unbound_order_duplicate_and_revision_behavior",
+      "core::runtime::checkpoint::tests::recorder_error_and_foreign_attribution_do_not_mutate_root_history",
+      "core::runtime::checkpoint::tests::lost_capture_suffix_errors_before_retiring_effect_or_advancing_revision",
+      "core::runtime::checkpoint::tests::storeless_non_reflexive_history_keeps_existing_equality_revision_semantics",
+      "core::runtime::checkpoint::tests::persisted_result_avoids_full_history_allocation_with_legacy_negative_control",
+      "core::bound_model::tests::failure_progress::terminal_suffix::valid_terminal_suffix_preserves_ids_without_extra_completions",
+      "core::bound_model::tests::failure_progress::terminal_suffix::empty_terminal_suffix_still_validates_response_envelope",
+      "core::execution_hooks::tests::completed_hook_trace_returns_the_recorded_output_allocation",
+      "core::execution_hooks::tests::completed_hook_trace_recorder_failure_does_not_return_output",
+      "core::execution_hooks::tests::empty_selection_chain_still_records_complete_boundary",
+      "core::execution_hooks::tests::notification_failure_records_later_handler_and_completed_output",
+      "core::execution_hooks::tests::actionable_failure_records_no_output_and_stops_later_handlers",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_envelope_shapes",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_ids_methods_and_payload_values",
+      "v3::frame::owned_tests::owned_parser_matches_borrowed_reference_for_error_bodies_and_error_precedence",
+      "v3::frame::owned_tests::owned_parser_moves_nonempty_strings_instead_of_deep_cloning_payloads",
+      "core::session_journal::storage::ownership::tests::owner_drop_releases_lease_while_duplicate_descriptor_remains_open",
+      "core::session_journal::storage::ownership::tests::fork_child_drop_does_not_unlock_the_live_parent_owner",
+      "app_server::profile_watch::tests::gate::metadata_gate_bounds_scan_age_without_poll_reads_or_deadline_sliding",
+      "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_instruction_edit_reloads_after_bounded_age",
+      "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_directory_member_is_discovered",
+      "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_read_failure_preserves_last_good_and_recovers",
+      "app_server::profile_watch::tests::bounded_age::bounded_revalidation_preserves_failed_fingerprint_suppression",
+      "app_server::profile_watch::tests::bounded_age::controlled_watcher_cancels_pending_and_releases_owner",
+      "app_server::profile_watch::tests::bounded_age::closed_poll_driver_does_not_keep_a_handle_alive",
+      "app_server::profile_watch::tests::bounded_age::unchanged_semantic_revalidation_advances_age_without_rebuilding"
+    ]
+  },
+  "candidate_only_case_count": 7,
+  "configuration_prerequisite": {
+    "runtime_patch": "foundation/2026-10-27/core-copy-reductions/06-config-runtime.patch",
+    "fixture_patch": "foundation/2026-10-27/core-copy-reductions/06-config-fixture.patch",
+    "test_patch": "foundation/2026-10-27/core-copy-reductions/06-config-tests.patch",
+    "legacy_patch": "foundation/2026-10-27/core-copy-reductions/06-config-legacy-control.patch",
+    "file_roles": {
+      "runtime": [
+        "crates/proteus-core/src/app_server/profile_watch.rs",
+        "crates/proteus-core/src/app_server/profile_watch/polling.rs",
+        "crates/proteus-core/src/core/config/inputs.rs",
+        "docs/guides/configuration.md"
+      ],
+      "fixture": [
+        "crates/proteus-core/src/core/config/inputs/tests.rs"
+      ],
+      "tests": [
+        "crates/proteus-core/src/app_server/profile_watch/tests.rs",
+        "crates/proteus-core/src/app_server/profile_watch/tests/gate.rs",
+        "crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs"
+      ]
+    },
+    "source_artifact_sha256": "0b1ec0094e7fd7c8525d307d022ca4c7827cdd8847397ce0c3977eed03f6aaf3",
+    "baseline_semantics": "Shared reviewed runtime refactor, test support and canonical fixture, with only the age predicate reverted to the reviewed legacy unlimited metadata-only gate. Original five runtime fixes remain absent. Not the untouched 7dec binary.",
+    "shipping_semantics": "Full reviewed cfg(test) support remains in source but Rust excludes requests/reports/oneshot/manual driver fields from shipping compilation.",
+    "canonical_semantics": "Original watcher test registrations retained; Polling::new uses requests=None and force_current=false. No authored counting allocator or controlled-driver activation. Low-level metadata fixture is explicitly amended.",
+    "negative_control": {
+      "name": "app_server::profile_watch::tests::bounded_age::persistent_same_stamp_instruction_edit_reloads_after_bounded_age",
+      "marker": "assertion `left == right` failed: persistent_same_stamp_edit_must_reload\n  left: Some(\"first\")\n right: Some(\"other\")",
+      "mechanism": "Per-instance manual monotonic polls and stale-positive metadata hints; final first-versus-other assertion after acknowledgments, not a timeout or actual filesystem timestamp-collision reproduction."
+    },
+    "metadata_fixture_case": "core::config::inputs::tests::watches_directory_members_external_includes_and_instruction_files",
+    "max_scan_age_seconds": 3,
+    "scan_age_status": "PROVISIONAL_UNMEASURED_NOT_A_SCHEDULER_DEADLINE",
+    "excluded": [
+      "plugin canonical-root fingerprint repair",
+      "recursive skill/body watching",
+      "native events",
+      "whole-file hashing",
+      "global shared watcher service",
+      "assembly retry/backoff changes",
+      "reload-tools scope repair",
+      "DCP work"
+    ],
+    "future_benchmark_requirement": "Apply both qualified ownership and configuration prerequisites identically to baseline and candidate performance arms.",
+    "existing_required_cases": [
+      "core::config::inputs::tests::watches_directory_members_external_includes_and_instruction_files",
+      "app_server::profile_watch::tests::file_and_ui_updates_reach_other_open_sessions_and_bad_source_preserves_the_epoch",
+      "app_server::profile_watch::tests::instruction_file_edits_reload_without_touching_the_profile",
+      "app_server::profile_watch::tests::watcher_does_not_keep_a_dropped_handle_alive"
+    ]
   }
 }

@@ -153,18 +153,46 @@ def plan_all(h, root, flat, qualified, patches, overlap, manifest):
         save(item["id"] + "-baseline-tests", tested)
         h.apply_exact(tested, patches[item["production_patch"]], [])
         save(item["id"] + "-candidate-tests", tested)
-    production, tested = dict(files), dict(files)
+    config = manifest["configuration_prerequisite"]
+    runtime = dict(files)
+    h.apply_exact(runtime, patches[config["runtime_patch"]], [])
+    save("config-runtime", runtime)
+    shared = dict(runtime)
+    h.apply_exact(shared, patches[config["fixture_patch"]], [])
+    save("config-production", shared)
+    supported = dict(shared)
+    h.apply_exact(supported, patches[config["test_patch"]], [])
+    save("config-candidate-tests", supported)
+    legacy = dict(supported)
+    h.apply_exact(legacy, patches[config["legacy_patch"]], [])
+    save("config-legacy-tests", legacy)
+    production, baseline, candidate = dict(shared), dict(legacy), dict(supported)
     for item in manifest["slices"]:
         h.apply_exact(production, patches[item["production_patch"]], [])
-        h.apply_exact(tested, patches[item["test_patch"]], [])
+        h.apply_exact(baseline, patches[item["test_patch"]], [])
+        h.apply_exact(candidate, patches[item["test_patch"]], [])
+        h.apply_exact(candidate, patches[item["production_patch"]], [])
     save("production", production)
-    save("baseline", tested)
-    for item in manifest["slices"]:
-        h.apply_exact(tested, patches[item["production_patch"]], [])
-    save("candidate-tests", tested)
-    h.apply_exact(tested, overlap, [])
-    save("focused", tested)
+    save("baseline", baseline)
+    save("candidate-tests", candidate)
+    h.apply_exact(candidate, overlap, [])
+    save("focused", candidate)
     return plans
+
+
+def phase_cases(h, manifest, phase):
+    """Resolve explicit ordered phase identities; never silently skip a case."""
+    cases = manifest["cases"]
+    by_name = {case["name"]: case for case in cases}
+    phases = manifest["phase_cases"]
+    if (len(by_name) != len(cases) or set(phases) != {"baseline", "focused"} or
+            phase not in phases or set(phases["focused"]) != set(by_name)):
+        raise h.GateRejected("invalid complete per-phase case inventory")
+    for names in phases.values():
+        if (not isinstance(names, list) or not names or len(names) != len(set(names)) or
+                any(name not in by_name for name in names)):
+            raise h.GateRejected("unknown, duplicate or empty phase case identity")
+    return [by_name[name] for name in phases[phase]]
 
 
 def compile_arguments(key):
@@ -274,6 +302,23 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
         if runner.ok("publication-head", ["git", "rev-parse", "HEAD"], publication, env, 10).strip() != ctx["head"]:
             raise h.GateRejected("publication head mismatch")
         inputs_root, inputs = h.fetch_inputs(runner, work, env, recipe)
+        required_full = manifest["production_required_full"]
+        required_unit = manifest["focused_core_required"]
+        ownership = strict(inputs["ownership"])["validation"]
+        pinned_unit = (ownership["candidate_extra_unit_tests"] +
+            ownership["candidate_existing_regression_tests"] + recipe["tests"]["recovery_required"] +
+            [case["name"] for case in phase_cases(h, manifest, "focused") if case["library"] == "core"] +
+            [recipe["cross_control"]["test_name"]])
+        config_required = manifest["configuration_prerequisite"]["existing_required_cases"]
+        if (len(config_required) != 4 or len(set(config_required)) != 4 or
+                manifest["configuration_prerequisite"]["metadata_fixture_case"] not in config_required):
+            raise h.GateRejected("configuration existing-test inventory is incomplete")
+        expected_full = list(dict.fromkeys(existing_required(recipe, inputs) + config_required))
+        if required_full != expected_full:
+            raise h.GateRejected("declared full inventory differs from pinned requirements plus configuration cases")
+        if (not isinstance(required_unit, list) or len(required_unit) != len(set(required_unit)) or
+                set(required_unit) != set(pinned_unit + config_required)):
+            raise h.GateRejected("declared focused inventory differs from pinned and configuration requirements")
         old = h.parse_tree(runner.ok("publication-base-tree",
             ["git", "ls-tree", "-r", "-z", "--full-tree", manifest["publication_base"]],
             inputs_root, env, 30, 2 * 1024 * 1024))
@@ -365,7 +410,7 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
                 output = runner.ok(key + "-compile", compile_arguments(key),
                     root, lane_env, 1800, 24 * 1024 * 1024)
                 binary = compiled(h, output, key, root, work / "target")
-                required = [case["name"] for case in manifest["cases"] if case["library"] == key]
+                required = [case["name"] for case in phase_cases(h, manifest, args.phase) if case["library"] == key]
                 if key == "core" and args.phase == "focused":
                     required.append(recipe["cross_control"]["test_name"])
                 inventory = runner.ok(key + "-inventory",
@@ -374,7 +419,7 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
                     [binary, "--list", "--ignored", "--format", "terse"], root, lane_env, 30, 128 * 1024)
                 require_inventory(h, inventory, ignored, required)
                 receipt["binaries"][key] = {"executable": binary, "sha256_before": h.file_sha(binary)}
-            for index, case in enumerate(manifest["cases"]):
+            for index, case in enumerate(phase_cases(h, manifest, args.phase)):
                 label = f"case-{index:02}"
                 binary = receipt["binaries"][case["library"]]["executable"]
                 result = runner.run(label, [binary, "--exact", case["name"], "--test-threads=1"],
@@ -389,10 +434,7 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
                 markers = re.findall(r"^RECOVERY_OWNED_DELETE_SCHEDULE: [^\n]+$", result["output"], re.M)
                 if sorted(markers) != sorted(recipe["cross_control"]["schedule_markers"]):
                     raise h.GateRejected("missing or duplicate retained overlap schedule")
-                ownership = strict(inputs["ownership"])["validation"]
-                required = (ownership["candidate_extra_unit_tests"] +
-                    ownership["candidate_existing_regression_tests"] + recipe["tests"]["recovery_required"] +
-                    [case["name"] for case in manifest["cases"] if case["library"] == "core"] + [name])
+                required = required_unit
                 ignored = [name for name in recipe["tests"]["full_allowed_ignored"] if name.startswith("core::")]
                 receipt["parallel_unit"] = h.require_passes(runner.ok("focused-parallel-unit",
                     [sys.executable, "scripts/test.py", "-p", "proteus-core", "--lib"],
@@ -403,7 +445,7 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
                     [sys.executable, "scripts/test.py", "-p", "proteus-module-protocol", "--", "--test-threads=1"],
                     root, lane_env, 1800, 16 * 1024 * 1024),
                     recipe["tests"]["protocol_required"] +
-                    [case["name"] for case in manifest["cases"] if case["library"] == "protocol"])
+                    [case["name"] for case in phase_cases(h, manifest, args.phase) if case["library"] == "protocol"])
             for value in receipt["binaries"].values():
                 value["sha256_after"] = h.file_sha(value["executable"])
                 if value["sha256_before"] != value["sha256_after"]:
@@ -428,7 +470,7 @@ def run_phase(h, recipe, manifest, manifest_hash, args):
                                                  for name, value in binaries.items()}
             if receipt["canonical_sha256_before"] != receipt["canonical_sha256_after"]:
                 raise h.GateRejected("canonical binaries changed after discovery")
-            receipt["required_full"] = existing_required(recipe, inputs)
+            receipt["required_full"] = required_full
             receipt["canonical_full"] = h.require_canonical_passes(output, receipt["required_full"],
                 recipe["canonical_harness"], binaries, recipe["tests"]["full_allowed_ignored"])
             if set(receipt["canonical_full"]["ignored"]) != set(recipe["tests"]["full_allowed_ignored"]):
@@ -562,14 +604,14 @@ def aggregate(h, recipe, manifest, manifest_hash, args):
                             not re.fullmatch(r"[0-9a-f]{64}", value.get("sha256_after", ""))):
                         raise h.GateRejected("binary provenance mismatch")
                     binaries[key] = binary
-                    required = [case["name"] for case in manifest["cases"] if case["library"] == key]
+                    required = [case["name"] for case in phase_cases(h, manifest, phase) if case["library"] == key]
                     if key == "core" and phase == "focused":
                         required.append(recipe["cross_control"]["test_name"])
                     require_inventory(h,
                         output(key + "-inventory", [binary, "--list", "--format", "terse"])["output"],
                         output(key + "-ignored", [binary, "--list", "--ignored", "--format", "terse"])["output"], required)
                 cases = []
-                for index, case in enumerate(manifest["cases"]):
+                for index, case in enumerate(phase_cases(h, manifest, phase)):
                     label = f"case-{index:02}"
                     observed = output(label, [binaries[case["library"]], "--exact", case["name"], "--test-threads=1"])
                     verdict = classify_case(h, observed, case, phase == "baseline")
@@ -596,7 +638,7 @@ def aggregate(h, recipe, manifest, manifest_hash, args):
                     parsed = h.require_passes(output("focused-protocol",
                         [sys.executable, "scripts/test.py", "-p", "proteus-module-protocol", "--", "--test-threads=1"])["output"],
                         recipe["tests"]["protocol_required"] +
-                        [case["name"] for case in manifest["cases"] if case["library"] == "protocol"])
+                        [case["name"] for case in phase_cases(h, manifest, phase) if case["library"] == "protocol"])
                     if not same_json_evidence(parsed, receipt["protocol"]):
                         raise h.GateRejected("focused protocol evidence mismatch")
             else:
@@ -747,6 +789,56 @@ def self_test(h, recipe, manifest):
     altered = dict(recorded)
     altered.pop("summaries")
     assert not same_json_evidence(parsed, altered)
+    inventory = {
+        "cases": [{"name": "existing"}, {"name": "candidate_only"}],
+        "phase_cases": {"baseline": ["existing"], "focused": ["existing", "candidate_only"]},
+    }
+    assert phase_cases(h, inventory, "baseline") == [{"name": "existing"}]
+    assert phase_cases(h, inventory, "focused") == inventory["cases"]
+    for invalid in (
+        {"baseline": ["foreign"], "focused": ["existing", "candidate_only"]},
+        {"baseline": ["existing", "existing"], "focused": ["existing", "candidate_only"]},
+        {"baseline": [], "focused": ["existing", "candidate_only"]},
+        {"baseline": ["existing"], "focused": ["existing"]},
+        {"baseline": ["existing"], "focused": ["existing", "candidate_only"], "extra": ["existing"]},
+    ):
+        try:
+            phase_cases(h, dict(inventory, phase_cases=invalid), "baseline")
+        except h.GateRejected:
+            pass
+        else:
+            raise h.GateRejected("invalid phase identity selection was accepted")
+    try:
+        phase_cases(h, dict(inventory, cases=inventory["cases"] + [{"name": "existing"}]), "focused")
+    except h.GateRejected:
+        pass
+    else:
+        raise h.GateRejected("duplicate global case identity was accepted")
+    actual_baseline = phase_cases(h, manifest, "baseline")
+    actual_focused = phase_cases(h, manifest, "focused")
+    actual_reds = [case for case in actual_baseline if case.get("baseline_red")]
+    if (len(actual_reds) != manifest["baseline_red_count"] or
+            len(actual_baseline) - len(actual_reds) != manifest["baseline_equivalence_count"] or
+            len(actual_focused) - len(actual_baseline) != manifest["candidate_only_case_count"] or
+            len(actual_focused) != manifest["new_unique_test_count"] + manifest["expanded_existing_test_count"] or
+            {case["name"] for case in actual_reds} !=
+            {case["name"] for case in manifest["cases"] if case.get("baseline_red")}):
+        raise h.GateRejected("actual package phase inventories disagree with declared counts")
+    config_required = manifest["configuration_prerequisite"]["existing_required_cases"]
+    if (len(config_required) != 4 or len(set(config_required)) != 4 or
+            manifest["configuration_prerequisite"]["metadata_fixture_case"] not in config_required):
+        raise h.GateRejected("actual package omitted existing configuration regressions")
+    for declared, retained in (
+        (manifest["production_required_full"], recipe["tests"]["recovery_required"] +
+         recipe["tests"]["protocol_required"] + recipe["tests"]["module_swap_required"] + config_required),
+        (manifest["focused_core_required"], recipe["tests"]["recovery_required"] +
+         [case["name"] for case in actual_focused if case["library"] == "core"] +
+         [recipe["cross_control"]["test_name"]] + config_required),
+    ):
+        if (not isinstance(declared, list) or not declared or
+                len(declared) != len(set(declared)) or not set(retained).issubset(declared)):
+            raise h.GateRejected("actual package suite inventory dropped declared controls")
+    print("Explicit per-phase identity selection and six rejection controls PASS")
     print("JSON receipt roundtrip and eight evidence-mutation rejection controls PASS")
     print("Aggregate identity, early-infrastructure and job-result controls PASS")
     print("Pinned helper and six strict frame-negative rejection controls PASS")
