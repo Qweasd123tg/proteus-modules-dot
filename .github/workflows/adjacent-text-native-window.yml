@@ -46,7 +46,7 @@ jobs:
       - name: Install build and isolated X11 software-rendering dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb xauth openbox dbus xdotool x11-utils x11-apps imagemagick tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus python3-pil xclip mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools mesa-utils fonts-dejavu-core
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb xauth openbox dbus xdotool x11-utils x11-apps x11-xserver-utils imagemagick tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus python3-pil xclip mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools mesa-utils fonts-dejavu-core
       - name: Install official pinned Rust
         run: rustup toolchain install 1.95.0 --profile minimal
       - name: Verify exact harness and adapt only copied qualifier npm audit environment
@@ -58,6 +58,12 @@ jobs:
         run: |
           /usr/bin/python3 foundation/2026-10-27/adjacent-text-native-window/test_gate.py \
             --report "$RUNNER_TEMP/native-controller-controls.json"
+      - name: Prove shared authenticated X11 infrastructure before expensive build (not native UX)
+        timeout-minutes: 3
+        run: |
+          /usr/bin/python3 foundation/2026-10-27/adjacent-text-native-window/test_x11_preflight.py \
+            --work-dir "$RUNNER_TEMP/native-x11-preflight-work" \
+            --evidence-dir "$RUNNER_TEMP/native-x11-preflight-evidence"
       - name: Recheck portable qualifier controller failure cleanup
         run: |
           python3 qualifier/foundation/2026-10-27/adjacent-text-portable-fast/test_controller.py \
@@ -84,6 +90,9 @@ jobs:
           path: |
             ${{ runner.temp }}/native-qualifier-adaptation.json
             ${{ runner.temp }}/native-controller-controls.json
+            ${{ runner.temp }}/native-x11-preflight-evidence/*.json
+            ${{ runner.temp }}/native-x11-preflight-evidence/*.png
+            ${{ runner.temp }}/native-x11-preflight-evidence/*.log
             ${{ runner.temp }}/native-portable-controller.json
             ${{ runner.temp }}/native-portable-evidence/result.json
             ${{ runner.temp }}/native-portable-evidence/portable-inventory.json

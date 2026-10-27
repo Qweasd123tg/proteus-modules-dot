@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from PIL import Image, ImageChops
-from native_assertions import (GateFailure, require, sha256, marker, window_ok,
+from native_assertions import (GateFailure, UtilityTimeout, require, sha256, marker, window_ok,
                                capture_ok, clipboard_ok, reported_errors)
 
 class Owner:
@@ -78,7 +78,8 @@ class Owner:
         self.check()
         return process
 
-    def run(self, args, timeout=10, input_data=None, cap=1024*1024, check=True, env=None):
+    def run(self, args, timeout=10, input_data=None, cap=1024*1024, check=True, env=None,
+            record_output=False):
         self.check()
         require(len(self.commands) < 4096, "Utility command count cap exceeded")
         args = list(map(str, args))
@@ -113,8 +114,13 @@ class Owner:
         try:
             while selector.get_map():
                 self.check()
-                require(time.monotonic() < limit, "Utility deadline exceeded: " + args[0])
-                for key, _ in selector.select(timeout=0.1):
+                remaining = limit - time.monotonic()
+                ready = selector.select(timeout=max(0, min(0.1, remaining)))
+                if remaining <= 0 and (process.poll() is None or not ready):
+                    raise UtilityTimeout("Utility deadline exceeded: " + args[0])
+                # A finished leader may have ready EOF/data after the deadline.
+                # Drain that readiness; an inherited orphan pipe still times out.
+                for key, _ in ready:
                     chunk = os.read(key.fileobj.fileno(), 65536)
                     if not chunk:
                         selector.unregister(key.fileobj)
@@ -122,7 +128,10 @@ class Owner:
                     require(len(output) + len(errors) + len(chunk) <= cap,
                             "Utility output cap exceeded: " + args[0])
                     key.data.extend(chunk)
-            process.wait(timeout=max(0.1, limit-time.monotonic()))
+            try:
+                process.wait(timeout=max(0.1, limit-time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise UtilityTimeout("Utility did not exit after closing pipes: " + args[0]) from exc
             if writer:
                 writer.join(timeout=1)
                 require(not writer.is_alive() and not writer_errors, "Utility input writer failed")
@@ -132,12 +141,16 @@ class Owner:
             require(not check or process.returncode == 0,
                     "Utility failed: " + args[0] + ": " + errors.decode(errors="replace")[-1000:])
             return bytes(output)
-        except BaseException:
-            row["status"] = "failure"
+        except BaseException as exc:
+            row.update(status="failure", failure_kind=type(exc).__name__, failure=str(exc),
+                       returncode_before_cleanup=process.poll())
             self.kill(process)
             process.wait(timeout=3)
             raise
         finally:
+            row.update(stdout_bytes=len(output), stderr_bytes=len(errors),
+                       stdout_sha256=sha256(bytes(output)), stderr_sha256=sha256(bytes(errors)),
+                       finished_ns=time.monotonic_ns(), duration_ms=(time.monotonic()-started)*1000)
             selector.close()
             # Clean immediately; do not retain exited PIDs or utility pipe FDs.
             self.kill(process)
@@ -149,6 +162,13 @@ class Owner:
                 if pipe and not pipe.closed:
                     pipe.close()
             self.processes.remove(process)
+            if record_output:
+                with self.lock:
+                    require(self.total_log_bytes + len(output) + len(errors) <= self.log_cap,
+                            "Complete utility diagnostic log cap exceeded")
+                    self.total_log_bytes += len(output) + len(errors)
+                row["stdout"] = bytes(output).decode("utf-8", errors="replace")
+                row["stderr"] = bytes(errors).decode("utf-8", errors="replace")
 
     def close(self):
         for process in reversed(self.processes):

@@ -5,7 +5,7 @@ import copy
 import json
 import time
 from pathlib import Path
-from native_assertions import (GateFailure, require, marker, window_ok, capture_ok, ordered,
+from native_assertions import (GateFailure, UtilityTimeout, require, marker, window_ok, capture_ok, ordered,
                                anchor_ok, clipboard_ok, cancel_ok, reported_errors, complete, continuation_ok)
 
 def run_tests():
@@ -183,6 +183,117 @@ def process_tests():
     require(len(owner.processes) == 1 and owner.processes[0].poll() is not None,
             "Signal during launch left an unowned child")
     results.append("signal-during-launch-owned-cleanup")
+    owner = Owner({"PATH":os.environ["PATH"]},time.monotonic()+5)
+    try:
+        try:
+            owner.run([sys.executable,"-c","import sys,time;print('READY-OUT',flush=True);"
+                       "print('READY-ERR',file=sys.stderr,flush=True);time.sleep(60)"],
+                      timeout=0.2,record_output=True)
+        except UtilityTimeout:
+            pass
+        else:
+            raise AssertionError("Partial-output timeout did not fail with typed timeout")
+        row = owner.commands[-1]
+        require(row["stdout"] == "READY-OUT\n" and row["stderr"] == "READY-ERR\n",
+                "Timeout diagnostics lost exact partial output")
+        require(row["failure_kind"] == "UtilityTimeout" and row["returncode_before_cleanup"] is None
+                and row["duration_ms"] >= 100,"Timeout process-state receipt is wrong")
+        results.append("typed-timeout-preserves-partial-diagnostics")
+    finally:
+        owner.close()
+    # Delay receipt processing after a finished child made its pipes readable.
+    # The controller must drain ready EOF, not misclassify that completed child.
+    real_selector = native_driver.selectors.DefaultSelector
+    class DelayedReceiptSelector:
+        def __init__(self):
+            self.inner,self.delayed = real_selector(),False
+        def __getattr__(self,name):
+            return getattr(self.inner,name)
+        def select(self,timeout=None):
+            events = self.inner.select(timeout)
+            if events and not self.delayed:
+                self.delayed = True
+                time.sleep(0.25)
+            return events
+    owner = Owner({"PATH":os.environ["PATH"]},time.monotonic()+5)
+    try:
+        native_driver.selectors.DefaultSelector = DelayedReceiptSelector
+        output = owner.run([sys.executable,"-c","print('COMPLETE')"],timeout=0.2)
+        require(output == b"COMPLETE\n" and owner.commands[-1]["exit_code"] == 0,
+                "Completed utility with ready EOF was falsely timed out")
+        results.append("completed-utility-ready-eof-not-false-timeout")
+    finally:
+        native_driver.selectors.DefaultSelector = real_selector
+        owner.close()
+    return results
+
+def bootstrap_tests():
+    from display_session import wait_x11, auth_denied
+    require(auth_denied("Authorization required") and not auth_denied("unable to open display"),
+            "Authentication-negative matcher accepts generic connection errors")
+    results = ["auth-negative-requires-specific-denial"]
+    ready = b"name of display: :99\n  dimensions: 1280x900 pixels (1x1 millimeters)\n"
+    def exercise(actions, expected_error=False):
+        class Process:
+            code = None
+            def poll(self):
+                return self.code
+        process = Process()
+        class FakeOwner:
+            def __init__(self):
+                self.commands,self.now = [],0.0
+                self.index = 0
+            def check(self):
+                pass
+            def run(self,args,**kwargs):
+                require(args == ["xdpyinfo"] and kwargs["record_output"],
+                        "Readiness lost exact utility diagnostics")
+                action = actions[min(self.index,len(actions)-1)]
+                self.index += 1
+                row = {"exit_code":1,"stderr":"","stdout":"","finished_ns":self.index}
+                self.commands.append(row)
+                if action == "timeout":
+                    self.now += kwargs["timeout"]
+                    row.pop("exit_code")
+                    raise UtilityTimeout("synthetic startup pending")
+                self.now += 0.01
+                if action == "fatal":
+                    raise GateFailure("Complete utility diagnostic log cap exceeded")
+                if action == "auth":
+                    row["stderr"] = "Authorization required, but no authorization protocol specified"
+                if action == "died":
+                    process.code = 1
+                if action == "unexpected-exit":
+                    row["exit_code"] = 2
+                if action in ("ready","malformed"):
+                    row["exit_code"] = 0
+                    return ready if action == "ready" else b"wrong display"
+                return b""
+            def sleep(self,seconds):
+                self.now += seconds
+        owner = FakeOwner()
+        try:
+            result = wait_x11(owner,process,seconds=3,clock=lambda:owner.now,sleep=owner.sleep)
+        except GateFailure:
+            require(expected_error,"Unexpected bootstrap rejection")
+            require(owner.now <= 3.2,"Bootstrap escaped total deadline")
+            return owner
+        require(not expected_error and result["status"] == "ready","Bootstrap false positive")
+        return owner
+    for name,actions,error in (
+        ("startup-timeout-then-ready",["timeout","ready"],False),
+        ("startup-notready-then-ready",["pending","ready"],False),
+        ("startup-total-deadline",["timeout"],True),
+        ("startup-auth-failure",["auth"],True),
+        ("startup-server-exit",["died"],True),
+        ("startup-evidence-overflow",["fatal"],True),
+        ("startup-malformed-success",["malformed"],True),
+        ("startup-unexpected-exit",["unexpected-exit"],True)):
+        owner = exercise(actions,error)
+        if name in ("startup-auth-failure","startup-server-exit","startup-evidence-overflow",
+                    "startup-malformed-success","startup-unexpected-exit"):
+            require(owner.index == 1,"Fatal bootstrap failure was retried")
+        results.append(name)
     return results
 
 def main():
@@ -193,6 +304,7 @@ def main():
     try:
         result["oracle_controls"] = run_tests()
         result["process_controls"] = process_tests()
+        result["bootstrap_controls"] = bootstrap_tests()
         result["status"] = "passed"
     finally:
         args.report.parent.mkdir(parents=True,exist_ok=True)

@@ -14,22 +14,13 @@ from native_assertions import (GateFailure, require, marker, ordered, anchor_ok,
                                cancel_ok, complete, reported_errors, continuation_ok)
 from fixture_server import Fixture, message
 from native_driver import Owner, Driver
+from display_session import DisplaySession, display_environment, wait_for
 
 ROOT = Path(__file__).resolve().parent
 
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
-
-def wait_for(owner, predicate, label, seconds=15):
-    until = time.monotonic() + seconds
-    while time.monotonic() < until:
-        owner.check()
-        value = predicate()
-        if value:
-            return value
-        time.sleep(0.05)
-    raise GateFailure("Timed out: " + label)
 
 def verify_inventory(portable, record, owner):
     """Check the complete qualified inventory without following escaping symlinks."""
@@ -250,6 +241,7 @@ def main():
               "limits":spec["limits"],"spec_sha256":digest(ROOT/"assertions.json"),
               "workflow_head":os.environ.get("GITHUB_SHA"),"workflow_run":os.environ.get("GITHUB_RUN_ID")}
     owner = None
+    display = None
     def save():
         data = (json.dumps(result,ensure_ascii=False,indent=2,sort_keys=True)+"\n").encode()
         require(len(data) <= spec["max_result_bytes"],"Native result JSON cap exceeded")
@@ -284,36 +276,14 @@ def main():
                       qualification_inventory_sha256=digest(inventory_file),
                       qualifier_environment_difference=spec["qualifier_environment_difference"])
         require(result["native_binary_before"] == native_hash,"Launched binary differs from qualifier")
-        env = {key:os.environ[key] for key in ("PATH",) if key in os.environ}
-        env.update({"LANG":"C.UTF-8","LC_ALL":"C.UTF-8","TZ":"UTC",
-                    "DISPLAY":":99","XAUTHORITY":str(work/"Xauthority"),
-                    "XDG_RUNTIME_DIR":str(work/"xdg-runtime"),
-                    "HOME":str(work/"service-home"),"GPUI_X11_SCALE_FACTOR":"1",
-                    "LIBGL_ALWAYS_SOFTWARE":"true","GALLIUM_DRIVER":"llvmpipe",
-                    "NO_PROXY":"127.0.0.1,localhost,::1","no_proxy":"127.0.0.1,localhost,::1",
-                    "PROTEUS_STARTUP_TRACE":"1","PYTHONDONTWRITEBYTECODE":"1","npm_config_audit":"false"})
-        Path(env["HOME"]).mkdir()
-        Path(env["XDG_RUNTIME_DIR"]).mkdir(mode=0o700)
-        icds = sorted(Path("/usr/share/vulkan/icd.d").glob("lvp_icd*.json"))
-        require(len(icds) == 1,"Exactly one installed Lavapipe ICD is required")
-        env["VK_DRIVER_FILES"] = str(icds[0])
+        env = display_environment(work)
         owner = Owner(env,time.monotonic()+spec["total_seconds"],spec["max_log_bytes"],
                       canceled=lambda: bool(cancellation_signal))
         verify_inventory(portable,inventory,owner)
-        require(not Path("/tmp/.X99-lock").exists(),"X display 99 is already in use")
-        owner.run(["xauth","-f",env["XAUTHORITY"],"add",":99","MIT-MAGIC-COOKIE-1",secrets.token_hex(16)])
-        owner.start("xvfb",["Xvfb",":99","-screen","0","1280x900x24","-nolisten","tcp",
-                            "-auth",env["XAUTHORITY"],"-noreset"])
-        wait_for(owner,lambda:owner.run(["xdpyinfo"],timeout=2,check=False).startswith(b"name of display"),
-                 "Xvfb readiness",seconds=30)
-        owner.start("dbus",["dbus-daemon","--session","--nofork","--print-address=1"])
-        address = wait_for(owner,lambda:bytes(owner.logs["dbus"]).splitlines(),"D-Bus readiness")[0].decode()
-        require(address.startswith("unix:"),"Unexpected D-Bus session address")
-        env["DBUS_SESSION_BUS_ADDRESS"] = address
-        owner.start("openbox",["openbox","--sm-disable"],env=env)
-        wait_for(owner,lambda:b"window id" in owner.run(["xprop","-root","_NET_SUPPORTING_WM_CHECK"],
-                                                      check=False),"Window manager readiness")
-        packages = ["xvfb","xauth","openbox","dbus","xdotool","x11-utils","x11-apps","imagemagick",
+        display = DisplaySession(owner)
+        display.start()
+        result["display_infrastructure"] = display.receipt
+        packages = ["xvfb","xauth","openbox","dbus","xdotool","x11-utils","x11-apps","x11-xserver-utils","imagemagick",
                     "tesseract-ocr","tesseract-ocr-eng","tesseract-ocr-rus","python3-pil","xclip",
                     "mesa-vulkan-drivers","libgl1-mesa-dri","vulkan-tools","mesa-utils"]
         result["system_packages"] = owner.run(["dpkg-query","-W","-f",
@@ -388,6 +358,12 @@ def main():
         raise
     finally:
         if owner:
+            if display:
+                try:
+                    display.close()
+                except BaseException as exc:
+                    owner.fatal = owner.fatal or "Display cleanup: "+str(exc)
+                result["display_infrastructure"] = display.receipt
             owner.close()
             result["utility_commands"] = owner.commands
             result["cleanup_error"] = owner.fatal

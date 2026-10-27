@@ -101,3 +101,29 @@ Primary source references:
 - https://github.com/Qweasd123tg/proteus-modules-dot/pull/28
 - https://github.com/longbridge/gpui-fast/tree/07b42ebf1f43088b8b74a7d4fca6b95e44e04265
 - https://sources.debian.org/src/xclip/0.13-4/xclip.1
+
+## First hosted result and bootstrap repair
+
+Run 40446487226 built and qualified the exact portable graph successfully, with npm audit explicitly
+disabled. Native startup then failed before launching Proteus: the first xdpyinfo returned nonzero,
+and the second exceeded its two-second probe limit; no case, window, screenshot or clipboard oracle
+ran. Artifact 12708639938 ZIP SHA256 37520de491f665f5e446518eddbce54eedf8b9e204e3a237893c9ecd4af741a9
+contains the failed receipt and an empty Xvfb log. This does not identify an application defect or
+establish whether Xvfb was merely initializing or hung.
+
+The shared display bootstrap now treats only typed probe timeouts and expected startup-not-ready
+as retryable inside a true 30-second deadline, checks Xvfb liveness, rejects authentication/unexpected
+exit/geometry/evidence errors, and retains exact probe stdout/stderr, hashes, duration and pre-cleanup
+return state within the existing aggregate log cap. Ready EOF from a completed utility is drained
+before timeout classification; orphan pipes still time out.
+
+A cheap pre-build infrastructure step uses the SAME bootstrap, checks authenticated access and
+unauthenticated rejection, window-manager readiness, a synthetic root-color capture, external
+CLIPBOARD utility roundtrip and software graphics utilities. It then gracefully closes its owned
+display and requires its lock/socket to be gone. It has 90 seconds of active work and a three-minute
+workflow bound. The later native stage starts a fresh display and retains every original native
+scenario/oracle. **Infrastructure preflight is not Proteus/GPUI native qualification.**
+Its one PNG (at most 5 MiB), JSON (8MiB), and complete aggregate logs (2MiB) are separately labeled.
+
+Xserver authorization/startup semantics are documented by the packaged upstream manual:
+https://manpages.debian.org/trixie/xserver-common/Xserver.1.en.html .

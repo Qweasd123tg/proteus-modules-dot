@@ -5,6 +5,10 @@ import re
 class GateFailure(RuntimeError):
     pass
 
+class UtilityTimeout(GateFailure):
+    """A bounded child utility did not close its pipes/exit before its deadline."""
+    pass
+
 def require(condition, message):
     if not condition:
         raise GateFailure(message)
