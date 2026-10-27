@@ -455,6 +455,40 @@ def stock_worker(h, output, modules, target, package_id):
 
 
 
+def cargo_metadata(h, output):
+    """Read one complete Cargo metadata JSON line from the retained combined log."""
+    documents = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = strict(line)
+        except json.JSONDecodeError as error:
+            if line.lstrip().startswith(("{", "[")):
+                raise h.GateRejected("malformed JSON-like Cargo metadata record") from error
+            continue
+        except RuntimeError as error:
+            raise h.GateRejected("duplicate Cargo metadata object key") from error
+        try:
+            json.dumps(value, allow_nan=False)
+        except ValueError as error:
+            raise h.GateRejected("non-finite Cargo metadata value") from error
+        documents.append(value)
+    if len(documents) != 1:
+        raise h.GateRejected("Cargo metadata must contain exactly one complete JSON record")
+    value = documents[0]
+    if (not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1 or
+            not isinstance(value.get("packages"), list) or not value["packages"] or
+            any(not isinstance(item, dict) for item in value["packages"]) or
+            not isinstance(value.get("workspace_members"), list) or not value["workspace_members"] or
+            any(not isinstance(item, str) or not item for item in value["workspace_members"]) or
+            not isinstance(value.get("resolve"), dict) or not isinstance(value["resolve"].get("nodes"), list) or
+            not isinstance(value.get("workspace_root"), str) or not value["workspace_root"].startswith("/") or
+            not isinstance(value.get("target_directory"), str) or not value["target_directory"].startswith("/")):
+        raise h.GateRejected("Cargo metadata complete-object schema mismatch")
+    return value
+
+
 def fixture_setup(h, runner, work, root, env, manifest, production):
     modules = work / "current-modules"
     target = work / "fixture-target"
@@ -466,9 +500,11 @@ def fixture_setup(h, runner, work, root, env, manifest, production):
         if h.file_sha(modules / path) != expected:
             raise h.GateRejected("fixture manifest/lock/source identity mismatch: " + path)
     fixture_env = dict(env, PROTEUS_MODULES_SOURCE=str(modules), CARGO_TARGET_DIR=str(target))
-    metadata = strict(runner.ok("fixture-metadata",
+    metadata = cargo_metadata(h, runner.ok("fixture-metadata",
         ["cargo", "metadata", "--locked", "--manifest-path", modules / "Cargo.toml", "--format-version", "1"],
         modules, fixture_env, 300, 16 * 1024 * 1024))
+    if Path(metadata["workspace_root"]).resolve() != modules or Path(metadata["target_directory"]).resolve() != target:
+        raise h.GateRejected("Cargo metadata workspace/target differs from selected fixture")
     sdk_packages = stock_graph(h, metadata, manifest)
     workers = [item for item in metadata["packages"] if item["name"] == "proteus-reference-module"]
     if (len(workers) != 1 or workers[0].get("source") is not None or workers[0].get("features") != {} or
@@ -724,8 +760,10 @@ def audit_fixture(h, output, records, receipt, manifest, source, work, productio
         raise h.GateRejected("fixture/stock SDK path isolation mismatch")
     def get(label, argv, cwd):
         return output(label, argv, cwd)["output"]
-    metadata = strict(get("fixture-metadata", ["cargo", "metadata", "--locked", "--manifest-path",
+    metadata = cargo_metadata(h, get("fixture-metadata", ["cargo", "metadata", "--locked", "--manifest-path",
         modules / "Cargo.toml", "--format-version", "1"], modules))
+    if Path(metadata["workspace_root"]).resolve() != modules or Path(metadata["target_directory"]).resolve() != target:
+        raise h.GateRejected("Cargo metadata workspace/target differs from selected fixture")
     if not same_json_evidence(stock_graph(h, metadata, manifest), item["sdk_packages"]):
         raise h.GateRejected("stock SDK five-package graph receipt mismatch")
     workers = [value for value in metadata["packages"] if value["name"] == "proteus-reference-module"]
@@ -1058,6 +1096,22 @@ def self_test(h, recipe, manifest):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+    metadata_sample = {"version": 1, "packages": [{"name": "marker"}],
+        "workspace_members": ["marker"], "resolve": {"nodes": []},
+        "workspace_root": "/source", "target_directory": "/target"}
+    metadata_json = json.dumps(metadata_sample, separators=(",", ":"))
+    metadata_log = "    Updating crates.io index\n Downloaded example v1.0.0\n" + metadata_json + "\n"
+    assert cargo_metadata(h, metadata_log) == metadata_sample
+    for invalid in (
+        "", "    Updating crates.io index\n", metadata_log + metadata_json + "\n",
+        metadata_log + "42\n", metadata_log + '{"version":',
+        '{"version":1,"version":1}\n', "[]\n",
+        json.dumps(dict(metadata_sample, version=True)),
+        json.dumps(dict(metadata_sample, workspace_root="relative")),
+        json.dumps(dict(metadata_sample, resolve=None)),
+        json.dumps(dict(metadata_sample, extra=float("nan"))),
+    ):
+        rejected(lambda invalid=invalid: cargo_metadata(h, invalid))
     sample = "running 1 test\ntest exact_json_control ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
     parsed = h.require_passes(sample, ["exact_json_control"], exact_inventory=True)
     recorded = json.loads(json.dumps(parsed))
@@ -1107,6 +1161,7 @@ def self_test(h, recipe, manifest):
     print("Pinned inherited parsers/process controls, exact arm selection, JSON type-sensitive equality,")
     print("early-infrastructure/foreign-receipt rejection, job-result and current-target section controls PASS")
     print("Stock Modules exact complete-target and child-header boundary self-controls PASS")
+    print("Exactly-one Cargo metadata document, schema and eleven rejection controls PASS")
 
 
 def main():

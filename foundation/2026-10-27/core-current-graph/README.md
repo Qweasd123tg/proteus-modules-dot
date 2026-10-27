@@ -51,6 +51,8 @@ These old-graph runs remain failures and are not retroactively qualified:
 - [40483121449](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40483121449): metadata-watch fixture failed; historical timestamps were not recorded.
 - [40491865543](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40491865543): parallel catalog-cache save assertion failed; exact failing branch and cause unknown.
 
+The first current-graph run [40512677031](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40512677031) also remains **failed / not qualified**. Baseline completed; production stopped before its product compilation/tests because the controller decoded Cargo's combined diagnostic/metadata log as a single JSON document. The controller-only correction retains the complete raw log, accepts exactly one complete strict metadata record, rejects ambiguous or malformed metadata, and uses identical parsing in phase and aggregate. No source patch, test selection, fixture pin or resource bound changed. A fresh exact-head run is required.
+
 ## Remaining limits
 
 This package does not establish numerical allocation/latency/RSS benefit or qualify a benchmark. The three-second semantic configuration scan age remains provisional and unmeasured; it is not a scheduler guarantee. Existing metadata fixture prerequisites are explicitly amended, not called unchanged. Unlock failures retain best-effort close fallback, not an OS-failure guarantee. Core source tests, selected stock Modules targets and the explicit fixture graph must all pass fresh before any qualification claim.
