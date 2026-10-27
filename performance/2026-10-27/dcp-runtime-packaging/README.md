@@ -32,7 +32,7 @@ hash, каждый original Git blob, UTF-8 byte count и SHA-256 новых ф�
 python3 -B -I apply.py \
   --source /clean/Proteus-modules \
   --bundle source-bundle.json \
-  --sha256 605e302fcf0cd734b0213ae1638aadc75b432e4ea6b2760f23c026e90267831c \
+  --sha256 ac057dd37a05a3c0540f288698f431fd45c64dbc5f21d9365048ce1ac58914ba \
   --output /new/output
 ```
 
@@ -64,3 +64,13 @@ inventories. Никакого npm advisory POST, включая retry или spl
 новые source/license/provenance overhead. Даже успешный Node gate не доказывает
 готовность shipping portable: отдельный consumer rebuild/launcher gate остаётся
 обязательным, а недоступный desktop этим bundle не редактируется.
+
+## Дополнение По Runtime Notices
+
+Выявленные отсутствующие MIT notices tiktoken 1.0.22 и undici-types 5.26.5
+сохранены отдельно в provenance по точным registry gitHead официальных
+репозиториев; package bytes/versions и WASM не меняются. Новые tests отклоняют
+отсутствие, подмену и version mismatch; hosted gate проверяет все четыре
+runtime package notices и сохраняет тексты в evidence. Это не общее правовое
+заключение. Размеры прошлой проверки head 043770 относятся к прежнему набору;
+размеры дополненной версии устанавливаются отдельным новым run.

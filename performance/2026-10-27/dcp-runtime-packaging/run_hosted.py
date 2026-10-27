@@ -16,7 +16,7 @@ import time
 MODULES = "0d9c5fd18f04e6e3a083351678065c5f72966792"
 HARNESS = "f3d01053dff6113c31afbd885ef1ab1a8d931d53"
 SHIPPING_HARNESS = "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
-BUNDLE_SHA256 = "605e302fcf0cd734b0213ae1638aadc75b432e4ea6b2760f23c026e90267831c"
+BUNDLE_SHA256 = "ac057dd37a05a3c0540f288698f431fd45c64dbc5f21d9365048ce1ac58914ba"
 HERE = Path(__file__).resolve().parent
 REPORT = {"schema": 1, "status": "running", "commands": [], "claims": {
     "scope": "Linux x64 Node.js packaging only; no portable consumer or full Rust workspace proof.",
@@ -242,7 +242,7 @@ def main():
         write("final-relocated-inventory.json", final_inventory)
         REPORT["shippingBytes"] = {"baseline": baseline_inventory["bytes"], "candidate": final_inventory["bytes"],
                                   "netReduction": baseline_inventory["bytes"] - final_inventory["bytes"]}
-        for name in ("esbuild-metafile.json", "embedded-packages.json", "source-inventory.json"):
+        for name in ("esbuild-metafile.json", "embedded-packages.json", "source-inventory.json", "runtime-packages.json"):
             shutil.copy2(relocated / "dist/provenance" / name, EVIDENCE / name)
         embedded = json.loads((EVIDENCE / "embedded-packages.json").read_text())
         assert any(item["path"] == "node_modules/zod" and item["version"] == "4.1.8" for item in embedded["packages"])
@@ -251,6 +251,25 @@ def main():
         assert not (relocated / "node_modules/esbuild").exists()
         assert (relocated / "dist/provenance/upstream/opencode-dcp/lib").is_dir()
         assert (relocated / "dist/provenance/package-notices/node_modules/@opencode-ai/plugin/LICENSE.upstream").is_file()
+        runtime_notices = json.loads((EVIDENCE / "runtime-packages.json").read_text())
+        expected_runtime = {"@anthropic-ai/tokenizer": "0.0.4", "tiktoken": "1.0.22",
+                            "@types/node": "18.19.130", "undici-types": "5.26.5"}
+        assert {item["name"]: item["version"] for item in runtime_notices["packages"]} == expected_runtime
+        assert len(runtime_notices["packages"]) == 4
+        fallback_hashes = {"tiktoken": "418cb499b436128d653d79941333a5437b7be2ea9213dcc2f04d15d5d2c51d86",
+                           "undici-types": "a6db8096b2707bc0102d256917d4d33f298ba36d8c3f25de067a2b5bb379db27"}
+        for package in runtime_notices["packages"]:
+            locked = new["packages"]["node_modules/" + package["name"]]
+            assert package["integrity"] == locked["integrity"] and package["resolved"] == locked["resolved"]
+            assert package["notices"]
+            for notice in package["notices"]:
+                path = relocated / "dist/provenance" / notice["path"]
+                assert path.stat().st_size == notice["bytes"] and digest(path) == notice["sha256"]
+            if package["name"] in fallback_hashes:
+                assert any(notice["sha256"] == fallback_hashes[package["name"]] for notice in package["notices"])
+        shutil.copytree(relocated / "dist/provenance/runtime-notices", EVIDENCE / "runtime-notices")
+        REPORT["runtimeNotices"] = {"packages": 4, "fallbackNotices": fallback_hashes,
+                                    "scope": "Identified package notices retained; not a blanket legal opinion."}
         assert run("source-remains-clean", ["git", "-C", str(source), "status", "--porcelain=v1",
                                           "--untracked-files=all"]).strip() == ""
         REPORT["status"] = "passed"
