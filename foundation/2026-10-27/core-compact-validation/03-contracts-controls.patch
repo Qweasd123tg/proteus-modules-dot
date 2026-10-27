@@ -1,0 +1,182 @@
+diff --git a/crates/proteus-contracts/src/model_standard/canonical_response.rs b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+index 1ce6ab1ee8a09ff1017c5e7e6e34e332252d06f0..160bac07cf60b233b08ee4c17522e91b52ab089f 100644
+--- a/crates/proteus-contracts/src/model_standard/canonical_response.rs
++++ b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+@@ -547,3 +547,7 @@
+         assert!(error.contains("at least one message"));
+     }
+ }
++
++#[cfg(test)]
++#[path = "canonical_response/validation_context_tests.rs"]
++mod validation_context_tests;
+diff --git a/crates/proteus-contracts/src/model_standard/canonical_response/validation_context_tests.rs b/crates/proteus-contracts/src/model_standard/canonical_response/validation_context_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-contracts/src/model_standard/canonical_response/validation_context_tests.rs
+@@ -0,0 +1,165 @@
++use super::*;
++use crate::{
++    domain::{
++        HostedToolConfig, ModelRef, ToolCallSurface, ToolSafety, ToolSurface,
++        WebSearchHostedToolConfig,
++    },
++    model_standard::CanonicalMessage,
++};
++use serde_json::json;
++
++fn tool(surface: crate::domain::ToolSurface) -> ToolSpec {
++    ToolSpec::new("edit", "Edit", json!({}), ToolSafety::WritesFiles).with_surface(surface)
++}
++
++fn request(tools: Vec<ToolSpec>) -> CanonicalModelRequest {
++    CanonicalModelRequest::new(ModelRef::new("probe", "probe"), Vec::new()).with_tools(tools)
++}
++
++fn response(call: ToolCall) -> CanonicalModelResponse {
++    CanonicalModelResponse::new(
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![ContentPart::ToolCall { call: call.clone() }],
++        ),
++        vec![call],
++        FinishReason::ToolCalls,
++    )
++}
++
++#[test]
++fn validation_context_preserves_structure_and_surface_errors() {
++    let request = request(vec![tool(ToolSurface::freeform_lark("start: /.+/"))]);
++    let valid = response(
++        ToolCall::new("call", "edit", json!({"input": "patch"}))
++            .with_surface(ToolCallSurface::Freeform),
++    );
++    let mut cases = Vec::new();
++    let mut invalid = valid.clone();
++    invalid.messages.clear();
++    cases.push((invalid, "at least one message"));
++    let mut invalid = valid.clone();
++    invalid.messages[0].role = MessageRole::User;
++    cases.push((invalid, "assistant role"));
++    let mut invalid = valid.clone();
++    invalid.messages[0].parts[0].payload = ContentPart::ToolResult {
++        result: crate::domain::ToolResult::ok("call".into(), "forged"),
++    };
++    cases.push((invalid, "cannot contain a tool result"));
++    for finish_reason in [
++        FinishReason::Stop,
++        FinishReason::Length,
++        FinishReason::ContentFilter,
++        FinishReason::Error,
++        FinishReason::Unknown,
++    ] {
++        let mut invalid = valid.clone();
++        invalid.finish_reason = finish_reason.clone();
++        let expected = if finish_reason == FinishReason::Length {
++            "length limit"
++        } else {
++            "finish_reason"
++        };
++        cases.push((invalid, expected));
++    }
++    let mut invalid = valid.clone();
++    invalid.tool_calls.clear();
++    cases.push((invalid, "without tool calls"));
++    let mut invalid = valid.clone();
++    invalid.messages[0].parts.clear();
++    cases.push((invalid, "does not match assistant messages"));
++    let mut invalid = valid.clone();
++    invalid.tool_calls[0].raw_arguments = Some("different".into());
++    cases.push((invalid, "does not match assistant message part"));
++    let mut invalid = valid.clone();
++    let duplicate_part = invalid.messages[0].parts[0].clone();
++    invalid.messages[0].parts.push(duplicate_part);
++    invalid.tool_calls.push(invalid.tool_calls[0].clone());
++    cases.push((invalid, "duplicated tool call id"));
++    cases.push((
++        response(ToolCall::new("call", "edit", json!({}))),
++        "declared freeform surface",
++    ));
++    let borrowed = ModelResponseValidationContext::from_request(&request);
++    let owned = borrowed.clone().into_owned();
++    for (invalid, expected) in cases {
++        let legacy = validate_model_response_against_request(&request, &invalid);
++        assert!(
++            legacy.as_ref().unwrap_err().contains(expected),
++            "{legacy:?}"
++        );
++        assert_eq!(borrowed.validate_response(&invalid), legacy);
++        assert_eq!(owned.validate_response(&invalid), legacy);
++    }
++    assert_eq!(borrowed.validate_response(&valid), Ok(()));
++    assert_eq!(owned.validate_response(&valid), Ok(()));
++}
++
++#[test]
++fn validation_context_is_an_independent_per_request_snapshot() {
++    let mut request = request(vec![tool(ToolSurface::freeform_lark("start: /.+/"))]);
++    let old = ModelResponseValidationContext::from_request(&request).into_owned();
++    request.tools[0] = tool(ToolSurface::function());
++    let current = ModelResponseValidationContext::from_request(&request).into_owned();
++    drop(request);
++    let function = response(ToolCall::new("call", "edit", json!({})));
++    let freeform = response(
++        ToolCall::new("call", "edit", json!({"input": "patch"}))
++            .with_surface(ToolCallSurface::Freeform),
++    );
++    assert!(old.validate_response(&function).is_err());
++    assert_eq!(old.validate_response(&freeform), Ok(()));
++    assert_eq!(current.validate_response(&function), Ok(()));
++    assert!(current.validate_response(&freeform).is_err());
++}
++
++#[test]
++fn validation_context_preserves_unknown_hosted_and_first_match_semantics() {
++    let function =
++        ToolCall::new("call", "edit", json!("{malformed")).with_raw_arguments("{malformed");
++    for first_freeform in [false, true] {
++        let freeform = tool(ToolSurface::freeform_lark("start: /.+/"));
++        let function_tool = tool(ToolSurface::function());
++        let tools = if first_freeform {
++            vec![freeform, function_tool]
++        } else {
++            vec![function_tool, freeform]
++        };
++        let request = request(tools);
++        let context = ModelResponseValidationContext::from_request(&request).into_owned();
++        assert_eq!(
++            context.validate_tool_call(&function).is_err(),
++            first_freeform
++        );
++        assert_eq!(
++            context
++                .validate_response(&response(function.clone()))
++                .is_err(),
++            first_freeform
++        );
++        let unknown = ToolCall::new("unknown-call", "unknown", json!({}));
++        assert_eq!(context.validate_tool_call(&unknown), Ok(()));
++        assert_eq!(context.validate_response(&response(unknown)), Ok(()));
++    }
++    let request = request(vec![
++        ToolSpec::new("web_search", "Search", json!({}), ToolSafety::Network).with_surface(
++            ToolSurface::provider_hosted(HostedToolConfig::WebSearch {
++                config: WebSearchHostedToolConfig::default(),
++            }),
++        ),
++    ]);
++    let context = ModelResponseValidationContext::from_request(&request).into_owned();
++    let call = ToolCall::new("hosted", "web_search", json!({}));
++    assert!(
++        context
++            .validate_tool_call(&call)
++            .unwrap_err()
++            .contains("provider-hosted")
++    );
++    assert!(
++        context
++            .validate_response(&response(call))
++            .unwrap_err()
++            .contains("provider-hosted")
++    );
++}

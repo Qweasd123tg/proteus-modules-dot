@@ -1,0 +1,321 @@
+diff --git a/crates/proteus-core/src/core/bound_model_tests.rs b/crates/proteus-core/src/core/bound_model_tests.rs
+index 27b3820c805b5e1d55d3356ea31c5a69d24bb04b..290704ac73063a3f1533cd2fb7d41d881112d18a 100644
+--- a/crates/proteus-core/src/core/bound_model_tests.rs
++++ b/crates/proteus-core/src/core/bound_model_tests.rs
+@@ -521,3 +521,6 @@
+     assert_eq!(facts.responses.len(), 1);
+     assert_eq!(facts.requests[0].1, ModelCallOrigin::Auxiliary);
+ }
++
++#[path = "bound_model_tests/compact_validation.rs"]
++mod compact_validation;
+diff --git a/crates/proteus-core/src/core/bound_model_tests/compact_validation.rs b/crates/proteus-core/src/core/bound_model_tests/compact_validation.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/bound_model_tests/compact_validation.rs
+@@ -0,0 +1,305 @@
++use super::*;
++use crate::{
++    contracts::{ExecutionHooks, HookEvent, HookInput, HookResponse, apply_hook_response},
++    domain::{ToolCall, ToolCallSurface, ToolSafety, ToolSurface},
++    model_standard::{
++        InstructionBlock, InstructionKind, ModelFailure, validate_model_response_against_request,
++    },
++};
++use futures_util::FutureExt;
++use std::collections::VecDeque;
++
++enum Script {
++    Events(Vec<ModelStreamEvent>),
++    StartFailure(ModelFailure),
++    Pending,
++}
++
++struct CompactAdapter(std::sync::Mutex<VecDeque<Script>>);
++
++#[async_trait]
++impl Model for CompactAdapter {
++    fn id(&self) -> std::borrow::Cow<'static, str> {
++        "compact".into()
++    }
++
++    fn capabilities(&self, _: &ModelRef) -> Result<ModelCapabilities> {
++        Ok(ModelCapabilities::empty()
++            .with_tools(true)
++            .with_freeform_tools(true))
++    }
++
++    async fn stream(&self, request: CanonicalModelRequest) -> Result<ModelEventStream> {
++        // The provider intentionally does not retain the request; the resource
++        // regression isolates the BoundModel validation owner.
++        drop(request);
++        match self.0.lock().unwrap().pop_front().expect("script") {
++            Script::Events(events) => Ok(Box::pin(stream::iter(events.into_iter().map(Ok)))),
++            Script::StartFailure(failure) => Err(failure.into()),
++            Script::Pending => Ok(Box::pin(stream::pending())),
++        }
++    }
++}
++
++fn model(scripts: Vec<Script>, recorder: Arc<dyn ExecutionRecorder>) -> BoundModel {
++    BoundModel::new(
++        Arc::new(ModelService::new(Arc::new(CompactAdapter(
++            std::sync::Mutex::new(scripts.into()),
++        )))),
++        ModelExecutionBinding::with_recorder(
++            ExecutionScope::fresh(CancellationToken::new()),
++            recorder,
++        ),
++        0,
++    )
++}
++
++fn tool(surface: ToolSurface) -> ToolSpec {
++    ToolSpec::new(
++        "edit",
++        "Edit",
++        serde_json::json!({}),
++        ToolSafety::WritesFiles,
++    )
++    .with_surface(surface)
++}
++
++fn tool_response(id: &str) -> CanonicalModelResponse {
++    let call =
++        ToolCall::new(id, "edit", serde_json::json!({})).with_surface(ToolCallSurface::Function);
++    CanonicalModelResponse::new(
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![ContentPart::ToolCall { call: call.clone() }],
++        ),
++        vec![call],
++        FinishReason::ToolCalls,
++    )
++}
++
++#[tokio::test]
++async fn compact_validation_uses_each_requests_current_tool_surface() {
++    let recorder = Arc::new(CollectingExecutionRecorder::default());
++    let model = model(
++        (0..3)
++            .map(|index| {
++                Script::Events(vec![ModelStreamEvent::Response {
++                    response: tool_response(&format!("call-{index}")),
++                }])
++            })
++            .collect(),
++        recorder.clone(),
++    );
++    for freeform in [true, false, true] {
++        let surface = if freeform {
++            ToolSurface::freeform_lark("start: /.+/")
++        } else {
++            ToolSurface::function()
++        };
++        let result = model
++            .complete(request("compact", "fresh schema").with_tools(vec![tool(surface)]))
++            .await;
++        if freeform {
++            assert!(
++                result
++                    .unwrap_err()
++                    .to_string()
++                    .contains("declared freeform surface")
++            );
++        } else {
++            assert!(result.is_ok());
++        }
++    }
++    let facts = recorder.facts.lock().await;
++    assert_eq!(facts.requests.len(), 3);
++    assert_eq!(facts.responses.len(), 1);
++    assert_eq!(facts.errors.len(), 2);
++}
++
++struct ReplaceHistory(CanonicalMessage);
++
++#[async_trait]
++impl ExecutionHooks for ReplaceHistory {
++    async fn apply(&self, input: HookInput) -> Result<HookEvent> {
++        apply_hook_response(
++            &input.event,
++            &HookResponse::ModelContext {
++                messages: vec![self.0.clone()],
++                instructions: vec![InstructionBlock::new(
++                    InstructionKind::Developer,
++                    "hooked",
++                    1,
++                )],
++            },
++        )
++    }
++}
++
++#[tokio::test]
++async fn compact_validation_snapshots_final_hook_history_in_all_terminal_paths() {
++    for conflict in [false, true] {
++        for placement in 0..4 {
++            let original = request("compact", "original");
++            let replacement = CanonicalMessage::text(MessageRole::User, "hook history");
++            let mut output = CanonicalMessage::text(MessageRole::Assistant, "output");
++            output.id = if conflict {
++                replacement.id
++            } else {
++                original.messages[0].id
++            };
++            let response = CanonicalModelResponse::new(output.clone(), vec![], FinishReason::Stop);
++            let failure = ModelFailure::other("provider failure")
++                .with_completed_messages(vec![output.clone()]);
++            let script = match placement {
++                0 => Script::Events(vec![ModelStreamEvent::Response { response }]),
++                1 => Script::Events(vec![
++                    ModelStreamEvent::MessageCompleted {
++                        message: output.clone(),
++                    },
++                    ModelStreamEvent::Response { response },
++                ]),
++                2 => Script::Events(vec![ModelStreamEvent::Error { failure }]),
++                _ => Script::StartFailure(failure),
++            };
++            let recorder = Arc::new(CollectingExecutionRecorder::default());
++            let model = model(vec![script], recorder.clone());
++            let attribution = model.binding().attribution();
++            let model = model.with_hooks(
++                Arc::new(ReplaceHistory(replacement.clone())),
++                attribution,
++                PathBuf::new(),
++            );
++            let result = model.complete(original).await;
++            if conflict {
++                let failure = ModelFailure::from_error(&result.unwrap_err());
++                assert!(
++                    failure
++                        .message
++                        .contains("conflicts with the request history")
++                );
++                assert!(failure.completed_messages.is_empty());
++            } else if placement < 2 {
++                assert_eq!(result.unwrap().messages, [output.clone()]);
++            } else {
++                let failure = ModelFailure::from_error(&result.unwrap_err());
++                assert_eq!(failure.message, "provider failure");
++                assert_eq!(failure.completed_messages, [output.clone()]);
++            }
++            let facts = recorder.facts.lock().await;
++            assert_eq!(facts.requests.len(), 1);
++            assert_eq!(facts.requests[0].2.messages, [replacement]);
++            assert_eq!(facts.requests[0].2.instructions[0].text, "hooked");
++            assert_eq!(
++                facts.responses.len(),
++                usize::from(!conflict && placement < 2)
++            );
++            assert_eq!(facts.errors.len(), usize::from(conflict || placement >= 2));
++            if !conflict && placement >= 2 {
++                assert_eq!(facts.errors[0].2, [output]);
++            }
++        }
++    }
++}
++
++#[tokio::test]
++async fn compact_validation_still_checks_final_structure_and_retains_accepted_progress() {
++    let prefix = CanonicalMessage::text(MessageRole::Assistant, "accepted");
++    let mut bad_length = CanonicalModelResponse::new(prefix.clone(), vec![], FinishReason::Length);
++    bad_length.end_turn = Some(true);
++    let no_calls = CanonicalModelResponse::new(prefix.clone(), vec![], FinishReason::ToolCalls);
++    let mut mismatch = tool_response("new-call");
++    mismatch.messages.insert(0, prefix.clone());
++    mismatch.tool_calls[0].args = serde_json::json!({"different": true});
++    let mut hidden = tool_response("hidden-call");
++    hidden.messages.insert(0, prefix.clone());
++    hidden.tool_calls.clear();
++    hidden.finish_reason = FinishReason::Stop;
++    for (response, expected) in [
++        (bad_length, "length limit"),
++        (no_calls, "without tool calls"),
++        (mismatch, "does not match assistant message part"),
++        (hidden, "does not match assistant messages"),
++    ] {
++        let recorder = Arc::new(CollectingExecutionRecorder::default());
++        let model = model(
++            vec![Script::Events(vec![
++                ModelStreamEvent::MessageCompleted {
++                    message: prefix.clone(),
++                },
++                ModelStreamEvent::Response { response },
++            ])],
++            recorder.clone(),
++        );
++        let failure = ModelFailure::from_error(
++            &model
++                .complete(
++                    request("compact", "malformed final")
++                        .with_tools(vec![tool(ToolSurface::function())]),
++                )
++                .await
++                .unwrap_err(),
++        );
++        assert!(failure.message.contains(expected), "{failure:?}");
++        assert_eq!(failure.completed_messages, [prefix.clone()]);
++        let facts = recorder.facts.lock().await;
++        assert!(facts.responses.is_empty());
++        assert_eq!(facts.errors.len(), 1);
++        assert_eq!(facts.errors[0].2, [prefix.clone()]);
++    }
++}
++
++#[test]
++fn request_based_validation_does_not_clone_large_tool_specs() {
++    let mut spec = tool(ToolSurface::function());
++    spec.description = "x".repeat(1024 * 1024);
++    spec.input_schema = serde_json::json!({"description": "y".repeat(1024 * 1024)});
++    let request = request("compact", "borrowed").with_tools(vec![spec]);
++    let response = response("done");
++    let (result, allocation) =
++        crate::test_alloc::measure(|| validate_model_response_against_request(&request, &response));
++    assert_eq!(result, Ok(()));
++    assert!(allocation.bytes < 4096, "{allocation:?}");
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn compact_stream_start_does_not_copy_historical_payload() {
++    let model = model(
++        vec![Script::Pending, Script::Pending],
++        Arc::new(NoopExecutionRecorder),
++    );
++    let small = request("compact", "small")
++        .with_instructions(vec![InstructionBlock::new(
++            InstructionKind::Developer,
++            "small",
++            1,
++        )])
++        .with_metadata(serde_json::json!({"payload": "small"}));
++    let mut large = small.clone();
++    large.messages[0].parts[0].payload = ContentPart::Text {
++        text: "x".repeat(1024 * 1024),
++    };
++    large.instructions[0].text = "y".repeat(1024 * 1024);
++    large.metadata = serde_json::json!({"payload": "z".repeat(1024 * 1024)});
++    // Count only synchronous startup, not input creation or async runtime setup.
++    // The provider is immediately ready and both returned streams remain live.
++    let (small_stream, small_alloc) = crate::test_alloc::measure(|| {
++        model
++            .stream(small)
++            .now_or_never()
++            .expect("immediate startup")
++            .unwrap()
++    });
++    let (large_stream, large_alloc) = crate::test_alloc::measure(|| {
++        model
++            .stream(large)
++            .now_or_never()
++            .expect("immediate startup")
++            .unwrap()
++    });
++    assert!(
++        large_alloc.bytes <= small_alloc.bytes + 16 * 1024,
++        "historical bytes must not create a retained validation clone: small={small_alloc:?}, large={large_alloc:?}"
++    );
++    // Allocation traffic is a mechanism check, not RSS, peak memory, or latency.
++    drop((small_stream, large_stream));
++}

@@ -1,0 +1,219 @@
+diff --git a/crates/proteus-contracts/src/model_standard/canonical_response.rs b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+index 19e0fc979f294abaff7f1acb7bbc255935c88918..1ce6ab1ee8a09ff1017c5e7e6e34e332252d06f0 100644
+--- a/crates/proteus-contracts/src/model_standard/canonical_response.rs
++++ b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashSet;
++use std::{borrow::Cow, collections::HashSet};
+ 
+ use serde::{Deserialize, Serialize};
+ 
+@@ -157,13 +157,47 @@
+     request: &CanonicalModelRequest,
+     response: &CanonicalModelResponse,
+ ) -> Result<(), String> {
+-    validate_model_response_structure(response)?;
+-
+-    for call in &response.tool_calls {
+-        validate_model_tool_call_surface(&request.tools, call)?;
+-    }
+-
+-    Ok(())
++    ModelResponseValidationContext::from_request(request).validate_response(response)
++}
++
++/// Request-specific данные для проверки ответа без удержания истории запроса.
++///
++/// Создаётся из окончательного request после shaping и hooks. Заимствованный
++/// context не копирует tools; `into_owned` делает независимый snapshot для
++/// stream lifetime. Это не request DTO и не кэш между вызовами.
++/// Новые request-specific правила добавляются сюда вместе с snapshot-полями,
++/// чтобы borrowed и owned пути использовали одну реализацию проверки.
++#[derive(Clone)]
++pub struct ModelResponseValidationContext<'a> {
++    tools: Cow<'a, [ToolSpec]>,
++}
++
++impl<'a> ModelResponseValidationContext<'a> {
++    pub fn from_request(request: &'a CanonicalModelRequest) -> Self {
++        Self {
++            tools: Cow::Borrowed(&request.tools),
++        }
++    }
++
++    pub fn into_owned(self) -> ModelResponseValidationContext<'static> {
++        ModelResponseValidationContext {
++            tools: Cow::Owned(self.tools.into_owned()),
++        }
++    }
++
++    pub fn validate_response(&self, response: &CanonicalModelResponse) -> Result<(), String> {
++        validate_model_response_structure(response)?;
++        for call in &response.tool_calls {
++            self.validate_tool_call(call)?;
++        }
++        Ok(())
++    }
++
++    /// Та же tool surface для MessageCompleted и terminal response.
++    /// Не заменяет workflow visibility/policy или проверку аргументов.
++    pub fn validate_tool_call(&self, call: &ToolCall) -> Result<(), String> {
++        validate_model_tool_call_surface(&self.tools, call)
++    }
+ }
+ 
+ /// A completed stream item and a terminal response use the same tool surface.
+diff --git a/crates/proteus-core/src/core/bound_model.rs b/crates/proteus-core/src/core/bound_model.rs
+index 66f6d338e0f01c93015c89d81680d2b13e0758a3..8d9b58772657ba564dbc83a243c7b8212ce8da0c 100644
+--- a/crates/proteus-core/src/core/bound_model.rs
++++ b/crates/proteus-core/src/core/bound_model.rs
+@@ -25,7 +25,6 @@
+     },
+     model_standard::{
+         CanonicalModelRequest, CanonicalModelResponse, ModelCapabilities, ModelStreamEvent,
+-        validate_model_response_against_request,
+     },
+ };
+ 
+@@ -278,7 +277,7 @@
+             )
+             .await?;
+ 
+-        let validation_request = request.clone();
++        let mut progress = CompletedMessageProgress::new(&request);
+         let cancellation =
+             crate::core::model_call_scope::operation_cancellation(&self.binding.scope.cancellation);
+         let recorder = self.binding.recorder();
+@@ -290,7 +289,6 @@
+             },
+             _ = wait_for_deadline(deadline), if deadline.is_some() => {
+                 let error = model_timeout(self.model_timeout_ms);
+-                let mut progress = CompletedMessageProgress::new(&validation_request);
+                 let failure = progress.attach_to_failure(
+                     crate::model_standard::ModelFailure::from_error(&error),
+                 );
+@@ -300,7 +298,6 @@
+             result = self.service.start_prepared(request) => match result {
+                 Ok(stream) => stream,
+                 Err(error) => {
+-                    let mut progress = CompletedMessageProgress::new(&validation_request);
+                     let failure = progress.attach_to_failure(
+                         crate::model_standard::ModelFailure::from_error(&error),
+                     );
+@@ -312,7 +309,7 @@
+ 
+         Ok(bound_recording_stream(
+             stream,
+-            validation_request,
++            progress,
+             recorder,
+             exchange_id,
+             cancellation,
+@@ -393,7 +390,7 @@
+ 
+ fn bound_recording_stream(
+     mut stream: ModelEventStream,
+-    validation_request: CanonicalModelRequest,
++    mut progress: CompletedMessageProgress,
+     recorder: Arc<dyn ExecutionRecorder>,
+     exchange_id: ExchangeId,
+     cancellation: crate::contracts::CancellationToken,
+@@ -402,7 +399,6 @@
+ ) -> ModelEventStream {
+     Box::pin(async_stream::try_stream! {
+         let mut terminal_recorded = false;
+-        let mut progress = CompletedMessageProgress::new(&validation_request);
+         loop {
+             enum Next {
+                 Item(Option<Result<ModelStreamEvent>>),
+@@ -451,8 +447,7 @@
+                 ModelStreamEvent::Response { response } => {
+                     if let Err(error) =
+                         progress.reconcile_response(response).and_then(|_| {
+-                            validate_model_response_against_request(&validation_request, response)
+-                                .map_err(anyhow::Error::msg)
++                            progress.validate_response(response)
+                         })
+                     {
+                         let error = anyhow!("model protocol error: {error}");
+diff --git a/crates/proteus-core/src/core/bound_model/progress.rs b/crates/proteus-core/src/core/bound_model/progress.rs
+index 6937a3e0c5987e122524981b3556e4d3fff26139..6da59b2acc0048057db50ee995331f302bbab8ff 100644
+--- a/crates/proteus-core/src/core/bound_model/progress.rs
++++ b/crates/proteus-core/src/core/bound_model/progress.rs
+@@ -3,10 +3,10 @@
+ use anyhow::{Result, bail};
+ 
+ use crate::{
+-    domain::{CallId, MessageId, PartId, ToolSpec},
++    domain::{CallId, MessageId, PartId},
+     model_standard::{
+-        CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole, ModelFailure, PartScope,
+-        validate_model_tool_call_surface,
++        CanonicalMessage, CanonicalModelRequest, CanonicalModelResponse, ContentPart, MessageRole,
++        ModelFailure, ModelResponseValidationContext, PartScope,
+     },
+ };
+ 
+@@ -18,7 +18,7 @@
+     messages: Vec<CanonicalMessage>,
+     positions: HashMap<MessageId, usize>,
+     call_ids: HashSet<CallId>,
+-    tools: Vec<ToolSpec>,
++    response_validation: ModelResponseValidationContext<'static>,
+ }
+ 
+ impl CompletedMessageProgress {
+@@ -42,7 +42,7 @@
+                     _ => None,
+                 })
+                 .collect(),
+-            tools: request.tools.clone(),
++            response_validation: ModelResponseValidationContext::from_request(request).into_owned(),
+         }
+     }
+ 
+@@ -93,7 +93,9 @@
+                 );
+             }
+             if let ContentPart::ToolCall { call } = &part.payload {
+-                validate_model_tool_call_surface(&self.tools, call).map_err(anyhow::Error::msg)?;
++                self.response_validation
++                    .validate_tool_call(call)
++                    .map_err(anyhow::Error::msg)?;
+                 if self.call_ids.contains(&call.id) || !message_call_ids.insert(call.id.clone()) {
+                     bail!(
+                         "completed model message {} reused tool call id '{}'",
+@@ -146,6 +148,12 @@
+         Ok(())
+     }
+ 
++    pub(super) fn validate_response(&self, response: &CanonicalModelResponse) -> Result<()> {
++        self.response_validation
++            .validate_response(response)
++            .map_err(anyhow::Error::msg)
++    }
++
+     pub(super) fn attach_to_failure(&mut self, mut failure: ModelFailure) -> ModelFailure {
+         let mut candidate = self.clone();
+         for message in std::mem::take(&mut failure.completed_messages) {
+diff --git a/docs/architecture/canonical-turn-data.md b/docs/architecture/canonical-turn-data.md
+index b876f6a662daefbe6ea7aa9eacd73b42b0a5478f..813ed39b02b800bbb45ae9438bf719cfe8123fdf 100644
+--- a/docs/architecture/canonical-turn-data.md
++++ b/docs/architecture/canonical-turn-data.md
+@@ -49,6 +49,16 @@
+ различает `commentary` и `final_answer`; journal и history projection сохраняют
+ item boundaries и phase без provider-specific parsing. Singular legacy shape
+ не читается.
++
++BoundModel записывает полный окончательный request после shaping и hooks до
++вызова provider. Для stream validation он сохраняет только request message,
++part и call identities и owned `ModelResponseValidationContext`, а не вторую
++копию historical payload. Context создаётся заново для каждого prepared request
++и используется одновременно для MessageCompleted и terminal response; tools
++между вызовами не кэшируются. Public request-based validator использует тот же
++context заимствованно, без копирования tools. При расширении request-specific
++правил меняются поля context и обе формы его construction, не фиктивный request.
++Provider DTO, полный journal request и failure reconciliation не меняются.
+ 
+ ### Parts
+ 
