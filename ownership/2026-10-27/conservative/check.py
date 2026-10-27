@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify the conservative ownership slice; run only in authorized hosted CI.
+"""Qualify the reviewed coordinated ownership slice; run only in authorized hosted CI.
 
 No shell command interpolation, upstream writes, automatic merge, release,
 portable build, benchmark, or production-session access is performed.
@@ -19,7 +19,7 @@ import time
 
 CORE_PIN = "63454d4e8b1e4e6b26d088fce2a17d46f30390ae"
 MODULES_PIN = "7fceaebc3bed8add9b0e3091110f59deca86ba46"
-BUNDLE_SHA256 = "779f9a7018a97d8d3a40bbb10968d8a341d9b36b737572e479ff332b78c2ba32"
+BUNDLE_SHA256 = "4fb6a5efa2cad9e4faac570931c088ab387c53cd4ee9117f932e851d44d7de60"
 TEST_PATH = "crates/proteus-core/tests/session_ownership_slice.rs"
 TARGET = "session_ownership_slice"
 MAX_TOTAL_OUTPUT = 80 * 1024 * 1024
@@ -220,12 +220,12 @@ def checkout(runner, label, destination, repo, revision, env):
 
 def apply_bundle(root, bundle, tests_only):
     changed = {}
-    for name, entry in bundle["files"].items():
+    selected = ({TEST_PATH: bundle["files"][TEST_PATH], **bundle["baseline_additional_files"]}
+                if tests_only else bundle["files"])
+    for name, entry in selected.items():
         rel = Path(name)
         if rel.is_absolute() or ".." in rel.parts or not name.startswith("crates/proteus-core/"):
             raise GateRejected("unsafe bundle path")
-        if tests_only and name != TEST_PATH:
-            continue
         path = root / rel
         if entry["original_blob"] is None:
             if path.exists():
@@ -242,14 +242,16 @@ def apply_bundle(root, bundle, tests_only):
     return changed
 
 
-def tracked_snapshot(runner, label, root, env):
+def tracked_snapshot(runner, label, root, env, extra_files=()):
     listing = runner.ok(label, ["git", "ls-files", "-z"], root, env, 30, 2 * 1024 * 1024)
     files = {}
     for name in listing.split("\0"):
         if name:
             files[name] = sha(bounded_file(root / name, 32 * 1024 * 1024))
-    if TEST_PATH not in files and (root / TEST_PATH).exists():
-        files[TEST_PATH] = sha(bounded_file(root / TEST_PATH, 1024 * 1024))
+    # New authored files are untracked in the detached source checkout too.
+    for name in extra_files:
+        if name not in files:
+            files[name] = sha(bounded_file(root / name, 4 * 1024 * 1024))
     return files
 
 
@@ -278,17 +280,60 @@ def compile_target(runner, lane, root, env):
     return emitted[0]
 
 
+def listed_tests(output):
+    return re.findall(r"^(\S+): test$", output, re.M)
+
+
 def inventory(runner, lane, binary, root, env, specs):
     output = runner.ok(lane + "-inventory", [binary, "--list", "--format", "terse"],
                        root, env, 30, 128 * 1024)
-    names = re.findall(r"^(\S+): test$", output, re.M)
+    names = listed_tests(output)
     expected = specs["candidate_mandatory_tests"] + [specs["intentional_ignored_helper"]]
     if len(names) != len(expected) or set(names) != set(expected):
         raise GateRejected(f"{lane}: unexpected test inventory")
     output = runner.ok(lane + "-ignored", [binary, "--list", "--ignored", "--format", "terse"],
                        root, env, 30, 128 * 1024)
-    if re.findall(r"^(\S+): test$", output, re.M) != [specs["intentional_ignored_helper"]]:
+    if listed_tests(output) != [specs["intentional_ignored_helper"]]:
         raise GateRejected(f"{lane}: mandatory test is ignored")
+
+
+def compile_library(runner, lane, root, env):
+    output = runner.ok(
+        lane + "-library-compile",
+        ["cargo", "test", "--locked", "-p", "proteus-core", "--lib",
+         "--no-run", "--message-format=json"],
+        root, env, 1500, 20 * 1024 * 1024,
+    )
+    emitted = []
+    for line in output.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (item.get("reason") == "compiler-artifact" and item.get("executable") and
+            item.get("target", {}).get("name") == "proteus_core" and
+            item["target"].get("kind") == ["lib"]):
+            expected = (root / "crates/proteus-core/src/lib.rs").resolve()
+            if Path(item["target"]["src_path"]).resolve() != expected:
+                raise GateRejected("unexpected library test source")
+            emitted.append(Path(item["executable"]).resolve())
+    if len(emitted) != 1 or not emitted[0].is_relative_to(Path(env["CARGO_TARGET_DIR"])):
+        raise GateRejected("missing or ambiguous compiled library test executable")
+    return emitted[0]
+
+
+def library_inventory(runner, lane, binary, root, env, required):
+    output = runner.ok(lane + "-library-inventory", [binary, "--list", "--format", "terse"],
+                       root, env, 30, 256 * 1024)
+    names = listed_tests(output)
+    if any(names.count(name) != 1 for name in required):
+        raise GateRejected("required library test missing or duplicated")
+    output = runner.ok(lane + "-library-ignored",
+                       [binary, "--list", "--ignored", "--format", "terse"],
+                       root, env, 30, 128 * 1024)
+    ignored = listed_tests(output)
+    if set(required) & set(ignored):
+        raise GateRejected("required library test is ignored")
 
 
 def qualify(args):
@@ -324,9 +369,8 @@ def qualify(args):
         "bundle_sha256": BUNDLE_SHA256, "core_pin": CORE_PIN,
         "canonical_fixture_modules_pin": MODULES_PIN,
         "canonical_fixture_core_dependency": "bee0e409e746e2df9db32748d4f8ea02201bd4af",
-        "coverage": "Conservative session-store ownership slice only",
-        "excluded": ["coordinated active-session deletion", "config/image transactions",
-                     "retirement of all stale runtime/API handles", "canceled-delete hold proof",
+        "coverage": "Stable writer ownership and explicit local-handle coordinated deletion",
+        "excluded": ["config/image transactions", "retirement of all stale runtime/API handles",
                      "portable packaging", "benchmarks", "mixed-version safety",
                      "same-UUID reincarnation", "malicious namespace mutation", "power-loss safety"],
         "cases": [], "stages": runner.records,
@@ -382,7 +426,9 @@ def qualify(args):
             runner.ok(lane + "-diff-check", ["git", "diff", "--check"], root, env, 30)
         snapshots = {}
         for lane, root in (("baseline", baseline), ("candidate", candidate)):
-            snapshots[lane] = tracked_snapshot(runner, lane + "-source-before", root, env)
+            snapshots[lane] = tracked_snapshot(
+                runner, lane + "-source-before", root, env,
+                receipt["baseline_test_files" if lane == "baseline" else "candidate_changed_files"])
         for lane, root in (("baseline", baseline), ("candidate", candidate)):
             lane_env = dict(env, CARGO_TARGET_DIR=str(work / (lane + "-target")))
             binary = compile_target(runner, lane, root, lane_env)
@@ -432,14 +478,34 @@ def qualify(args):
             PROTEUS_TEST_REFERENCE_MODULE=str(reference),
             PROTEUS_TEST_DCP_MODULE=str(dcp_worker),
         )
+        for lane, root in (("baseline", baseline), ("candidate", candidate)):
+            lane_env = dict(full_env, CARGO_TARGET_DIR=str(work / (lane + "-target")))
+            binary = compile_library(runner, lane, root, lane_env)
+            receipt[lane + "_library_binary_sha256"] = file_sha(binary)
+            required = (list(specs["baseline_library_expected_red"]) +
+                        specs["baseline_library_positive_controls"] if lane == "baseline" else
+                        specs["candidate_extra_unit_tests"] + specs["candidate_existing_regression_tests"])
+            if len(required) != len(set(required)):
+                raise GateRejected("duplicate required library case")
+            library_inventory(runner, lane, binary, root, lane_env, required)
+            for index, name in enumerate(required):
+                result = runner.run(
+                    f"{lane}-library-case-{index:02}", [binary, "--exact", name, "--test-threads=1"],
+                    root, lane_env, 60, 256 * 1024,
+                )
+                marker = specs["baseline_library_expected_red"].get(name) if lane == "baseline" else None
+                verdict = classify(result, name, marker)
+                receipt["cases"].append({"lane": lane + "-library", "name": name, "verdict": verdict})
         output = runner.ok("candidate-canonical-full",
                            [sys.executable, "scripts/test.py", "full"],
                            candidate, full_env, 1800, 32 * 1024 * 1024)
         for name in specs["candidate_extra_unit_tests"] + specs["candidate_existing_regression_tests"]:
             if len(re.findall(r"^test " + re.escape(name) + r" \.\.\. ok$", output, re.M)) != 1:
-                raise GateRejected(f"full gate did not uniquely pass new unit test {name}")
+                raise GateRejected(f"full gate did not uniquely pass required test {name}")
         for lane, root in (("baseline", baseline), ("candidate", candidate)):
-            after = tracked_snapshot(runner, lane + "-source-after", root, env)
+            after = tracked_snapshot(
+                runner, lane + "-source-after", root, env,
+                receipt["baseline_test_files" if lane == "baseline" else "candidate_changed_files"])
             if snapshots[lane] != after:
                 raise GateRejected(f"{lane}: source changed during qualification")
             receipt[lane + "_source_snapshot_sha256"] = sha(
@@ -463,6 +529,9 @@ def qualify(args):
 
 
 def self_test():
+    assert listed_tests(
+        "app_server::ownership_tests::case: test\nhelper: test\n2 tests, 0 benchmarks\n"
+    ) == ["app_server::ownership_tests::case", "helper"], "libtest inventory parser"
     name, marker = "case", "OWNERSHIP_EXAMPLE"
     good = {
         "code": 101,
@@ -525,7 +594,7 @@ def self_test():
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
-    print("Controller self-tests: 10 rejection controls and 4 process-limit controls passed.")
+    print("Controller self-tests: 10 rejection, 4 process-limit and 1 inventory parser controls passed.")
 
 
 def main():

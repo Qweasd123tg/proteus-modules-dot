@@ -1,11 +1,15 @@
-# Conservative session ownership slice
+# Session ownership and coordinated local deletion
 
 **Experimental source candidate, not an accepted full ownership fix.** It is
 based on Proteus-core commit
 `63454d4e8b1e4e6b26d088fce2a17d46f30390ae`.
-At initial authoring, Rust source has only been parsed/formatted. Compilation,
-baseline failures, candidate passes and canonical full tests are **not run**.
-A later CI receipt is evidence only for its exact package and repository commit.
+The initial conservative candidate at `bae05a0bc9ac7da2f6e17e5627214f762c2ffb3b`
+compiled and passed its 11 focused cases, but the
+[canonical full gate failed](https://github.com/Qweasd123tg/proteus-modules-dot/actions/runs/40438671031)
+on two existing HTTP deletion tests: local Busy broke the established lifecycle.
+This correction preserves those tests and adds explicit local-owner coordination.
+Its new code has been parsed/formatted only; its hosted qualification is **not run
+at authoring**. Each later receipt applies only to its exact commit and hashes.
 
 ## What this slice changes
 
@@ -20,17 +24,29 @@ A later CI receipt is evidence only for its exact package and repository commit.
 - Preflight ownership is tentative. Failed identity/materialization/recovery
   releases only a newly acquired lease, including during unwinding; a previously
   committed owner's lease is retained.
-- Deletion runs entirely inside an owned blocking task and acquires the same
-  external lease. It returns Busy for **every live writer, including a local
-  writer**. Callers must stop work and drop all owner handles before retrying.
-  The existing Weak registry and retirement latch are preserved.
+- Cold path-only deletion remains Busy for every live owner; a path cannot steal
+  another runtime's lease. An explicit matching AppServerHandle instead validates
+  its configured scope, closes admission and awaits terminal settlement inline.
+  HTTP removes its closed server cache entry before invoking owned deletion.
+- Owned deletion permanently retires the shared writer generation and transfers
+  its actual OS lease plus retirement completion tail into the blocking worker.
+  No unlock/reacquire gap is introduced. Retained stores reject future primary
+  journal writes as Retired, including while removal is paused. Canceling the
+  async waiter does not drop the worker's lease. Lease close precedes completion.
+  The existing Weak registry and retirement latch remain intact.
 
 ## Deliberate limits
 
-This conservative Busy behavior is a temporary usability tradeoff, not
-coordinated active-session deletion. HTTP/direct-runtime teardown, retirement of
-all stale runtime handles, canonical config/image transaction ownership, and
-deterministic canceled-delete testing remain separate unfinished work.
+This only coordinates deletion through an explicit AppServerHandle; path-only
+deletion still requires stopping work and dropping all owners. It does not
+shutdown all other local runtimes or claim comprehensive API retirement.
+Canonical config/image transaction ownership remains unfinished; the primary
+journal/store guards are not a substitute for that work.
+
+Validation failures preserve an already committed owner. Once a generation is
+retired, a later filesystem removal failure leaves it retired (fail closed), not
+resurrected across a lease gap. Cancellation before ownership transfer may leave
+a closed server and existing storage; it does not force detached deletion.
 
 A **quiescent upgrade is required**: old binaries use an internal lock and do not
 coordinate with this external lease. This patch does not establish mixed-version
@@ -40,7 +56,7 @@ no schema migration, quarantine or client-token API.
 
 ## Exact qualification plan
 
-The source bundle contains nine complete replacement/new files and original
+The source bundle contains 13 complete replacement/new files and original
 Git blob IDs. The controller verifies the pinned upstream source before applying
 anything. It never writes to the upstream repository.
 
@@ -58,14 +74,28 @@ by assertion markers:
 
 Six positive controls cover normal owner-drop deletion, read-only opening, cold
 identity/recovery rejection releasing a tentative lease, legitimate ownership
-retention, and lazy construction. Two additional candidate unit cases cover
-panic-time lease release versus retention.
+retention, and lazy construction. Five additional new unit cases cover:
+panic-time tentative release versus existing-owner retention (two), canceled
+owned deletion retaining a real OS lease while stale clones stay retired, invalid
+owned-delete scope preserving its legitimate owner, and direct handle deletion
+closing admission while a retained store cannot recreate the directory.
 
-The controller compiles the baseline plus test-only addition first. It verifies
+The direct-handle test is additionally inserted into an otherwise unchanged
+baseline library using a test-only module declaration; its expected behavioral
+failure marker is `OWNERSHIP_DIRECT_DELETE`. The two unchanged HTTP regressions
+are mandatory baseline positive controls. Candidate library execution requires
+all five new unit cases plus those two HTTP controls and the two existing writer
+lifecycle controls individually. These nine names must also pass in the full gate.
+
+Fifteen controller self-controls cover ten false-red rejections, four bounded
+process/cleanup cases and exact libtest inventory parsing.
+
+The controller compiles the baseline plus test-only additions first. It verifies
 the emitted executable and exact inventory, then runs each case separately.
 Compiler failures, timeout, signal, oversized output, zero/ignored/wrong tests,
 or a different panic cannot count as a baseline behavioral failure. The candidate
-must pass every mandatory integration case.
+must pass every mandatory integration and library case. Before/after source
+snapshots include every authored untracked file, not only Git-tracked originals.
 
 Finally it builds canonical fixture Modules
 `7fceaebc3bed8add9b0e3091110f59deca86ba46` using that repository's own dependency
