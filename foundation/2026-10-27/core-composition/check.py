@@ -596,6 +596,182 @@ def source_after(runner, label, root, env, before, tree):
     return sha(json.dumps(after, sort_keys=True, separators=(",", ":")).encode())
 
 
+def canonical_targets(output, root, target_root, spec):
+    """Read Cargo JSON only; never execute the discovered custom binaries."""
+    root, target_root = Path(root), Path(target_root)
+    if (not root.is_absolute() or not target_root.is_absolute() or
+            ".." in root.parts or ".." in target_root.parts):
+        raise GateRejected("canonical source/target roots must be direct absolute paths")
+    found = {}
+    for line in output.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        target = item.get("target", {})
+        name = target.get("name")
+        if item.get("reason") != "compiler-artifact" or not item.get("executable") or name not in spec["targets"]:
+            continue
+        expected = spec["targets"][name]
+        binary = Path(item["executable"])
+        features = item.get("features")
+        if (target.get("kind") != ["test"] or
+                Path(target.get("src_path", "")) != root / expected["source"] or
+                not binary.is_absolute() or ".." in binary.parts or
+                binary.parent != target_root / "debug/deps" or
+                not re.fullmatch(re.escape(name) + r"-[0-9a-f]+", binary.name) or
+                not isinstance(features, list) or any(not isinstance(value, str) for value in features) or
+                len(features) != len(set(features)) or name in found):
+            raise GateRejected("canonical compiled source/executable inventory differs")
+        found[name] = {"source": str(root / expected["source"]), "executable": str(binary),
+                       "kind": target["kind"], "features": features}
+    if set(found) != set(spec["targets"]):
+        raise GateRejected("canonical no-run discovery lacks an exact required target")
+    return found
+
+
+def require_canonical_passes(output, names, spec, binaries, allowed_ignored):
+    """Partition only the two pinned harness=false targets, not arbitrary OK lines."""
+    if set(binaries) != set(spec["targets"]):
+        raise GateRejected("canonical target binding inventory differs")
+    boundary = re.compile(
+        r"^     Running ([^\n]+?) \((/[^\n()]+)\)$|^   Doc-tests [^\n]+$", re.M)
+    headers = list(boundary.finditer(output))
+    sections = {}
+    for name, expected in spec["targets"].items():
+        matches = [(index, header) for index, header in enumerate(headers)
+                   if header.group(1) == expected["cargo_label"]]
+        if len(matches) != 1:
+            raise GateRejected("missing or duplicated canonical Cargo section: " + name)
+        index, header = matches[0]
+        if header.group(2) != binaries[name]["executable"]:
+            raise GateRejected("canonical Cargo section executed a different binary: " + name)
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(output)
+        sections[name] = (header.start(), end, output[header.end():end])
+    removed = []
+    custom = {}
+    for name in ("session", "sandbox"):
+        start, end, body = sections[name]
+        lines = [line for line in body.splitlines() if line]
+        if lines != spec["targets"][name]["expected_lines"]:
+            raise GateRejected("custom harness exact ordered outcomes differ: " + name)
+        removed.append((start, end))
+        custom[name] = {"target": binaries[name], "completed_lines": lines,
+                        "outcome_count": len(lines)}
+    ordinary = output
+    for start, end in sorted(removed, reverse=True):
+        ordinary = ordinary[:start] + ordinary[end:]
+    if re.search(r"^PASS(?:\s|$)", ordinary, re.M):
+        raise GateRejected("unrelated PASS line outside the pinned sandbox section")
+    for name in spec["targets"]["session"]["case_names"]:
+        if re.search(r"^test " + re.escape(name) + r" \.\.\. ", ordinary, re.M):
+            raise GateRejected("custom session case appeared outside its bound section")
+    helper = spec["targets"]["capability_environment"]
+    helper_checked = require_passes(sections["capability_environment"][2], [])
+    executions = helper["top_level_cases"] + helper["helper_executions"]
+    if (helper["top_level_cases"] != 1 or helper["helper_executions"] != 2 or
+            helper_checked["passed"] != [helper["case_name"]] * executions or
+            helper_checked["ignored"] or len(helper_checked["summaries"]) != executions or
+            any(int(summary[1]) != 1 for summary in helper_checked["summaries"])):
+        raise GateRejected("source-pinned nested helper execution inventory differs")
+    checked = require_passes(ordinary, names, allowed_ignored=allowed_ignored)
+    if checked["passed"].count(helper["case_name"]) != executions:
+        raise GateRejected("nested helper outcome occurred outside its bound section")
+    checked["custom_harnesses"] = custom
+    checked["nested_helper"] = {
+        "target": binaries["capability_environment"], "name": helper["case_name"],
+        "top_level_cases": 1, "helper_executions": 2,
+    }
+    checked["libtest_execution_count"] = checked["libtest_passed_count"]
+    checked["libtest_top_level_passed_count"] = checked["libtest_passed_count"] - 2
+    checked["custom_session_case_count"] = len(spec["targets"]["session"]["case_names"])
+    checked["sandbox_check_count"] = len(spec["targets"]["sandbox"]["expected_lines"])
+    checked["top_level_named_passed_count"] = (
+        checked["libtest_top_level_passed_count"] + checked["custom_session_case_count"])
+    checked["counting_note"] = spec["counting_note"]
+    return checked
+
+
+def canonical_parser_self_test(spec):
+    """Pure data-only controls: no files, process launch, or product imports."""
+    root, target = Path("/source/candidate"), Path("/source/candidate-target")
+    artifacts = [
+        {"reason": "compiler-artifact", "executable": str(target / "debug/deps" / (name + "-012abc")),
+         "target": {"name": name, "kind": ["test"], "src_path": str(root / value["source"])},
+         "features": []}
+        for name, value in spec["targets"].items()]
+    compiled = "\n".join(json.dumps(item) for item in artifacts)
+    binaries = canonical_targets(compiled, root, target, spec)
+    summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    helper = spec["targets"]["capability_environment"]
+    sections = {}
+    for name, value in spec["targets"].items():
+        header = f'     Running {value["cargo_label"]} ({binaries[name]["executable"]})\n'
+        body = ("\n".join(value["expected_lines"]) + "\n" if name != "capability_environment" else
+                (f'running 1 test\ntest {helper["case_name"]} ... ok\n' + summary) * 3)
+        sections[name] = header + "\n" + body + "\n"
+    ordinary = "     Running unittests src/lib.rs (/source/candidate-target/debug/deps/core-012abc)\n"
+    ordinary += "running 1 test\ntest ordinary ... ok\n" + summary + "\n"
+    good = ordinary + sections["capability_environment"] + sections["sandbox"] + sections["session"]
+    good += "   Doc-tests example\nrunning 0 tests\n"
+    good += summary.replace("1 passed", "0 passed")
+    checked = require_canonical_passes(good, ["ordinary"], spec, binaries, [])
+    assert checked["libtest_execution_count"] == 4
+    assert checked["libtest_top_level_passed_count"] == 2
+    assert checked["custom_session_case_count"] == 26
+    assert checked["sandbox_check_count"] == 7
+    assert checked["top_level_named_passed_count"] == 28
+    first = spec["targets"]["session"]["expected_lines"][0]
+    second = spec["targets"]["session"]["expected_lines"][1]
+    sandbox = spec["targets"]["sandbox"]["expected_lines"][0]
+    mutations = {
+        "missing-custom-case": good.replace(first + "\n", "", 1),
+        "duplicate-custom-case": good.replace(first + "\n", (first + "\n") * 2, 1),
+        "wrong-custom-case": good.replace(first, "test unrelated ... ok", 1),
+        "reordered-custom-cases": good.replace(first + "\n" + second, second + "\n" + first, 1),
+        "failed-custom-case": good.replace(first, first[:-2] + "FAILED", 1),
+        "custom-extra-summary": good.replace(first + "\n", first + "\n" + summary, 1),
+        "wrong-custom-binary": good.replace(binaries["session"]["executable"], "/foreign/session-012abc", 1),
+        "wrong-custom-header": good.replace("Running tests/session.rs", "Running tests/foreign.rs", 1),
+        "duplicate-custom-section": good + sections["session"],
+        "missing-sandbox-check": good.replace(sandbox + "\n", "", 1),
+        "duplicate-sandbox-check": good.replace(sandbox + "\n", (sandbox + "\n") * 2, 1),
+        "wrong-sandbox-check": good.replace(sandbox, "PASS unrelated check", 1),
+        "unrelated-pass-line": good + "PASS unrelated extra line\n",
+        "custom-case-outside-section": good + first + "\n" + summary,
+        "ordinary-summary-mismatch": good.replace("test ordinary ... ok\n", "", 1),
+        "missing-helper-execution": good.replace(
+            f'running 1 test\ntest {helper["case_name"]} ... ok\n' + summary, "", 1),
+        "extra-helper-execution": good.replace(
+            sections["capability_environment"],
+            sections["capability_environment"] + f'test {helper["case_name"]} ... ok\n' + summary, 1),
+    }
+    rejected = []
+    for label, bad in mutations.items():
+        try:
+            require_canonical_passes(bad, ["ordinary"], spec, binaries, [])
+        except GateRejected:
+            rejected.append(label)
+        else:
+            raise AssertionError("canonical parser accepted invalid evidence: " + label)
+    compile_mutations = {
+        "missing-compiled-target": artifacts[:-1],
+        "duplicate-compiled-target": artifacts + [artifacts[0]],
+        "foreign-compiled-source": [dict(artifacts[0], target=dict(artifacts[0]["target"], src_path="/foreign/session.rs")), *artifacts[1:]],
+        "foreign-compiled-target-dir": [dict(artifacts[0], executable="/foreign/session-012abc"), *artifacts[1:]],
+        "wrong-compiled-kind": [dict(artifacts[0], target=dict(artifacts[0]["target"], kind=["lib"])), *artifacts[1:]],
+    }
+    for label, bad in compile_mutations.items():
+        try:
+            canonical_targets("\n".join(json.dumps(item) for item in bad), root, target, spec)
+        except GateRejected:
+            rejected.append(label)
+        else:
+            raise AssertionError("canonical discovery accepted invalid evidence: " + label)
+    return {"positive_partition": "PASS", "negative_controls": rejected,
+            "negative_count": len(rejected)}
+
+
 def checkout(runner, label, destination, repo, revision, env):
     destination.mkdir()
     runner.ok(label + "-init", ["git", "init", "-q"], destination, env, 30)
@@ -869,11 +1045,16 @@ def qualify(args):
                 ["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"], root, env, 30, 2 * 1024 * 1024))
             if complete_tree(flat) != manifest["core"]["tree"]:
                 raise GateRejected("Core complete source root mismatch")
+            for path, digest in manifest["canonical_harness"]["source_blobs"].items():
+                if (flat.get(path, {}).get("sha") != digest or
+                        git_blob(source_bytes(root, path)) != digest):
+                    raise GateRejected("canonical harness source preflight differs: " + path)
             source_maps[label] = flat
             if label != "instrumented":
                 plans[label] = plan_composition(root, flat, inputs, manifest, label == "baseline")
         plans["instrumented"] = plan_instrumented(
             instrumented, source_maps["instrumented"], plans["candidate"][0], control_patch, manifest)
+        receipt["canonical_source_blobs"] = manifest["canonical_harness"]["source_blobs"]
         # ALL three plans are verified before the first source replacement.
         receipt["all_input_preflight"] = "PASS_BEFORE_ANY_SOURCE_REPLACEMENT"
         for label, root in source_lanes:
@@ -978,9 +1159,25 @@ def qualify(args):
                 specs["candidate_mandatory_tests"] + specs["candidate_extra_unit_tests"] +
                 specs["candidate_existing_regression_tests"] + manifest["tests"]["recovery_required"] +
                 manifest["tests"]["protocol_required"] + manifest["tests"]["module_swap_required"]))
-            receipt["canonical_full"] = require_passes(runner.ok("candidate-canonical-full",
-                [sys.executable, "scripts/test.py", "full"], candidate, candidate_env, 1800, 40 * 1024 * 1024),
-                required_full, allowed_ignored=manifest["tests"]["full_allowed_ignored"])
+            canonical_spec = manifest["canonical_harness"]
+            # Use the unchanged canonical wrapper, full workspace feature graph,
+            # effective environment and target directory for no-run discovery.
+            compiled_output = runner.ok("candidate-canonical-compile",
+                [sys.executable, *canonical_spec["compile_arguments"]],
+                candidate, candidate_env, 1800, 24 * 1024 * 1024)
+            canonical_binaries = canonical_targets(compiled_output, candidate,
+                Path(candidate_env["CARGO_TARGET_DIR"]), canonical_spec)
+            receipt["canonical_workspace_targets"] = canonical_binaries
+            receipt["canonical_binary_sha256_before"] = {
+                name: file_sha(item["executable"]) for name, item in canonical_binaries.items()}
+            full_output = runner.ok("candidate-canonical-full",
+                [sys.executable, "scripts/test.py", "full"], candidate, candidate_env, 1800, 40 * 1024 * 1024)
+            receipt["canonical_binary_sha256_after"] = {
+                name: file_sha(item["executable"]) for name, item in canonical_binaries.items()}
+            if receipt["canonical_binary_sha256_before"] != receipt["canonical_binary_sha256_after"]:
+                raise GateRejected("canonical target binary changed between discovery and full gate")
+            receipt["canonical_full"] = require_canonical_passes(full_output, required_full,
+                canonical_spec, canonical_binaries, manifest["tests"]["full_allowed_ignored"])
             if set(receipt["canonical_full"]["ignored"]) != set(manifest["tests"]["full_allowed_ignored"]):
                 raise GateRejected("canonical ignored inventory changed")
         if args.phase == "instrumented":
@@ -1147,6 +1344,13 @@ def validate_phase_outcome(phase, receipt, paths, records, manifest):
             raise GateRejected("missing or ambiguous raw compiled executable")
         return root, emitted[0]
 
+    if receipt.get("canonical_source_blobs") != manifest["canonical_harness"]["source_blobs"]:
+        raise GateRejected("canonical source provenance receipt differs")
+    for lane in ("baseline", "candidate", "instrumented"):
+        original = parse_tree(result(lane + "-original-tree")["output"])
+        if any(original.get(path, {}).get("sha") != digest
+               for path, digest in manifest["canonical_harness"]["source_blobs"].items()):
+            raise GateRejected("canonical source pins differ from original complete source trees")
     inputs = {}
     for key, expected in manifest["inputs"].items():
         raw = bounded_file(paths["input-" + key], expected["bytes"] + 1)
@@ -1159,11 +1363,11 @@ def validate_phase_outcome(phase, receipt, paths, records, manifest):
     tests = manifest["tests"]
     expected_compiles = {
         "baseline": {"baseline-compile", "baseline-library-compile", "baseline-protocol-compile"},
-        "production": {"candidate-compile", "candidate-library-compile"},
+        "production": {"candidate-compile", "candidate-library-compile", "candidate-canonical-compile"},
         "instrumented": {"instrumented-library-compile"},
     }
     observed_compiles = {label for label in records if re.fullmatch(
-        r"(?:baseline|candidate|instrumented)-(?:compile|library-compile|protocol-compile)", label)}
+        r"(?:baseline|candidate|instrumented)-(?:compile|library-compile|protocol-compile|canonical-compile)", label)}
     if observed_compiles != expected_compiles[phase]:
         raise GateRejected("phase compiled-target inventory is missing or foreign")
     expected_cases = []
@@ -1238,6 +1442,23 @@ def validate_phase_outcome(phase, receipt, paths, records, manifest):
             specs["candidate_mandatory_tests"] + specs["candidate_extra_unit_tests"] +
             specs["candidate_existing_regression_tests"] + tests["recovery_required"] +
             tests["protocol_required"] + tests["module_swap_required"]))
+        canonical_spec = manifest["canonical_harness"]
+        compile_label = "candidate-canonical-compile"
+        canonical_argv = records["candidate-canonical-full"].get("argv", [])
+        if not canonical_argv or Path(canonical_argv[0]).name != "python3":
+            raise GateRejected("canonical gate interpreter differs")
+        command(compile_label, [canonical_argv[0], *canonical_spec["compile_arguments"]], root)
+        if list(records).index(compile_label) >= list(records).index("candidate-canonical-full"):
+            raise GateRejected("canonical binary discovery did not precede full execution")
+        canonical_binaries = canonical_targets(result(compile_label)["output"], root,
+                                               root.parent / "candidate-target", canonical_spec)
+        before = receipt.get("canonical_binary_sha256_before")
+        after = receipt.get("canonical_binary_sha256_after")
+        if (receipt.get("canonical_workspace_targets") != canonical_binaries or
+                not isinstance(before, dict) or set(before) != set(canonical_binaries) or
+                after != before or any(not re.fullmatch(r"[0-9a-f]{64}", digest)
+                                       for digest in before.values())):
+            raise GateRejected("canonical binary source/feature/digest provenance differs")
         for key, label, required, exact, ignored in (
             ("protocol", "candidate-protocol", tests["protocol_required"], False, []),
             ("module_swap", "candidate-module-swap", tests["module_swap_required"], True, []),
@@ -1252,8 +1473,11 @@ def validate_phase_outcome(phase, receipt, paths, records, manifest):
             if not actual_argv or Path(actual_argv[0]).name != "python3":
                 raise GateRejected("canonical gate interpreter differs")
             command(label, [actual_argv[0], *arguments], root)
-            checked = strict_json(json.dumps(require_passes(result(label)["output"], required,
-                                     exact_inventory=exact, allowed_ignored=ignored)))
+            parsed = (require_canonical_passes(result(label)["output"], required,
+                      canonical_spec, canonical_binaries, ignored) if key == "canonical_full" else
+                      require_passes(result(label)["output"], required,
+                                     exact_inventory=exact, allowed_ignored=ignored))
+            checked = strict_json(json.dumps(parsed))
             if receipt.get(key) != checked or set(checked["ignored"]) != set(ignored):
                 raise GateRejected("production aggregate differs from raw required gate")
         if receipt.get("required_full_named_passes") != required_full:
@@ -1687,6 +1911,8 @@ def main():
         self_test()
         composition_self_test()
         resource_aggregation_self_test()
+        manifest = strict_json(bounded_file(Path(__file__).resolve().with_name("manifest.json"), 1024 * 1024))
+        print("Canonical parser controls:", canonical_parser_self_test(manifest["canonical_harness"]))
     elif args.aggregate is not None:
         if args.manifest is None or args.evidence is None or args.phase is not None or args.work is not None:
             parser.error("aggregation requires only --manifest, --aggregate and --evidence")
