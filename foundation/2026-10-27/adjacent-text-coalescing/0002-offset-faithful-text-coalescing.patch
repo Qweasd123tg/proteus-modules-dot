@@ -1,0 +1,184 @@
+diff --git a/src/transcript/text_run.rs b/src/transcript/text_run.rs
+index 1f0f1d736488cda73e9d6df4ec7ef696a95d8f51..028c84c3cdd9cdea04146a778f189d1e433ceaf5 100644
+--- a/src/transcript/text_run.rs
++++ b/src/transcript/text_run.rs
+@@ -41,6 +41,7 @@
+         self.events.push(event);
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn into_events(self) -> Vec<Box<AppServerEvent>> {
+         self.events
+     }
+@@ -65,7 +66,13 @@
+     }
+ 
+     pub fn layout_changes(&self) -> impl Iterator<Item = Change> + '_ {
+-        self.event_changes()
++        // Creation must survive even if a later empty delta truncates the row.
++        let change = if self.changes.contains(&Change::Pushed) {
++            Some(Change::Pushed)
++        } else {
++            self.event_changes().last()
++        };
++        change.into_iter()
+     }
+ 
+     pub fn shown(&self) -> bool {
+@@ -105,17 +112,131 @@
+ 
+ impl Transcript {
+     pub(crate) fn apply_text_run(&mut self, run: &TextRun) -> TextRunOutcome {
++        let Some(first) = run.events.first().and_then(|event| delta(event)) else {
++            return TextRunOutcome {
++                changes: Vec::new(),
++            };
++        };
++        // Do not add a tail buffer to the common singleton arrival path.
++        if run.events.len() == 1 {
++            let change = self.apply_runtime(first.envelope.thread_id, &first.envelope.event);
++            self.stamp(change, first.envelope.timestamp_ms);
++            return TextRunOutcome {
++                changes: vec![change],
++            };
++        }
++        if !self.is_turn_thread(first.envelope.thread_id) {
++            return TextRunOutcome {
++                changes: vec![Change::None; run.events.len()],
++            };
++        }
++        #[cfg(test)]
++        {
++            self.text_work.delta_lookups += 1;
++        }
++        let index = self
++            .entries
++            .iter()
++            .rposition(|entry| entry.message_id == Some(first.message_id));
++        let base = index.map(|index| self.entries[index].text.clone());
++        let mut edit = DeltaEdit::new(base.as_deref().unwrap_or(""));
++        let row = index.unwrap_or(self.entries.len());
++        let mut exists = index.is_some();
++        let mut created_at = None;
+         let mut changes = Vec::with_capacity(run.events.len());
+         for event in &run.events {
+             let item = delta(event).expect("validated text event");
+-            let change = self.apply_runtime(item.envelope.thread_id, &item.envelope.event);
+-            self.stamp(change, item.envelope.timestamp_ms);
++            let change = if !exists {
++                if item.text.is_empty() {
++                    Change::None
++                } else {
++                    // A first nonempty delta creates a row regardless of offset.
++                    edit.apply(0, item.text);
++                    exists = true;
++                    created_at = Some(item.envelope.timestamp_ms);
++                    Change::Pushed
++                }
++            } else {
++                edit.apply(item.offset, item.text);
++                Change::Updated(row)
++            };
+             changes.push(change);
+         }
++        if !exists {
++            return TextRunOutcome { changes };
++        }
++        #[cfg(test)]
++        {
++            self.text_work.prior_row_prefix_bytes += edit.keep;
++            self.text_work.delta_row_replacements += 1;
++        }
++        let text = edit.finish();
++        if let Some(index) = index {
++            let entry = &mut self.entries[index];
++            entry.text = text;
++            entry.streaming = true;
++        } else {
++            self.stop_streaming();
++            let key = self.allocate_key();
++            self.entries.push(super::Entry {
++                key,
++                message_id: Some(first.message_id),
++                role: super::Role::Assistant,
++                text,
++                images: Vec::new(),
++                tool: None,
++                subagent: None,
++                streaming: true,
++                time: created_at,
++            });
++        }
+         TextRunOutcome { changes }
+     }
+ }
+ 
++/// A composition of the existing UTF-8 byte-offset splice rule, without
++/// copying the unchanged base until the run is materialized.
++struct DeltaEdit<'a> {
++    base: &'a str,
++    keep: usize,
++    tail: String,
++}
++
++impl<'a> DeltaEdit<'a> {
++    fn new(base: &'a str) -> Self {
++        Self {
++            base,
++            keep: base.len(),
++            tail: String::new(),
++        }
++    }
++
++    fn apply(&mut self, offset: usize, text: &str) {
++        let length = self.keep.checked_add(self.tail.len()).expect("text length");
++        let valid = if offset <= self.keep {
++            self.base.is_char_boundary(offset)
++        } else {
++            offset <= length && self.tail.is_char_boundary(offset - self.keep)
++        };
++        let keep = if valid { offset } else { length };
++        if keep <= self.keep {
++            self.keep = keep;
++            self.tail.clear();
++        } else {
++            self.tail.truncate(keep - self.keep);
++        }
++        self.tail.push_str(text);
++    }
++
++    fn finish(self) -> std::sync::Arc<str> {
++        let length = self.keep.checked_add(self.tail.len()).expect("text length");
++        let mut text = String::with_capacity(length);
++        text.push_str(&self.base[..self.keep]);
++        text.push_str(&self.tail);
++        text.into()
++    }
++}
++
+ /// Deterministic logical work, not wall time or allocator/RSS measurements.
+ #[cfg(test)]
+ #[derive(Debug, Default, PartialEq, Eq)]
+diff --git a/src/ui/chat/pump.rs b/src/ui/chat/pump.rs
+index e0b91914f0ed123b8cbf75cbdf54c6df530cef4f..a28a54b7bb87dec513aa7f67d81b3e8c7ec6f57d 100644
+--- a/src/ui/chat/pump.rs
++++ b/src/ui/chat/pump.rs
+@@ -44,11 +44,14 @@
+             match item {
+                 BatchItem::Barrier(item) => shown |= self.apply(item, cx),
+                 BatchItem::Text(run) => {
+-                    // Extraction baseline keeps every original mutation/layout/
+-                    // observer step interleaved, including no-op changes.
+-                    for event in run.into_events() {
+-                        shown |= self.apply(PumpItem::Event(event), cx);
++                    let outcome = self.session.apply_text_run(run);
++                    for change in outcome.layout_changes() {
++                        self.apply_change(change, cx);
+                     }
++                    for change in outcome.event_changes() {
++                        cx.emit(ChatEvent::SessionEntriesChanged(change));
++                    }
++                    shown |= outcome.shown();
+                 }
+             }
+         }

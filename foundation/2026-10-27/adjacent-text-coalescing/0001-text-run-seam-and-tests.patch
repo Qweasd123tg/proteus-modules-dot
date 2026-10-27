@@ -1,0 +1,1558 @@
+diff --git a/src/transcript/mod.rs b/src/transcript/mod.rs
+index 54b6fc10c9576f4885eb01f459f0e48cd169a5ba..e565aa0aa1a814430220c9d1746350c175c91b84 100644
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -55,6 +55,8 @@
+     entries: Vec<Entry>,
+     turn_thread: Option<ThreadId>,
+     next_key: u64,
++    #[cfg(test)]
++    text_work: text_run::TextWork,
+ }
+ 
+ impl Transcript {
+@@ -334,6 +336,10 @@
+         offset: Option<usize>,
+     ) -> Change {
+         let completed = offset.is_none();
++        #[cfg(test)]
++        if !completed {
++            self.text_work.delta_lookups += 1;
++        }
+         if let Some(index) = self
+             .entries
+             .iter()
+@@ -341,7 +347,15 @@
+         {
+             let entry = &mut self.entries[index];
+             entry.text = match offset {
+-                Some(offset) => splice_delta(&entry.text, offset, text),
++                Some(offset) => {
++                    let keep = delta_keep(&entry.text, offset);
++                    #[cfg(test)]
++                    {
++                        self.text_work.prior_row_prefix_bytes += keep;
++                        self.text_work.delta_row_replacements += 1;
++                    }
++                    splice_delta(&entry.text, keep, text)
++                }
+                 None if *entry.text == *text => entry.text.clone(),
+                 None => text.into(),
+             };
+@@ -352,6 +366,10 @@
+             return Change::None;
+         }
+         self.stop_streaming();
++        #[cfg(test)]
++        if !completed {
++            self.text_work.delta_row_replacements += 1;
++        }
+         let key = self.allocate_key();
+         self.entries.push(Entry {
+             key,
+@@ -464,12 +482,15 @@
+         .and_then(|before| before.time)
+ }
+ 
+-fn splice_delta(current: &Arc<str>, offset: usize, delta: &str) -> Arc<str> {
+-    let keep = if offset <= current.len() && current.is_char_boundary(offset) {
++fn delta_keep(current: &str, offset: usize) -> usize {
++    if offset <= current.len() && current.is_char_boundary(offset) {
+         offset
+     } else {
+         current.len()
+-    };
++    }
++}
++
++fn splice_delta(current: &Arc<str>, keep: usize, delta: &str) -> Arc<str> {
+     let mut text = String::with_capacity(keep + delta.len());
+     text.push_str(&current[..keep]);
+     text.push_str(delta);
+@@ -513,7 +534,10 @@
+ }
+ 
+ mod chains;
++mod text_run;
+ 
++pub(crate) use text_run::{TextRun, TextRunOutcome};
++
+ pub use chains::{affected_rows, tool_chain};
+ 
+ #[cfg(test)]
+diff --git a/src/transcript/text_run.rs b/src/transcript/text_run.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f0f1d736488cda73e9d6df4ec7ef696a95d8f51
+--- /dev/null
++++ b/src/transcript/text_run.rs
+@@ -0,0 +1,138 @@
++//! Adjacent assistant deltas retain their original envelopes and ordered effects.
++use proteus_contracts::app_protocol::AppServerEvent;
++use proteus_contracts::domain::{Event, EventEnvelope, MessageId};
++use proteus_contracts::model_standard::MessagePhase;
++
++use super::{Change, Transcript};
++
++/// Only compatible text events can enter a run. Every other event is a barrier.
++#[cfg_attr(test, derive(Clone))]
++pub(crate) struct TextRun {
++    events: Vec<Box<AppServerEvent>>,
++}
++
++impl TextRun {
++    pub fn new(event: Box<AppServerEvent>) -> Result<Self, Box<AppServerEvent>> {
++        if delta(&event).is_none() {
++            return Err(event);
++        }
++        Ok(Self {
++            events: vec![event],
++        })
++    }
++
++    pub fn accepts(&self, event: &AppServerEvent) -> bool {
++        let Some(first) = self.events.first().and_then(|event| delta(event)) else {
++            return false;
++        };
++        let Some(next) = delta(event) else {
++            return false;
++        };
++        first.envelope.schema_version == next.envelope.schema_version
++            && first.envelope.session_id == next.envelope.session_id
++            && first.envelope.thread_id == next.envelope.thread_id
++            && first.envelope.turn_id == next.envelope.turn_id
++            && first.message_id == next.message_id
++            && first.phase == next.phase
++    }
++
++    pub fn push(&mut self, event: Box<AppServerEvent>) {
++        assert!(self.accepts(&event), "incompatible text run event");
++        self.events.push(event);
++    }
++
++    pub(crate) fn into_events(self) -> Vec<Box<AppServerEvent>> {
++        self.events
++    }
++
++    /// Keep the real cursor gate and its source order, including rejected events.
++    pub fn retain(&mut self, mut accept: impl FnMut(&AppServerEvent) -> bool) {
++        self.events.retain(|event| accept(event));
++    }
++}
++
++/// Original per-event effects remain observable even when layout work is reduced.
++pub(crate) struct TextRunOutcome {
++    changes: Vec<Change>,
++}
++
++impl TextRunOutcome {
++    pub fn event_changes(&self) -> impl Iterator<Item = Change> + '_ {
++        self.changes
++            .iter()
++            .copied()
++            .filter(|change| *change != Change::None)
++    }
++
++    pub fn layout_changes(&self) -> impl Iterator<Item = Change> + '_ {
++        self.event_changes()
++    }
++
++    pub fn shown(&self) -> bool {
++        self.event_changes().next().is_some()
++    }
++}
++
++struct Delta<'a> {
++    envelope: &'a EventEnvelope,
++    message_id: MessageId,
++    phase: Option<MessagePhase>,
++    offset: usize,
++    text: &'a str,
++}
++
++fn delta(event: &AppServerEvent) -> Option<Delta<'_>> {
++    let AppServerEvent::Runtime { envelope } = event else {
++        return None;
++    };
++    let Event::AssistantTextDelta {
++        offset,
++        message_id,
++        phase,
++        text,
++    } = &envelope.event
++    else {
++        return None;
++    };
++    Some(Delta {
++        envelope,
++        message_id: *message_id,
++        phase: *phase,
++        offset: *offset,
++        text,
++    })
++}
++
++impl Transcript {
++    pub(crate) fn apply_text_run(&mut self, run: &TextRun) -> TextRunOutcome {
++        let mut changes = Vec::with_capacity(run.events.len());
++        for event in &run.events {
++            let item = delta(event).expect("validated text event");
++            let change = self.apply_runtime(item.envelope.thread_id, &item.envelope.event);
++            self.stamp(change, item.envelope.timestamp_ms);
++            changes.push(change);
++        }
++        TextRunOutcome { changes }
++    }
++}
++
++/// Deterministic logical work, not wall time or allocator/RSS measurements.
++#[cfg(test)]
++#[derive(Debug, Default, PartialEq, Eq)]
++pub(crate) struct TextWork {
++    pub delta_lookups: usize,
++    /// Prior row-prefix bytes copied; excludes tail buffers and Arc conversion.
++    pub prior_row_prefix_bytes: usize,
++    /// Final logical delta row-text replacements, not allocation counts.
++    pub delta_row_replacements: usize,
++}
++
++#[cfg(test)]
++impl Transcript {
++    pub(crate) fn take_text_work(&mut self) -> TextWork {
++        std::mem::take(&mut self.text_work)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/src/transcript/text_run/tests.rs b/src/transcript/text_run/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..25655f3808670a4bbaeb3c4418cccc3c541341ad
+--- /dev/null
++++ b/src/transcript/text_run/tests.rs
+@@ -0,0 +1,397 @@
++use super::*;
++use crate::transcript::{Entry, Role};
++use proteus_contracts::app_protocol::{AppTranscriptMessage, AppTranscriptTool};
++use proteus_contracts::domain::EventContext;
++use uuid::Uuid;
++
++fn id(value: u128) -> Uuid {
++    Uuid::from_u128(value)
++}
++
++fn message(message_id: u128, text: &str) -> AppTranscriptMessage {
++    AppTranscriptMessage {
++        message_id: Some(id(message_id)),
++        phase: None,
++        role: "assistant".into(),
++        text: text.into(),
++        images: Vec::new(),
++        tool: None,
++        subagent: None,
++        streaming: true,
++    }
++}
++
++fn fixture(base: Option<&str>) -> Transcript {
++    let mut transcript = Transcript::default();
++    let mut rows = vec![message(200, "other row")];
++    if let Some(base) = base {
++        rows.push(message(100, base));
++    }
++    transcript.reset(rows);
++    transcript.entries[0].time = Some(7);
++    if base.is_some() {
++        transcript.entries[1].streaming = false;
++    }
++    transcript.set_root_thread(Some(id(10)));
++    transcript
++}
++
++fn event(offset: usize, text: &str, time: i64) -> Box<AppServerEvent> {
++    let mut envelope = EventEnvelope::new(
++        EventContext::new(id(1), id(10), Some(id(3))),
++        time as u64,
++        Event::AssistantTextDelta {
++            offset,
++            message_id: id(100),
++            phase: None,
++            text: text.into(),
++        },
++    );
++    envelope.event_id = id(10_000 + time.unsigned_abs() as u128);
++    envelope.timestamp_ms = time;
++    Box::new(AppServerEvent::Runtime {
++        envelope: Box::new(envelope),
++    })
++}
++
++fn run(events: &[Box<AppServerEvent>]) -> TextRun {
++    let mut run = TextRun::new(events[0].clone()).unwrap();
++    for event in &events[1..] {
++        run.push(event.clone());
++    }
++    run
++}
++
++/// The production single-event reducer is the oracle, never a copied splice.
++fn apply_oracle(transcript: &mut Transcript, events: &[Box<AppServerEvent>]) -> Vec<Change> {
++    events
++        .iter()
++        .map(|event| {
++            let AppServerEvent::Runtime { envelope } = event.as_ref() else {
++                panic!("expected runtime event");
++            };
++            let change = transcript.apply_runtime(envelope.thread_id, &envelope.event);
++            transcript.stamp(change, envelope.timestamp_ms);
++            change
++        })
++        .collect()
++}
++
++fn assert_entry(actual: &Entry, expected: &Entry) {
++    assert_eq!(actual.key, expected.key);
++    assert_eq!(actual.message_id, expected.message_id);
++    assert_eq!(actual.role, expected.role);
++    assert_eq!(actual.text, expected.text);
++    assert_eq!(actual.images, expected.images);
++    assert_eq!(
++        actual
++            .tool
++            .as_ref()
++            .map(|value| serde_json::to_value(value).unwrap()),
++        expected
++            .tool
++            .as_ref()
++            .map(|value| serde_json::to_value(value).unwrap()),
++    );
++    assert_eq!(
++        actual
++            .subagent
++            .as_ref()
++            .map(|value| serde_json::to_value(value).unwrap()),
++        expected
++            .subagent
++            .as_ref()
++            .map(|value| serde_json::to_value(value).unwrap()),
++    );
++    assert_eq!(actual.streaming, expected.streaming);
++    assert_eq!(actual.time, expected.time);
++}
++
++fn assert_transcript(actual: &Transcript, expected: &Transcript) {
++    assert_eq!(actual.next_key, expected.next_key);
++    assert_eq!(actual.turn_thread, expected.turn_thread);
++    assert_eq!(actual.entries.len(), expected.entries.len());
++    for (actual, expected) in actual.entries.iter().zip(&expected.entries) {
++        assert_entry(actual, expected);
++    }
++}
++
++/// Compare after EVERY partition boundary, not just the final string.
++fn compare_partition(base: Option<&str>, events: &[Box<AppServerEvent>], mask: usize) {
++    let mut actual = fixture(base);
++    let mut expected = fixture(base);
++    let mut start = 0;
++    for end in 1..=events.len() {
++        if end != events.len() && mask & (1 << (end - 1)) == 0 {
++            continue;
++        }
++        let expected_changes = apply_oracle(&mut expected, &events[start..end]);
++        let outcome = actual.apply_text_run(&run(&events[start..end]));
++        assert_eq!(outcome.changes, expected_changes);
++        assert_eq!(
++            outcome.event_changes().collect::<Vec<_>>(),
++            expected_changes
++                .iter()
++                .copied()
++                .filter(|change| *change != Change::None)
++                .collect::<Vec<_>>(),
++        );
++        assert_eq!(
++            outcome.shown(),
++            expected_changes
++                .iter()
++                .any(|change| *change != Change::None),
++        );
++        assert_transcript(&actual, &expected);
++        start = end;
++    }
++}
++
++#[test]
++fn all_small_utf8_offset_sequences_match_real_reducer_at_every_partition() {
++    let offsets = [0, 1, 2, 3, 5, usize::MAX];
++    let texts = ["", "x", "é", "🦀"];
++    let operations: Vec<_> = offsets
++        .into_iter()
++        .flat_map(|offset| texts.into_iter().map(move |text| (offset, text)))
++        .collect();
++    let mut cases = 0;
++    for base in [
++        None,
++        Some(""),
++        Some("a"),
++        Some("é"),
++        Some("🦀"),
++        Some("é"),
++        Some("aé"),
++    ] {
++        for &(a, x) in &operations {
++            for &(b, y) in &operations {
++                for &(c, z) in &operations {
++                    let events = [event(a, x, 11), event(b, y, 12), event(c, z, 13)];
++                    for mask in 0..4 {
++                        compare_partition(base, &events, mask);
++                        cases += 1;
++                    }
++                }
++            }
++        }
++    }
++    assert_eq!(cases, 387_072);
++}
++
++#[test]
++fn current_text_boundaries_and_shrinking_offsets_match_real_reducer() {
++    for (base, operations, final_text) in [
++        ("é", vec![(1, "a"), (2, "b")], "éb"),
++        ("éa", vec![(0, "🦀"), (2, "b")], "🦀b"),
++        ("abcdef", vec![(2, "X"), (5, "Y")], "abXY"),
++    ] {
++        let events: Vec<_> = operations
++            .into_iter()
++            .enumerate()
++            .map(|(i, (offset, text))| event(offset, text, i as i64 + 11))
++            .collect();
++        for mask in 0..2 {
++            compare_partition(Some(base), &events, mask);
++        }
++        let mut transcript = fixture(Some(base));
++        transcript.apply_text_run(&run(&events));
++        assert_eq!(&*transcript.entries[1].text, final_text);
++    }
++}
++
++#[test]
++fn first_nonempty_stamp_key_and_final_empty_row_survive_coalescing() {
++    let events = [event(999, "", 11), event(999, "a", 12), event(0, "", 13)];
++    let mut actual = fixture(None);
++    let mut expected = fixture(None);
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_eq!(changes, [Change::None, Change::Pushed, Change::Updated(1)]);
++    assert_transcript(&actual, &expected);
++    assert_eq!(actual.entries.len(), 2);
++    assert_eq!(&*actual.entries[1].text, "");
++    assert_eq!(actual.entries[1].time, Some(12));
++    assert!(actual.entries[1].streaming);
++    assert!(!actual.entries[0].streaming);
++    assert_eq!(
++        outcome
++            .layout_changes()
++            .filter(|change| *change == Change::Pushed)
++            .count(),
++        1,
++    );
++}
++
++#[test]
++fn first_creation_uses_physical_order_not_timestamp_sorting() {
++    let events = [event(0, "", 100), event(0, "a", -5), event(1, "b", -100)];
++    for mask in 0..4 {
++        compare_partition(None, &events, mask);
++    }
++    let mut transcript = fixture(None);
++    transcript.apply_text_run(&run(&events));
++    assert_eq!(transcript.entries[1].time, Some(-5));
++}
++
++#[test]
++fn empty_noop_reopens_existing_row_without_stamping_or_stopping_other_rows() {
++    let mut actual = fixture(Some("é"));
++    let mut expected = fixture(Some("é"));
++    let events = [event(2, "", 11), event(2, "", 12)];
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_transcript(&actual, &expected);
++    assert_eq!(actual.entries[1].time, None);
++    assert!(actual.entries[0].streaming);
++    assert!(actual.entries[1].streaming);
++    assert_eq!(&*actual.entries[1].text, "é");
++}
++
++#[test]
++fn reverse_identity_lookup_preserves_nonassistant_metadata() {
++    let make = || {
++        let mut transcript = fixture(Some("older duplicate"));
++        transcript.push_user(Some(id(100)), "latest duplicate", Vec::new());
++        let entry = transcript.entries.last_mut().unwrap();
++        entry.time = Some(42);
++        entry.images.push(proteus_contracts::domain::ImageRef {
++            id: "image".into(),
++            name: "fixture.png".into(),
++            mime_type: "image/png".into(),
++            path: "fixture.png".into(),
++        });
++        entry.subagent = Some(proteus_contracts::app_protocol::AppTranscriptSubagent {
++            child_thread_id: id(20).to_string(),
++            role: "fixture".into(),
++            description: Some("unchanged".into()),
++            status: "running".into(),
++            iterations: Some(4),
++            tools: Vec::new(),
++        });
++        entry.tool = Some(AppTranscriptTool {
++            call_id: "collision".into(),
++            name: "fixture".into(),
++            args: serde_json::json!({"exact": [1, 2]}),
++            effective_args: Some(serde_json::json!({"resolved": true})),
++            status: "done".into(),
++            result: Some("result".into()),
++            metadata: serde_json::json!({"keep": "all"}),
++        });
++        transcript
++    };
++    let mut actual = make();
++    let mut expected = make();
++    let events = [event(6, "replacement", 11), event(0, "", 12)];
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_eq!(changes, [Change::Updated(2), Change::Updated(2)]);
++    assert_transcript(&actual, &expected);
++    assert_eq!(actual.entries[2].role, Role::User);
++    assert_eq!(actual.entries[2].time, Some(42));
++    assert_eq!(&*actual.entries[1].text, "older duplicate");
++}
++
++#[test]
++fn foreign_root_run_is_ignored_without_consuming_identity_or_work() {
++    let mut actual = fixture(None);
++    let mut expected = fixture(None);
++    let mut events = [event(0, "child", 11), event(5, " text", 12)];
++    for event in &mut events {
++        let AppServerEvent::Runtime { envelope } = event.as_mut() else {
++            unreachable!();
++        };
++        envelope.thread_id = id(20);
++    }
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_transcript(&actual, &expected);
++    assert!(!outcome.shown());
++    assert_eq!(actual.take_text_work(), TextWork::default());
++}
++
++#[test]
++fn work_budget_for_adjacent_appends() {
++    let base = "p".repeat(4096);
++    let text = "d".repeat(64);
++    let events: Vec<_> = (0..64)
++        .map(|i| event(base.len() + i * text.len(), &text, i as i64 + 11))
++        .collect();
++    let mut actual = fixture(Some(&base));
++    let mut expected = fixture(Some(&base));
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_transcript(&actual, &expected);
++    let old = expected.take_text_work();
++    assert_eq!(old.delta_lookups, 64);
++    assert_eq!(old.delta_row_replacements, 64);
++    assert_eq!(old.prior_row_prefix_bytes, 64 * 4096 + 64 * 64 * 63 / 2);
++    let work = actual.take_text_work();
++    assert_eq!(
++        (
++            work.delta_lookups,
++            work.delta_row_replacements,
++            work.prior_row_prefix_bytes
++        ),
++        (1, 1, 4096),
++        "stream-coalescing work budget: prior-row-prefix bytes/delta lookups/delta row replacements, not timing",
++    );
++}
++
++#[test]
++fn all_empty_absent_run_preserves_rows_keys_and_zero_delta_row_replacements() {
++    let mut actual = fixture(None);
++    let mut expected = fixture(None);
++    let events = [
++        event(0, "", 11),
++        event(usize::MAX, "", 12),
++        event(1, "", 13),
++    ];
++    let changes = apply_oracle(&mut expected, &events);
++    let outcome = actual.apply_text_run(&run(&events));
++    assert_eq!(outcome.changes, changes);
++    assert_transcript(&actual, &expected);
++    assert_eq!(actual.entries.len(), 1);
++    assert!(actual.entries[0].streaming);
++    assert!(!outcome.shown());
++    assert_eq!(outcome.event_changes().count(), 0);
++    assert_eq!(outcome.layout_changes().count(), 0);
++    let work = actual.take_text_work();
++    assert_eq!(work.prior_row_prefix_bytes, 0);
++    assert_eq!(work.delta_row_replacements, 0);
++}
++
++#[test]
++fn singleton_runs_preserve_real_reducer_state_and_logical_work() {
++    for base in [None, Some(""), Some("é")] {
++        for offset in [0, 1, 2, usize::MAX] {
++            for text in ["", "x", "🦀"] {
++                for thread in [10, 20] {
++                    let mut actual = fixture(base);
++                    let mut expected = fixture(base);
++                    let mut item = event(offset, text, 11);
++                    let AppServerEvent::Runtime { envelope } = item.as_mut() else {
++                        unreachable!();
++                    };
++                    envelope.thread_id = id(thread);
++                    let events = [item];
++                    let changes = apply_oracle(&mut expected, &events);
++                    let outcome = actual.apply_text_run(&run(&events));
++                    assert_eq!(outcome.changes, changes);
++                    assert_transcript(&actual, &expected);
++                    assert_eq!(actual.take_text_work(), expected.take_text_work());
++                    assert_eq!(
++                        outcome.layout_changes().collect::<Vec<_>>(),
++                        outcome.event_changes().collect::<Vec<_>>(),
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/src/ui/chat/mod.rs b/src/ui/chat/mod.rs
+index 00c329aa5f1e69dd437eb553a6c9de80865f268e..0b5fa04c4f8d3968558d13dd0bb12921c6ff690e 100644
+--- a/src/ui/chat/mod.rs
++++ b/src/ui/chat/mod.rs
+@@ -21,11 +21,13 @@
+ mod question_card;
+ mod replies;
+ mod requests;
++mod row_layout;
+ mod scroller;
+ mod session;
+ #[cfg(test)]
+ mod snapshot_tests;
+ mod stamp;
++mod stream_batch;
+ mod thread;
+ mod tool_chain;
+ pub(super) mod tool_row;
+@@ -226,9 +228,7 @@
+             _pump: pump,
+             _subscriptions: subscriptions,
+         };
+-        for event in initial {
+-            chat.apply(event, cx);
+-        }
++        chat.apply_batch(initial, cx);
+         chat.load_config(cx);
+         chat
+     }
+diff --git a/src/ui/chat/pump.rs b/src/ui/chat/pump.rs
+index dd3ec9eda9e32763ca1a2fbad7ac62f0830f058d..e0b91914f0ed123b8cbf75cbdf54c6df530cef4f 100644
+--- a/src/ui/chat/pump.rs
++++ b/src/ui/chat/pump.rs
+@@ -6,6 +6,8 @@
+ use proteus_contracts::domain::Event as RuntimeEvent;
+ 
+ use super::context_usage::ContextUsage;
++use super::row_layout::{prepares_replies, row_layout};
++use super::stream_batch::{BatchItem, batches};
+ use super::{Chat, ChatEvent};
+ use crate::connection::PumpItem;
+ use crate::transcript::{Change, Role};
+@@ -20,10 +22,7 @@
+                 batch.push(item);
+             }
+             let applied = this.update(cx, |this, cx| {
+-                let mut shown = false;
+-                for item in batch {
+-                    shown |= this.apply(item, cx);
+-                }
++                let shown = this.apply_batch(batch, cx);
+                 // Copies of other sessions' activity and runtime events
+                 // without a trace in the chat leave it as drawn.
+                 if shown {
+@@ -38,6 +37,24 @@
+ }
+ 
+ impl Chat {
++    /// Preserve event ordering and effects while preparing adjacent text together.
++    pub(super) fn apply_batch(&mut self, batch: Vec<PumpItem>, cx: &mut Context<Self>) -> bool {
++        let mut shown = false;
++        for item in batches(batch) {
++            match item {
++                BatchItem::Barrier(item) => shown |= self.apply(item, cx),
++                BatchItem::Text(run) => {
++                    // Extraction baseline keeps every original mutation/layout/
++                    // observer step interleaved, including no-op changes.
++                    for event in run.into_events() {
++                        shown |= self.apply(PumpItem::Event(event), cx);
++                    }
++                }
++            }
++        }
++        shown
++    }
++
+     /// Folds one stream item in; true when the chat looks different.
+     pub(super) fn apply(&mut self, item: PumpItem, cx: &mut Context<Self>) -> bool {
+         let session = &mut self.session;
+@@ -184,7 +201,7 @@
+     }
+ 
+     pub(super) fn apply_change(&mut self, change: Change, cx: &mut Context<Self>) {
+-        if matches!(change, Change::Spliced { .. }) {
++        if prepares_replies(change) {
+             let entries = self.session.transcript.entries();
+             self.replies
+                 .retain(&entries.iter().map(|entry| entry.key).collect());
+@@ -194,34 +211,30 @@
+                 .map(|entry| (entry.key, &entry.text));
+             self.replies.prepare(replies, cx);
+         }
+-        if matches!(change, Change::Pushed)
+-            && let Some(entry) = self.session.transcript.entries().last()
+-        {
+-            self.fresh_rows.mark(entry.key);
+-        }
+-        self.scroller.update(cx, |scroller, cx| match change {
+-            Change::None => {}
+-            Change::Pushed => {
+-                scroller.append(1, cx);
+-            }
+-            Change::Updated(row) => {
+-                scroller.remeasure_items(row..row + 1, cx);
++        if let Some(layout) = row_layout(self.session.transcript.entries(), change) {
++            if let Some(key) = layout.fresh_key {
++                self.fresh_rows.mark(key);
+             }
+-            Change::Spliced {
+-                start,
+-                removed,
+-                inserted,
+-            } => {
+-                scroller.splice(start..start + removed, inserted, cx);
++            self.scroller
++                .update(cx, |scroller, cx| match layout.primary {
++                    Change::Pushed => scroller.append(1, cx),
++                    Change::Updated(row) => scroller.remeasure_items(row..row + 1, cx),
++                    _ => unreachable!("row layout contains only a push or update"),
++                });
++            if let Some(rows) = layout.chain {
++                self.scroller
++                    .update(cx, |scroller, cx| scroller.remeasure_items(rows, cx));
+             }
+-        });
+-        let changed = match change {
+-            Change::Pushed => self.session.transcript.entries().len().checked_sub(1),
+-            Change::Updated(row) => Some(row),
+-            Change::None | Change::Spliced { .. } => None,
+-        };
+-        if let Some(row) = changed {
+-            self.remeasure_chain(row, cx);
++        } else {
++            self.scroller.update(cx, |scroller, cx| match change {
++                Change::None => {}
++                Change::Spliced {
++                    start,
++                    removed,
++                    inserted,
++                } => scroller.splice(start..start + removed, inserted, cx),
++                _ => unreachable!("row change has a layout plan"),
++            });
+         }
+     }
+ }
+diff --git a/src/ui/chat/row_layout.rs b/src/ui/chat/row_layout.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..18de33e46709dab1d0bc986d175681f739651268
+--- /dev/null
++++ b/src/ui/chat/row_layout.rs
+@@ -0,0 +1,35 @@
++//! Layout effects of one changed row, shared by the pump and parity tests.
++use std::ops::Range;
++
++use crate::transcript::{Change, Entry, affected_rows};
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) struct RowLayout {
++    pub primary: Change,
++    pub fresh_key: Option<u64>,
++    pub chain: Option<Range<usize>>,
++}
++
++/// Snapshot preparation is separate from live row changes.
++pub(super) fn prepares_replies(change: Change) -> bool {
++    matches!(change, Change::Spliced { .. })
++}
++
++pub(super) fn row_layout(entries: &[Entry], change: Change) -> Option<RowLayout> {
++    let row = match change {
++        Change::Pushed => entries.len().checked_sub(1),
++        Change::Updated(row) => Some(row),
++        Change::None | Change::Spliced { .. } => return None,
++    };
++    let fresh_key = (change == Change::Pushed)
++        .then(|| entries.last().map(|entry| entry.key))
++        .flatten();
++    let chain = row
++        .map(|row| affected_rows(entries, row))
++        .filter(|rows| rows.len() > 1);
++    Some(RowLayout {
++        primary: change,
++        fresh_key,
++        chain,
++    })
++}
+diff --git a/src/ui/chat/session.rs b/src/ui/chat/session.rs
+index 903188915440b7170283fddb78b2fd06292eeeb1..c2fa5641bea82f63eca86ab208c086661ea9990b 100644
+--- a/src/ui/chat/session.rs
++++ b/src/ui/chat/session.rs
+@@ -11,7 +11,7 @@
+ 
+ use super::context_usage::ContextUsage;
+ use super::history::History;
+-use crate::transcript::{Change, Transcript};
++use crate::transcript::{Change, TextRun, TextRunOutcome, Transcript};
+ 
+ /// What the client knows about one open session.
+ pub(in crate::ui) struct Session {
+@@ -65,6 +65,12 @@
+         history.apply(&mut self.transcript, snapshot.transcript, snapshot.history)
+     }
+ 
++    /// Text runs still pass every original event through the session cursor.
++    pub(super) fn apply_text_run(&mut self, mut run: TextRun) -> TextRunOutcome {
++        run.retain(|event| self.cursor.accept(event));
++        self.transcript.apply_text_run(&run)
++    }
++
+     pub fn running(&self) -> bool {
+         self.execution.active.is_some()
+     }
+diff --git a/src/ui/chat/stream_batch.rs b/src/ui/chat/stream_batch.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d41f92269854e423c840acc7a048074cb6fabef
+--- /dev/null
++++ b/src/ui/chat/stream_batch.rs
+@@ -0,0 +1,43 @@
++//! Partition one ready batch without crossing any non-text event.
++use crate::connection::PumpItem;
++use crate::transcript::TextRun;
++
++pub(super) enum BatchItem {
++    Text(TextRun),
++    Barrier(PumpItem),
++}
++
++pub(super) struct Batches {
++    items: std::iter::Peekable<std::vec::IntoIter<PumpItem>>,
++}
++
++pub(super) fn batches(items: Vec<PumpItem>) -> Batches {
++    Batches {
++        items: items.into_iter().peekable(),
++    }
++}
++
++impl Iterator for Batches {
++    type Item = BatchItem;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        let item = self.items.next()?;
++        let PumpItem::Event(event) = item else {
++            return Some(BatchItem::Barrier(item));
++        };
++        let mut run = match TextRun::new(event) {
++            Ok(run) => run,
++            Err(event) => return Some(BatchItem::Barrier(PumpItem::Event(event))),
++        };
++        while matches!(self.items.peek(), Some(PumpItem::Event(event)) if run.accepts(event)) {
++            let Some(PumpItem::Event(event)) = self.items.next() else {
++                unreachable!("peeked text event");
++            };
++            run.push(event);
++        }
++        Some(BatchItem::Text(run))
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/src/ui/chat/stream_batch/tests.rs b/src/ui/chat/stream_batch/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ed0778d66ef45b1d45bd89bb590ac18f65d1689
+--- /dev/null
++++ b/src/ui/chat/stream_batch/tests.rs
+@@ -0,0 +1,487 @@
++use super::*;
++use crate::transcript::Change;
++use crate::ui::chat::{Session, history::History};
++use proteus_contracts::app_protocol::{
++    AppExecutionState, AppPendingRequests, AppRun, AppRunStatus, AppServerEvent,
++    AppSessionSnapshot, AppTranscriptMessage, AppTranscriptTool,
++};
++use proteus_contracts::domain::{Event, EventContext, EventEnvelope, ToolCall, ToolResult};
++use proteus_contracts::model_standard::MessagePhase;
++use serde_json::{Value, json};
++use uuid::Uuid;
++
++fn id(value: u128) -> Uuid {
++    Uuid::from_u128(value)
++}
++
++fn event(event: Event, number: u64) -> Box<AppServerEvent> {
++    let mut envelope =
++        EventEnvelope::new(EventContext::new(id(1), id(10), Some(id(3))), number, event);
++    envelope.event_id = id(10_000 + number as u128);
++    envelope.timestamp_ms = number as i64;
++    Box::new(AppServerEvent::Runtime {
++        envelope: Box::new(envelope),
++    })
++}
++
++fn text(number: u64) -> Box<AppServerEvent> {
++    event(
++        Event::AssistantTextDelta {
++            offset: number as usize,
++            message_id: id(100),
++            phase: None,
++            text: format!("delta {number}"),
++        },
++        number,
++    )
++}
++
++fn snapshot(stream: &str, seq: u64, root: u128) -> AppServerEvent {
++    AppServerEvent::SessionSnapshot {
++        snapshot: Box::new(AppSessionSnapshot {
++            session_id: id(1),
++            stream_id: stream.into(),
++            seq,
++            root_thread_id: Some(id(root)),
++            transcript: Vec::new(),
++            history: None,
++            execution: Default::default(),
++        }),
++    }
++}
++
++fn apply_snapshot(session: &mut Session, history: &mut History, event: AppServerEvent) {
++    assert!(session.cursor.accept(&event));
++    let AppServerEvent::SessionSnapshot { snapshot } = event else {
++        panic!("expected snapshot");
++    };
++    session.apply_snapshot(*snapshot, history);
++}
++
++fn ready() -> (Session, History) {
++    let mut session = Session::new(Default::default());
++    session.cursor.begin_connection();
++    let mut history = History::default();
++    apply_snapshot(&mut session, &mut history, snapshot("first", 1, 10));
++    (session, history)
++}
++
++fn run(events: Vec<Box<AppServerEvent>>) -> TextRun {
++    let mut events = events.into_iter();
++    let mut run = TextRun::new(events.next().unwrap()).unwrap();
++    for event in events {
++        run.push(event);
++    }
++    run
++}
++
++fn wire(item: &PumpItem) -> Value {
++    match item {
++        PumpItem::Connected => json!({"connection": "connected"}),
++        PumpItem::Disconnected(error) => json!({"connection": "disconnected", "error": error}),
++        PumpItem::Event(event) => serde_json::to_value(event).unwrap(),
++    }
++}
++
++#[test]
++fn representative_nondelta_events_flush_before_exact_barrier() {
++    let call = ToolCall::new("call", "tool", json!({"a": 1}));
++    let runtime = |event| PumpItem::Event(self::event(event, 40));
++    let barriers = vec![
++        PumpItem::Connected,
++        PumpItem::Disconnected("offline".into()),
++        PumpItem::Event(Box::new(snapshot("first", 1, 10))),
++        PumpItem::Event(Box::new(AppServerEvent::ExecutionUpdated {
++            execution: AppExecutionState {
++                active: Some(AppRun {
++                    run_id: "run".into(),
++                    options: Default::default(),
++                    status: AppRunStatus::CancelRequested,
++                    error: None,
++                }),
++                last: None,
++            },
++        })),
++        runtime(Event::TurnStarted {
++            session_id: id(1),
++            thread_id: id(10),
++            turn_id: id(3),
++        }),
++        runtime(Event::AssistantMessageCompleted {
++            message_id: id(100),
++            phase: None,
++            text: "completed".into(),
++        }),
++        runtime(Event::AssistantReasoningDelta {
++            text: "ignored".into(),
++        }),
++        runtime(Event::AssistantToolArgsDelta {
++            call_id: "call".into(),
++            args_delta: "{}".into(),
++        }),
++        runtime(Event::ToolCallRequested { call: call.clone() }),
++        runtime(Event::ToolCallResolved { call }),
++        runtime(Event::ApprovalRequested {
++            call_id: "call".into(),
++            reason: "review".into(),
++        }),
++        runtime(Event::ApprovalResolved {
++            call_id: "call".into(),
++            approved: true,
++        }),
++        runtime(Event::ToolFinished {
++            result: ToolResult::ok("call".into(), "done"),
++        }),
++        runtime(Event::SubagentStarted {
++            role: "child".into(),
++            description: None,
++            child_thread_id: id(20),
++        }),
++        PumpItem::Event(Box::new(AppServerEvent::PendingRequestsUpdated {
++            snapshot: Box::new(AppPendingRequests::new(id(1), "first".into())),
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::UserMessageSubmitted {
++            text: "user".into(),
++            images: Vec::new(),
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::ApprovalResolved {
++            approval_id: "approval".into(),
++            approved: true,
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::UserInputResolved {
++            request_id: "input".into(),
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::EventStreamLagged { count: 3 })),
++        PumpItem::Event(Box::new(AppServerEvent::ProfileReloadStatus {
++            error: None,
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::ModulesReloaded {
++            old_epoch: 1,
++            new_epoch: 2,
++            tool_names: Vec::new(),
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::SessionCatalogUpdated)),
++        PumpItem::Event(Box::new(AppServerEvent::Error {
++            message: "error".into(),
++        })),
++        PumpItem::Event(Box::new(AppServerEvent::Shutdown)),
++    ];
++    for barrier in barriers {
++        let items = vec![
++            PumpItem::Event(text(11)),
++            PumpItem::Event(text(12)),
++            barrier,
++            PumpItem::Event(text(13)),
++            PumpItem::Event(text(14)),
++        ];
++        let expected: Vec<_> = items.iter().map(wire).collect();
++        let mut flattened = Vec::new();
++        let mut lengths = Vec::new();
++        for item in batches(items) {
++            match item {
++                BatchItem::Text(run) => {
++                    let events = run.into_events();
++                    lengths.push(events.len());
++                    flattened.extend(events.into_iter().map(PumpItem::Event));
++                }
++                BatchItem::Barrier(item) => {
++                    lengths.push(0);
++                    flattened.push(item);
++                }
++            }
++        }
++        assert_eq!(lengths, [2, 0, 2]);
++        assert_eq!(flattened.iter().map(wire).collect::<Vec<_>>(), expected);
++    }
++}
++
++#[test]
++fn only_equal_context_and_phase_join_but_seq_and_timestamp_are_not_rewritten() {
++    for field in 0..6 {
++        let first = text(11);
++        let mut second = text(12);
++        let AppServerEvent::Runtime { envelope } = second.as_mut() else {
++            unreachable!();
++        };
++        match field {
++            0 => envelope.schema_version += 1,
++            1 => envelope.session_id = id(2),
++            2 => envelope.thread_id = id(20),
++            3 => envelope.turn_id = Some(id(4)),
++            4 | 5 => {
++                let Event::AssistantTextDelta {
++                    message_id, phase, ..
++                } = &mut envelope.event
++                else {
++                    unreachable!();
++                };
++                if field == 4 {
++                    *message_id = id(101);
++                } else {
++                    *phase = Some(MessagePhase::Commentary);
++                }
++            }
++            _ => unreachable!(),
++        }
++        assert!(!TextRun::new(first).unwrap().accepts(&second));
++        assert_eq!(
++            batches(vec![PumpItem::Event(text(11)), PumpItem::Event(second)]).count(),
++            2,
++        );
++    }
++    let mut events = vec![text(11), text(12), text(13)];
++    for (event, seq) in events.iter_mut().zip([9, 9, 1]) {
++        let AppServerEvent::Runtime { envelope } = event.as_mut() else {
++            unreachable!();
++        };
++        envelope.seq = seq;
++    }
++    let expected: Vec<_> = events
++        .iter()
++        .map(|event| serde_json::to_value(event).unwrap())
++        .collect();
++    let run = run(events);
++    assert_eq!(
++        run.into_events()
++            .iter()
++            .map(|event| serde_json::to_value(event).unwrap())
++            .collect::<Vec<_>>(),
++        expected,
++    );
++}
++
++#[test]
++fn cursor_gates_lag_and_reconnect_before_root_routing() {
++    let mut session = Session::new(Default::default());
++    session.cursor.begin_connection();
++    assert!(!session.apply_text_run(run(vec![text(11)])).shown());
++    let mut history = History::default();
++    apply_snapshot(&mut session, &mut history, snapshot("first", 1, 10));
++    assert!(
++        session
++            .apply_text_run(run(vec![text(11), text(12)]))
++            .shown()
++    );
++    assert!(
++        session
++            .cursor
++            .accept(&AppServerEvent::EventStreamLagged { count: 1 })
++    );
++    assert!(!session.apply_text_run(run(vec![text(13)])).shown());
++    apply_snapshot(&mut session, &mut history, snapshot("first", 1, 10));
++    assert!(session.apply_text_run(run(vec![text(14)])).shown());
++
++    session.cursor.begin_connection();
++    assert!(!session.apply_text_run(run(vec![text(15)])).shown());
++    apply_snapshot(&mut session, &mut history, snapshot("second", 0, 20));
++    assert!(!session.apply_text_run(run(vec![text(16)])).shown());
++    let mut new_root = text(17);
++    let AppServerEvent::Runtime { envelope } = new_root.as_mut() else {
++        unreachable!();
++    };
++    envelope.thread_id = id(20);
++    assert!(session.apply_text_run(run(vec![new_root])).shown());
++
++    let mut foreign = text(18);
++    let AppServerEvent::Runtime { envelope } = foreign.as_mut() else {
++        unreachable!();
++    };
++    envelope.session_id = id(2);
++    envelope.thread_id = id(20);
++    assert!(!session.apply_text_run(run(vec![foreign])).shown());
++    assert_eq!(session.transcript.entries().len(), 1);
++    assert_eq!(&*session.transcript.entries()[0].text, "delta 17");
++}
++
++fn projection(session: &Session, change: Change) -> Option<Value> {
++    crate::ui::extensions::session::changed(session, change)
++        .map(|update| serde_json::to_value(update).unwrap())
++}
++
++fn oracle(session: &mut Session, events: &[Box<AppServerEvent>]) -> (Vec<Change>, Vec<Value>) {
++    let mut changes = Vec::new();
++    let mut updates = Vec::new();
++    for event in events {
++        if !session.cursor.accept(event) {
++            continue;
++        }
++        let AppServerEvent::Runtime { envelope } = event.as_ref() else {
++            unreachable!();
++        };
++        let change = session
++            .transcript
++            .apply_runtime(envelope.thread_id, &envelope.event);
++        session.transcript.stamp(change, envelope.timestamp_ms);
++        if change != Change::None {
++            changes.push(change);
++        }
++        if let Some(update) = projection(session, change) {
++            updates.push(update);
++        }
++    }
++    (changes, updates)
++}
++
++#[test]
++fn original_observer_changes_and_public_metadata_projection_are_preserved() {
++    for collision in [false, true] {
++        let make = || {
++            let (mut session, history) = ready();
++            if collision {
++                session.transcript.reset(vec![AppTranscriptMessage {
++                    message_id: Some(id(100)),
++                    phase: None,
++                    role: "user".into(),
++                    text: "original".into(),
++                    images: Vec::new(),
++                    tool: Some(AppTranscriptTool {
++                        call_id: "collision".into(),
++                        name: "tool".into(),
++                        args: json!({"keep": 1}),
++                        effective_args: None,
++                        status: "done".into(),
++                        result: Some("unchanged".into()),
++                        metadata: json!({"source": "fixture"}),
++                    }),
++                    subagent: None,
++                    streaming: false,
++                }]);
++            }
++            (session, history)
++        };
++        let (mut actual, _) = make();
++        let (mut expected, _) = make();
++        let events = vec![text(11), text(12), text(13)];
++        let (changes, updates) = oracle(&mut expected, &events);
++        let outcome = actual.apply_text_run(run(events));
++        assert_eq!(outcome.event_changes().collect::<Vec<_>>(), changes);
++        assert_eq!(
++            outcome
++                .event_changes()
++                .filter_map(|change| projection(&actual, change))
++                .collect::<Vec<_>>(),
++            updates,
++        );
++        assert_eq!(
++            actual.transcript.entries().len(),
++            expected.transcript.entries().len()
++        );
++        assert_eq!(
++            actual.transcript.entries()[0].text,
++            expected.transcript.entries()[0].text
++        );
++        assert_eq!(
++            actual.transcript.entries()[0].time,
++            expected.transcript.entries()[0].time
++        );
++    }
++}
++
++fn observed_rows(session: &Session) -> Vec<Value> {
++    session
++        .transcript
++        .entries()
++        .iter()
++        .map(|entry| {
++            json!({
++                "key": entry.key,
++                "id": entry.message_id,
++                "role": format!("{:?}", entry.role),
++                "text": &*entry.text,
++                "images": entry.images,
++                "tool": entry.tool,
++                "subagent": entry.subagent,
++                "streaming": entry.streaming,
++                "time": entry.time,
++            })
++        })
++        .collect()
++}
++
++#[test]
++fn real_reducer_matches_at_completion_tool_and_turn_barriers() {
++    let delta = |offset, value: &str, number, thread| {
++        let mut event = event(
++            Event::AssistantTextDelta {
++                offset,
++                message_id: id(100),
++                phase: None,
++                text: value.into(),
++            },
++            number,
++        );
++        let AppServerEvent::Runtime { envelope } = event.as_mut() else {
++            unreachable!();
++        };
++        envelope.thread_id = id(thread);
++        PumpItem::Event(event)
++    };
++    let mut turn = event(
++        Event::TurnStarted {
++            session_id: id(1),
++            thread_id: id(20),
++            turn_id: id(4),
++        },
++        17,
++    );
++    let AppServerEvent::Runtime { envelope } = turn.as_mut() else {
++        unreachable!();
++    };
++    envelope.thread_id = id(20);
++    let source = vec![
++        delta(0, "a", 11, 10),
++        delta(1, "b", 12, 10),
++        PumpItem::Event(event(
++            Event::AssistantMessageCompleted {
++                message_id: id(100),
++                phase: None,
++                text: "done".into(),
++            },
++            13,
++        )),
++        delta(4, "", 14, 10),
++        PumpItem::Event(event(
++            Event::ToolCallRequested {
++                call: ToolCall::new("barrier", "tool", json!({})),
++            },
++            15,
++        )),
++        delta(4, "!", 16, 10),
++        PumpItem::Event(turn),
++        delta(5, "ignored old root", 18, 10),
++        delta(5, "new root", 19, 20),
++        delta(13, " tail", 20, 20),
++    ];
++    let (mut actual, _) = ready();
++    let (mut expected, _) = ready();
++    let mut barriers = 0;
++    for item in batches(source) {
++        match item {
++            BatchItem::Text(run) => {
++                let events = run.clone().into_events();
++                let (changes, updates) = oracle(&mut expected, &events);
++                let outcome = actual.apply_text_run(run);
++                assert_eq!(outcome.event_changes().collect::<Vec<_>>(), changes);
++                assert_eq!(
++                    outcome
++                        .event_changes()
++                        .filter_map(|change| projection(&actual, change))
++                        .collect::<Vec<_>>(),
++                    updates,
++                );
++            }
++            BatchItem::Barrier(PumpItem::Event(event)) => {
++                // Both paths execute the unchanged production reducer at a barrier.
++                let (expected_changes, _) = oracle(&mut expected, &[event.clone()]);
++                let (actual_changes, _) = oracle(&mut actual, &[event]);
++                assert_eq!(actual_changes, expected_changes);
++                barriers += 1;
++            }
++            BatchItem::Barrier(_) => unreachable!("runtime-only fixture"),
++        }
++        assert_eq!(observed_rows(&actual), observed_rows(&expected));
++    }
++    assert_eq!(barriers, 3);
++}
++
++mod layout;
+diff --git a/src/ui/chat/stream_batch/tests/layout.rs b/src/ui/chat/stream_batch/tests/layout.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac6530e759f469c53f183383e48db017f89732ef
+--- /dev/null
++++ b/src/ui/chat/stream_batch/tests/layout.rs
+@@ -0,0 +1,149 @@
++//! Native-independent parity of the production row-layout instructions.
++use super::*;
++use crate::ui::chat::row_layout::{prepares_replies, row_layout};
++use std::collections::BTreeSet;
++
++#[derive(Debug, Default, PartialEq, Eq)]
++struct Effects {
++    appends: usize,
++    dirty_rows: BTreeSet<usize>,
++    fresh_keys: BTreeSet<u64>,
++}
++
++impl Effects {
++    fn record(&mut self, session: &Session, change: Change) {
++        // Live text never enters the production snapshot reply-preparation guard.
++        assert!(!prepares_replies(change));
++        let Some(plan) = row_layout(session.transcript.entries(), change) else {
++            return;
++        };
++        match plan.primary {
++            Change::Pushed => {
++                self.appends += 1;
++                self.dirty_rows
++                    .insert(session.transcript.entries().len() - 1);
++            }
++            Change::Updated(row) => {
++                self.dirty_rows.insert(row);
++            }
++            _ => unreachable!("production row-layout plan"),
++        }
++        self.fresh_keys.extend(plan.fresh_key);
++        if let Some(rows) = plan.chain {
++            self.dirty_rows.extend(rows);
++        }
++    }
++}
++
++#[test]
++fn text_plans_preserve_appends_fresh_keys_dirty_chains_and_no_reply_preparation() {
++    assert!(prepares_replies(Change::Spliced {
++        start: 0,
++        removed: 1,
++        inserted: 1,
++    }));
++    let delta = |offset, value: &str, number| {
++        event(
++            Event::AssistantTextDelta {
++                offset,
++                message_id: id(100),
++                phase: None,
++                text: value.into(),
++            },
++            number,
++        )
++    };
++    for case in 0..3 {
++        let make = || {
++            let (mut session, _) = ready();
++            let rows = match case {
++                0 => Vec::new(),
++                1 => vec![AppTranscriptMessage {
++                    message_id: Some(id(100)),
++                    phase: None,
++                    role: "assistant".into(),
++                    text: "é".into(),
++                    images: Vec::new(),
++                    tool: None,
++                    subagent: None,
++                    streaming: false,
++                }],
++                _ => (0..3)
++                    .map(|row| AppTranscriptMessage {
++                        message_id: Some(id(if row == 1 { 100 } else { 200 + row })),
++                        phase: None,
++                        role: "system".into(),
++                        text: "tool row".into(),
++                        images: Vec::new(),
++                        tool: Some(AppTranscriptTool {
++                            call_id: format!("chain-{row}"),
++                            name: "tool".into(),
++                            args: json!({"row": row}),
++                            effective_args: None,
++                            status: "done".into(),
++                            result: Some("unchanged".into()),
++                            metadata: json!({}),
++                        }),
++                        subagent: None,
++                        streaming: false,
++                    })
++                    .collect(),
++            };
++            session.transcript.reset(rows);
++            session
++        };
++        let events = match case {
++            0 => vec![delta(99, "", 11), delta(99, "a", 12), delta(0, "", 13)],
++            1 => vec![delta(2, "", 11), delta(2, "", 12)],
++            _ => vec![delta(2, "replacement", 11), delta(0, "", 12)],
++        };
++        let mut expected = make();
++        let mut expected_effects = Effects::default();
++        let mut expected_changes = Vec::new();
++        let mut expected_updates = Vec::new();
++        for event in &events {
++            let (changes, updates) = oracle(&mut expected, &[event.clone()]);
++            for &change in &changes {
++                expected_effects.record(&expected, change);
++            }
++            expected_changes.extend(changes);
++            expected_updates.extend(updates);
++        }
++
++        let mut actual = make();
++        let outcome = actual.apply_text_run(run(events));
++        let mut actual_effects = Effects::default();
++        for change in outcome.layout_changes() {
++            actual_effects.record(&actual, change);
++        }
++        assert_eq!(actual_effects, expected_effects);
++        assert_eq!(observed_rows(&actual), observed_rows(&expected));
++        assert_eq!(
++            outcome.event_changes().collect::<Vec<_>>(),
++            expected_changes
++        );
++        assert_eq!(
++            outcome
++                .event_changes()
++                .filter_map(|change| projection(&actual, change))
++                .collect::<Vec<_>>(),
++            expected_updates,
++        );
++        if case == 0 {
++            assert_eq!(actual_effects.appends, 1);
++            assert_eq!(actual_effects.fresh_keys.len(), 1);
++        } else {
++            assert_eq!(actual_effects.appends, 0);
++            assert!(actual_effects.fresh_keys.is_empty());
++        }
++        if case == 2 {
++            assert_eq!(actual_effects.dirty_rows, BTreeSet::from([0, 1, 2]));
++            assert_eq!(
++                row_layout(actual.transcript.entries(), Change::Updated(1))
++                    .unwrap()
++                    .chain,
++                Some(0..3),
++            );
++        }
++    }
++}
+diff --git a/src/ui/chat/tool_chain.rs b/src/ui/chat/tool_chain.rs
+index 67e22eb7c14468c00b9ba8a9dd6c945332d12621..c7cd0ea7646b60ad89fa02bb3c175b901f78a8d9 100644
+--- a/src/ui/chat/tool_chain.rs
++++ b/src/ui/chat/tool_chain.rs
+@@ -41,15 +41,6 @@
+             .then(|| tool_chain(self.session.transcript.entries(), ix))
+             .flatten()
+     }
+-
+-    /// Remeasures rows a change of row `ix` may fold or unfold.
+-    pub(super) fn remeasure_chain(&mut self, ix: usize, cx: &mut Context<Self>) {
+-        let rows = affected_rows(self.session.transcript.entries(), ix);
+-        if rows.len() > 1 {
+-            self.scroller
+-                .update(cx, |scroller, cx| scroller.remeasure_items(rows, cx));
+-        }
+-    }
+ }
+ 
+ /// Motion key of the run starting at row `head`; row keys repeat across chats.

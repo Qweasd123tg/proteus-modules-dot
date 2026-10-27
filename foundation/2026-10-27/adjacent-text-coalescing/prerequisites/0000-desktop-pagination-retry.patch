@@ -1,0 +1,485 @@
+diff --git a/src/ui/chat/mod.rs b/src/ui/chat/mod.rs
+index c4ea83bb263fef954df8762cf9869ae856be892f..fa86ada8cd37cd8d5b88de4e26349dc8f3505ae4
+--- a/src/ui/chat/mod.rs
++++ b/src/ui/chat/mod.rs
+@@ -13,6 +13,7 @@
+ mod draft;
+ mod fences;
+ mod history;
++mod history_flow;
+ mod images;
+ mod notice;
+ mod plan_panel;
+diff --git a/src/ui/chat/history.rs b/src/ui/chat/history.rs
+index e228f80b2639b551de8656e23340b26a170d7313..6f9399d381d220e695126ae32b771a9b06025368
+--- a/src/ui/chat/history.rs
++++ b/src/ui/chat/history.rs
+@@ -1,5 +1,6 @@
+ //! Older rows are read on demand; a snapshot retains only a server-verified prefix.
+ use super::Chat;
++use super::history_flow::HistoryRequests;
+ use crate::transcript::{Change, Transcript};
+ use gpui_kit::*;
+ use proteus_contracts::app_protocol::{AppTranscriptCursor, AppTranscriptMessage};
+@@ -7,8 +8,7 @@
+ #[derive(Default)]
+ pub(super) struct History {
+     cursor: Option<AppTranscriptCursor>,
+-    epoch: u64,
+-    loading: bool,
++    requests: HistoryRequests,
+ }
+ 
+ impl History {
+@@ -17,7 +17,7 @@
+         transcript: &mut Transcript,
+         messages: Vec<AppTranscriptMessage>,
+         next: Option<AppTranscriptCursor>,
+-    ) -> Change {
++    ) -> (Change, bool) {
+         let keep = match (&self.cursor, &next) {
+             (Some(old), Some(next))
+                 if old.before <= next.before
+@@ -37,25 +37,30 @@
+             next.as_ref().map_or(0, |cursor| cursor.before)
+         };
+         self.cursor = next.map(|cursor| AppTranscriptCursor { before, ..cursor });
+-        self.epoch += 1;
+-        self.loading = false;
+-        transcript.reset_suffix(keep, messages)
++        let cancelled = self.requests.invalidate();
++        (transcript.reset_suffix(keep, messages), cancelled)
++    }
++
++    fn begin_request(&mut self) -> Option<(u64, AppTranscriptCursor)> {
++        let cursor = self
++            .cursor
++            .as_ref()
++            .filter(|cursor| cursor.before > 0)?
++            .clone();
++        Some((self.requests.begin()?, cursor))
++    }
++
++    fn finish_request(&mut self, request: u64, cursor: &AppTranscriptCursor) -> bool {
++        self.cursor.as_ref() == Some(cursor) && self.requests.finish(request)
+     }
+ }
+ 
+ impl Chat {
+     pub(super) fn load_older(&mut self, cx: &mut Context<Self>) {
+-        if self.history.loading {
+-            return;
+-        }
+-        let Some(cursor) = self.history.cursor.clone() else {
++        let Some((request, cursor)) = self.history.begin_request() else {
+             return;
+         };
+-        if cursor.before == 0 {
+-            return;
+-        }
+-        self.history.loading = true;
+-        let epoch = self.history.epoch;
++        self.clear_history_notice(cx);
+         let api = self.api.clone();
+         let dir = self.session.dir.clone();
+         cx.spawn(async move |this, cx| {
+@@ -65,10 +70,9 @@
+                 .spawn(async move { api.history_page(&dir, &requested) })
+                 .await;
+             this.update(cx, |this, cx| {
+-                if this.history.epoch != epoch || this.history.cursor.as_ref() != Some(&cursor) {
++                if !this.history.finish_request(request, &cursor) {
+                     return;
+                 }
+-                this.history.loading = false;
+                 match page {
+                     Ok(page)
+                         if page.revision == cursor.revision
+@@ -83,10 +87,16 @@
+                         cx.emit(super::ChatEvent::SessionEntriesChanged(change));
+                     }
+                     Ok(_) => {
+-                        this.show_notice("История изменилась; ожидаю новый снимок сессии", cx);
++                        this.show_history_notice(
++                            "История изменилась; дождитесь нового снимка и повторите загрузку",
++                            cx,
++                        );
+                     }
+                     Err(error) => {
+-                        this.show_notice(format!("Не удалось загрузить историю: {error:#}"), cx);
++                        this.show_history_notice(
++                            format!("Не удалось загрузить историю: {error:#}"),
++                            cx,
++                        );
+                     }
+                 }
+                 cx.notify();
+@@ -194,4 +204,76 @@
+         assert!(transcript.entries().is_empty());
+         assert_eq!(state.cursor.unwrap().before, 0);
+     }
+-}
++    #[test]
++    fn unchanged_snapshot_rearms_demand_and_rejects_the_cancelled_page() {
++        use crate::ui::chat::history_flow::HistoryDemand;
++
++        let mut state = History::default();
++        let mut transcript = Transcript::default();
++        state.apply(
++            &mut transcript,
++            rows(100, 150),
++            Some(cursor("same", 100, None)),
++        );
++        let key = transcript.entries()[0].key;
++        let mut demand = HistoryDemand::default();
++        assert!(demand.check(true));
++        let (old, old_cursor) = state.begin_request().unwrap();
++        assert!(state.begin_request().is_none());
++
++        let (change, cancelled) = state.apply(
++            &mut transcript,
++            rows(100, 150),
++            Some(cursor("same", 100, None)),
++        );
++        assert_eq!(change, crate::transcript::Change::None);
++        assert_eq!(transcript.entries()[0].key, key);
++        assert_eq!(transcript.entries().len(), 50);
++        assert!(cancelled);
++        assert!(demand.snapshot(cancelled));
++        assert!(demand.check(true)); // No scroll-away or changed anchor.
++        let (new, new_cursor) = state.begin_request().unwrap();
++        assert!(!state.finish_request(old, &old_cursor));
++        assert!(state.begin_request().is_none()); // Old reply cannot free the new slot.
++        assert!(state.finish_request(new, &new_cursor));
++    }
++
++    #[test]
++    fn failed_request_waits_for_explicit_retry_even_after_an_idle_snapshot() {
++        use crate::ui::chat::history_flow::HistoryDemand;
++
++        let mut state = History::default();
++        let mut transcript = Transcript::default();
++        state.apply(
++            &mut transcript,
++            rows(100, 150),
++            Some(cursor("same", 100, None)),
++        );
++        let mut demand = HistoryDemand::default();
++        assert!(demand.check(true));
++        let (failed, requested) = state.begin_request().unwrap();
++        assert!(state.finish_request(failed, &requested)); // HTTP error uses this path.
++        let (_, cancelled) = state.apply(
++            &mut transcript,
++            rows(100, 150),
++            Some(cursor("same", 100, None)),
++        );
++        assert!(!cancelled);
++        assert!(!demand.snapshot(cancelled));
++        for _ in 0..100 {
++            assert!(!demand.check(true)); // Redraws never retry an error.
++        }
++        let (retry, requested) = state.begin_request().unwrap(); // Retry button.
++        assert!(!state.finish_request(failed, &requested));
++        assert!(state.begin_request().is_none()); // Double click stays single-flight.
++        assert!(state.finish_request(retry, &requested));
++    }
++
++    #[test]
++    fn missing_or_exhausted_cursor_never_starts_a_request() {
++        let mut state = History::default();
++        assert!(state.begin_request().is_none());
++        state.cursor = Some(cursor("complete", 0, None));
++        assert!(state.begin_request().is_none());
++    }
++}
+diff --git a/src/ui/chat/pump.rs b/src/ui/chat/pump.rs
+index c89251c5ab032069bdfb4f1d17fca64526ecf742..adfbba3d0ac72c85cb064f9e9cf69a1159a3fd91
+--- a/src/ui/chat/pump.rs
++++ b/src/ui/chat/pump.rs
+@@ -95,11 +95,14 @@
+                 let snapshot = *snapshot;
+                 session.execution = snapshot.execution;
+                 session.root_thread = snapshot.root_thread_id;
+-                self.history.apply(
++                let (change, cancelled) = self.history.apply(
+                     &mut session.transcript,
+                     snapshot.transcript,
+                     snapshot.history,
+-                )
++                );
++                self.scroller
++                    .update(cx, |scroller, cx| scroller.history_snapshot(cancelled, cx));
++                change
+             }
+             AppServerEvent::ExecutionUpdated { execution } => {
+                 let settled = session.running() && execution.active.is_none();
+diff --git a/src/ui/chat/scroller.rs b/src/ui/chat/scroller.rs
+index a6970cf57f7047808c0494c3d32e1e3eaddde95a..68e53c394f542e742761f49c355f38485d3934ec
+--- a/src/ui/chat/scroller.rs
++++ b/src/ui/chat/scroller.rs
+@@ -24,6 +24,8 @@
+ use crate::ui::kit;
+ use crate::ui::kit::Hint as _;
+ use crate::ui::motion;
++
++use super::history_flow::HistoryDemand;
+ 
+ const OVERDRAW: Pixels = px(400.);
+ /// Time constant of the glide: the remaining distance shrinks by ~63% per τ.
+@@ -49,7 +51,7 @@
+     size: Option<gpui_kit::Size<Pixels>>,
+     hold: Option<Hold>,
+     tail: TailFloor,
+-    history_edge: bool,
++    history_edge: HistoryDemand,
+ }
+ 
+ pub(super) struct HistoryEdge;
+@@ -84,7 +86,15 @@
+             size: None,
+             hold: None,
+             tail: TailFloor::default(),
+-            history_edge: false,
++            history_edge: HistoryDemand::default(),
++        }
++    }
++
++    /// A snapshot cancelled a page request, not the user's demand for it.
++    /// Re-evaluate against the current anchor on the next render.
++    pub(super) fn history_snapshot(&mut self, cancelled: bool, cx: &mut Context<Self>) {
++        if self.history_edge.snapshot(cancelled) {
++            cx.notify();
+         }
+     }
+ 
+@@ -349,10 +359,9 @@
+         if self.state.update(cx, |state, cx| {
+             let running = state.step(Instant::now());
+             let at_edge = !state.following && state.list.logical_scroll_top().item_ix < 8;
+-            if at_edge && !state.history_edge {
++            if state.history_edge.check(at_edge) {
+                 cx.emit(HistoryEdge);
+             }
+-            state.history_edge = at_edge;
+             running
+         }) {
+             window.request_animation_frame();
+diff --git a/src/ui/chat/notice.rs b/src/ui/chat/notice.rs
+index d86cf2a7c0bfc1bdd4e12fe6bec3afbf2e5b69b9..39b13ae6bb64204a0c4537dc0fed2d4da3c891c2
+--- a/src/ui/chat/notice.rs
++++ b/src/ui/chat/notice.rs
+@@ -1,11 +1,14 @@
+ //! Short notes over the composer: a refused attachment, a server error.
+ //! A note stays a few seconds, longer for a longer text, or until closed.
++//! History errors keep an explicit retry action instead of retrying on redraw.
++// Поведение Retry по образцу Zed: crates/ui/src/components/banner.rs.
+ 
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::kit::Frame as _;
+ use std::time::{Duration, Instant};
+ 
+ use gpui_kit::component::*;
++use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+ use super::Chat;
+@@ -24,6 +27,7 @@
+     /// When the note came; shown again after a tab switch it stays put.
+     shown_at: Option<Instant>,
+     hide: Option<Task<()>>,
++    retry_history: bool,
+ }
+ 
+ impl Chat {
+@@ -31,6 +35,7 @@
+         let text = text.into();
+         let stay = (SHOWN + PER_CHAR * text.chars().count() as u32).min(LONGEST);
+         self.notice.text = Some(text);
++        self.notice.retry_history = false;
+         self.notice.count += 1;
+         self.notice.shown_at = Some(Instant::now());
+         self.notice.hide = Some(cx.spawn(async move |this, cx| {
+@@ -44,8 +49,26 @@
+         cx.notify();
+     }
+ 
++    pub(super) fn show_history_notice(
++        &mut self,
++        text: impl Into<SharedString>,
++        cx: &mut Context<Self>,
++    ) {
++        self.show_notice(text, cx);
++        self.notice.retry_history = true;
++        // Keep the recovery action available until used, dismissed or replaced.
++        self.notice.hide = None;
++    }
++
++    pub(super) fn clear_history_notice(&mut self, cx: &mut Context<Self>) {
++        if self.notice.retry_history {
++            self.clear_notice(cx);
++        }
++    }
++
+     pub(super) fn clear_notice(&mut self, cx: &mut Context<Self>) {
+         self.notice.hide = None;
++        self.notice.retry_history = false;
+         if self.notice.text.take().is_some() {
+             cx.notify();
+         }
+@@ -68,6 +91,16 @@
+             .text_xs()
+             .text_color(theme.muted_foreground)
+             .child(div().flex_1().min_w_0().child(text.clone()))
++            .when(self.notice.retry_history, |note| {
++                note.child(
++                    kit::button("history-retry")
++                        .faded_label("Повторить")
++                        .quiet(cx)
++                        .xsmall()
++                        .hint("Повторить загрузку предыдущей страницы истории", cx)
++                        .on_click(cx.listener(|this, _, _, cx| this.load_older(cx))),
++                )
++            })
+             .child(
+                 kit::Clipboard::new("notice-copy")
+                     .value(text)
+diff --git a/DESIGN.md b/DESIGN.md
+index 7662dfefbab7be899a89f2d840a5e27f2831ae49..00283afdda4977a3248e50022f79e5d04a7c9556
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -19,6 +19,9 @@
+   предыдущую страницу, сохраняя строку под взглядом. Reconnect и новый ответ
+   сохраняют уже открытый префикс только при подтверждении его ревизии сервером.
+   Запоздавшая страница от старого снимка не меняет текущую ленту.
++  Если снимок отменил запрос у верхнего края, догрузка возобновляется без
++  прокрутки туда-обратно. Ошибка страницы оставляет явное «Повторить»;
++  перерисовки и снимки без отменённого запроса не запускают цикл повторов.
+ 
+ - Состояние отрисовки хранится в Entity, Global и состояниях списков GPUI.
+   Изменение внешнего `Rc<Cell<_>>` или времени, от которого зависит вид, требует
+diff --git a/src/ui/chat/history_flow.rs b/src/ui/chat/history_flow.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3eac537895b28b9dabbce7fed665bc28316e421
+--- /dev/null
++++ b/src/ui/chat/history_flow.rs
+@@ -0,0 +1,120 @@
++//! Request identity and viewport demand for older chat pages, without UI/I/O.
++
++#[derive(Default)]
++pub(super) struct HistoryRequests {
++    generation: u64,
++    in_flight: Option<u64>,
++}
++
++impl HistoryRequests {
++    pub fn begin(&mut self) -> Option<u64> {
++        if self.in_flight.is_some() {
++            return None;
++        }
++        self.generation = self.generation.wrapping_add(1);
++        self.in_flight = Some(self.generation);
++        Some(self.generation)
++    }
++
++    /// A snapshot invalidates the old page and reports cancelled demand.
++    pub fn invalidate(&mut self) -> bool {
++        self.in_flight.take().is_some()
++    }
++
++    /// Old or duplicate completions must not release a newer request's slot.
++    pub fn finish(&mut self, request: u64) -> bool {
++        if self.in_flight != Some(request) {
++            return false;
++        }
++        self.in_flight = None;
++        true
++    }
++}
++
++#[derive(Default)]
++pub(super) struct HistoryDemand {
++    latched: bool,
++}
++
++impl HistoryDemand {
++    pub fn check(&mut self, at_edge: bool) -> bool {
++        let request = at_edge && !self.latched;
++        self.latched = at_edge;
++        request
++    }
++
++    /// Only an interrupted request rearms automatic demand. In particular,
++    /// errors followed by redraws or idle snapshots do not retry forever.
++    pub fn snapshot(&mut self, cancelled: bool) -> bool {
++        if cancelled {
++            return std::mem::take(&mut self.latched);
++        }
++        false
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn cancelled_page_rearms_same_edge_once() {
++        let mut demand = HistoryDemand::default();
++        let mut requests = HistoryRequests::default();
++        assert!(demand.check(true));
++        let old = requests.begin().unwrap();
++        assert!(requests.begin().is_none());
++        assert!(demand.snapshot(requests.invalidate()));
++        assert!(demand.check(true));
++        assert!(!demand.check(true));
++        let new = requests.begin().unwrap();
++        assert_ne!(old, new);
++        assert!(!requests.finish(old));
++        assert!(requests.begin().is_none());
++        assert!(requests.finish(new));
++    }
++
++    #[test]
++    fn error_needs_user_retry_not_redraw_or_idle_snapshot() {
++        let mut demand = HistoryDemand::default();
++        let mut requests = HistoryRequests::default();
++        assert!(demand.check(true));
++        let first = requests.begin().unwrap();
++        assert!(requests.finish(first)); // Failure releases only the request.
++        assert!(!demand.snapshot(requests.invalidate()));
++        for _ in 0..100 {
++            assert!(!demand.check(true));
++        }
++        let retry = requests.begin().unwrap(); // Explicit Retry action.
++        assert!(!requests.finish(first));
++        assert!(requests.begin().is_none());
++        assert!(requests.finish(retry));
++    }
++
++    #[test]
++    fn leaving_edge_cancels_visible_demand_but_not_response_identity() {
++        let mut demand = HistoryDemand::default();
++        let mut requests = HistoryRequests::default();
++        assert!(demand.check(true));
++        let old = requests.begin().unwrap();
++        assert!(!demand.check(false));
++        assert!(!demand.snapshot(requests.invalidate()));
++        assert!(!demand.check(false)); // Snapshot must not drag user back.
++        assert!(demand.check(true)); // A later deliberate return can request.
++        let new = requests.begin().unwrap();
++        assert!(!requests.finish(old));
++        assert!(requests.finish(new));
++    }
++
++    #[test]
++    fn repeated_snapshots_coalesce_before_next_render() {
++        let mut demand = HistoryDemand::default();
++        let mut requests = HistoryRequests::default();
++        assert!(demand.check(true));
++        requests.begin().unwrap();
++        assert!(demand.snapshot(requests.invalidate()));
++        assert!(!demand.snapshot(requests.invalidate()));
++        assert!(demand.check(true));
++        assert!(!demand.check(true));
++    }
++}
