@@ -1,0 +1,95 @@
+name: Desktop native-window streaming qualification
+
+# Isolated exact-branch experiment; never changes upstream workflows or security policy.
+on:
+  push:
+    branches: [ci/adjacent-text-native-window-20261027]
+    paths:
+      - 'foundation/2026-10-27/adjacent-text-native-window/**'
+      - '.github/workflows/adjacent-text-native-window.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adjacent-text-native-window-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  npm_config_audit: 'false'
+
+jobs:
+  qualify:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/adjacent-text-native-window-20261027'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 195
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Qweasd123tg/proteus-modules-dot
+          ref: cc69f8140c8cc9966356e7152b3a47594f672a65
+          path: qualifier
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.15'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - name: Install build and isolated X11 software-rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb xauth openbox dbus xdotool x11-utils x11-apps imagemagick tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus python3-pil xclip mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools mesa-utils fonts-dejavu-core
+      - name: Install official pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Verify exact harness and adapt only copied qualifier npm audit environment
+        run: |
+          python3 foundation/2026-10-27/adjacent-text-native-window/prepare_qualifier.py \
+            --qualifier-root "$GITHUB_WORKSPACE/qualifier" \
+            --receipt "$RUNNER_TEMP/native-qualifier-adaptation.json"
+      - name: Prove native oracle and bounded process negative controls
+        run: |
+          /usr/bin/python3 foundation/2026-10-27/adjacent-text-native-window/test_gate.py \
+            --report "$RUNNER_TEMP/native-controller-controls.json"
+      - name: Recheck portable qualifier controller failure cleanup
+        run: |
+          python3 qualifier/foundation/2026-10-27/adjacent-text-portable-fast/test_controller.py \
+            --root "$RUNNER_TEMP/native-portable-controller-fixtures" \
+            --report "$RUNNER_TEMP/native-portable-controller.json"
+      - name: Fresh same-job portable-fast qualification of the exact candidate graph
+        run: |
+          python3 qualifier/foundation/2026-10-27/adjacent-text-portable-fast/run_qualification.py \
+            --work-dir "$RUNNER_TEMP/native-portable-work" \
+            --evidence-dir "$RUNNER_TEMP/native-portable-evidence"
+      - name: Actual mapped-window feasibility first, then external streaming UX scenarios
+        timeout-minutes: 12
+        run: |
+          /usr/bin/python3 foundation/2026-10-27/adjacent-text-native-window/run_native_window.py \
+            --qualified-work "$RUNNER_TEMP/native-portable-work" \
+            --qualification-evidence "$RUNNER_TEMP/native-portable-evidence" \
+            --work-dir "$RUNNER_TEMP/native-window-work" \
+            --evidence-dir "$RUNNER_TEMP/native-window-evidence"
+      - name: Retain bounded synthetic screenshots and receipts, never binaries or runtime homes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: adjacent-text-native-window-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/native-qualifier-adaptation.json
+            ${{ runner.temp }}/native-controller-controls.json
+            ${{ runner.temp }}/native-portable-controller.json
+            ${{ runner.temp }}/native-portable-evidence/result.json
+            ${{ runner.temp }}/native-portable-evidence/portable-inventory.json
+            ${{ runner.temp }}/native-portable-evidence/source-commit.txt
+            ${{ runner.temp }}/native-window-evidence/*.json
+            ${{ runner.temp }}/native-window-evidence/*.png
+            ${{ runner.temp }}/native-window-evidence/*.log
+          if-no-files-found: warn
+          retention-days: 7
