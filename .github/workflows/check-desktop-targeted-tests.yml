@@ -1,0 +1,44 @@
+name: Desktop targeted test launcher controls
+
+# Only small pinned text fixtures and fake-subprocess Python controls.
+# No upstream checkout, Rust/npm install, native/extension or portable build.
+on:
+  push:
+    branches: [ci/desktop-targeted-tests-20261028]
+    paths:
+      - 'build-speed/desktop/targeted-tests/**'
+      - '.github/workflows/check-desktop-targeted-tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-targeted-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  runner-controls:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/desktop-targeted-tests-20261028' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: build-speed/desktop/targeted-tests
+      - name: Reconstruct exact candidate and check runner selection with fakes
+        run: |
+          python3 build-speed/desktop/targeted-tests/check.py \
+            --output "$RUNNER_TEMP/desktop-targeted-tests-result.json"
+      - name: Retain the small source-bound control receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-targeted-tests-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ runner.temp }}/desktop-targeted-tests-result.json
+          if-no-files-found: error
+          retention-days: 7
