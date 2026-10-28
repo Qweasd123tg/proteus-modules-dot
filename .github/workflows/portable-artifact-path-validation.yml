@@ -1,0 +1,72 @@
+name: Portable artifact-path mocked validation
+
+on:
+  push:
+    branches: ['dot/portable-artifact-paths-20261028']
+    paths:
+      - 'build-speed/desktop/portable-artifact-paths/**'
+      - '.github/workflows/portable-artifact-path-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-artifact-mocks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mocked-validation:
+    if: github.ref == 'refs/heads/dot/portable-artifact-paths-20261028'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12.15'
+      - name: Verify source pins and delivered file hashes
+        working-directory: build-speed/desktop/portable-artifact-paths
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import json
+          record = json.loads(Path("VALIDATION.json").read_text())
+          assert record["source_commit"] == "f5c5c88a686b4b85c03734b6d83227ba65afb96b"
+          assert record["extension_reference_commit"] == "3361fc1650c4ac6f167c3e48a0fba8980a5c9038"
+          for name, expected in record["sha256"].items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected, name
+          source = Path("before/scripts/portable.py").read_bytes()
+          git_blob = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
+          assert git_blob == "280474d5f3aaf59abdc47a49d559036b4a80a567", git_blob
+          print("PASS: source identity and all delivered bytes")
+          PY
+      - name: Reconstruct exact tested sources from patch (git only)
+        working-directory: build-speed/desktop/portable-artifact-paths
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+          root = Path.cwd()
+          patch = root / "portable-artifact-paths.patch"
+          with tempfile.TemporaryDirectory(prefix="portable-patch-check-") as temporary:
+              patched = Path(temporary) / "snapshot"
+              shutil.copytree(root / "before", patched)
+              for flags in (["--check", "--whitespace=error-all"], ["--whitespace=error-all"]):
+                  subprocess.run(["git", "apply", *flags, str(patch)], cwd=patched, check=True)
+              def files(directory):
+                  return {str(path.relative_to(directory)): path.read_bytes()
+                          for path in directory.rglob("*") if path.is_file()}
+              assert files(patched) == files(root / "after"), "Patch differs from tested after sources"
+          print("PASS: exact patch reconstruction, no product execution")
+          PY
+      - name: Run 26 mocked stdlib controls under process/network guard
+        working-directory: build-speed/desktop/portable-artifact-paths
+        run: python3 validate_mocked.py
