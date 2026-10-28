@@ -1,0 +1,69 @@
+name: Desktop pure tabs crate qualification
+
+# Publishing this exact branch requests one hosted pure-crate qualification.
+# No PR trigger, native Desktop target, UI, extension runner or portable build.
+on:
+  push:
+    branches: [ci/desktop-tabs-crate-20261027]
+    paths:
+      - 'build-speed/desktop/tabs-crate/**'
+      - 'build-speed/desktop/diff-crate/**'
+      - 'build-speed/desktop/pure_crate.py'
+      - '.github/workflows/check-desktop-tabs-crate.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-pure-tabs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  pure-tabs:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/desktop-tabs-crate-20261027' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Read the exact Desktop source into a disposable checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Proteus-harness/Proteus-desktop
+          ref: 50f8b53b686816e7e32b89901aa6ed399826fb37
+          path: .qualification-desktop-tabs
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install only the required linker and pinned Rust
+        run: |
+          python3 -c 'import shutil; raise SystemExit(0 if shutil.disk_usage(".").free >= 8 * 1024**3 else "Need 8 GiB before toolchain setup")'
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y lld
+          rustup toolchain install 1.95.0 --profile minimal
+      - name: Replay the 14 diff controls and 12 tabs/configuration controls
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s build-speed/desktop/diff-crate -p test_qualify_diff.py -v 2>&1 | tee "$RUNNER_TEMP/desktop-tabs-parser-tests.log"
+          python3 -m unittest discover -s build-speed/desktop/tabs-crate -p test_qualify_tabs.py -v 2>&1 | tee -a "$RUNNER_TEMP/desktop-tabs-parser-tests.log"
+      - name: Verify both exact patch stages and run only the 38 tabs library tests
+        run: |
+          python3 build-speed/desktop/tabs-crate/qualify_tabs.py \
+            --source "$GITHUB_WORKSPACE/.qualification-desktop-tabs" \
+            --output "$RUNNER_TEMP/desktop-tabs-evidence"
+      - name: Retain receipts and text logs, never compiled binaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-pure-tabs-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/desktop-tabs-evidence/result.json
+            ${{ runner.temp }}/desktop-tabs-evidence/cargo.log
+            ${{ runner.temp }}/desktop-tabs-evidence/command-partial.log
+            ${{ runner.temp }}/desktop-tabs-parser-tests.log
+          if-no-files-found: warn
+          retention-days: 7

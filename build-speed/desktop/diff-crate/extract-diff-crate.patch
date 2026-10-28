@@ -1,0 +1,98 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,7 @@
+ [workspace]
+ resolver = "2"
+-members = ["crates/client-common"]
++members = ["crates/client-common", "crates/diff"]
++default-members = [".", "crates/diff"]
+ exclude = ["vendor/gpui-fast-wgpu", "vendor/gpui-component"]
+ 
+ [patch.crates-io]
+@@ -35,6 +36,7 @@
+     "tree-sitter-yaml",
+ ] }
+ proteus-client-common = { path = "crates/client-common" }
++proteus-diff = { path = "crates/diff" }
+ proteus-contracts = { git = "https://github.com/Proteus-harness/Proteus-core.git", rev = "f2ef701ef53c7bd45ba3acf58360fa1e77ddfb60" }
+ anyhow = "1"
+ async-channel = "2"
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5330,6 +5330,13 @@
+ ]
+ 
+ [[package]]
++name = "proteus-diff"
++version = "0.1.0-alpha.3"
++dependencies = [
++ "serde",
++]
++
++[[package]]
+ name = "proteus-native"
+ version = "0.1.0-alpha.3"
+ dependencies = [
+@@ -5343,6 +5350,7 @@
+  "naga",
+  "proteus-client-common",
+  "proteus-contracts",
++ "proteus-diff",
+  "roxmltree 0.21.1",
+  "serde",
+  "serde_json",
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,7 +4,6 @@
+ mod catalog;
+ mod connection;
+ mod declarative;
+-mod diff;
+ mod graphics;
+ mod launch;
+ mod navigation;
+@@ -24,6 +23,7 @@
+ mod version;
+ 
+ use gpui_kit::*;
++use proteus_diff as diff;
+ 
+ use launch::Launch;
+ use ui::Launcher;
+diff --git a/crates/diff/Cargo.toml b/crates/diff/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/crates/diff/Cargo.toml
+@@ -0,0 +1,10 @@
++[package]
++name = "proteus-diff"
++version = "0.1.0-alpha.3"
++edition = "2024"
++publish = false
++license = "GPL-3.0-or-later"
++description = "Read-only unified and apply_patch diff parsing for Proteus Desktop"
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
+diff --git a/crates/diff/LICENSE-GPL b/crates/diff/LICENSE-GPL
+new file mode 120000
+--- /dev/null
++++ b/crates/diff/LICENSE-GPL
+@@ -0,0 +1,1 @@
++../../LICENSE-GPL
+\ No newline at end of file
+diff --git a/src/diff/mod.rs b/crates/diff/src/lib.rs
+similarity index 100%
+rename from src/diff/mod.rs
+rename to crates/diff/src/lib.rs
+diff --git a/src/diff/parse.rs b/crates/diff/src/parse.rs
+similarity index 100%
+rename from src/diff/parse.rs
+rename to crates/diff/src/parse.rs
+diff --git a/src/diff/tests.rs b/crates/diff/src/tests.rs
+similarity index 100%
+rename from src/diff/tests.rs
+rename to crates/diff/src/tests.rs
