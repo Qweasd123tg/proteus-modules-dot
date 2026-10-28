@@ -1,0 +1,54 @@
+name: Isolated component split validation
+
+on:
+  push:
+    branches: [ci/component-split-20261028]
+    paths:
+      - 'research/component-split-20261028/**'
+      - '.github/workflows/check-component-split.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: component-split-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  component-split:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/component-split-20261028'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # Existing reviewed pin.
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /research/component-split-20261028/
+            /.github/workflows/check-component-split.yml
+          sparse-checkout-cone-mode: false
+      - name: Install official pinned Rust without native product dependencies
+        timeout-minutes: 3
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+      - name: Source-bound selected tests, release binaries and bounded wire parity
+        run: |
+          python3 -B research/component-split-20261028/run_validation.py \
+            --work-dir "$RUNNER_TEMP/component-split-work" \
+            --evidence-dir "$RUNNER_TEMP/component-split-evidence"
+      - name: Retain validation evidence, not binaries or caches
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # Existing v4.6.2 pin.
+        with:
+          name: component-split-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/component-split-evidence/
+          if-no-files-found: error
+          retention-days: 7
