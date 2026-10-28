@@ -1,0 +1,527 @@
+diff --git a/crates/proteus-core/src/core/runtime/checkpoint.rs b/crates/proteus-core/src/core/runtime/checkpoint.rs
+--- a/crates/proteus-core/src/core/runtime/checkpoint.rs
++++ b/crates/proteus-core/src/core/runtime/checkpoint.rs
+@@ -259,9 +259,12 @@
+                 self.revision
+                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+             }
+             // No cancellation point between accepting final and retiring raw.
+             effects.retain(|effect| effect.call_id != result.call_id);
+         }
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/lib.rs b/crates/proteus-core/src/lib.rs
+--- a/crates/proteus-core/src/lib.rs
++++ b/crates/proteus-core/src/lib.rs
+@@ -7,6 +7,9 @@
+ pub(crate) mod tools;
+ 
+ #[cfg(test)]
++pub(crate) mod test_alloc;
++
++#[cfg(test)]
+ pub(crate) mod test_support;
+ 
+ #[cfg(test)]
+diff --git a/crates/proteus-core/src/test_alloc.rs b/crates/proteus-core/src/test_alloc.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/test_alloc.rs
+@@ -0,0 +1,83 @@
++//! Allocation accounting for synchronous resource regressions in the Core library
++//! test executable only. Per-thread state excludes parallel test activity.
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct Allocations {
++    pub bytes: usize,
++    pub calls: usize,
++}
++
++thread_local! {
++    static COUNT: Cell<Option<Allocations>> = const { Cell::new(None) };
++}
++
++struct CountingSystem;
++
++#[global_allocator]
++static ALLOCATOR: CountingSystem = CountingSystem;
++
++fn record(bytes: usize) {
++    // TLS may already be unavailable when a test thread is being destroyed.
++    let _ = COUNT.try_with(|count| {
++        if let Some(mut value) = count.get() {
++            value.bytes = value.bytes.saturating_add(bytes);
++            value.calls = value.calls.saturating_add(1);
++            count.set(Some(value));
++        }
++    });
++}
++
++unsafe impl GlobalAlloc for CountingSystem {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: forward the caller's exact GlobalAlloc contract to System.
++        let pointer = unsafe { System.alloc(layout) };
++        if !pointer.is_null() {
++            record(layout.size());
++        }
++        pointer
++    }
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: forward the caller's exact GlobalAlloc contract to System.
++        let pointer = unsafe { System.alloc_zeroed(layout) };
++        if !pointer.is_null() {
++            record(layout.size());
++        }
++        pointer
++    }
++    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++        // SAFETY: forward the caller's exact allocation and layout to System.
++        let pointer = unsafe { System.realloc(pointer, layout, size) };
++        if !pointer.is_null() {
++            record(size);
++        }
++        pointer
++    }
++    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
++        // SAFETY: forward the original pointer and layout unchanged.
++        unsafe { System.dealloc(pointer, layout) };
++    }
++}
++
++struct Reset;
++impl Drop for Reset {
++    fn drop(&mut self) {
++        let _ = COUNT.try_with(|count| count.set(None));
++    }
++}
++
++/// Count allocation calls and requested bytes, including realloc's new size;
++/// this is aggregate allocation traffic, not peak resident or live memory.
++pub(crate) fn measure<T>(operation: impl FnOnce() -> T) -> (T, Allocations) {
++    COUNT.with(|count| {
++        assert!(
++            count.replace(Some(Allocations::default())).is_none(),
++            "nested allocation measurement"
++        )
++    });
++    let _reset = Reset;
++    let output = operation();
++    let allocations = COUNT.with(|count| count.get().expect("measurement is active"));
++    (output, allocations)
++}
+diff --git a/crates/proteus-core/src/core/runtime/checkpoint/tests.rs b/crates/proteus-core/src/core/runtime/checkpoint/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/runtime/checkpoint/tests.rs
+@@ -0,0 +1,405 @@
++//! Callback-local semantics and allocation traffic; no product timing claims.
++use std::{
++    future::Future,
++    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
++    task::{Context, Poll, Waker},
++};
++
++use super::*;
++use crate::{
++    contracts::{NoopToolExecutionRecorder, OperationOwner, WorkflowToolResultBinding},
++    domain::{ContextChunk, new_execution_id, new_session_id, new_thread_id, new_turn_id},
++    model_standard::{CanonicalPart, ContentPart, MessageRole, PartProvenance, PartScope},
++    test_alloc,
++};
++
++const REVISION: u64 = 7;
++
++#[derive(Clone)]
++struct Seed {
++    history: Vec<CanonicalMessage>,
++    bindings: Vec<WorkflowToolResultBinding>,
++}
++
++fn seed(payload_bytes: usize) -> Seed {
++    let calls = [
++        ToolCall::new("first", "probe", serde_json::json!({})),
++        ToolCall::new("second", "probe", serde_json::json!({})),
++    ];
++    let history = vec![
++        CanonicalMessage::text(MessageRole::User, "x".repeat(payload_bytes)),
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            calls
++                .iter()
++                .cloned()
++                .map(|call| ContentPart::ToolCall { call })
++                .collect(),
++        ),
++    ];
++    Seed {
++        history,
++        bindings: calls
++            .into_iter()
++            .map(WorkflowToolResultBinding::new)
++            .collect(),
++    }
++}
++
++struct Fixture {
++    recorder: TurnHistoryRecorder,
++    // Keep the unmaterialized SessionStore's roots alive through the callback.
++    _root: tempfile::TempDir,
++    _workspace: tempfile::TempDir,
++}
++
++fn fixture(seed: &Seed, persisted: bool) -> Fixture {
++    let root = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let session_id = new_session_id();
++    let store =
++        persisted.then(|| SessionStore::new(root.path(), workspace.path(), session_id).unwrap());
++    let mut history = seed.history.clone();
++    history.reserve(seed.bindings.len());
++    let capture = HistoryCapture::new(&history, &seed.bindings).unwrap();
++    Fixture {
++        recorder: TurnHistoryRecorder {
++            attribution: ExecutionAttribution::for_turn(
++                new_execution_id(),
++                session_id,
++                new_thread_id(),
++                new_turn_id(),
++            ),
++            store,
++            history: Arc::new(Mutex::new(history)),
++            revision: Arc::new(std::sync::atomic::AtomicU64::new(REVISION)),
++            model_context: Default::default(),
++            interrupted_turns: Default::default(),
++            initial_history: seed.history.clone(),
++            current_user: seed.history[0].clone(),
++            steering: None,
++            tools: Arc::new(NoopToolExecutionRecorder),
++            capture: Mutex::new(capture),
++            recorded_changed_compactions: Default::default(),
++            recorded_compactions: Default::default(),
++            pending_effects: Default::default(),
++        },
++        _root: root,
++        _workspace: workspace,
++    }
++}
++
++// Uncontended Tokio locks and the test recorders complete without a runtime.
++// One poll keeps the allocation scope on one thread and rejects a hidden wait.
++fn complete<T>(future: impl Future<Output = T>) -> T {
++    let mut future = std::pin::pin!(future);
++    let mut context = Context::from_waker(Waker::noop());
++    match future.as_mut().poll(&mut context) {
++        Poll::Ready(output) => output,
++        Poll::Pending => panic!("callback fixture unexpectedly suspended"),
++    }
++}
++
++fn deliver(recorder: &TurnHistoryRecorder, result: &ToolResult) -> Result<()> {
++    complete(recorder.tool_result_recorded(recorder.attribution, result))
++}
++
++fn revision(recorder: &TurnHistoryRecorder) -> u64 {
++    recorder.revision.load(Ordering::SeqCst)
++}
++
++#[test]
++fn root_results_preserve_bound_unbound_order_duplicate_and_revision_behavior() {
++    let seed = seed(64);
++    let first = ToolResult::ok("first".into(), "first output");
++    let second = ToolResult::ok("second".into(), "second output");
++    let unbound = ToolResult::ok("unbound".into(), "not captured");
++    for persisted in [false, true] {
++        let fixture = fixture(&seed, persisted);
++        let recorder = &fixture.recorder;
++        *recorder.pending_effects.try_lock().unwrap() =
++            vec![first.clone(), second.clone(), unbound.clone()];
++        deliver(recorder, &unbound).unwrap();
++        assert_eq!(*recorder.history.try_lock().unwrap(), seed.history);
++        assert_eq!(revision(recorder), REVISION);
++        assert_eq!(recorder.pending_effects.try_lock().unwrap().len(), 2);
++
++        deliver(recorder, &second).unwrap();
++        let mut expected = seed.history.clone();
++        expected.push(seed.bindings[1].message(second.clone()));
++        assert_eq!(*recorder.history.try_lock().unwrap(), expected);
++        assert_eq!(revision(recorder), REVISION + u64::from(!persisted));
++
++        deliver(recorder, &first).unwrap();
++        expected.insert(seed.history.len(), seed.bindings[0].message(first.clone()));
++        assert_eq!(*recorder.history.try_lock().unwrap(), expected);
++        assert_eq!(revision(recorder), REVISION + 2 * u64::from(!persisted));
++        assert!(recorder.pending_effects.try_lock().unwrap().is_empty());
++
++        recorder
++            .pending_effects
++            .try_lock()
++            .unwrap()
++            .push(first.clone());
++        let error = deliver(recorder, &first).unwrap_err();
++        assert!(error.to_string().contains("duplicate tool result"));
++        assert_eq!(*recorder.history.try_lock().unwrap(), expected);
++        assert_eq!(revision(recorder), REVISION + 2 * u64::from(!persisted));
++        assert_eq!(
++            *recorder.pending_effects.try_lock().unwrap(),
++            vec![first.clone()]
++        );
++    }
++}
++
++struct ProbeRecorder {
++    history: Arc<Mutex<Vec<CanonicalMessage>>>,
++    calls: AtomicUsize,
++    observed_len: AtomicUsize,
++    fail: AtomicBool,
++}
++
++#[async_trait]
++impl ToolExecutionRecorder for ProbeRecorder {
++    async fn tool_call_requested(
++        &self,
++        _: ExecutionAttribution,
++        _: OperationOwner,
++        _: &ToolCall,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    async fn tool_call_resolved(
++        &self,
++        _: ExecutionAttribution,
++        _: &ToolCall,
++        _: &ToolCallResolution,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    async fn tool_approval_requested(
++        &self,
++        _: ExecutionAttribution,
++        _: &ToolCall,
++        _: &str,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    async fn tool_result_recorded(&self, _: ExecutionAttribution, _: &ToolResult) -> Result<()> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        // The delegated recorder still runs before the live-history lock/mutation.
++        self.observed_len.store(
++            self.history
++                .try_lock()
++                .expect("history locked before recorder")
++                .len(),
++            Ordering::SeqCst,
++        );
++        ensure!(
++            !self.fail.load(Ordering::SeqCst),
++            "injected recorder rejection"
++        );
++        Ok(())
++    }
++}
++
++#[test]
++fn recorder_error_and_foreign_attribution_do_not_mutate_root_history() {
++    let seed = seed(64);
++    let result = ToolResult::ok("first".into(), "output");
++    for persisted in [false, true] {
++        let mut fixture = fixture(&seed, persisted);
++        let probe = Arc::new(ProbeRecorder {
++            history: fixture.recorder.history.clone(),
++            calls: Default::default(),
++            observed_len: Default::default(),
++            fail: AtomicBool::new(true),
++        });
++        fixture.recorder.tools = probe.clone();
++        let recorder = &fixture.recorder;
++        recorder
++            .pending_effects
++            .try_lock()
++            .unwrap()
++            .push(result.clone());
++        assert!(deliver(recorder, &result).is_err());
++        assert_eq!(*recorder.history.try_lock().unwrap(), seed.history);
++        assert_eq!(revision(recorder), REVISION);
++        assert_eq!(recorder.pending_effects.try_lock().unwrap().len(), 1);
++        assert_eq!(
++            probe.observed_len.load(Ordering::SeqCst),
++            seed.history.len()
++        );
++
++        probe.fail.store(false, Ordering::SeqCst);
++        complete(
++            recorder
++                .tool_result_recorded(ExecutionAttribution::detached(new_execution_id()), &result),
++        )
++        .unwrap();
++        assert_eq!(*recorder.history.try_lock().unwrap(), seed.history);
++        assert_eq!(revision(recorder), REVISION);
++        assert_eq!(recorder.pending_effects.try_lock().unwrap().len(), 1);
++
++        deliver(recorder, &result).unwrap();
++        assert_eq!(
++            recorder.history.try_lock().unwrap().len(),
++            seed.history.len() + 1
++        );
++        assert_eq!(revision(recorder), REVISION + u64::from(!persisted));
++        assert!(recorder.pending_effects.try_lock().unwrap().is_empty());
++        assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
++        assert_eq!(
++            probe.observed_len.load(Ordering::SeqCst),
++            seed.history.len()
++        );
++    }
++}
++
++#[test]
++fn lost_capture_suffix_errors_before_retiring_effect_or_advancing_revision() {
++    let seed = seed(64);
++    let result = ToolResult::ok("first".into(), "output");
++    for persisted in [false, true] {
++        let fixture = fixture(&seed, persisted);
++        let recorder = &fixture.recorder;
++        recorder.history.try_lock().unwrap().clear();
++        recorder
++            .pending_effects
++            .try_lock()
++            .unwrap()
++            .push(result.clone());
++        let error = deliver(recorder, &result).unwrap_err();
++        assert!(error.to_string().contains("history suffix was lost"));
++        assert!(recorder.history.try_lock().unwrap().is_empty());
++        assert_eq!(revision(recorder), REVISION);
++        assert_eq!(recorder.pending_effects.try_lock().unwrap().len(), 1);
++        *recorder.history.try_lock().unwrap() = seed.history.clone();
++        deliver(recorder, &result).unwrap();
++        assert_eq!(
++            recorder.history.try_lock().unwrap().len(),
++            seed.history.len() + 1
++        );
++        assert_eq!(revision(recorder), REVISION + u64::from(!persisted));
++    }
++}
++
++#[test]
++fn storeless_non_reflexive_history_keeps_existing_equality_revision_semantics() {
++    let mut seed = seed(64);
++    seed.history.push(CanonicalMessage::from_parts(
++        MessageRole::Assistant,
++        vec![CanonicalPart::new(
++            PartProvenance::ContextBuilder,
++            PartScope::Conversation,
++            ContentPart::Context {
++                chunk: ContextChunk::new("fixture", "non-reflexive").with_score(f32::NAN),
++            },
++        )],
++    ));
++    assert_ne!(seed.history, seed.history.clone());
++    let result = ToolResult::ok("unbound".into(), "not captured");
++    for persisted in [false, true] {
++        let fixture = fixture(&seed, persisted);
++        let recorder = &fixture.recorder;
++        let before_ids: Vec<_> = recorder
++            .history
++            .try_lock()
++            .unwrap()
++            .iter()
++            .map(|message| message.id)
++            .collect();
++        deliver(recorder, &result).unwrap();
++        let after_ids: Vec<_> = recorder
++            .history
++            .try_lock()
++            .unwrap()
++            .iter()
++            .map(|message| message.id)
++            .collect();
++        assert_eq!(after_ids, before_ids);
++        assert_eq!(revision(recorder), REVISION + u64::from(!persisted));
++    }
++}
++
++#[test]
++fn persisted_result_avoids_full_history_allocation_with_legacy_negative_control() {
++    const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
++    let ((), idle) = test_alloc::measure(|| {});
++    assert_eq!(idle.bytes, 0, "empty-scope allocation control");
++    assert_eq!(idle.calls, 0, "empty-scope allocation control");
++    let (control, counted) = test_alloc::measure(|| std::hint::black_box(vec![0_u8; 1024]));
++    assert_eq!(control.len(), 1024);
++    assert!(counted.bytes >= 1024 && counted.calls >= 1);
++    drop(control);
++    let seed = seed(PAYLOAD_BYTES);
++    for call_id in ["first", "unbound"] {
++        let actual = fixture(&seed, true);
++        let legacy = fixture(&seed, true);
++        let result = ToolResult::ok(call_id.into(), "small result");
++        let (actual_result, optimized) = test_alloc::measure(|| deliver(&actual.recorder, &result));
++        actual_result.unwrap();
++        let (legacy_result, reference) = test_alloc::measure(|| {
++            complete(legacy_result_recorded(
++                &legacy.recorder,
++                legacy.recorder.attribution,
++                &result,
++            ))
++        });
++        legacy_result.unwrap();
++        assert_eq!(
++            *actual.recorder.history.try_lock().unwrap(),
++            *legacy.recorder.history.try_lock().unwrap()
++        );
++        assert_eq!(revision(&actual.recorder), REVISION);
++        assert_eq!(revision(&legacy.recorder), REVISION);
++        assert!(
++            optimized.bytes < PAYLOAD_BYTES / 8,
++            "persisted callback copied history: {optimized:?}"
++        );
++        assert!(
++            reference.bytes >= PAYLOAD_BYTES,
++            "legacy negative control did not count the history clone: {reference:?}"
++        );
++        println!(
++            "checkpoint_callback_allocations={}",
++            serde_json::json!({
++                "call_id": call_id,
++                "history_text_bytes": PAYLOAD_BYTES,
++                "optimized_allocated_bytes": optimized.bytes,
++                "legacy_allocated_bytes": reference.bytes,
++                "optimized_calls": optimized.calls,
++                "legacy_calls": reference.calls,
++                "scope": "same-thread callback allocation traffic; not live heap, RSS or PSS"
++            })
++        );
++    }
++}
++
++// Preceding callback logic; used only to prove the allocation assertion
++// detects the removed copy (including an accidental eager then_some clone).
++async fn legacy_result_recorded(
++    recorder: &TurnHistoryRecorder,
++    attribution: ExecutionAttribution,
++    result: &ToolResult,
++) -> Result<()> {
++    let mut capture = recorder.capture.lock().await;
++    recorder
++        .tools
++        .tool_result_recorded(attribution, result)
++        .await?;
++    if attribution == recorder.attribution {
++        let mut effects = recorder.pending_effects.lock().await;
++        let mut history = recorder.history.lock().await;
++        let previous = history.clone();
++        capture.record(&mut history, result)?;
++        if recorder.store.is_none() && *history != previous {
++            recorder.revision.fetch_add(1, Ordering::SeqCst);
++        }
++        effects.retain(|effect| effect.call_id != result.call_id);
++    }
++    Ok(())
++}

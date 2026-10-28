@@ -1,0 +1,213 @@
+diff --git a/crates/proteus-core/src/core/execution_hooks_tests.rs b/crates/proteus-core/src/core/execution_hooks_tests.rs
+--- a/crates/proteus-core/src/core/execution_hooks_tests.rs
++++ b/crates/proteus-core/src/core/execution_hooks_tests.rs
+@@ -238,3 +238,209 @@
+     );
+     assert!(calls.lock().unwrap().is_empty());
+ }
++
++#[derive(Debug)]
++struct HookRecordingFailure;
++impl std::fmt::Display for HookRecordingFailure {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("hook recorder rejected trace")
++    }
++}
++impl std::error::Error for HookRecordingFailure {}
++
++#[derive(Default)]
++struct TraceRecorder {
++    traces: Mutex<Vec<HookTrace>>,
++    output_pointer: Mutex<Option<usize>>,
++    reject: bool,
++}
++#[async_trait]
++impl ExecutionRecorder for TraceRecorder {
++    async fn hook_recorded(&self, trace: &HookTrace) -> Result<()> {
++        let output_pointer = match &trace.output {
++            Some(HookEvent::AfterTool { result, .. }) => Some(result.output.as_ptr() as usize),
++            _ => None,
++        };
++        // The borrowed trace must remain complete across a suspended recorder.
++        tokio::task::yield_now().await;
++        if let Some(pointer) = output_pointer {
++            let Some(HookEvent::AfterTool { result, .. }) = &trace.output else {
++                panic!("recorded output disappeared");
++            };
++            assert_eq!(result.output.as_ptr() as usize, pointer);
++        }
++        self.traces.lock().unwrap().push(trace.clone());
++        *self.output_pointer.lock().unwrap() = output_pointer;
++        if self.reject {
++            return Err(anyhow::Error::new(HookRecordingFailure));
++        }
++        Ok(())
++    }
++
++    async fn model_request_recorded(
++        &self,
++        _: crate::domain::ExchangeId,
++        _: ModelCallOrigin,
++        _: crate::contracts::OperationOwner,
++        _: &CanonicalModelRequest,
++    ) -> Result<()> {
++        panic!("hook trace test must not record a model request")
++    }
++
++    async fn model_response_recorded(
++        &self,
++        _: crate::domain::ExchangeId,
++        _: &crate::model_standard::CanonicalModelResponse,
++    ) -> Result<()> {
++        panic!("hook trace test must not record a model response")
++    }
++
++    async fn model_error_recorded(
++        &self,
++        _: crate::domain::ExchangeId,
++        _: &crate::model_standard::ModelFailure,
++    ) -> Result<()> {
++        panic!("hook trace test must not record a model failure")
++    }
++}
++
++#[tokio::test]
++async fn completed_hook_trace_returns_the_recorded_output_allocation() {
++    let (mut chain, calls) = chain(&[("continue", false, false)], CancellationToken::new());
++    let recorder = Arc::new(TraceRecorder::default());
++    chain.recorder = recorder.clone();
++    let call = ToolCall::new(new_call_id(), "read", serde_json::json!({}));
++    let event = HookEvent::AfterTool {
++        result: crate::domain::ToolResult::ok(call.id.clone(), "payload".repeat(8192)),
++        call,
++    };
++    let input = bound_input(&chain, event);
++    let output = chain.apply(input.clone()).await.unwrap();
++    let HookEvent::AfterTool { result, .. } = &output else {
++        panic!("hook changed event kind");
++    };
++    assert_eq!(
++        Some(result.output.as_ptr() as usize),
++        *recorder.output_pointer.lock().unwrap(),
++        "return the output already observed by the recorder, without a second payload allocation"
++    );
++    let traces = recorder.traces.lock().unwrap();
++    assert_eq!(traces.len(), 1);
++    assert_eq!(traces[0].input, input);
++    assert_eq!(traces[0].output.as_ref(), Some(&output));
++    assert_eq!(traces[0].steps.len(), 1);
++    assert_eq!(traces[0].steps[0].module_id, "continue");
++    assert!(matches!(
++        &traces[0].steps[0].outcome,
++        HookStepOutcome::Accepted {
++            response: HookResponse::Continue
++        }
++    ));
++    assert_eq!(*calls.lock().unwrap(), vec!["continue"]);
++}
++
++#[tokio::test]
++async fn completed_hook_trace_recorder_failure_does_not_return_output() {
++    let (mut chain, calls) = chain(&[("continue", false, false)], CancellationToken::new());
++    let recorder = Arc::new(TraceRecorder {
++        reject: true,
++        ..Default::default()
++    });
++    chain.recorder = recorder.clone();
++    let input = bound_input(&chain, model_event());
++    let error = chain.apply(input.clone()).await.unwrap_err();
++    assert!(error.downcast_ref::<HookRecordingFailure>().is_some());
++    let traces = recorder.traces.lock().unwrap();
++    assert_eq!(traces.len(), 1);
++    assert_eq!(traces[0].input, input);
++    assert!(traces[0].output.is_some());
++    assert_eq!(traces[0].steps.len(), 1);
++    assert_eq!(*calls.lock().unwrap(), vec!["continue"]);
++}
++
++#[tokio::test]
++async fn empty_selection_chain_still_records_complete_boundary() {
++    let (mut chain, _) = chain(&[], CancellationToken::new());
++    let recorder = Arc::new(TraceRecorder::default());
++    chain.recorder = recorder.clone();
++    let selection = crate::contracts::ToolSelectionInput::new(
++        crate::contracts::ToolSelectionRequest::new(crate::domain::AgentTask::new(
++            "select",
++            "/tmp".into(),
++        )),
++        vec![],
++    );
++    let input = bound_input(
++        &chain,
++        HookEvent::BeforeToolSelection {
++            input: selection,
++            output: crate::contracts::ToolSelectionOutput::new(vec![]),
++        },
++    );
++    assert!(!chain.is_active());
++    let output = chain.apply(input.clone()).await.unwrap();
++    let traces = recorder.traces.lock().unwrap();
++    assert_eq!(traces.len(), 1);
++    assert_eq!(traces[0].input, input);
++    assert!(traces[0].steps.is_empty());
++    assert_eq!(traces[0].output.as_ref(), Some(&output));
++    assert_eq!(output, input.event);
++}
++
++#[tokio::test]
++async fn notification_failure_records_later_handler_and_completed_output() {
++    let (mut chain, calls) = chain(
++        &[("failed", true, false), ("continued", false, false)],
++        CancellationToken::new(),
++    );
++    let recorder = Arc::new(TraceRecorder::default());
++    chain.recorder = recorder.clone();
++    let input = bound_input(
++        &chain,
++        HookEvent::TurnSettled {
++            status: crate::contracts::HookTurnStatus::Error,
++            output: None,
++            error: Some("turn failed".into()),
++        },
++    );
++    let output = chain.apply(input.clone()).await.unwrap();
++    let traces = recorder.traces.lock().unwrap();
++    assert_eq!(traces.len(), 1);
++    assert_eq!(traces[0].input, input);
++    assert_eq!(traces[0].output.as_ref(), Some(&output));
++    assert_eq!(traces[0].steps.len(), 2);
++    assert!(matches!(
++        &traces[0].steps[0].outcome,
++        HookStepOutcome::Failed { .. }
++    ));
++    assert!(matches!(
++        &traces[0].steps[1].outcome,
++        HookStepOutcome::Accepted {
++            response: HookResponse::Continue
++        }
++    ));
++    assert_eq!(*calls.lock().unwrap(), vec!["failed", "continued"]);
++}
++
++#[tokio::test]
++async fn actionable_failure_records_no_output_and_stops_later_handlers() {
++    let (mut chain, calls) = chain(
++        &[("failed", true, false), ("never", false, false)],
++        CancellationToken::new(),
++    );
++    let recorder = Arc::new(TraceRecorder::default());
++    chain.recorder = recorder.clone();
++    let input = bound_input(&chain, model_event());
++    let error = chain.apply(input.clone()).await.unwrap_err();
++    assert_eq!(error.to_string(), "handler failed");
++    let traces = recorder.traces.lock().unwrap();
++    assert_eq!(traces.len(), 1);
++    assert_eq!(traces[0].input, input);
++    assert!(traces[0].output.is_none());
++    assert_eq!(traces[0].steps.len(), 1);
++    assert!(matches!(
++        &traces[0].steps[0].outcome,
++        HookStepOutcome::Failed { .. }
++    ));
++    assert_eq!(*calls.lock().unwrap(), vec!["failed"]);
++}

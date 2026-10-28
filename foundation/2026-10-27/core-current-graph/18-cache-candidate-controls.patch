@@ -1,0 +1,212 @@
+diff --git a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+@@ -335,3 +335,208 @@
+         let _ = fs::remove_file(&self.temp);
+     }
+ }
++#[cfg(test)]
++impl CacheGate {
++    // Keep the mechanism controls identical when the helpers return bare File.
++    fn try_clone(&self) -> io::Result<fs::File> {
++        self.file.try_clone()
++    }
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod gate_lifetime_tests {
++    use super::*;
++    use std::fs::TryLockError;
++
++    const NAME: &str = "gate-lifetime";
++
++    fn fixture() -> tempfile::TempDir {
++        let dir = tempfile::tempdir().expect("gate fixture");
++        drop(lock_file(dir.path(), NAME).expect("create persistent gate"));
++        dir
++    }
++
++    fn independent(dir: &Path) -> fs::File {
++        OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(dir.join(format!(".read-{NAME}.lock")))
++            .expect("independent gate descriptor")
++    }
++
++    fn assert_exclusive_blocked(file: &fs::File) {
++        match file.try_lock() {
++            Err(TryLockError::WouldBlock) => {}
++            Ok(()) => panic!("a live independent gate must exclude replacement"),
++            Err(error) => panic!("unexpected exclusive probe error: {error:?}"),
++        }
++    }
++
++    macro_rules! duplicate_release_case {
++        ($test:ident, $acquire:ident, $marker:literal) => {
++            #[test]
++            fn $test() {
++                let dir = fixture();
++                let owner = $acquire(dir.path(), NAME).expect("logical gate owner");
++                let duplicate = owner.try_clone().expect("duplicate gate descriptor");
++                let contender = independent(dir.path());
++                assert_exclusive_blocked(&contender);
++                drop(owner);
++                match contender.try_lock() {
++                    Ok(()) => {}
++                    Err(TryLockError::WouldBlock) => panic!($marker),
++                    Err(error) => panic!("unexpected replacement lock error: {error:?}"),
++                }
++                duplicate.metadata().expect("old duplicate remains open");
++                let observer = independent(dir.path());
++                assert_exclusive_blocked(&observer);
++                drop(duplicate);
++                assert_exclusive_blocked(&observer);
++                // Raw contender cleanup must not itself depend on last-close:
++                // a concurrently forked control may retain an incidental alias.
++                contender.unlock().expect("explicit replacement release");
++                drop(contender);
++                observer.try_lock().expect("released replacement gate");
++                observer.unlock().expect("explicit observer release");
++            }
++        };
++    }
++
++    duplicate_release_case!(
++        write_gate_drop_releases_while_duplicate_remains,
++        write_lock,
++        "CACHE_GATE_WRITE_DUPLICATE: logical gate drop must release despite a live duplicate"
++    );
++    duplicate_release_case!(
++        update_gate_drop_releases_while_duplicate_remains,
++        update_lock,
++        "CACHE_GATE_UPDATE_DUPLICATE: logical gate drop must release despite a live duplicate"
++    );
++    duplicate_release_case!(
++        read_open_gate_drop_releases_while_duplicate_remains,
++        read_open_lock,
++        "CACHE_GATE_READ_OPEN_DUPLICATE: logical gate drop must release despite a live duplicate"
++    );
++
++    #[test]
++    fn dropping_one_shared_gate_preserves_every_independent_live_peer() {
++        for first_is_reader in [true, false] {
++            for second_is_reader in [true, false] {
++                let dir = fixture();
++                let first = if first_is_reader {
++                    read_open_lock(dir.path(), NAME)
++                } else {
++                    update_lock(dir.path(), NAME)
++                }
++                .expect("first shared gate");
++                let second = if second_is_reader {
++                    read_open_lock(dir.path(), NAME)
++                } else {
++                    update_lock(dir.path(), NAME)
++                }
++                .expect("independent shared peer");
++                let contender = independent(dir.path());
++                assert_exclusive_blocked(&contender);
++                drop(first);
++                assert_exclusive_blocked(&contender);
++                drop(second);
++                contender.try_lock().expect("all shared owners have ended");
++                contender.unlock().expect("explicit contender release");
++            }
++        }
++    }
++
++    #[test]
++    fn exclusive_gate_blocks_both_shared_admissions() {
++        let dir = fixture();
++        let owner = write_lock(dir.path(), NAME).expect("exclusive gate");
++        assert!(read_open_lock(dir.path(), NAME).is_none());
++        assert!(update_lock(dir.path(), NAME).is_none());
++        let shared = independent(dir.path());
++        match shared.try_lock_shared() {
++            Err(TryLockError::WouldBlock) => {}
++            Ok(()) => panic!("a live exclusive gate must exclude shared admission"),
++            Err(error) => panic!("unexpected shared probe error: {error:?}"),
++        }
++        drop(owner);
++        shared.try_lock_shared().expect("released exclusive gate");
++        shared.unlock().expect("explicit shared probe release");
++    }
++
++    macro_rules! child_drop_case {
++        ($test:ident, $acquire:ident) => {
++            #[test]
++            fn $test() {
++                use std::os::unix::process::CommandExt;
++                use std::process::{Command, Stdio};
++
++                let dir = fixture();
++                let owner = $acquire(dir.path(), NAME).expect("parent gate");
++                let mut inherited = Some(owner);
++                let mut command = Command::new(std::env::current_exe().expect("test executable"));
++                command
++                    .arg("--list")
++                    .stdin(Stdio::null())
++                    .stdout(Stdio::null())
++                    .stderr(Stdio::null());
++                // SAFETY: Only a File, or the candidate File + u32 guard, is
++                // captured. The child callback drops that inherited handle
++                // (getpid/close, without a foreign-PID unlock) and returns Ok.
++                // It does not allocate, log, touch TLS, or lock a Rust mutex.
++                // No SQLite object is captured. The parent's callback copy
++                // retains its original live gate.
++                unsafe {
++                    command.pre_exec(move || {
++                        drop(inherited.take());
++                        Ok(())
++                    });
++                }
++                let mut child = command.spawn().expect("spawn fork/drop control");
++                assert!(child.wait().expect("wait for list-only child").success());
++                let contender = independent(dir.path());
++                assert_exclusive_blocked(&contender);
++                drop(command);
++                contender
++                    .try_lock()
++                    .expect("parent callback drop releases gate");
++                contender.unlock().expect("explicit contender release");
++            }
++        };
++    }
++
++    child_drop_case!(child_drop_preserves_parent_write_gate, write_lock);
++    child_drop_case!(child_drop_preserves_parent_update_gate, update_lock);
++    child_drop_case!(child_drop_preserves_parent_read_open_gate, read_open_lock);
++
++    #[test]
++    fn reader_never_creates_coordination_metadata() {
++        let dir = tempfile::tempdir().expect("read-only gate fixture");
++        assert!(read_open_lock(dir.path(), NAME).is_none());
++        assert!(Reader::open(dir.path(), NAME).is_none());
++        assert!(read_open_lock(dir.path(), "../invalid").is_none());
++        assert_eq!(fs::read_dir(dir.path()).expect("empty fixture").count(), 0);
++
++        let path = cache_path(dir.path(), NAME).expect("cache path");
++        let bytes = b"an older disposable cache with no coordination gate";
++        fs::write(&path, bytes).expect("older cache");
++        let before = FileStamp::from(fs::symlink_metadata(&path).expect("older cache stamp"));
++        assert!(Reader::open(dir.path(), NAME).is_none());
++        assert_eq!(
++            fs::read(&path).expect("unchanged older cache"),
++            bytes.to_vec()
++        );
++        assert_eq!(
++            FileStamp::from(fs::symlink_metadata(&path).expect("unchanged cache stamp")),
++            before
++        );
++        let names = fs::read_dir(dir.path())
++            .expect("read-only fixture")
++            .map(|entry| entry.expect("fixture entry").file_name())
++            .collect::<Vec<_>>();
++        assert_eq!(
++            names,
++            vec![path.file_name().expect("cache basename").to_os_string()]
++        );
++        assert!(!dir.path().join(format!(".read-{NAME}.lock")).exists());
++    }
++}

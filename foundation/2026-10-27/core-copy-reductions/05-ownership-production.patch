@@ -1,0 +1,71 @@
+diff --git a/crates/proteus-core/src/core/session_journal/storage/ownership.rs b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+--- a/crates/proteus-core/src/core/session_journal/storage/ownership.rs
++++ b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+@@ -27,23 +27,37 @@
+     Ok(parent.join(lock_name))
+ }
+ 
+ #[derive(Debug)]
+ pub(crate) struct SessionWriteOwnership {
+     _file: File,
++    owner_pid: u32,
++}
++
++impl Drop for SessionWriteOwnership {
++    fn drop(&mut self) {
++        // A forked child must only close its inherited descriptor, not unlock
++        // the still-live parent's shared open-file-description lease.
++        if self.owner_pid == std::process::id() {
++            // Close alone can leave a lock held by a transient fork/dup copy.
++            // Explicitly end this owner's lease before retirement is signaled;
++            // File drop still closes the descriptor if unlock reports an error.
++            let _ = self._file.unlock();
++        }
++    }
+ }
+ 
+ impl SessionWriteOwnership {
+     pub(crate) fn acquire(session_dir: &Path, _session_id: SessionId) -> Result<Self> {
+         Self::acquire_slot(session_dir)
+     }
+ 
+     pub(crate) fn acquire_slot(session_dir: &Path) -> Result<Self> {
+         let path = ownership_path(session_dir)?;
+         reject_symlink(&path)?;
+-        let mut file = OpenOptions::new()
++        let file = OpenOptions::new()
+             .create(true)
+             .read(true)
+             .write(true)
+             .truncate(false)
+             .open(&path)
+             .with_context(|| format!("failed to open session writer lock {}", path.display()))?;
+@@ -60,19 +74,26 @@
+                 return Err(error).with_context(|| {
+                     format!("failed to acquire session writer lock {}", path.display())
+                 });
+             }
+         }
+ 
++        // Install rollback ownership immediately after acquiring the lock so
++        // errors while writing diagnostic metadata also release this lease.
++        let ownership = Self {
++            _file: file,
++            owner_pid: std::process::id(),
++        };
++        let mut file = &ownership._file;
+         file.set_len(0)
+             .with_context(|| format!("failed to reset session writer lock {}", path.display()))?;
+-        writeln!(file, "pid={}", std::process::id())
++        writeln!(file, "pid={}", ownership.owner_pid)
+             .with_context(|| format!("failed to identify session writer in {}", path.display()))?;
+         file.sync_data()
+             .with_context(|| format!("failed to sync session writer lock {}", path.display()))?;
+-        Ok(Self { _file: file })
++        Ok(ownership)
+     }
+ }
+ 
+ fn reject_symlink(path: &Path) -> Result<()> {
+     match fs::symlink_metadata(path) {
+         Ok(metadata) if metadata.file_type().is_symlink() => {

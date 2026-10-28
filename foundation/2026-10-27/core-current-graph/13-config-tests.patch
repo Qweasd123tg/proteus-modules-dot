@@ -1,0 +1,357 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+--- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
++++ b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+@@ -1,3 +1,6 @@
++mod bounded_age;
++mod gate;
++
+ use super::*;
+ use crate::{
+     app_server::AgentAppServer,
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests/gate.rs b/crates/proteus-core/src/app_server/profile_watch/tests/gate.rs
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/profile_watch/tests/gate.rs
+@@ -0,0 +1,52 @@
++use super::super::*;
++use std::cell::Cell;
++
++#[test]
++fn metadata_gate_bounds_scan_age_without_poll_reads_or_deadline_sliding() {
++    let start = Instant::now();
++    let probes = Cell::new(0);
++    let current = || {
++        probes.set(probes.get() + 1);
++        true
++    };
++    assert!(!metadata_allows_skip(false, None, start, current));
++    assert_eq!(probes.get(), 0, "first scan must not probe cached metadata");
++    let last = Some(start);
++    for tick in 1..10 {
++        assert!(metadata_allows_skip(
++            false,
++            last,
++            start + Duration::from_millis(tick * 300),
++            current,
++        ));
++    }
++    assert_eq!(probes.get(), 9);
++    assert!(!metadata_allows_skip(
++        false,
++        last,
++        start + MAX_SEMANTIC_SCAN_AGE,
++        current,
++    ));
++    assert_eq!(probes.get(), 9, "overdue scans bypass metadata probes");
++    assert!(!metadata_allows_skip(
++        true,
++        last,
++        start + Duration::from_millis(300),
++        current,
++    ));
++    assert_eq!(probes.get(), 9, "pending second sample bypasses metadata");
++    assert!(!metadata_allows_skip(
++        false,
++        last,
++        start + Duration::from_millis(300),
++        || false,
++    ));
++    // A completed attempt, whether valid or invalid, starts the next age.
++    let next = start + MAX_SEMANTIC_SCAN_AGE;
++    assert!(metadata_allows_skip(
++        false,
++        Some(next),
++        next + Duration::from_millis(300),
++        current,
++    ));
++}
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs b/crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/profile_watch/tests/bounded_age.rs
+@@ -0,0 +1,287 @@
++//! Real files and the production watcher/loader/publication path, with only
++//! poll times and stale-positive metadata hints injected. No filesystem timestamp
++//! collision, process module, model request or wall-clock sleep is required.
++use super::super::*;
++use crate::app_server::{AgentAppServer, AppServerEvent};
++use polling::{Poll, PollReport};
++use tokio::sync::{mpsc, oneshot};
++
++fn bare_config() -> AppConfig {
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    config.agent_control.surface = crate::core::AgentControlSurface::None;
++    config
++}
++
++async fn controlled_server(path: &Path) -> (AppServerHandle, mpsc::UnboundedSender<Poll>, Instant) {
++    let config = AppConfig::load(Some(path)).await.unwrap();
++    let cwd = path.parent().unwrap().to_path_buf();
++    // None suppresses the normal autonomous watcher and session persistence.
++    // The same production loop is then started once with controlled polls.
++    let server = AgentAppServer::launch(config, cwd, None).await.unwrap();
++    let (polling, sender) = Polling::controlled();
++    let start = Instant::now();
++    start_with_polling(&server, path.to_path_buf(), polling).await;
++    (server, sender, start)
++}
++
++async fn tick(sender: &mpsc::UnboundedSender<Poll>, now: Instant) -> PollReport {
++    let (completed, receipt) = oneshot::channel();
++    assert!(
++        sender.send(Poll::controlled(now, completed)).is_ok(),
++        "controlled watcher must accept the poll"
++    );
++    tokio::time::timeout(Duration::from_secs(5), receipt)
++        .await
++        .expect("controlled watcher must finish or cancel each poll")
++        .expect("controlled watcher must acknowledge each accepted poll")
++}
++
++async fn settle(sender: &mpsc::UnboundedSender<Poll>, start: Instant) {
++    assert!(tick(sender, start).await.scanned);
++    assert!(
++        tick(sender, start + Duration::from_millis(300))
++            .await
++            .scanned,
++        "pending requires a second stable observation"
++    );
++    assert!(
++        !tick(sender, start + Duration::from_millis(600))
++            .await
++            .scanned,
++        "a completed metadata-only skip witnesses the settled initial state"
++    );
++}
++
++fn write_instruction_profile(path: &Path) {
++    let mut config = bare_config();
++    config.instructions = vec![
++        serde_json::from_value(serde_json::json!({
++            "kind": "System", "priority": 100, "file": "rules.md"
++        }))
++        .unwrap(),
++    ];
++    std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
++}
++
++#[tokio::test]
++async fn persistent_same_stamp_instruction_edit_reloads_after_bounded_age() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let rules = root.path().join("rules.md");
++    std::fs::write(&rules, "first").unwrap();
++    write_instruction_profile(&path);
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let epoch = server.runtime.module_epoch().await;
++    std::fs::write(&rules, "other").unwrap();
++    assert_eq!(std::fs::metadata(&rules).unwrap().len(), 5);
++
++    // Metadata hints are deliberately stale-positive for this watcher only.
++    // The existing input snapshot must not turn them into an unlimited lease.
++    for milliseconds in (900..=3000).step_by(300) {
++        assert!(
++            !tick(&sender, start + Duration::from_millis(milliseconds))
++                .await
++                .scanned,
++            "idle fast polls must not parse on every tick"
++        );
++    }
++    let first = tick(&sender, start + Duration::from_millis(3300)).await;
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    assert_eq!(
++        server.config.read().await.instructions[0].text.as_deref(),
++        Some("first"),
++        "one changed sample must not publish"
++    );
++    let second = tick(&sender, start + Duration::from_millis(3600)).await;
++    assert_eq!(
++        server.config.read().await.instructions[0].text.as_deref(),
++        Some("other"),
++        "persistent_same_stamp_edit_must_reload"
++    );
++    assert!(server.runtime.module_epoch().await > epoch);
++    assert!(first.scanned && !first.refresh_attempted);
++    assert!(second.scanned && second.refresh_attempted);
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn persistent_same_stamp_directory_member_is_discovered() {
++    let root = tempfile::tempdir().unwrap();
++    let profile = root.path().join("profile");
++    std::fs::create_dir(&profile).unwrap();
++    std::fs::write(
++        profile.join("base.toml"),
++        toml::to_string(&bare_config()).unwrap(),
++    )
++    .unwrap();
++    let (server, sender, start) = controlled_server(&profile).await;
++    settle(&sender, start).await;
++    let epoch = server.runtime.module_epoch().await;
++    std::fs::write(
++        profile.join("new.toml"),
++        "[profile]\nname = 'directory-added'\n",
++    )
++    .unwrap();
++    tick(&sender, start + Duration::from_millis(3300)).await;
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    tick(&sender, start + Duration::from_millis(3600)).await;
++    assert_eq!(
++        server.config.read().await.profile.name,
++        "directory-added",
++        "persistent_same_stamp_directory_member_must_reload"
++    );
++    assert!(server.runtime.module_epoch().await > epoch);
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn persistent_same_stamp_read_failure_preserves_last_good_and_recovers() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let rules = root.path().join("rules.md");
++    std::fs::write(&rules, "first").unwrap();
++    write_instruction_profile(&path);
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let mut events = server.subscribe();
++    let epoch = server.runtime.module_epoch().await;
++    std::fs::remove_file(&rules).unwrap();
++    tick(&sender, start + Duration::from_millis(3300)).await;
++    tick(&sender, start + Duration::from_millis(3600)).await;
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    assert_eq!(
++        server.config.read().await.instructions[0].text.as_deref(),
++        Some("first")
++    );
++    assert!(server.profile_error.lock().await.is_some());
++    assert!(
++        !tick(&sender, start + Duration::from_millis(3900))
++            .await
++            .scanned
++    );
++    assert!(
++        tick(&sender, start + Duration::from_millis(6600))
++            .await
++            .scanned,
++        "stable errors must also receive bounded revalidation"
++    );
++    let mut reported_errors = 0;
++    while let Ok(event) = events.try_recv() {
++        if matches!(
++            event,
++            AppServerEvent::ProfileReloadStatus { error: Some(_) }
++        ) {
++            reported_errors += 1;
++        }
++    }
++    assert_eq!(reported_errors, 1, "stable read failure is reported once");
++
++    std::fs::write(&rules, "other").unwrap();
++    tick(&sender, start + Duration::from_millis(9600)).await;
++    tick(&sender, start + Duration::from_millis(9900)).await;
++    assert_eq!(
++        server.config.read().await.instructions[0].text.as_deref(),
++        Some("other"),
++        "persistent_same_stamp_read_recovery_must_reload"
++    );
++    assert!(server.runtime.module_epoch().await > epoch);
++    assert!(server.profile_error.lock().await.is_none());
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn bounded_revalidation_preserves_failed_fingerprint_suppression() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let mut config = bare_config();
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let epoch = server.runtime.module_epoch().await;
++    config.modules.policy = Some("not-registered".into());
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    tick(&sender, start + Duration::from_millis(3300)).await;
++    assert!(
++        tick(&sender, start + Duration::from_millis(3600))
++            .await
++            .refresh_attempted
++    );
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    assert!(server.profile_error.lock().await.is_some());
++    let repeated = tick(&sender, start + Duration::from_millis(6600)).await;
++    assert!(repeated.scanned);
++    assert!(
++        !repeated.refresh_attempted,
++        "periodic verification must not retry an unchanged failed assembly"
++    );
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn controlled_watcher_cancels_pending_and_releases_owner() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let mut config = bare_config();
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let epoch = server.runtime.module_epoch().await;
++    config.profile.name = "pending-change".into();
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    assert!(
++        tick(&sender, start + Duration::from_millis(3300))
++            .await
++            .scanned
++    );
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    server.profile_stop.cancel();
++    tokio::time::timeout(Duration::from_secs(5), sender.closed())
++        .await
++        .expect("cancellation must close the controlled poll receiver");
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    let owner = std::sync::Arc::downgrade(&server.inner);
++    server.shutdown().await;
++    drop(server);
++    assert!(
++        owner.upgrade().is_none(),
++        "watcher must not retain its owner"
++    );
++}
++
++#[tokio::test]
++async fn closed_poll_driver_does_not_keep_a_handle_alive() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    std::fs::write(&path, toml::to_string(&bare_config()).unwrap()).unwrap();
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let owner = std::sync::Arc::downgrade(&server.inner);
++    drop(sender);
++    // Do not cancel through shutdown: this checks owner retention after closing
++    // the test driver. None -> break in the loop is the separate exit guarantee.
++    drop(server);
++    assert!(
++        owner.upgrade().is_none(),
++        "poll driver must not retain its owner"
++    );
++}
++
++#[tokio::test]
++async fn unchanged_semantic_revalidation_advances_age_without_rebuilding() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    std::fs::write(&path, toml::to_string(&bare_config()).unwrap()).unwrap();
++    let (server, sender, start) = controlled_server(&path).await;
++    settle(&sender, start).await;
++    let epoch = server.runtime.module_epoch().await;
++    let due = tick(&sender, start + Duration::from_millis(3300)).await;
++    assert!(due.scanned && !due.refresh_attempted);
++    let next = tick(&sender, start + Duration::from_millis(3600)).await;
++    assert!(!next.scanned && !next.refresh_attempted);
++    assert_eq!(server.runtime.module_epoch().await, epoch);
++    server.shutdown().await;
++}

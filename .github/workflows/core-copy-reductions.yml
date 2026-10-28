@@ -1,0 +1,230 @@
+name: Core default copy-reduction qualification
+
+on:
+  push:
+    branches: [ci/core-copy-reductions-20261027]
+    paths:
+      - 'foundation/2026-10-27/core-copy-reductions/**'
+      - '.github/workflows/core-copy-reductions.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-copy-reductions-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  RUST_TEST_THREADS: '4'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: '0'
+  GIT_TERMINAL_PROMPT: '0'
+  npm_config_audit: 'false'
+  npm_config_fund: 'false'
+
+jobs:
+  qualify:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/core-copy-reductions-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        phase: [baseline, production]
+    steps: &qualification_steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Admit only a standard runner with the initial disk reserve
+        run: python3 -c 'import os, shutil; assert shutil.disk_usage(os.environ["RUNNER_TEMP"]).free >= 8 * 1024 ** 3, "hosted disk admission below 8 GiB"'
+      - name: Install Linux compile dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev ripgrep meson ninja-build libcap-dev libcap2-bin libselinux1-dev curl xz-utils
+      - name: Build and install the verified unprivileged sandbox dependency
+        timeout-minutes: 10
+        run: |
+          test "$(id -u)" -ne 0
+          build_root="$RUNNER_TEMP/core-copy-bubblewrap-0.13.1"
+          mkdir "$build_root"
+          cd "$build_root"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 129472 \
+            --output bubblewrap-0.13.1.tar.xz \
+            https://github.com/containers/bubblewrap/releases/download/v0.13.1/bubblewrap-0.13.1.tar.xz
+          test "$(stat -c '%s' bubblewrap-0.13.1.tar.xz)" -eq 129472
+          echo '0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d  bubblewrap-0.13.1.tar.xz' | sha256sum --check
+          tar --extract --xz --file bubblewrap-0.13.1.tar.xz
+          cd bubblewrap-0.13.1
+          meson setup out --buildtype=release --wrap-mode=nodownload \
+            -Dman=disabled -Dbash_completion=disabled -Dzsh_completion=disabled \
+            -Dselinux=enabled -Dtests=false
+          meson compile -C out -j2
+          # Only this ordinary dependency binary is installed in the ephemeral
+          # VM. No setuid, file capabilities, or security-policy changes.
+          sudo install -o root -g root -m0755 out/bwrap /usr/bin/bwrap
+          cmp --silent out/bwrap /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test "$(stat -c '%a:%u:%g' /usr/bin/bwrap)" = '755:0:0'
+          test -z "$(getcap /usr/bin/bwrap)"
+          test "$(/usr/bin/bwrap --version)" = 'bubblewrap 0.13.1'
+      - name: Require real default-policy namespace and FD capabilities
+        timeout-minutes: 2
+        run: |
+          test "$(id -u)" -ne 0
+          help_text=$(/usr/bin/bwrap --help)
+          for flag in --disable-userns --bind-fd --ro-bind-fd --argv0; do
+            grep -Fq -- "$flag" <<<"$help_text"
+          done
+          probe_root="$RUNNER_TEMP/core-copy-bwrap-probe"
+          mkdir "$probe_root"
+          exec 3</usr
+          exec 4<"$probe_root"
+          /usr/bin/bwrap --unshare-all --unshare-user --disable-userns \
+            --cap-drop ALL --die-with-parent --new-session --clearenv \
+            --ro-bind / / --ro-bind-fd 3 /usr --bind-fd 4 /tmp \
+            --proc /proc --dev /dev --remount-ro / \
+            --argv0 core-copy-namespace-probe -- /usr/bin/true
+          {
+            echo 'source_release=v0.13.1'
+            echo 'source_sha256=0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d'
+            echo 'vendor_selftests=NOT_RUN; canonical_Core_sandbox_tests=REQUIRED'
+            echo 'security_policy_changes=NONE'
+            /usr/bin/bwrap --version
+            sha256sum /usr/bin/bwrap
+            stat -c 'mode_uid_gid=%a:%u:%g' /usr/bin/bwrap
+            echo 'file_capabilities=NONE'
+            uname -a
+            cat /etc/os-release
+            echo 'unprivileged_namespace_and_fd_probe=PASS'
+          } > "$RUNNER_TEMP/core-copy-bwrap-evidence.txt"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.18.0'
+      - name: Install exact official Rust
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+          node --version
+          npm --version
+      - name: Fetch immutable reviewed support as data and verify before import
+        timeout-minutes: 3
+        run: |
+          mkdir "$RUNNER_TEMP/core-copy-support"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 109703 \
+            --output "$RUNNER_TEMP/core-copy-support/check.py" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/check.py
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 23264 \
+            --output "$RUNNER_TEMP/core-copy-support/manifest.json" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/manifest.json
+          echo '2f917a4ca4dc71a3dfa8cf2dc376991a7ddf1580cd347aaff8cb6ccc50568147  '"$RUNNER_TEMP/core-copy-support/check.py" | sha256sum --check
+          echo '0a6b5a4aba9112abe866fa5131d7f0f58a771f3542ec891af51f96d9bd7dae82  '"$RUNNER_TEMP/core-copy-support/manifest.json" | sha256sum --check
+      - name: Verify exact package identities before execution
+        run: |
+          echo '9859b9ece1a0bfbf18fadb1bfd4e3a6da4a7e5e5aa4a7a34181f4c7dcd28361d  foundation/2026-10-27/core-copy-reductions/manifest.json' | sha256sum --check
+          echo '8312a3b2b17d6a6b9d999fd2f4bbaa09e6852887af64fcf5b5ee669fc99d790a  foundation/2026-10-27/core-copy-reductions/check.py' | sha256sum --check
+      - name: Exercise strict inherited and new controller rejection controls
+        timeout-minutes: 2
+        run: |
+          python3 -B foundation/2026-10-27/core-copy-reductions/check.py \
+            --manifest foundation/2026-10-27/core-copy-reductions/manifest.json \
+            --helper "$RUNNER_TEMP/core-copy-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-copy-support/manifest.json" --self-test
+      - name: Qualify the exact selected isolated phase
+        run: |
+          python3 -B foundation/2026-10-27/core-copy-reductions/check.py \
+            --manifest foundation/2026-10-27/core-copy-reductions/manifest.json \
+            --helper "$RUNNER_TEMP/core-copy-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-copy-support/manifest.json" \
+            --phase "${{ matrix.phase }}" \
+            --work "$RUNNER_TEMP/core-copy-work" \
+            --evidence "$RUNNER_TEMP/core-copy-evidence"
+      - name: Retain only bounded source qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-copy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}
+          path: |
+            ${{ runner.temp }}/core-copy-evidence/result.json
+            ${{ runner.temp }}/core-copy-evidence/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  focused:
+    needs: qualify
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/core-copy-reductions-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    strategy:
+      max-parallel: 1
+      matrix:
+        phase: [focused]
+    steps: *qualification_steps
+
+  aggregate:
+    needs: [qualify, focused]
+    if: always() && github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/core-copy-reductions-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      QUALIFY_JOB_RESULT: ${{ needs.qualify.result }}
+      FOCUSED_JOB_RESULT: ${{ needs.focused.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Fetch immutable reviewed support as data and verify before import
+        timeout-minutes: 3
+        run: |
+          mkdir "$RUNNER_TEMP/core-copy-support"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 109703 \
+            --output "$RUNNER_TEMP/core-copy-support/check.py" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/check.py
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 23264 \
+            --output "$RUNNER_TEMP/core-copy-support/manifest.json" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/manifest.json
+          echo '2f917a4ca4dc71a3dfa8cf2dc376991a7ddf1580cd347aaff8cb6ccc50568147  '"$RUNNER_TEMP/core-copy-support/check.py" | sha256sum --check
+          echo '0a6b5a4aba9112abe866fa5131d7f0f58a771f3542ec891af51f96d9bd7dae82  '"$RUNNER_TEMP/core-copy-support/manifest.json" | sha256sum --check
+      - name: Download exact baseline evidence from this run attempt
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: core-copy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-baseline
+          path: ${{ runner.temp }}/core-copy-phases/baseline
+      - name: Download exact production evidence from this run attempt
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: core-copy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-production
+          path: ${{ runner.temp }}/core-copy-phases/production
+      - name: Download exact focused evidence from this run attempt
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: core-copy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-focused
+          path: ${{ runner.temp }}/core-copy-phases/focused
+      - name: Independently bind and reclassify all current-run raw outputs
+        run: |
+          echo '9859b9ece1a0bfbf18fadb1bfd4e3a6da4a7e5e5aa4a7a34181f4c7dcd28361d  foundation/2026-10-27/core-copy-reductions/manifest.json' | sha256sum --check
+          echo '8312a3b2b17d6a6b9d999fd2f4bbaa09e6852887af64fcf5b5ee669fc99d790a  foundation/2026-10-27/core-copy-reductions/check.py' | sha256sum --check
+          python3 -B foundation/2026-10-27/core-copy-reductions/check.py \
+            --manifest foundation/2026-10-27/core-copy-reductions/manifest.json \
+            --helper "$RUNNER_TEMP/core-copy-support/check.py" \
+            --recipe "$RUNNER_TEMP/core-copy-support/manifest.json" \
+            --aggregate "$RUNNER_TEMP/core-copy-phases" \
+            --evidence "$RUNNER_TEMP/core-copy-aggregate"
+      - name: Retain exact aggregate receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-copy-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-aggregate
+          path: |
+            ${{ runner.temp }}/core-copy-aggregate/result.json
+            ${{ runner.temp }}/core-copy-aggregate/*.log
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,2781 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -250,17 +250,41 @@
+         };
+         list_workspace_session_summaries(&config_store_root(config_path), &self.cwd)
+     }
+ 
+     pub async fn delete_workspace_session(&self, session_dir: PathBuf) -> Result<bool> {
+         let Some(config_path) = self.config_path.as_deref() else {
+             return Ok(false);
+         };
++        if self.is_session_dir(&session_dir) {
++            let store = self
++                .runtime
++                .session_store()
++                .ok_or_else(|| anyhow!("session has no storage"))?;
++            store.validate_owned_delete_scope(&config_store_root(config_path), &self.cwd)?;
++            // Inline: cancellation before settlement must not detach shutdown or
++            // remove storage underneath admitted runtime work.
++            self.shutdown().await;
++            return self.delete_closed_session().await;
++        }
++        // A path alone never authorizes taking another local runtime's lease.
+         delete_workspace_session(&config_store_root(config_path), &self.cwd, session_dir).await
++    }
++
++    pub(crate) async fn delete_closed_session(&self) -> Result<bool> {
++        let Some(config_path) = self.config_path.as_deref() else {
++            return Ok(false);
++        };
++        let Some(store) = self.runtime.session_store() else {
++            return Ok(false);
++        };
++        store
++            .delete_owned(&config_store_root(config_path), &self.cwd)
++            .await
+     }
+ 
+     pub fn is_session_dir(&self, session_dir: &Path) -> bool {
+         let Some(active_dir) = self.runtime.session_dir() else {
+             return false;
+         };
+         normalize_session_dir_path(session_dir.to_path_buf())
+             .is_ok_and(|session_dir| paths_equal(active_dir, &session_dir))
+@@ -273,20 +297,20 @@
+             && cursor.before > 0
+         {
+             let store = self
+                 .runtime
+                 .session_store()
+                 .cloned()
+                 .ok_or_else(|| anyhow!("paged history has no session store"))?;
+             let revision = cursor.revision.clone();
+-            let mut history =
+-                tokio::task::spawn_blocking(move || store.saved_transcript(&revision))
+-                    .await?
+-                    .ok_or_else(|| anyhow!("history revision changed; retry reading history"))?;
++            let mut history = tokio::task::spawn_blocking(move || {
++                read_model::transcript_at_revision(&store, &revision)
++            })
++            .await??;
+             history.extend(snapshot.transcript.into_iter().skip(50));
+             return Ok(history);
+         }
+         Ok(snapshot.transcript)
+     }
+ 
+     pub async fn context_map_snapshot(
+         &self,
+@@ -577,8 +601,11 @@
+         PreparedAssembly::from_config(config, cwd, config_path.as_deref())
+     })
+     .await
+     .map_err(|error| anyhow!("assembly builder blocking task failed: {error}"))?
+ }
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++mod ownership_tests;
+diff --git a/crates/proteus-core/src/app_server/http/lifecycle.rs b/crates/proteus-core/src/app_server/http/lifecycle.rs
+--- a/crates/proteus-core/src/app_server/http/lifecycle.rs
++++ b/crates/proteus-core/src/app_server/http/lifecycle.rs
+@@ -107,23 +107,27 @@
+                 .join(encode_workspace_path(&workspace)?)
+                 .join(name),
+         )?;
+         if expected != session_dir {
+             return Err(anyhow!(
+                 "session path is outside configured workspace sessions"
+             ));
+         }
+-        if let Some(server) = live_server {
++        let deleted = if let Some(server) = live_server {
++            // Keep the owner's lease throughout terminal settlement. Removing a
++            // cache entry is not ownership release: other handles remain valid
++            // references to the generation that owned deletion will retire.
+             server.shutdown().await;
+             state.remove_session_server(&session_dir).await;
+-        }
+-        let deleted =
++            server.delete_closed_session().await?
++        } else {
+             delete_workspace_session(&config_store_root(config_path), &workspace, session_dir)
+-                .await?;
++                .await?
++        };
+         Ok(Some(json!({ "deleted": deleted || was_live })))
+     }
+     .await;
+     command_response(id, result)
+ }
+ 
+ async fn resume_session(state: &HttpAppState, session_dir: PathBuf) -> Result<Value> {
+     let _lifecycle = state.session_lifecycle.lock().await;
+diff --git a/crates/proteus-core/src/app_server/http/sessions.rs b/crates/proteus-core/src/app_server/http/sessions.rs
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -231,27 +231,17 @@
+ ) -> Result<proteus_contracts::app_protocol::AppTranscriptPage> {
+     let dir = canonicalize_session_dir_path(required_session_query(query)?)?;
+     let [before, revision] = super::workspace::query_params(query, ["before", "revision"])?;
+     let before = before.map(|value| value.parse::<usize>()).transpose()?;
+     tokio::task::spawn_blocking(move || {
+         let store = SessionStore::open(dir)?;
+         #[cfg(unix)]
+         {
+-            if let Some(page) = store.saved_transcript_page(before, revision.as_deref()) {
+-                return Ok(page);
+-            }
+-            anyhow::ensure!(
+-                revision.is_none(),
+-                "history revision changed; refresh the session snapshot"
+-            );
+-            let _ = crate::app_server::read_model::current_read_model(&store)?;
+-            return store
+-                .saved_transcript_page(before, None)
+-                .ok_or_else(|| anyhow!("history index changed during reading"));
++            crate::app_server::read_model::transcript_page(&store, before, revision.as_deref())
+         }
+         #[cfg(not(unix))]
+         {
+             let _ = (store, before, revision);
+             anyhow::bail!("paged history requires a source fingerprint on this platform")
+         }
+     })
+     .await
+diff --git a/crates/proteus-core/src/app_server/http/tests/session_reads.rs b/crates/proteus-core/src/app_server/http/tests/session_reads.rs
+--- a/crates/proteus-core/src/app_server/http/tests/session_reads.rs
++++ b/crates/proteus-core/src/app_server/http/tests/session_reads.rs
+@@ -47,16 +47,47 @@
+         "session_dir={}&before=71&revision={}",
+         store.session_dir().display(),
+         cursor.revision
+     );
+     let page = super::super::sessions::history_page_json(Some(&query))
+         .await
+         .unwrap();
+     assert_eq!((page.start, page.messages.len()), (21, 50));
++    // Full active-session reads and revision-bound pages must both survive a
++    // disposable-index failure. Exercise each path independently: the first
++    // recovery must not mask the second by repairing its cache beforehand.
++    for damage in ["missing", "malformed", "checksum", "unwritable"] {
++        for full_read in [true, false] {
++            damage_read_index(&store, damage);
++            if full_read {
++                assert_eq!(
++                    serde_json::to_value(server.transcript().await.unwrap()).unwrap(),
++                    serde_json::to_value(&full).unwrap(),
++                    "{damage}: active full history"
++                );
++            } else {
++                let recovered = super::super::sessions::history_page_json(Some(&query))
++                    .await
++                    .unwrap();
++                assert_eq!(recovered.revision, cursor.revision, "{damage}");
++                assert_eq!((recovered.start, recovered.total), (21, 121), "{damage}");
++                assert_eq!(
++                    serde_json::to_value(&recovered.messages).unwrap(),
++                    serde_json::to_value(&full[21..71]).unwrap(),
++                    "{damage}: older page"
++                );
++            }
++            assert_eq!(
++                std::fs::read(store.journal_path()).unwrap(),
++                before,
++                "{damage}"
++            );
++        }
++    }
+     let query = format!(
+         "session_dir={}&before=71&revision=wrong",
+         store.session_dir().display()
+     );
+     assert!(
+         super::super::sessions::history_page_json(Some(&query))
+             .await
+             .is_err()
+@@ -273,8 +304,42 @@
+     let cold = super::super::sessions::history_json(&state, Some(&query))
+         .await
+         .expect("cold history");
+     assert_eq!(
+         serde_json::to_value(live).unwrap(),
+         serde_json::to_value(cold).unwrap()
+     );
+ }
++
++#[cfg(unix)]
++fn damage_read_index(store: &crate::core::SessionStore, damage: &str) {
++    let path = store.session_dir().join(".read-view.sqlite");
++    if path.is_dir() {
++        std::fs::remove_dir(&path).unwrap();
++    } else if path.exists() {
++        std::fs::remove_file(&path).unwrap();
++    }
++    store
++        .project_read_model(|projection| {
++            crate::app_server::journal_transcript_messages(projection, None)
++        })
++        .unwrap();
++    match damage {
++        "missing" => std::fs::remove_file(&path).unwrap(),
++        "malformed" => std::fs::write(&path, b"not a SQLite database").unwrap(),
++        "checksum" => {
++            let db = rusqlite::Connection::open(&path).unwrap();
++            db.execute(
++                "UPDATE records SET payload=x'00' WHERE section='transcript'",
++                [],
++            )
++            .unwrap();
++        }
++        "unwritable" => {
++            // Deterministic even when tests run as root: rename cannot replace
++            // this directory. Canonical reads must not depend on cache writes.
++            std::fs::remove_file(&path).unwrap();
++            std::fs::create_dir(&path).unwrap();
++        }
++        _ => unreachable!(),
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/ownership_tests.rs b/crates/proteus-core/src/app_server/ownership_tests.rs
+--- a/crates/proteus-core/src/app_server/ownership_tests.rs
++++ b/crates/proteus-core/src/app_server/ownership_tests.rs
+@@ -0,0 +1,51 @@
++use super::*;
++use crate::model_standard::{CanonicalMessage, MessageRole};
++
++#[tokio::test]
++async fn direct_owned_delete_closes_admission_and_retires_retained_store() {
++    let config = tempfile::tempdir().expect("config");
++    let workspace = tempfile::tempdir().expect("workspace");
++    let server = AgentAppServer::launch(
++        crate::test_model::config(),
++        workspace.path().to_owned(),
++        Some(&config.path().join("config.toml")),
++    )
++    .await
++    .expect("server");
++    let store = server.runtime.session_store().expect("store").clone();
++    let thread = new_thread_id();
++    let message = CanonicalMessage::text(MessageRole::User, "direct delete");
++    store
++        .append_history(thread, None, &[message.clone()])
++        .await
++        .expect("materialize");
++    let retained = server.clone();
++    let directory = store.session_dir().to_owned();
++    assert!(
++        server
++            .delete_workspace_session(directory.clone())
++            .await
++            .expect("owned delete")
++    );
++    assert!(!directory.exists());
++    let error = store
++        .append_history(thread, None, &[message])
++        .await
++        .expect_err("OWNERSHIP_DIRECT_DELETE: retained store is retired");
++    assert!(
++        error.to_string().contains("retired"),
++        "OWNERSHIP_DIRECT_DELETE: expected retired generation, got {error:#}"
++    );
++    let error = retained
++        .send_user_message("late request".into())
++        .await
++        .expect_err("direct deletion closes admission on every clone");
++    assert!(
++        error.to_string().contains("session is shutting down"),
++        "{error:#}"
++    );
++    assert!(
++        !directory.exists(),
++        "OWNERSHIP_DIRECT_DELETE: no late recreation"
++    );
++}
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -40,16 +40,86 @@
+                 }),
+             };
+         }
+         let _ = (store, stale);
+         transcript.into()
+     }
+ }
+ 
++/// Read a complete named display revision. A disposable cache miss must not
++/// make the canonical history unreadable, but a newer source is not that revision.
++#[cfg(unix)]
++pub(super) fn transcript_at_revision(
++    store: &SessionStore,
++    revision: &str,
++) -> anyhow::Result<Vec<AppTranscriptMessage>> {
++    if let Some(messages) = store.saved_transcript(revision) {
++        return Ok(messages);
++    }
++    Ok(rebuild_transcript(store, Some(revision))?.1)
++}
++
++/// Read a bounded page, repairing a missing/corrupt index at most once.
++#[cfg(unix)]
++pub(super) fn transcript_page(
++    store: &SessionStore,
++    before: Option<usize>,
++    expected: Option<&str>,
++) -> anyhow::Result<proteus_contracts::app_protocol::AppTranscriptPage> {
++    if let Some(page) = store.saved_transcript_page(before, expected) {
++        return Ok(page);
++    }
++    let (revision, messages) = rebuild_transcript(store, expected)?;
++    let total = messages.len();
++    let end = before.unwrap_or(total);
++    anyhow::ensure!(
++        end <= total,
++        "history position is outside the requested revision"
++    );
++    let start = end.saturating_sub(50);
++    Ok(proteus_contracts::app_protocol::AppTranscriptPage {
++        revision,
++        start,
++        total,
++        messages: messages.into_iter().skip(start).take(end - start).collect(),
++        // Rebuilding cannot prove a relationship to a lost display projection.
++        base: None,
++    })
++}
++
++#[cfg(unix)]
++fn rebuild_transcript(
++    store: &SessionStore,
++    expected: Option<&str>,
++) -> anyhow::Result<(String, Vec<AppTranscriptMessage>)> {
++    use crate::core::session_read_cache::SourceFingerprint;
++
++    let source = SourceFingerprint::read(store.session_dir(), 8192)
++        .ok_or_else(|| anyhow::anyhow!("history source cannot be fingerprinted"))?;
++    let revision = source
++        .revision()
++        .ok_or_else(|| anyhow::anyhow!("history source revision is unavailable"))?;
++    anyhow::ensure!(
++        expected.is_none_or(|expected| expected == revision),
++        "history revision changed; refresh the session snapshot"
++    );
++    // Strict journal validation is mandatory; cached conversation state is not
++    // an authority. project_read_model saves the index only on a stable source.
++    let model =
++        store.project_read_model(|projection| journal_transcript_messages(projection, None))?;
++    anyhow::ensure!(
++        SourceFingerprint::read(store.session_dir(), 8192).as_ref() == Some(&source),
++        "history source changed during recovery; refresh the session snapshot"
++    );
++    // Cache writes are best effort (e.g. disk full). The verified in-memory
++    // result remains usable without retrying indefinitely or requiring a writer lease.
++    Ok((revision, model.transcript))
++}
++
+ /// Cold HTTP reads share the same current projection without opening a runtime.
+ pub(super) fn current_read_model(store: &SessionStore) -> anyhow::Result<SessionReadModel> {
+     match store.fresh_read_model() {
+         Some(model) => Ok(model),
+         None => {
+             store.project_read_model(|projection| journal_transcript_messages(projection, None))
+         }
+     }
+@@ -128,8 +198,11 @@
+         .await;
+         if let Err(error) = result {
+             let message = format!("Не удалось обновить сохранённую историю: {error:#}");
+             eprintln!("warning: {message}");
+             let _ = server.events.send(AppServerEvent::Error { message });
+         }
+     });
+ }
++
++#[cfg(all(test, unix))]
++mod tests;
+diff --git a/crates/proteus-core/src/app_server/read_model/tests.rs b/crates/proteus-core/src/app_server/read_model/tests.rs
+--- a/crates/proteus-core/src/app_server/read_model/tests.rs
++++ b/crates/proteus-core/src/app_server/read_model/tests.rs
+@@ -0,0 +1,114 @@
++use super::*;
++use crate::{
++    domain::{new_session_id, new_thread_id},
++    model_standard::{CanonicalMessage, MessageRole},
++};
++use proteus_contracts::app_protocol::AppTranscriptPage;
++
++async fn fixture(
++    count: usize,
++) -> (
++    tempfile::TempDir,
++    tempfile::TempDir,
++    SessionStore,
++    AppTranscriptPage,
++) {
++    let root = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let store = SessionStore::new(root.path(), workspace.path(), new_session_id()).unwrap();
++    let thread = new_thread_id();
++    let messages: Vec<_> = (0..count.max(1))
++        .map(|row| CanonicalMessage::text(MessageRole::User, format!("row {row}")))
++        .collect();
++    store.append_history(thread, None, &messages).await.unwrap();
++    if count == 0 {
++        store.clear_history(thread).await.unwrap();
++    }
++    store
++        .project_read_model(|projection| journal_transcript_messages(projection, None))
++        .unwrap();
++    let page = store.saved_transcript_page(None, None).unwrap();
++    (root, workspace, store, page)
++}
++
++#[tokio::test]
++async fn history_recovery_covers_empty_short_and_exact_page_boundaries() {
++    for count in [0usize, 1, 49, 50, 51, 100, 121] {
++        let (_root, _workspace, store, old) = fixture(count).await;
++        let journal = std::fs::read(store.journal_path()).unwrap();
++        std::fs::remove_file(store.session_dir().join(".read-view.sqlite")).unwrap();
++        let mut page = transcript_page(&store, None, Some(&old.revision)).unwrap();
++        assert_eq!(page.revision, old.revision);
++        assert_eq!(page.total, count);
++        assert_eq!(page.messages.len(), count.min(50));
++        assert_eq!(page.start, count.saturating_sub(50));
++        let mut rows = page.messages;
++        while page.start > 0 {
++            page = transcript_page(&store, Some(page.start), Some(&old.revision)).unwrap();
++            let mut prefix = page.messages;
++            prefix.extend(rows);
++            rows = prefix;
++        }
++        assert_eq!(
++            rows.iter()
++                .map(|message| message.text.clone())
++                .collect::<Vec<_>>(),
++            (0..count)
++                .map(|row| format!("row {row}"))
++                .collect::<Vec<_>>()
++        );
++        assert!(transcript_page(&store, Some(count + 1), Some(&old.revision)).is_err());
++        assert_eq!(std::fs::read(store.journal_path()).unwrap(), journal);
++    }
++}
++
++#[tokio::test]
++async fn history_recovery_never_relabels_new_source_as_a_lost_revision() {
++    let (_root, _workspace, store, old) = fixture(121).await;
++    store
++        .append_history(
++            new_thread_id(),
++            None,
++            &[CanonicalMessage::text(MessageRole::User, "new row")],
++        )
++        .await
++        .unwrap();
++    let journal = std::fs::read(store.journal_path()).unwrap();
++    // A surviving completed display still addresses the old immutable rows.
++    assert_eq!(
++        transcript_at_revision(&store, &old.revision).unwrap().len(),
++        121
++    );
++    assert_eq!(
++        transcript_page(&store, Some(71), Some(&old.revision))
++            .unwrap()
++            .total,
++        121
++    );
++    let index = store.session_dir().join(".read-view.sqlite");
++    std::fs::remove_file(&index).unwrap();
++    assert!(transcript_at_revision(&store, &old.revision).is_err());
++    assert!(transcript_page(&store, Some(71), Some(&old.revision)).is_err());
++    assert!(
++        !index.exists(),
++        "a rejected old revision must not trigger a rebuild"
++    );
++    let current = transcript_page(&store, None, None).unwrap();
++    assert_ne!(current.revision, old.revision);
++    assert_eq!(current.total, 122);
++    assert_eq!(current.messages.last().unwrap().text, "new row");
++    assert_eq!(std::fs::read(store.journal_path()).unwrap(), journal);
++}
++
++#[tokio::test]
++async fn history_recovery_does_not_hide_corrupt_canonical_source() {
++    let (_root, _workspace, store, old) = fixture(51).await;
++    let index = store.session_dir().join(".read-view.sqlite");
++    std::fs::remove_file(&index).unwrap();
++    std::fs::write(store.journal_path(), b"{broken complete record}\n").unwrap();
++    let damaged = std::fs::read(store.journal_path()).unwrap();
++    assert!(transcript_at_revision(&store, &old.revision).is_err());
++    assert!(transcript_page(&store, None, None).is_err());
++    assert!(!index.exists());
++    assert_eq!(std::fs::read(store.journal_path()).unwrap(), damaged);
++}
+diff --git a/crates/proteus-core/src/core/runtime/tests/resume_cache.rs b/crates/proteus-core/src/core/runtime/tests/resume_cache.rs
+--- a/crates/proteus-core/src/core/runtime/tests/resume_cache.rs
++++ b/crates/proteus-core/src/core/runtime/tests/resume_cache.rs
+@@ -52,20 +52,28 @@
+         .into_iter()
+         .enumerate()
+     {
+         runtime.run(input.into()).await.unwrap();
+         assert!(unloaded());
+         assert!(runtime.session.history.lock().await.is_empty());
+         // SessionStore handles in one process share a writer. A fresh OS
+         // handle must still be excluded after its decoded state is hibernated.
++        // The persistent ownership inode is outside the removable session
++        // directory. Derive its canonical parent/name independently of the
++        // owner implementation, then probe with a separately opened File.
++        let session_dir = store.session_dir();
++        let parent = std::fs::canonicalize(session_dir.parent().unwrap()).unwrap();
++        let mut lock_name = std::ffi::OsString::from(".");
++        lock_name.push(session_dir.file_name().unwrap());
++        lock_name.push(".write.lock");
+         let lock = std::fs::OpenOptions::new()
+             .read(true)
+             .write(true)
+-            .open(store.session_dir().join("journal.write.lock"))
++            .open(parent.join(lock_name))
+             .unwrap();
+         assert!(matches!(
+             lock.try_lock(),
+             Err(std::fs::TryLockError::WouldBlock)
+         ));
+         assert_eq!(runtime.history_len().await, 3 + index * 2);
+         assert_eq!(
+             runtime.history().await.unwrap(),
+diff --git a/crates/proteus-core/src/core/session_journal/mod.rs b/crates/proteus-core/src/core/session_journal/mod.rs
+--- a/crates/proteus-core/src/core/session_journal/mod.rs
++++ b/crates/proteus-core/src/core/session_journal/mod.rs
+@@ -13,16 +13,17 @@
+ pub use projection::JournalProjection;
+ pub(crate) use projection::JournalValidationState;
+ pub use recorder::{SessionExecutionRecorder, SessionToolExecutionRecorder};
+ pub use storage::{DEFAULT_BLOB_THRESHOLD_BYTES, JOURNAL_FILE};
+ pub use types::*;
+ 
+ pub(crate) use storage::redacted_history;
+ pub(crate) use storage::{
+-    JournalRecordAttribution, JournalWriterState, WriterRetirement, append_record,
+-    initialize_writer_projection, initialize_writer_state, journal_path, load_records,
++    JournalRecordAttribution, JournalWriterState, SessionWriteOwnership, WriterRetirement,
++    append_record, initialize_writer_projection, initialize_writer_state, journal_path,
++    load_records,
+ };
+ 
+ #[cfg(test)]
+ mod context_tests;
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/proteus-core/src/core/session_journal/storage.rs b/crates/proteus-core/src/core/session_journal/storage.rs
+--- a/crates/proteus-core/src/core/session_journal/storage.rs
++++ b/crates/proteus-core/src/core/session_journal/storage.rs
+@@ -22,17 +22,17 @@
+ mod read;
+ pub(crate) use append::append_record;
+ pub(crate) use read::load_records;
+ mod recovery;
+ mod redaction;
+ mod retirement;
+ pub(crate) use retirement::WriterRetirement;
+ 
+-use ownership::SessionWriteOwnership;
++pub(crate) use ownership::SessionWriteOwnership;
+ use recovery::{AppendRollback, restore_committed_offset};
+ pub(super) use redaction::contains_redacted_sensitive_value;
+ use redaction::redact_sensitive_values;
+ pub(crate) use redaction::redacted_history;
+ 
+ pub const JOURNAL_FILE: &str = "journal.jsonl";
+ const BLOBS_DIR: &str = "blobs";
+ pub const DEFAULT_BLOB_THRESHOLD_BYTES: usize = 256 * 1024;
+@@ -64,16 +64,17 @@
+         bytes: u64,
+         relative_path: PathBuf,
+     },
+ }
+ 
+ #[derive(Debug, Default)]
+ pub(crate) struct JournalWriterState {
+     initialized: bool,
++    retired: bool,
+     usage: super::UsageProjection,
+     model_context: crate::core::model_context::projection::ModelContextProjection,
+     next_seq: u64,
+     validation: JournalValidationState,
+     committed_offset: u64,
+     _ownership: Option<SessionWriteOwnership>,
+     #[cfg(test)]
+     initial_recovery_scans: usize,
+@@ -115,16 +116,66 @@
+ 
+ impl JournalWriterState {
+     /// Release decoded execution state without releasing the sole-writer lease.
+     pub(crate) fn hibernate(&mut self) {
+         self.initialized = false;
+         self.validation = Default::default();
+         self.usage = Default::default();
+         self.model_context = Default::default();
++    }
++
++    /// Newly acquired ownership remains tentative until preflight succeeds.
++    /// A rejected preflight must not strand a lease in a still-live read handle.
++    /// Existing ownership is never released by a rejected later operation.
++    pub(crate) fn with_ownership_preflight<T>(
++        &mut self,
++        session_dir: &Path,
++        session_id: SessionId,
++        preflight: impl FnOnce(&mut Self) -> Result<T>,
++    ) -> Result<T> {
++        self.ensure_active()?;
++        let newly_acquired = self._ownership.is_none();
++        if newly_acquired {
++            self._ownership = Some(SessionWriteOwnership::acquire(session_dir, session_id)?);
++        }
++        struct Tentative<'a> {
++            state: &'a mut JournalWriterState,
++            newly_acquired: bool,
++            committed: bool,
++        }
++        impl Drop for Tentative<'_> {
++            fn drop(&mut self) {
++                if self.newly_acquired && !self.committed {
++                    self.state._ownership.take();
++                }
++            }
++        }
++        let mut tentative = Tentative {
++            state: self,
++            newly_acquired,
++            committed: false,
++        };
++        let result = preflight(&mut *tentative.state);
++        tentative.committed = result.is_ok();
++        result
++    }
++
++    pub(crate) fn ensure_active(&self) -> Result<()> {
++        anyhow::ensure!(!self.retired, "session writer generation is retired");
++        Ok(())
++    }
++
++    /// Transfer the actual lease and completion tail, never unlock/reacquire.
++    /// The shared generation remains terminal even if filesystem deletion fails.
++    pub(crate) fn retire_for_delete(&mut self) -> Result<impl Send + use<>> {
++        self.ensure_active()?;
++        self.retired = true;
++        // Tuple fields drop in order: OS lease closes before completion is signaled.
++        Ok((self._ownership.take(), self._retirement.take()))
+     }
+ 
+     pub(crate) fn with_retirement(retirement: std::sync::Arc<WriterRetirement>) -> Self {
+         Self {
+             _retirement: Some(retirement::RetirementGuard(retirement)),
+             ..Self::default()
+         }
+     }
+diff --git a/crates/proteus-core/src/core/session_journal/storage/initialize.rs b/crates/proteus-core/src/core/session_journal/storage/initialize.rs
+--- a/crates/proteus-core/src/core/session_journal/storage/initialize.rs
++++ b/crates/proteus-core/src/core/session_journal/storage/initialize.rs
+@@ -18,24 +18,31 @@
+ }
+ 
+ fn initialize(
+     session_dir: &Path,
+     session_id: SessionId,
+     state: &mut JournalWriterState,
+     include_projection: bool,
+ ) -> Result<Option<JournalProjection>> {
++    state.ensure_active()?;
+     if state.initialized {
+         return Ok(None);
+     }
+-    let ownership = if state._ownership.is_none() {
+-        Some(SessionWriteOwnership::acquire(session_dir, session_id)?)
+-    } else {
+-        None
+-    };
++    state.with_ownership_preflight(session_dir, session_id, |state| {
++        recover(session_dir, session_id, state, include_projection)
++    })
++}
++
++fn recover(
++    session_dir: &Path,
++    session_id: SessionId,
++    state: &mut JournalWriterState,
++    include_projection: bool,
++) -> Result<Option<JournalProjection>> {
+     let path = journal_path(session_dir);
+     recovery::repair_unterminated_tail(&path)?;
+     #[cfg(test)]
+     {
+         state.initial_recovery_scans += 1;
+     }
+     let mut validation = JournalValidationState::default();
+     let mut usage = super::super::UsageProjection::default();
+@@ -57,14 +64,11 @@
+     let committed_offset = journal_len(&path)?;
+     let projection =
+         records.map(|records| JournalProjection::from_validated(records, validation.clone()));
+     state.next_seq = next_seq;
+     state.validation = validation;
+     state.usage = usage;
+     state.model_context = model_context;
+     state.committed_offset = committed_offset;
+-    if let Some(ownership) = ownership {
+-        state._ownership = Some(ownership);
+-    }
+     state.initialized = true;
+     Ok(projection)
+ }
+diff --git a/crates/proteus-core/src/core/session_journal/storage/ownership.rs b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+--- a/crates/proteus-core/src/core/session_journal/storage/ownership.rs
++++ b/crates/proteus-core/src/core/session_journal/storage/ownership.rs
+@@ -2,40 +2,62 @@
+     fs::{self, File, OpenOptions, TryLockError},
+     io::Write,
+     path::Path,
+ };
+ 
+ use anyhow::{Context, Result, bail};
+ use proteus_contracts::domain::SessionId;
+ 
+-const SESSION_WRITE_LOCK_FILE: &str = "journal.write.lock";
++/// The inode is outside the removable session directory and is never unlinked.
++pub(crate) fn ownership_path(session_dir: &Path) -> Result<std::path::PathBuf> {
++    let parent = session_dir
++        .parent()
++        .context("session writer slot has no parent")?;
++    let parent = fs::canonicalize(parent).with_context(|| {
++        format!(
++            "failed to resolve session writer parent {}",
++            parent.display()
++        )
++    })?;
++    let name = session_dir
++        .file_name()
++        .context("session writer slot has no basename")?;
++    let mut lock_name = std::ffi::OsString::from(".");
++    lock_name.push(name);
++    lock_name.push(".write.lock");
++    Ok(parent.join(lock_name))
++}
+ 
+ #[derive(Debug)]
+-pub(super) struct SessionWriteOwnership {
++pub(crate) struct SessionWriteOwnership {
+     _file: File,
+ }
+ 
+ impl SessionWriteOwnership {
+-    pub(super) fn acquire(session_dir: &Path, session_id: SessionId) -> Result<Self> {
+-        let path = session_dir.join(SESSION_WRITE_LOCK_FILE);
++    pub(crate) fn acquire(session_dir: &Path, _session_id: SessionId) -> Result<Self> {
++        Self::acquire_slot(session_dir)
++    }
++
++    pub(crate) fn acquire_slot(session_dir: &Path) -> Result<Self> {
++        let path = ownership_path(session_dir)?;
+         reject_symlink(&path)?;
+         let mut file = OpenOptions::new()
+             .create(true)
+             .read(true)
+             .write(true)
+             .truncate(false)
+             .open(&path)
+             .with_context(|| format!("failed to open session writer lock {}", path.display()))?;
+         match file.try_lock() {
+             Ok(()) => {}
+             Err(TryLockError::WouldBlock) => {
+                 let owner = active_owner_description(&path);
+                 bail!(
+-                    "session {session_id} already has an active writer in another process{owner}; lock: {}",
++                    "session already has an active writer in another process{owner}; lock: {}",
+                     path.display()
+                 );
+             }
+             Err(TryLockError::Error(error)) => {
+                 return Err(error).with_context(|| {
+                     format!("failed to acquire session writer lock {}", path.display())
+                 });
+             }
+@@ -78,45 +100,90 @@
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn lock_file_is_persistent_but_unlocked_after_owner_drop() {
+-        let session_dir = tempfile::tempdir().expect("session dir");
++        let root = tempfile::tempdir().expect("test root");
++        let session_dir = root.path().join("1234567890");
++        fs::create_dir(&session_dir).expect("session dir");
+         let session_id = proteus_contracts::domain::new_session_id();
+ 
+-        let ownership = SessionWriteOwnership::acquire(session_dir.path(), session_id)
+-            .expect("first ownership");
+-        let error = SessionWriteOwnership::acquire(session_dir.path(), session_id)
++        let ownership =
++            SessionWriteOwnership::acquire(&session_dir, session_id).expect("first ownership");
++        let error = SessionWriteOwnership::acquire(&session_dir, session_id)
+             .expect_err("second handle must not acquire ownership");
+         assert!(
+             error
+                 .to_string()
+                 .contains("active writer in another process"),
+             "{error:#}"
+         );
+ 
+         drop(ownership);
+-        SessionWriteOwnership::acquire(session_dir.path(), session_id)
+-            .expect("ownership after drop");
+-        assert!(session_dir.path().join(SESSION_WRITE_LOCK_FILE).is_file());
++        SessionWriteOwnership::acquire(&session_dir, session_id).expect("ownership after drop");
++        assert!(ownership_path(&session_dir).expect("lock path").is_file());
+     }
+ 
+     #[cfg(unix)]
+     #[test]
+     fn symlink_lock_file_is_rejected() {
+-        let session_dir = tempfile::tempdir().expect("session dir");
+-        let target = session_dir.path().join("target");
++        let root = tempfile::tempdir().expect("test root");
++        let session_dir = root.path().join("1234567890");
++        fs::create_dir(&session_dir).expect("session dir");
++        let target = &session_dir.join("target");
+         fs::write(&target, "not a lock").expect("target");
+-        std::os::unix::fs::symlink(&target, session_dir.path().join(SESSION_WRITE_LOCK_FILE))
++        std::os::unix::fs::symlink(&target, ownership_path(&session_dir).expect("lock path"))
+             .expect("lock symlink");
+ 
+         let error = SessionWriteOwnership::acquire(
+-            session_dir.path(),
++            &session_dir,
+             proteus_contracts::domain::new_session_id(),
+         )
+         .expect_err("symlink lock must fail closed");
+         assert!(error.to_string().contains("must not be a symlink"));
+     }
++
++    #[test]
++    fn tentative_panic_releases_only_new_lease() {
++        let root = tempfile::tempdir().expect("test root");
++        let session = root.path().join("1234567890");
++        let id = proteus_contracts::domain::new_session_id();
++        let mut state = crate::core::session_journal::JournalWriterState::default();
++        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _: Result<()> = state.with_ownership_preflight(&session, id, |_| {
++                panic!("test-only preflight panic");
++            });
++        }));
++        assert!(panic.is_err());
++        let _next = SessionWriteOwnership::acquire(&session, id)
++            .expect("new tentative lease must release during unwind");
++    }
++
++    #[test]
++    fn tentative_panic_preserves_existing_lease() {
++        let root = tempfile::tempdir().expect("test root");
++        let session = root.path().join("1234567890");
++        let id = proteus_contracts::domain::new_session_id();
++        let mut state = crate::core::session_journal::JournalWriterState::default();
++        state
++            .with_ownership_preflight(&session, id, |_| Ok(()))
++            .expect("commit ownership");
++        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _: Result<()> = state.with_ownership_preflight(&session, id, |_| {
++                panic!("test-only later preflight panic");
++            });
++        }));
++        assert!(panic.is_err());
++        let error = SessionWriteOwnership::acquire(&session, id)
++            .expect_err("existing lease must survive rejected preflight");
++        assert!(
++            error
++                .to_string()
++                .contains("active writer in another process")
++        );
++        drop(state);
++        SessionWriteOwnership::acquire(&session, id).expect("lease after owner drop");
++    }
+ }
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -19,16 +19,17 @@
+ };
+ 
+ #[cfg(test)]
+ use crate::model_standard::{ContentPart, MessageRole};
+ 
+ mod catalog;
+ mod checkpoint;
+ mod context_summary;
++mod deletion;
+ pub(crate) use context_summary::summarize_context_history;
+ mod identity;
+ mod path_identity;
+ #[cfg(unix)]
+ pub(crate) mod read_cache;
+ mod read_model;
+ mod usage;
+ mod workspace_dir;
+@@ -50,53 +51,58 @@
+ pub use workspace_dir::{decode_workspace_path, encode_workspace_path};
+ 
+ #[derive(Debug, Clone)]
+ pub struct SessionStore {
+     session_dir: PathBuf,
+     session_id: SessionId,
+     directory_kind: SessionDirectoryKind,
+     writer: Arc<Mutex<JournalWriterState>>,
++    // Permission originates in the constructor's single initial observation.
++    // Clones share it; the first mkdir/observed existing slot consumes it.
++    may_create: Arc<std::sync::atomic::AtomicBool>,
+     blob_threshold_bytes: usize,
+     #[cfg(unix)]
+     read_metadata: Arc<std::sync::RwLock<Option<read_model::CachedReadMetadata>>>,
+ }
+ 
+ impl SessionStore {
+     pub fn new(config_dir: &Path, cwd: &Path, session_id: SessionId) -> Result<Self> {
+         let workspace = encode_workspace_path(cwd)?;
+         let session_dir = canonicalize_unmaterialized_path(
+             &config_dir
+                 .join("sessions")
+                 .join(workspace)
+                 .join(short_session_directory_name(session_id)),
+         )?;
+-        validate_new_session_target(&session_dir, session_id)?;
++        let may_create = validate_new_session_target(&session_dir, session_id)?;
+         let writer = writer_for_session_dir(&session_dir)?;
+         Ok(Self {
+             session_dir,
+             session_id,
+             directory_kind: SessionDirectoryKind::ShortNumeric,
+             writer,
++            may_create: Arc::new(std::sync::atomic::AtomicBool::new(may_create)),
+             blob_threshold_bytes: DEFAULT_BLOB_THRESHOLD_BYTES,
+             #[cfg(unix)]
+             read_metadata: Default::default(),
+         })
+     }
+ 
+     pub fn open(session_dir: PathBuf) -> Result<Self> {
+         let session_dir = canonicalize_unmaterialized_path(&session_dir)?;
+         let identity = resolve_session_identity(&session_dir)?;
+         workspace_path_from_session_dir(&session_dir)?;
+         let writer = writer_for_session_dir(&session_dir)?;
+         Ok(Self {
+             session_dir,
+             session_id: identity.session_id,
+             directory_kind: identity.directory_kind,
+             writer,
++            may_create: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+             blob_threshold_bytes: DEFAULT_BLOB_THRESHOLD_BYTES,
+             #[cfg(unix)]
+             read_metadata: Default::default(),
+         })
+     }
+ 
+     pub fn session_dir(&self) -> &Path {
+         &self.session_dir
+@@ -240,56 +246,78 @@
+         .await
+     }
+ 
+     pub async fn clear_history(&self, thread_id: ThreadId) -> Result<()> {
+         self.replace_history(thread_id, None, &[], None).await
+     }
+ }
+ 
++/// Conservatively refuse deletion while any cooperating process owns a writer.
++/// Callers must stop work and drop all owner handles before retrying. This does
++/// not implement coordinated active-session shutdown or local retirement.
+ pub async fn delete_workspace_session(
+     config_root: &Path,
+     workspace_path: &Path,
+     session_path: PathBuf,
+ ) -> Result<bool> {
+-    let session_dir = normalize_session_dir_path(session_path)?;
+-    let metadata = match std::fs::symlink_metadata(&session_dir) {
+-        Ok(metadata) => metadata,
+-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+-        Err(error) => {
+-            return Err(error)
+-                .with_context(|| format!("failed to inspect {}", session_dir.display()));
+-        }
+-    };
+-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+-        return Err(anyhow!(
+-            "session path is not a directory: {}",
+-            session_dir.display()
+-        ));
+-    }
+-
+-    let workspace_dir = config_root
+-        .join("sessions")
+-        .join(encode_workspace_path(workspace_path)?);
+-    let workspace_root = std::fs::canonicalize(&workspace_dir)
+-        .with_context(|| format!("failed to resolve {}", workspace_dir.display()))?;
+-    let target = std::fs::canonicalize(&session_dir)
+-        .with_context(|| format!("failed to resolve {}", session_dir.display()))?;
+-    if target.parent() != Some(workspace_root.as_path()) {
+-        return Err(anyhow!(
+-            "session path is outside current workspace sessions: {}",
+-            session_dir.display()
+-        ));
+-    }
+-    resolve_session_identity(&target)?;
+-
+-    tokio::fs::remove_dir_all(&target)
+-        .await
+-        .with_context(|| format!("failed to delete {}", target.display()))?;
+-    Ok(true)
++    let config_root = config_root.to_path_buf();
++    let workspace_path = workspace_path.to_path_buf();
++    // The closure owns both deletion and its lease. Canceling the waiter cannot
++    // release the lease while remove_dir_all is still running.
++    tokio::task::spawn_blocking(move || {
++        let session_dir = normalize_session_dir_path(session_path)?;
++        let metadata = match std::fs::symlink_metadata(&session_dir) {
++            Ok(metadata) => metadata,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
++            Err(error) => {
++                return Err(error)
++                    .with_context(|| format!("failed to inspect {}", session_dir.display()));
++            }
++        };
++        if metadata.file_type().is_symlink() || !metadata.is_dir() {
++            return Err(anyhow!(
++                "session path is not a directory: {}",
++                session_dir.display()
++            ));
++        }
++        let workspace_dir = config_root
++            .join("sessions")
++            .join(encode_workspace_path(&workspace_path)?);
++        let workspace_root = std::fs::canonicalize(&workspace_dir)
++            .with_context(|| format!("failed to resolve {}", workspace_dir.display()))?;
++        let target = std::fs::canonicalize(&session_dir)
++            .with_context(|| format!("failed to resolve {}", session_dir.display()))?;
++        if target.parent() != Some(workspace_root.as_path()) {
++            return Err(anyhow!(
++                "session path is outside current workspace sessions: {}",
++                session_dir.display()
++            ));
++        }
++        let _ownership =
++            crate::core::session_journal::SessionWriteOwnership::acquire_slot(&target)?;
++        // Validate again under the lease; a cold handle never grants identity.
++        match std::fs::symlink_metadata(&target) {
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
++            Err(error) => return Err(error.into()),
++            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
++                return Err(anyhow!(
++                    "session path is not a directory: {}",
++                    target.display()
++                ));
++            }
++            Ok(_) => {}
++        }
++        resolve_session_identity(&target)?;
++        std::fs::remove_dir_all(&target)
++            .with_context(|| format!("failed to delete {}", target.display()))?;
++        Ok(true)
++    })
++    .await
++    .context("session deletion worker failed")?
+ }
+ 
+ pub fn normalize_session_dir_path(session_path: PathBuf) -> Result<PathBuf> {
+     if session_path.file_name().and_then(|name| name.to_str())
+         == Some(crate::core::session_journal::JOURNAL_FILE)
+     {
+         return session_path
+             .parent()
+@@ -306,17 +334,23 @@
+ 
+ struct RegisteredWriter {
+     writer: Weak<Mutex<JournalWriterState>>,
+     retirement: Arc<WriterRetirement>,
+ }
+ 
+ fn writer_for_session_dir(session_dir: &Path) -> Result<Arc<Mutex<JournalWriterState>>> {
+     static WRITERS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredWriter>>> = OnceLock::new();
+-    let key = canonicalize_unmaterialized_path(&journal_path(session_dir))?;
++    let parent = session_dir
++        .parent()
++        .context("session writer slot has no parent")?;
++    let name = session_dir
++        .file_name()
++        .context("session writer slot has no basename")?;
++    let key = canonicalize_unmaterialized_path(parent)?.join(name);
+     let writers = WRITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+     loop {
+         let mut writers = writers.lock().expect("session journal writer map poisoned");
+         if let Some(registered) = writers.get(&key) {
+             if let Some(writer) = registered.writer.upgrade() {
+                 return Ok(writer);
+             }
+             if !registered.retirement.completed() {
+diff --git a/crates/proteus-core/src/core/session_store/deletion.rs b/crates/proteus-core/src/core/session_store/deletion.rs
+--- a/crates/proteus-core/src/core/session_store/deletion.rs
++++ b/crates/proteus-core/src/core/session_store/deletion.rs
+@@ -0,0 +1,233 @@
++//! Explicit local-owner deletion; cold path deletion never borrows this capability.
++use super::*;
++
++impl SessionStore {
++    /// Validate the configured scope before an app-server closes admission.
++    pub(crate) fn validate_owned_delete_scope(
++        &self,
++        config_root: &Path,
++        workspace: &Path,
++    ) -> Result<()> {
++        let name = self
++            .session_dir
++            .file_name()
++            .context("invalid session directory")?;
++        let expected = canonicalize_unmaterialized_path(
++            &config_root
++                .join("sessions")
++                .join(encode_workspace_path(workspace)?)
++                .join(name),
++        )?;
++        anyhow::ensure!(
++            expected == self.session_dir,
++            "session path is outside configured workspace sessions"
++        );
++        Ok(())
++    }
++
++    /// Only an explicit runtime's store may transfer its local generation.
++    /// The caller must first settle its admitted work and close admission.
++    pub(crate) async fn delete_owned(&self, config_root: &Path, workspace: &Path) -> Result<bool> {
++        self.delete_owned_with(config_root, workspace, || Ok(()))
++            .await
++    }
++
++    async fn delete_owned_with(
++        &self,
++        config_root: &Path,
++        workspace: &Path,
++        before_remove: impl FnOnce() -> Result<()> + Send + 'static,
++    ) -> Result<bool> {
++        self.validate_owned_delete_scope(config_root, workspace)?;
++        let mut writer = self.writer.clone().lock_owned().await;
++        let store = self.clone();
++        let config_root = config_root.to_owned();
++        let workspace = workspace.to_owned();
++        tokio::task::spawn_blocking(move || {
++            writer.ensure_active()?;
++            store.validate_owned_delete_scope(&config_root, &workspace)?;
++            let parent = store
++                .session_dir
++                .parent()
++                .context("session has no parent")?;
++            // An unsaved session may have no parent. Retire it without creating
++            // directories or a lease for a slot that will not be removed.
++            let parent_exists = parent.try_exists()?;
++            let exists = if parent_exists {
++                writer.with_ownership_preflight(&store.session_dir, store.session_id, |_| {
++                    match std::fs::symlink_metadata(&store.session_dir) {
++                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
++                        Err(error) => Err(error.into()),
++                        Ok(metadata) => {
++                            anyhow::ensure!(
++                                metadata.is_dir() && !metadata.file_type().is_symlink(),
++                                "session path is not a directory: {}",
++                                store.session_dir.display()
++                            );
++                            let identity = resolve_session_identity(&store.session_dir)?;
++                            anyhow::ensure!(
++                                identity.session_id == store.session_id,
++                                "session identity changed before owned deletion"
++                            );
++                            Ok(true)
++                        }
++                    }
++                })?
++            } else {
++                false
++            };
++            // Move ownership before releasing the shared mutex. Retired handles
++            // now fail immediately; the independent worker retains the OS lease.
++            let tail = writer.retire_for_delete()?;
++            drop(writer);
++            before_remove()?;
++            if exists {
++                std::fs::remove_dir_all(&store.session_dir)
++                    .with_context(|| format!("failed to delete {}", store.session_dir.display()))?;
++            }
++            // Completion is published only after the actual OS lease has closed.
++            drop(tail);
++            Ok(exists)
++        })
++        .await
++        .context("owned session deletion worker failed")?
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::domain::{new_session_id, new_thread_id};
++    use std::fs::{OpenOptions, TryLockError};
++    use std::time::Duration;
++
++    #[tokio::test]
++    async fn canceled_owned_delete_retains_lease_and_retires_clones() {
++        let config = tempfile::tempdir().expect("config");
++        let workspace = tempfile::tempdir().expect("workspace");
++        let store =
++            SessionStore::new(config.path(), workspace.path(), new_session_id()).expect("store");
++        let thread = new_thread_id();
++        let message = CanonicalMessage::text(MessageRole::User, "owned deletion");
++        store
++            .append_history(thread, None, &[message.clone()])
++            .await
++            .expect("materialize");
++        let stale = store.clone();
++        let session_dir = store.session_dir().to_owned();
++        let lock_path = session_dir.parent().unwrap().join(format!(
++            ".{}.write.lock",
++            session_dir.file_name().unwrap().to_str().unwrap()
++        ));
++        let lease = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(lock_path)
++            .expect("lease");
++        let (entered, ready) = tokio::sync::oneshot::channel();
++        let (release, resume) = std::sync::mpsc::channel();
++        // Dropping this on panic also unblocks the worker. Its own finite wait
++        // prevents a failed control from hanging the full suite.
++        struct Release(Option<std::sync::mpsc::Sender<()>>);
++        impl Drop for Release {
++            fn drop(&mut self) {
++                if let Some(tx) = self.0.take() {
++                    let _ = tx.send(());
++                }
++            }
++        }
++        let release = Release(Some(release));
++        let config_path = config.path().to_owned();
++        let workspace_path = workspace.path().to_owned();
++        let deleting = tokio::spawn(async move {
++            store
++                .delete_owned_with(&config_path, &workspace_path, move || {
++                    let _ = entered.send(());
++                    resume
++                        .recv_timeout(Duration::from_secs(10))
++                        .context("bounded delete pause")?;
++                    Ok(())
++                })
++                .await
++        });
++        tokio::time::timeout(Duration::from_secs(3), ready)
++            .await
++            .expect("delete reaches worker")
++            .expect("worker ready");
++        assert!(session_dir.exists(), "pause precedes removal");
++        assert!(matches!(lease.try_lock(), Err(TryLockError::WouldBlock)));
++        deleting.abort();
++        assert!(deleting.await.expect_err("waiter canceled").is_cancelled());
++        assert!(
++            matches!(lease.try_lock(), Err(TryLockError::WouldBlock)),
++            "OWNERSHIP_CANCELED_DELETE: canceled waiter must not release actual lease"
++        );
++        let error = tokio::time::timeout(
++            Duration::from_secs(1),
++            stale.append_history(thread, None, &[message.clone()]),
++        )
++        .await
++        .expect("retired append does not wait for blocking removal")
++        .expect_err("retired clone cannot append");
++        assert!(error.to_string().contains("retired"), "{error:#}");
++        drop(release);
++        tokio::time::timeout(Duration::from_secs(3), async {
++            loop {
++                match lease.try_lock() {
++                    Ok(()) => break,
++                    Err(TryLockError::WouldBlock) => {
++                        tokio::time::sleep(Duration::from_millis(5)).await
++                    }
++                    Err(error) => panic!("lease probe: {error}"),
++                }
++            }
++        })
++        .await
++        .expect("lease closes after worker completion");
++        assert!(
++            !session_dir.exists(),
++            "lease cannot become free before removal finishes"
++        );
++        drop(lease); // Do not let the probe's competing lock mask retirement as Busy.
++        let error = stale
++            .append_history(thread, None, &[message])
++            .await
++            .expect_err("retired clone stays retired after completion");
++        assert!(error.to_string().contains("retired"), "{error:#}");
++        assert!(
++            !session_dir.exists(),
++            "retired clone never recreates deleted storage"
++        );
++    }
++
++    #[tokio::test]
++    async fn rejected_owned_delete_preserves_committed_owner() {
++        let config = tempfile::tempdir().expect("config");
++        let other = tempfile::tempdir().expect("outside");
++        let workspace = tempfile::tempdir().expect("workspace");
++        let store =
++            SessionStore::new(config.path(), workspace.path(), new_session_id()).expect("store");
++        let thread = new_thread_id();
++        let message = CanonicalMessage::text(MessageRole::User, "valid owner");
++        store
++            .append_history(thread, None, &[message.clone()])
++            .await
++            .expect("materialize");
++        store
++            .delete_owned(other.path(), workspace.path())
++            .await
++            .expect_err("scope mismatch");
++        let following = CanonicalMessage::text(MessageRole::Assistant, "owner remains live");
++        store
++            .append_history(thread, None, &[following])
++            .await
++            .expect("owner still live");
++        super::super::delete_workspace_session(
++            config.path(),
++            workspace.path(),
++            store.session_dir().to_owned(),
++        )
++        .await
++        .expect_err("committed lease remains held");
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/identity.rs b/crates/proteus-core/src/core/session_store/identity.rs
+--- a/crates/proteus-core/src/core/session_store/identity.rs
++++ b/crates/proteus-core/src/core/session_store/identity.rs
+@@ -34,31 +34,34 @@
+     workspace_path: PathBuf,
+     journal_schema_version: u32,
+ }
+ 
+ pub(super) fn short_session_directory_name(session_id: SessionId) -> String {
+     format!("{:010}", session_id.as_u128() % SHORT_SESSION_ID_MODULUS)
+ }
+ 
+-pub(super) fn validate_new_session_target(session_dir: &Path, session_id: SessionId) -> Result<()> {
++pub(super) fn validate_new_session_target(
++    session_dir: &Path,
++    session_id: SessionId,
++) -> Result<bool> {
+     match std::fs::symlink_metadata(session_dir) {
+         Ok(_) => {
+             let existing = resolve_session_identity(session_dir)?;
+             if existing.session_id != session_id {
+                 bail!(
+                     "short session directory collision at {}: existing session {}, new session {}",
+                     session_dir.display(),
+                     existing.session_id,
+                     session_id
+                 );
+             }
+-            Ok(())
++            Ok(false)
+         }
+-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
++        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+         Err(error) => Err(error)
+             .with_context(|| format!("failed to inspect session target {}", session_dir.display())),
+     }
+ }
+ 
+ pub(super) fn resolve_session_identity(session_dir: &Path) -> Result<ResolvedSessionIdentity> {
+     let filesystem_metadata = std::fs::metadata(session_dir).with_context(|| {
+         format!(
+diff --git a/crates/proteus-core/src/core/session_store/lifecycle_tests.rs b/crates/proteus-core/src/core/session_store/lifecycle_tests.rs
+--- a/crates/proteus-core/src/core/session_store/lifecycle_tests.rs
++++ b/crates/proteus-core/src/core/session_store/lifecycle_tests.rs
+@@ -14,20 +14,34 @@
+     store
+         .append_history(thread_id, None, &[original.clone()])
+         .await
+         .expect("first append");
+     let session_dir = store.session_dir().to_owned();
+     let peer = SessionStore::open(session_dir.clone()).expect("second handle");
+     let writer = Arc::downgrade(&store.writer);
+     assert!(Arc::ptr_eq(&store.writer, &peer.writer));
++    let lease_path = session_dir
++        .parent()
++        .expect("session slot parent")
++        .join(format!(
++            ".{}.write.lock",
++            session_dir
++                .file_name()
++                .expect("session slot name")
++                .to_string_lossy()
++        ));
++    assert!(
++        !session_dir.join("journal.write.lock").exists(),
++        "writer lease must be outside the removable session directory"
++    );
+     let lease = OpenOptions::new()
+         .read(true)
+         .write(true)
+-        .open(session_dir.join("journal.write.lock"))
++        .open(lease_path)
+         .expect("persistent lease file");
+ 
+     drop(store);
+     assert!(
+         writer.upgrade().is_some(),
+         "another store still owns the writer"
+     );
+     assert!(matches!(lease.try_lock(), Err(TryLockError::WouldBlock)));
+diff --git a/crates/proteus-core/src/core/session_store/writer.rs b/crates/proteus-core/src/core/session_store/writer.rs
+--- a/crates/proteus-core/src/core/session_store/writer.rs
++++ b/crates/proteus-core/src/core/session_store/writer.rs
+@@ -15,86 +15,92 @@
+     }
+ 
+     /// The prefix is captured when TurnOpened commits. Later facts, including
+     /// late responses from another execution, cannot change this turn's input.
+     pub(crate) async fn model_context_before_turn(
+         &self,
+         turn_id: TurnId,
+     ) -> Result<Vec<crate::contracts::ModelContextObservation>> {
+-        if let Some(context) = self
+-            .writer
+-            .lock()
+-            .await
+-            .model_context_before_turn(turn_id)?
+         {
+-            return Ok(context);
++            let writer = self.writer.lock().await;
++            writer.ensure_active()?;
++            if let Some(context) = writer.model_context_before_turn(turn_id)? {
++                return Ok(context);
++            }
+         }
+         self.write_transaction(move |_, writer| {
+             writer
+                 .model_context_before_turn(turn_id)?
+                 .ok_or_else(|| anyhow!("writer was not initialized"))
+         })
+         .await
+     }
+ 
+     /// Reconcile acknowledged or lost-ack checkpoints from the sole writer's
+     /// validated state, without replaying every previous request and tool output.
+     pub(crate) async fn committed_history(
+         &self,
+         thread_id: ThreadId,
+         turn_id: TurnId,
+     ) -> Result<(Vec<CanonicalMessage>, usize)> {
+-        if let Some(state) = self
+-            .writer
+-            .lock()
+-            .await
+-            .committed_history(thread_id, turn_id)
+         {
+-            return Ok(state);
++            let writer = self.writer.lock().await;
++            writer.ensure_active()?;
++            if let Some(state) = writer.committed_history(thread_id, turn_id) {
++                return Ok(state);
++            }
+         }
+         self.write_transaction(move |_, writer| {
+             writer
+                 .committed_history(thread_id, turn_id)
+                 .ok_or_else(|| anyhow!("writer was not initialized"))
+         })
+         .await
+     }
+ 
+     /// Execution reads the projection already validated by the sole writer.
+     /// Cold initialization still acquires ownership and validates on a worker.
+     pub(crate) async fn execution_state(
+         &self,
+     ) -> Result<(u64, Vec<crate::contracts::WorkflowHistoryInterruption>)> {
+-        if let Some(state) = self.writer.lock().await.execution_state() {
+-            return Ok(state);
++        {
++            let writer = self.writer.lock().await;
++            writer.ensure_active()?;
++            if let Some(state) = writer.execution_state() {
++                return Ok(state);
++            }
+         }
+         self.write_transaction(|_, writer| {
+             writer
+                 .execution_state()
+                 .ok_or_else(|| anyhow!("writer was not initialized"))
+         })
+         .await
+     }
+ 
+     /// First continuation acquires the existing writer lease and reuses its strict
+     /// recovery projection. Display caches never initialize writer validation.
+     pub(crate) async fn prepare_resume_projection(&self) -> Result<JournalProjection> {
+         let mut writer = self.writer.clone().lock_owned().await;
+         let store = self.clone();
+         tokio::task::spawn_blocking(move || {
+-            store.materialize_for_write()?;
+-            match crate::core::session_journal::initialize_writer_projection(
+-                &store.session_dir,
+-                store.session_id,
+-                &mut writer,
+-            )? {
+-                Some(projection) => Ok(projection),
+-                None => store.load_projection(),
+-            }
++            writer.ensure_active()?;
++            store.prepare_lease_parent()?;
++            writer.with_ownership_preflight(&store.session_dir, store.session_id, |writer| {
++                store.materialize_for_write()?;
++                match crate::core::session_journal::initialize_writer_projection(
++                    &store.session_dir,
++                    store.session_id,
++                    writer,
++                )? {
++                    Some(projection) => Ok(projection),
++                    None => store.load_projection(),
++                }
++            })
+         })
+         .await
+         .context("session resume validation worker failed")?
+     }
+ 
+     #[cfg(test)]
+     pub(crate) async fn pause_next_append(
+         &self,
+@@ -109,57 +115,122 @@
+     /// the caller only stops waiting; it cannot interrupt a durable transaction.
+     async fn write_transaction<T: Send + 'static>(
+         &self,
+         operation: impl FnOnce(&Self, &mut JournalWriterState) -> Result<T> + Send + 'static,
+     ) -> Result<T> {
+         let mut writer = self.writer.clone().lock_owned().await;
+         let store = self.clone();
+         tokio::task::spawn_blocking(move || {
+-            store.materialize_for_write()?;
+-            initialize_writer_state(&store.session_dir, store.session_id, &mut writer)?;
++            writer.ensure_active()?;
++            store.prepare_lease_parent()?;
++            writer.with_ownership_preflight(&store.session_dir, store.session_id, |writer| {
++                store.materialize_for_write()?;
++                initialize_writer_state(&store.session_dir, store.session_id, writer)
++            })?;
++            // Ownership is committed before the requested operation. A rejected
++            // append must not discard an already valid writer's lease.
+             operation(&store, &mut writer)
+         })
+         .await
+         .context("session journal transaction worker failed")?
+     }
+ 
+     /// Admission may write image bytes before the first journal record. Create
+     /// the canonical session identity and acquire its writer lease first.
+     pub(crate) async fn prepare_attachments(&self) -> Result<()> {
+         self.write_transaction(|_, _| Ok(())).await
+     }
+ 
++    fn prepare_lease_parent(&self) -> Result<()> {
++        let parent = self
++            .session_dir
++            .parent()
++            .context("session directory has no parent")?;
++        if self.may_create.load(std::sync::atomic::Ordering::SeqCst) {
++            // Only ancestors, never the session or its metadata, precede the lease.
++            std::fs::create_dir_all(parent)
++                .with_context(|| format!("failed to create session parent {}", parent.display()))?;
++        }
++        Ok(())
++    }
++
+     fn materialize_for_write(&self) -> Result<()> {
+-        let parent = self.session_dir.parent().ok_or_else(|| {
+-            anyhow!(
+-                "session directory has no parent: {}",
+-                self.session_dir.display()
+-            )
+-        })?;
+-        std::fs::create_dir_all(parent)
+-            .with_context(|| format!("failed to create session parent {}", parent.display()))?;
+-        let created = match std::fs::create_dir(&self.session_dir) {
+-            Ok(()) => true,
+-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
++        use std::sync::atomic::Ordering;
++        let created = match std::fs::symlink_metadata(&self.session_dir) {
++            Ok(metadata) => {
++                self.may_create.store(false, Ordering::SeqCst);
++                if metadata.file_type().is_symlink() || !metadata.is_dir() {
++                    anyhow::bail!(
++                        "session path is not a directory: {}",
++                        self.session_dir.display()
++                    );
++                }
++                false
++            }
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                if !self.may_create.load(Ordering::SeqCst) {
++                    anyhow::bail!(
++                        "existing session is missing: {}",
++                        self.session_dir.display()
++                    );
++                }
++                match std::fs::create_dir(&self.session_dir) {
++                    Ok(()) => {
++                        // Consumed even if the subsequent metadata write fails.
++                        self.may_create.store(false, Ordering::SeqCst);
++                        true
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
++                        self.may_create.store(false, Ordering::SeqCst);
++                        false
++                    }
++                    Err(error) => {
++                        return Err(error).with_context(|| {
++                            format!(
++                                "failed to create session dir {}",
++                                self.session_dir.display()
++                            )
++                        });
++                    }
++                }
++            }
+             Err(error) => {
+                 return Err(error).with_context(|| {
+                     format!(
+-                        "failed to create session dir {}",
++                        "failed to inspect session dir {}",
+                         self.session_dir.display()
+                     )
+                 });
+             }
+         };
++        if !created {
++            let metadata = std::fs::symlink_metadata(&self.session_dir)?;
++            if metadata.file_type().is_symlink() || !metadata.is_dir() {
++                anyhow::bail!(
++                    "session path is not a directory: {}",
++                    self.session_dir.display()
++                );
++            }
++            let identity = resolve_session_identity(&self.session_dir)?;
++            if identity.session_id != self.session_id {
++                anyhow::bail!(
++                    "session identity changed: expected {}, found {}",
++                    self.session_id,
++                    identity.session_id
++                );
++            }
++            return Ok(());
++        }
+         ensure_writable_identity(
+             &self.session_dir,
+             self.session_id,
+             self.directory_kind,
+             &self.workspace_path()?,
+-            created,
++            true,
+         )
+     }
+ 
+     pub(super) async fn append_fact(
+         &self,
+         attribution: JournalRecordAttribution,
+         entry: JournalEntry,
+     ) -> Result<JournalRecord> {
+diff --git a/crates/proteus-core/tests/session_ownership_slice.rs b/crates/proteus-core/tests/session_ownership_slice.rs
+--- a/crates/proteus-core/tests/session_ownership_slice.rs
++++ b/crates/proteus-core/tests/session_ownership_slice.rs
+@@ -0,0 +1,365 @@
++//! Conservative ownership qualification. These tests use real child processes,
++//! temporary workspaces and public SessionStore APIs, not a model of locking.
++//! An outer controller must impose a whole-test process-group deadline.
++use std::{
++    io::Read,
++    path::{Path, PathBuf},
++    process::{Child, Command, Stdio},
++    thread,
++    time::{Duration, Instant},
++};
++
++use proteus_contracts::{
++    domain::{SessionId, new_session_id, new_thread_id},
++    model_standard::{CanonicalMessage, MessageRole},
++};
++use proteus_core::core::{SessionStore, delete_workspace_session};
++
++const ENV: &str = "PROTEUS_OWNERSHIP_SLICE_HELPER";
++const READY_LIMIT: Duration = Duration::from_secs(10);
++
++struct Fixture {
++    _config: tempfile::TempDir,
++    _workspace: tempfile::TempDir,
++    config: PathBuf,
++    workspace: PathBuf,
++    session: PathBuf,
++    id: SessionId,
++}
++
++impl Fixture {
++    async fn persisted() -> Self {
++        let config = tempfile::tempdir().expect("config");
++        let workspace = tempfile::tempdir().expect("workspace");
++        let id = new_session_id();
++        let store = SessionStore::new(config.path(), workspace.path(), id).expect("new");
++        append(&store, "seed").await.expect("seed");
++        let session = store.session_dir().to_path_buf();
++        drop(store);
++        Self {
++            config: config.path().to_path_buf(),
++            workspace: workspace.path().to_path_buf(),
++            _config: config,
++            _workspace: workspace,
++            session,
++            id,
++        }
++    }
++
++    async fn delete(&self) -> anyhow::Result<bool> {
++        delete_workspace_session(&self.config, &self.workspace, self.session.clone()).await
++    }
++
++    fn open(&self) -> SessionStore {
++        SessionStore::open(self.session.clone()).expect("open existing")
++    }
++}
++
++async fn append(store: &SessionStore, text: &str) -> anyhow::Result<()> {
++    store
++        .append_history(
++            new_thread_id(),
++            None,
++            &[CanonicalMessage::text(MessageRole::User, text)],
++        )
++        .await
++}
++
++struct ChildGuard {
++    child: Child,
++    result: PathBuf,
++}
++
++impl ChildGuard {
++    fn spawn(fixture: &Fixture, mode: &str, label: &str) -> Self {
++        let result = fixture.config.join(format!("{label}.json"));
++        let child = Command::new(std::env::current_exe().expect("test executable"))
++            .args([
++                "--exact",
++                "ownership_slice_process_helper",
++                "--ignored",
++                "--nocapture",
++                "--test-threads=1",
++            ])
++            .env(ENV, mode)
++            .env("PROTEUS_OWNERSHIP_CONFIG", &fixture.config)
++            .env("PROTEUS_OWNERSHIP_WORKSPACE", &fixture.workspace)
++            .env("PROTEUS_OWNERSHIP_ID", fixture.id.to_string())
++            .env("PROTEUS_OWNERSHIP_RESULT", &result)
++            .stdin(Stdio::null())
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .spawn()
++            .expect("spawn ownership helper");
++        Self { child, result }
++    }
++
++    fn wait_report(&mut self, must_exit: bool) -> serde_json::Value {
++        let deadline = Instant::now() + READY_LIMIT;
++        loop {
++            let exited = self.child.try_wait().expect("poll child");
++            if self.result.exists() && (!must_exit || exited.is_some()) {
++                if let Some(status) = exited {
++                    assert!(status.success(), "ownership helper failed: {status}");
++                }
++                let mut bytes = Vec::new();
++                std::fs::File::open(&self.result)
++                    .expect("open helper report")
++                    .take(4097)
++                    .read_to_end(&mut bytes)
++                    .expect("read helper report");
++                assert!(bytes.len() <= 4096, "helper report exceeded bound");
++                return serde_json::from_slice(&bytes).expect("helper JSON");
++            }
++            assert!(exited.is_none(), "ownership helper exited without report");
++            assert!(
++                Instant::now() < deadline,
++                "ownership helper readiness timed out"
++            );
++            thread::sleep(Duration::from_millis(10));
++        }
++    }
++}
++
++impl Drop for ChildGuard {
++    fn drop(&mut self) {
++        // RAII also runs on assertion panic. The controller supplies the outer
++        // deadline; no helper is intentionally left alive after a test failure.
++        if self.child.try_wait().ok().flatten().is_none() {
++            let _ = self.child.kill();
++        }
++        let _ = self.child.wait();
++    }
++}
++
++#[test]
++#[ignore = "invoked only by the bounded ownership child protocol"]
++fn ownership_slice_process_helper() {
++    let Some(mode) = std::env::var_os(ENV) else {
++        return;
++    };
++    let config = PathBuf::from(std::env::var_os("PROTEUS_OWNERSHIP_CONFIG").expect("config"));
++    let workspace =
++        PathBuf::from(std::env::var_os("PROTEUS_OWNERSHIP_WORKSPACE").expect("workspace"));
++    let id = std::env::var("PROTEUS_OWNERSHIP_ID")
++        .expect("id")
++        .parse()
++        .expect("UUID");
++    let result = PathBuf::from(std::env::var_os("PROTEUS_OWNERSHIP_RESULT").expect("result"));
++    let runtime = tokio::runtime::Runtime::new().expect("runtime");
++    let store = SessionStore::new(&config, &workspace, id).expect("helper store");
++    let attempt = runtime.block_on(append(&store, "child"));
++    let report = match attempt {
++        Ok(()) => serde_json::json!({"ok":true}),
++        Err(error) => serde_json::json!({"ok":false,"error":format!("{error:#}")}),
++    };
++    let temp = result.with_extension("tmp");
++    std::fs::write(&temp, serde_json::to_vec(&report).expect("report")).expect("write report");
++    std::fs::rename(temp, &result).expect("publish report");
++    if mode == "hold" {
++        assert_eq!(report["ok"], true, "holder failed to acquire writer");
++        // Finite even if the supervising process disappears unexpectedly.
++        thread::sleep(Duration::from_secs(30));
++    }
++}
++
++#[tokio::test]
++async fn foreign_live_writer_blocks_deletion() {
++    let fixture = Fixture::persisted().await;
++    let mut owner = ChildGuard::spawn(&fixture, "hold", "foreign-owner");
++    assert_eq!(owner.wait_report(false)["ok"], true);
++    let before = std::fs::read(fixture.session.join("journal.jsonl")).expect("before");
++    let result = fixture.delete().await;
++    assert!(
++        result.is_err(),
++        "OWNERSHIP_FOREIGN_DELETE: active writer was deleted"
++    );
++    assert!(
++        format!("{:#}", result.unwrap_err()).contains("active writer in another process"),
++        "busy error must identify ownership"
++    );
++    assert_eq!(
++        std::fs::read(fixture.session.join("journal.jsonl")).expect("after"),
++        before
++    );
++    assert!(owner.child.try_wait().expect("owner status").is_none());
++}
++
++#[tokio::test]
++async fn local_live_writer_blocks_deletion_without_deadlock() {
++    let fixture = Fixture::persisted().await;
++    let owner = fixture.open();
++    append(&owner, "owned").await.expect("own");
++    let result = tokio::time::timeout(Duration::from_secs(3), fixture.delete())
++        .await
++        .expect("local deletion must not wait for its own lease");
++    assert!(
++        result.is_err(),
++        "OWNERSHIP_LOCAL_DELETE: local writer was deleted"
++    );
++    drop(owner);
++    assert!(fixture.delete().await.expect("delete after owner drop"));
++}
++
++#[tokio::test]
++async fn closed_owner_can_be_deleted() {
++    let fixture = Fixture::persisted().await;
++    assert!(fixture.delete().await.expect("delete closed session"));
++    assert!(!fixture.session.exists());
++    assert!(!fixture.delete().await.expect("second delete is absent"));
++}
++
++#[tokio::test]
++async fn cold_existing_handle_cannot_recreate_deleted_session() {
++    let fixture = Fixture::persisted().await;
++    let cold = fixture.open();
++    assert!(fixture.delete().await.expect("cold delete"));
++    let result = append(&cold, "must not resurrect").await;
++    assert!(
++        result.is_err(),
++        "OWNERSHIP_COLD_MISSING: existing handle recreated session"
++    );
++    assert!(
++        !fixture.session.exists(),
++        "existing append created a directory"
++    );
++}
++
++#[tokio::test]
++async fn new_for_existing_slot_cannot_recreate_deleted_session() {
++    let fixture = Fixture::persisted().await;
++    let cold = SessionStore::new(&fixture.config, &fixture.workspace, fixture.id)
++        .expect("new on existing identity");
++    assert!(fixture.delete().await.expect("cold delete"));
++    let result = append(&cold, "must not resurrect").await;
++    assert!(
++        result.is_err(),
++        "OWNERSHIP_NEW_EXISTING: existing constructor recreated session"
++    );
++    assert!(
++        !fixture.session.exists(),
++        "existing constructor created a directory"
++    );
++}
++
++#[tokio::test]
++async fn failed_new_materialization_consumes_creation_permission() {
++    let config = tempfile::tempdir().expect("config");
++    let workspace = tempfile::tempdir().expect("workspace");
++    let store = SessionStore::new(config.path(), workspace.path(), new_session_id()).expect("new");
++    // Deterministically fail workspace identity decoding after session mkdir.
++    std::fs::remove_dir(workspace.path()).expect("remove fixture workspace");
++    assert!(append(&store, "first").await.is_err());
++    assert!(store.session_dir().is_dir(), "fixture must reach mkdir");
++    std::fs::remove_dir(store.session_dir()).expect("remove empty failed fixture");
++    std::fs::create_dir(workspace.path()).expect("restore fixture workspace");
++    let result = append(&store, "retry").await;
++    assert!(
++        result.is_err(),
++        "OWNERSHIP_NEW_CONSUMED: failed first mkdir granted recreation"
++    );
++    assert!(!store.session_dir().exists());
++}
++
++#[tokio::test]
++async fn read_only_open_does_not_claim_writer() {
++    let fixture = Fixture::persisted().await;
++    let mut owner = ChildGuard::spawn(&fixture, "hold", "read-owner");
++    assert_eq!(owner.wait_report(false)["ok"], true);
++    let cold = fixture.open();
++    assert!(!cold.load_messages().expect("read while owned").is_empty());
++    assert!(append(&cold, "denied").await.is_err());
++    assert!(owner.child.try_wait().expect("owner status").is_none());
++}
++
++fn replace_identity(path: &Path) -> Vec<u8> {
++    let original = std::fs::read(path).expect("metadata");
++    let mut value: serde_json::Value = serde_json::from_slice(&original).expect("metadata JSON");
++    let id: SessionId = serde_json::from_value(value["session_id"].clone()).expect("metadata id");
++    // A distinct UUID with the same 10-digit directory suffix.
++    let other = SessionId::from_u128(id.as_u128().checked_add(10_000_000_000).expect("UUID room"));
++    value["session_id"] = serde_json::to_value(other).expect("new id");
++    std::fs::write(path, serde_json::to_vec(&value).expect("changed metadata")).expect("change id");
++    original
++}
++
++#[tokio::test]
++async fn rejected_cold_identity_releases_tentative_lease() {
++    let fixture = Fixture::persisted().await;
++    let cold = fixture.open();
++    let metadata = fixture.session.join("session.json");
++    let original = replace_identity(&metadata);
++    assert!(append(&cold, "denied identity").await.is_err());
++    std::fs::write(metadata, original).expect("restore metadata");
++    let mut contender = ChildGuard::spawn(&fixture, "attempt", "identity-contender");
++    assert_eq!(
++        contender.wait_report(true)["ok"],
++        true,
++        "OWNERSHIP_TENTATIVE_IDENTITY: rejected cold handle retained lease"
++    );
++    // Keep the rejected handle alive through the competing process's append.
++    assert!(
++        !cold
++            .load_messages()
++            .expect("still-live cold read")
++            .is_empty()
++    );
++}
++
++#[tokio::test]
++async fn rejected_cold_recovery_releases_tentative_lease() {
++    let fixture = Fixture::persisted().await;
++    let cold = fixture.open();
++    let journal = fixture.session.join("journal.jsonl");
++    let original = std::fs::read(&journal).expect("journal");
++    std::fs::write(&journal, b"invalid-json\n").expect("corrupt fixture");
++    assert!(append(&cold, "denied recovery").await.is_err());
++    std::fs::write(&journal, original).expect("restore fixture");
++    let mut contender = ChildGuard::spawn(&fixture, "attempt", "recovery-contender");
++    assert_eq!(
++        contender.wait_report(true)["ok"],
++        true,
++        "OWNERSHIP_TENTATIVE_RECOVERY: rejected cold recovery retained lease"
++    );
++    assert!(
++        !cold
++            .load_messages()
++            .expect("still-live cold read")
++            .is_empty()
++    );
++}
++
++#[tokio::test]
++async fn rejected_existing_owner_preserves_legitimate_lease() {
++    let fixture = Fixture::persisted().await;
++    let owner = fixture.open();
++    append(&owner, "legitimate owner").await.expect("acquire");
++    let metadata = fixture.session.join("session.json");
++    let original = replace_identity(&metadata);
++    assert!(append(&owner, "denied identity").await.is_err());
++    std::fs::write(metadata, original).expect("restore metadata");
++    let mut contender = ChildGuard::spawn(&fixture, "attempt", "retained-contender");
++    let report = contender.wait_report(true);
++    assert_eq!(
++        report["ok"], false,
++        "OWNERSHIP_RETAINED: valid owner lost lease"
++    );
++    assert!(
++        report["error"]
++            .as_str()
++            .expect("error")
++            .contains("active writer in another process")
++    );
++    append(&owner, "owner still works")
++        .await
++        .expect("retained writer");
++}
++
++#[test]
++fn constructing_new_session_remains_lazy() {
++    let config = tempfile::tempdir().expect("config");
++    let workspace = tempfile::tempdir().expect("workspace");
++    let store = SessionStore::new(config.path(), workspace.path(), new_session_id()).expect("new");
++    assert!(!store.session_dir().exists());
++    assert!(!config.path().join("sessions").exists());
++}
+diff --git a/crates/proteus-module-protocol/src/v3/broker.rs b/crates/proteus-module-protocol/src/v3/broker.rs
+--- a/crates/proteus-module-protocol/src/v3/broker.rs
++++ b/crates/proteus-module-protocol/src/v3/broker.rs
+@@ -45,24 +45,20 @@
+ }
+ 
+ pub(super) enum StartAck {
+     Async(oneshot::Sender<Result<StartMeta, ComponentBrokerError>>),
+     Blocking(mpsc::Sender<Result<StartMeta, ComponentBrokerError>>),
+ }
+ 
+ impl StartAck {
+-    pub(super) fn send(self, result: Result<StartMeta, ComponentBrokerError>) {
++    pub(super) fn send(self, result: Result<StartMeta, ComponentBrokerError>) -> bool {
+         match self {
+-            Self::Async(sender) => {
+-                let _ = sender.send(result);
+-            }
+-            Self::Blocking(sender) => {
+-                let _ = sender.send(result);
+-            }
++            Self::Async(sender) => sender.send(result).is_ok(),
++            Self::Blocking(sender) => sender.send(result).is_ok(),
+         }
+     }
+ }
+ 
+ pub(crate) enum ControlCommand {
+     EnsureInitialized {
+         ack: mpsc::Sender<Result<proteus_contracts::contracts::ProcessComponentManifest, String>>,
+     },
+diff --git a/crates/proteus-module-protocol/src/v3/failure.rs b/crates/proteus-module-protocol/src/v3/failure.rs
+--- a/crates/proteus-module-protocol/src/v3/failure.rs
++++ b/crates/proteus-module-protocol/src/v3/failure.rs
+@@ -15,17 +15,21 @@
+ 
+ impl LoopState {
+     pub(super) fn finish(&mut self, id: &str, terminal: InvocationTerminal) {
+         if self.finish_without_admission(id, terminal) {
+             self.admit_queued_roots();
+         }
+     }
+ 
+-    fn finish_without_admission(&mut self, id: &str, terminal: InvocationTerminal) -> bool {
++    pub(super) fn finish_without_admission(
++        &mut self,
++        id: &str,
++        terminal: InvocationTerminal,
++    ) -> bool {
+         let Some(mut pending) = self.pending.remove(id) else {
+             return false;
+         };
+         if pending.active {
+             if pending.is_root() {
+                 self.active_roots = self.active_roots.saturating_sub(1);
+             } else {
+                 self.active_nested = self.active_nested.saturating_sub(1);
+@@ -42,21 +46,17 @@
+         true
+     }
+ 
+     fn admit_queued_roots(&mut self) {
+         while self.can_activate_root() {
+             let Some(id) = self.queued_roots.pop_front() else {
+                 break;
+             };
+-            let Some(pending) = self.pending.get(&id) else {
+-                continue;
+-            };
+-            if pending.invocation.deadline <= Instant::now() {
+-                self.finish(&id, InvocationTerminal::TimedOut);
++            if !self.pending.contains_key(&id) {
+                 continue;
+             }
+             self.activate(&id);
+             if self.worker.is_none() {
+                 break;
+             }
+         }
+     }
+@@ -98,16 +98,27 @@
+             let _ = self.cancel(&id, generation, CancelCause::Timeout);
+             if self.worker.is_none() && !self.pending.is_empty() {
+                 break;
+             }
+         }
+     }
+ 
+     pub(super) fn cancel(
++        &mut self,
++        id: &str,
++        generation: u64,
++        cause: CancelCause,
++    ) -> Result<(), ComponentBrokerError> {
++        self.cancel_without_admission(id, generation, cause)?;
++        self.admit_queued_roots();
++        Ok(())
++    }
++
++    pub(super) fn cancel_without_admission(
+         &mut self,
+         id: &str,
+         generation: u64,
+         cause: CancelCause,
+     ) -> Result<(), ComponentBrokerError> {
+         if generation != self.generation {
+             return Err(ComponentBrokerError::new(
+                 ComponentBrokerErrorKind::ParentInactive,
+@@ -170,17 +181,16 @@
+             });
+             if let Some(Err(error)) = send_result {
+                 self.resource_failure(format!(
+                     "failed to queue cancel for invocation {affected_id}: {error}"
+                 ));
+                 break;
+             }
+         }
+-        self.admit_queued_roots();
+         Ok(())
+     }
+ 
+     fn is_descendant_or_same(&self, candidate: &str, ancestor: &str) -> bool {
+         let mut current = Some(candidate);
+         while let Some(id) = current {
+             if id == ancestor {
+                 return true;
+diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-module-protocol/src/v3/runtime.rs
+--- a/crates/proteus-module-protocol/src/v3/runtime.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime.rs
+@@ -5,18 +5,18 @@
+ 
+ use anyhow::Result;
+ use proteus_process_host::{NewlineJsonFraming, ProcessTransport};
+ 
+ use super::{
+     broker::{ComponentBrokerSnapshot, ControlCommand, StartRequest},
+     handshake::initialize_transport,
+     invocation::{
+-        ComponentBrokerError, ComponentBrokerErrorKind, ComponentFailure, InvocationRef,
+-        InvocationTerminal, StartMeta,
++        CancelCause, ComponentBrokerError, ComponentBrokerErrorKind, ComponentFailure,
++        InvocationRef, InvocationTerminal, StartMeta,
+     },
+     pending::{LoopState, PendingInvocation, WorkerGeneration},
+     wire,
+ };
+ 
+ const MAX_CONTROL_COMMANDS_PER_TICK: usize = 64;
+ const MAX_ROOT_COMMANDS_PER_TICK: usize = 8;
+ const MAX_FRAMES_PER_TICK: usize = 32;
+@@ -319,16 +319,20 @@
+                     ComponentBrokerErrorKind::RuntimeUnavailable,
+                     format!(
+                         "component-v3 worker failed to initialize; next call may retry: {error:#}"
+                     ),
+                 )));
+                 return;
+             }
+         };
++        // Initialization may block while the caller abandons admission.
++        if request.terminal.receiver_dropped() {
++            return;
++        }
+         let id = wire::host_id(self.generation, self.next_host_sequence);
+         self.next_host_sequence = self.next_host_sequence.saturating_add(1);
+         let root_id = if root_id.is_empty() {
+             id.clone()
+         } else {
+             root_id
+         };
+         let invocation = InvocationRef {
+@@ -361,17 +365,21 @@
+                 cancel: None,
+                 cancel_deadline: None,
+                 outstanding_callbacks: Default::default(),
+             },
+         );
+         if !request.bootstrap {
+             self.runtime_started = true;
+         }
+-        request.ack.send(Ok(meta));
++        if !request.ack.send(Ok(meta)) {
++            // No caller can own this invocation, and it has not been queued.
++            self.finish_without_admission(&id, InvocationTerminal::Canceled);
++            return;
++        }
+ 
+         if effective_deadline <= Instant::now() {
+             self.finish(&id, InvocationTerminal::TimedOut);
+         } else if is_root && !self.can_activate_root() {
+             self.queued_roots.push_back(id);
+         } else {
+             self.activate(&id);
+         }
+@@ -379,16 +387,46 @@
+ 
+     pub(super) fn can_activate_root(&self) -> bool {
+         self.active_roots < self.options.max_active_roots
+             && self.active_roots + self.active_nested
+                 < self.options.max_active_total - self.options.reserved_nested
+     }
+ 
+     pub(super) fn activate(&mut self, id: &str) {
++        let pending = self
++            .pending
++            .get(id)
++            .expect("pending invocation disappeared before activation");
++        assert!(!pending.active, "invocation activated twice");
++        if let Some(cause) = pending.cancel {
++            // Cancellation already visited the tree; inactive records normally
++            // settle immediately. Preserve its recorded cause if one remains.
++            self.finish_without_admission(id, InvocationTerminal::canceled(cause));
++            return;
++        }
++        let cause = if pending
++            .terminal
++            .as_ref()
++            .is_some_and(|sender| sender.receiver_dropped())
++        {
++            Some(CancelCause::User)
++        } else if pending.invocation.deadline <= Instant::now() {
++            Some(CancelCause::Timeout)
++        } else {
++            None
++        };
++        if let Some(cause) = cause {
++            // Queued parents can already own nested invocations. Cancel the
++            // whole tree before the caller continues iterative admission.
++            let generation = pending.invocation.generation;
++            let _ = self.cancel_without_admission(id, generation, cause);
++            return;
++        }
++
+         let frame = {
+             let pending = self
+                 .pending
+                 .get_mut(id)
+                 .expect("pending invocation disappeared before activation");
+             let params = pending
+                 .params
+                 .take()
+@@ -431,8 +469,12 @@
+         pending.active = true;
+         if pending.is_root() {
+             self.active_roots += 1;
+         } else {
+             self.active_nested += 1;
+         }
+     }
+ }
++
++#[cfg(test)]
++#[path = "runtime_tests.rs"]
++mod tests;
+diff --git a/crates/proteus-module-protocol/src/v3/runtime_tests.rs b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+--- a/crates/proteus-module-protocol/src/v3/runtime_tests.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+@@ -0,0 +1,352 @@
++use std::{
++    io::{Read, Write},
++    net::{TcpListener, TcpStream},
++    path::PathBuf,
++    sync::{Arc, mpsc},
++    thread,
++    time::{Duration, Instant},
++};
++
++use anyhow::{Context, Result, ensure};
++use proteus_contracts::contracts::{PROCESS_WORKFLOW_CONTRACT_VERSION, PROCESS_WORKFLOW_METHOD};
++use proteus_process_host::ProcessSpec;
++use serde_json::{Value, json};
++use tokio::sync::oneshot;
++
++use crate::v3::{
++    broker::{StartAck, StartRequest},
++    config::ComponentBrokerOptions,
++    invocation::{
++        CancelCause, ComponentBrokerError, ComponentFailure, InvocationRef, InvocationTerminal,
++        NoAsyncHostRequests, StartMeta,
++    },
++    notification::NotificationSink,
++    pending::{LoopState, TerminalSender},
++};
++use crate::{ProcessComponentBinding, ProcessExportBinding};
++
++const WAIT: Duration = Duration::from_secs(3);
++
++fn state(spec: ProcessSpec) -> Result<LoopState> {
++    let binding = ProcessComponentBinding::new(
++        "admission",
++        [ProcessExportBinding::new(
++            "workflow",
++            "fixture.workflow",
++            PROCESS_WORKFLOW_CONTRACT_VERSION,
++            json!({}),
++        )?],
++    )?;
++    let options = ComponentBrokerOptions {
++        handshake_timeout: Duration::from_secs(5),
++        max_active_roots: 1,
++        ..ComponentBrokerOptions::default()
++    };
++    options.validate()?;
++    let wake = proteus_process_host::ProcessWake::default();
++    let (control_tx, _) = crate::v3::signal::channel(options.control_command_capacity, &wake);
++    Ok(LoopState::new(spec, binding, options, control_tx, wake))
++}
++
++fn fixture() -> ProcessSpec {
++    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multiplex_worker.py");
++    ProcessSpec::new("python3")
++        .arg("-B")
++        .arg(path.to_string_lossy().into_owned())
++}
++
++fn request(
++    state: &LoopState,
++    params: Value,
++    parent: Option<InvocationRef>,
++) -> (
++    StartRequest,
++    mpsc::Receiver<Result<StartMeta, ComponentBrokerError>>,
++    mpsc::Receiver<InvocationTerminal>,
++) {
++    let (terminal_tx, terminal_rx) = mpsc::channel();
++    let (ack_tx, ack_rx) = mpsc::channel();
++    let (notifications, _) = NotificationSink::channel(state.options.notification_limits);
++    (
++        StartRequest {
++            target: state.binding.exports[0].export_ref(),
++            method: PROCESS_WORKFLOW_METHOD.to_owned(),
++            params,
++            deadline: Instant::now() + Duration::from_secs(30),
++            parent,
++            dispatcher: Arc::new(NoAsyncHostRequests),
++            executor: None,
++            terminal: TerminalSender::Blocking(terminal_tx),
++            notifications,
++            ack: StartAck::Blocking(ack_tx),
++            bootstrap: false,
++        },
++        ack_rx,
++        terminal_rx,
++    )
++}
++
++fn admit(
++    state: &mut LoopState,
++    params: Value,
++    parent: Option<InvocationRef>,
++) -> Result<(StartMeta, mpsc::Receiver<InvocationTerminal>)> {
++    let (request, ack, terminal) = request(state, params, parent);
++    state.accept_start(request);
++    Ok((ack.recv_timeout(WAIT)??, terminal))
++}
++
++fn receive(state: &mut LoopState) -> Result<Value> {
++    Ok(state
++        .worker
++        .as_mut()
++        .context("worker disappeared")?
++        .transport
++        .recv_frame(WAIT)?)
++}
++
++fn assert_clean(state: &LoopState) -> Result<()> {
++    ensure!(state.pending.is_empty() && state.queued_roots.is_empty());
++    ensure!(state.active_roots == 0 && state.active_nested == 0);
++    ensure!(state.callbacks.is_empty() && state.pending_callback_counts.is_empty());
++    Ok(())
++}
++
++fn terminal(
++    receiver: &mpsc::Receiver<InvocationTerminal>,
++    expected: InvocationTerminal,
++) -> Result<()> {
++    ensure!(receiver.recv_timeout(WAIT)? == expected);
++    ensure!(matches!(
++        receiver.try_recv(),
++        Err(mpsc::TryRecvError::Disconnected)
++    ));
++    Ok(())
++}
++
++#[test]
++fn abandoned_start_during_restart_is_not_dispatched() -> Result<()> {
++    let listener = TcpListener::bind(("127.0.0.1", 0))?;
++    listener.set_nonblocking(true)?;
++    let spec = fixture().env(
++        "PROTEUS_TEST_RESTART_HANDSHAKE_PORT",
++        listener.local_addr()?.port().to_string(),
++    );
++    let mut state = state(spec)?;
++    state.ensure_worker()?;
++    state.reset_generation(ComponentFailure::Shutdown);
++    ensure!(state.generation == 2);
++    let (mut request, _, _) = request(&state, json!({"op": "wait_cancel"}), None);
++    let (terminal_tx, terminal_rx) = oneshot::channel();
++    let (ack_tx, ack_rx) = oneshot::channel();
++    request.terminal = TerminalSender::Async(terminal_tx);
++    request.ack = StartAck::Async(ack_tx);
++    let (done_tx, done_rx) = mpsc::sync_channel(1);
++    let admission = thread::spawn(move || {
++        state.accept_start(request);
++        let _ = done_tx.send(state);
++    });
++    let gate_result = (|| -> Result<()> {
++        let mut gate = accept_barrier(&listener)?;
++        gate.set_read_timeout(Some(WAIT))?;
++        gate.set_write_timeout(Some(WAIT))?;
++        let mut ready = [0_u8; 6];
++        gate.read_exact(&mut ready)?;
++        ensure!(&ready == b"ready\n");
++        drop(terminal_rx);
++        drop(ack_rx);
++        gate.write_all(b"1")?;
++        Ok(())
++    })();
++    // This watchdog bounds the test's wait, not reclamation of a wedged
++    // admission thread. Handshake/socket deadlines and transport Drop cover
++    // ordinary exits; run this target under an outer process watchdog.
++    let mut state = done_rx
++        .recv_timeout(Duration::from_secs(8))
++        .context("restart admission did not finish within watchdog")?;
++    admission.join().expect("admission thread panicked");
++    let dispatched = state
++        .pending
++        .values()
++        .any(|pending| pending.dispatch.is_some());
++    let clean = assert_clean(&state);
++    let generation = state.generation;
++    state.reset_generation(ComponentFailure::Shutdown);
++    gate_result?;
++    ensure!(
++        generation == 2,
++        "handshake failed instead of exercising admission"
++    );
++    ensure!(
++        !dispatched,
++        "abandoned restart admission reached the frame writer"
++    );
++    clean?;
++    Ok(())
++}
++
++#[test]
++fn undeliverable_blocking_start_ack_never_dispatches() -> Result<()> {
++    check_undeliverable_start_ack(false)
++}
++
++#[test]
++fn undeliverable_async_start_ack_never_dispatches() -> Result<()> {
++    check_undeliverable_start_ack(true)
++}
++
++fn check_undeliverable_start_ack(asynchronous_ack: bool) -> Result<()> {
++    let mut state = state(fixture())?;
++    let (mut request, ack, result) = request(&state, json!({"op": "wait_cancel"}), None);
++    drop(ack);
++    if asynchronous_ack {
++        let (sender, receiver) = oneshot::channel();
++        request.ack = StartAck::Async(sender);
++        drop(receiver);
++    }
++    state.accept_start(request);
++    ensure!(state.generation == 1 && state.worker.is_some());
++    // Preserve the existing bootstrap-closing point after validation.
++    ensure!(state.runtime_started);
++    ensure!(
++        !state
++            .pending
++            .values()
++            .any(|pending| pending.dispatch.is_some()),
++        "undeliverable start ACK reached the frame writer (async={asynchronous_ack})"
++    );
++    assert_clean(&state).context("undeliverable start ACK retained invocation state")?;
++    terminal(&result, InvocationTerminal::Canceled)?;
++
++    let (_, result) = admit(&mut state, json!({"op": "echo", "value": "live"}), None)?;
++    let response = receive(&mut state)?;
++    state.handle_frame(response);
++    ensure!(matches!(
++        result.recv_timeout(WAIT)?,
++        InvocationTerminal::Success(value) if value["value"] == "live"
++    ));
++    assert_clean(&state)?;
++    state.reset_generation(ComponentFailure::Shutdown);
++    Ok(())
++}
++
++#[test]
++fn queued_abandonment_cancels_nested_work_and_promotes_live_follower() -> Result<()> {
++    check_queued_rejection(true)
++}
++
++#[test]
++fn queued_expiry_cancels_nested_work_and_promotes_live_follower() -> Result<()> {
++    check_queued_rejection(false)
++}
++
++fn check_queued_rejection(abandoned: bool) -> Result<()> {
++    let mut state = state(fixture())?;
++    let (incumbent, incumbent_result) =
++        admit(&mut state, json!({"op": "echo", "value": "first"}), None)?;
++    let (mut queued, ack, _) = request(&state, json!({"op": "wait_cancel"}), None);
++    let (sender, receiver) = oneshot::channel();
++    queued.terminal = TerminalSender::Async(sender);
++    state.accept_start(queued);
++    let queued = ack.recv_timeout(WAIT)??;
++    ensure!(!state.pending[queued.invocation.id()].active);
++    let (child, child_result) = admit(
++        &mut state,
++        json!({"op": "wait_cancel", "notify_started": true}),
++        Some(queued.invocation.clone()),
++    )?;
++    let (follower, follower_result) =
++        admit(&mut state, json!({"op": "echo", "value": "last"}), None)?;
++    ensure!(!state.pending[follower.invocation.id()].active);
++
++    // Hold the incumbent response so queue promotion cannot run yet.
++    // The child progress frame proves that its writer claim already happened.
++    let mut incumbent_response = None;
++    let mut child_started = false;
++    for _ in 0..2 {
++        let frame = receive(&mut state)?;
++        if frame["id"].as_str() == Some(incumbent.invocation.id()) {
++            incumbent_response = Some(frame);
++        } else {
++            ensure!(frame["method"] == "module.progress");
++            ensure!(frame["params"]["invocation_id"].as_str() == Some(child.invocation.id()));
++            state.handle_frame(frame);
++            child_started = true;
++        }
++    }
++    ensure!(child_started && incumbent_response.is_some());
++    ensure!(state.pending[child.invocation.id()].is_visible_to_worker());
++
++    let mut receiver = Some(receiver);
++    let cause = if abandoned {
++        drop(receiver.take());
++        CancelCause::User
++    } else {
++        state
++            .pending
++            .get_mut(queued.invocation.id())
++            .unwrap()
++            .invocation
++            .deadline = Instant::now();
++        CancelCause::Timeout
++    };
++    // Exercise the actual finish -> queued promotion path, without a tick
++    // of enforce_deadlines that could hide the activation bug.
++    state.handle_frame(incumbent_response.unwrap());
++    ensure!(
++        !state.pending.contains_key(queued.invocation.id()),
++        "rejected queued parent reached activation (abandoned={abandoned})"
++    );
++    ensure!(
++        state.pending[child.invocation.id()].cancel == Some(cause),
++        "rejected queued parent orphaned its active child (abandoned={abandoned})"
++    );
++    ensure!(
++        state.pending[follower.invocation.id()].active,
++        "rejected queued parent blocked its live follower"
++    );
++    ensure!(state.pending[follower.invocation.id()].dispatch.is_some());
++    ensure!(state.active_roots == 1 && state.active_nested == 1);
++    if let Some(mut receiver) = receiver {
++        ensure!(receiver.try_recv()? == InvocationTerminal::TimedOut);
++        ensure!(matches!(
++            receiver.try_recv(),
++            Err(oneshot::error::TryRecvError::Closed)
++        ));
++    }
++    // Child cancellation and the follower each produce exactly one terminal.
++    for _ in 0..2 {
++        let frame = receive(&mut state)?;
++        state.handle_frame(frame);
++    }
++    terminal(&child_result, InvocationTerminal::canceled(cause))?;
++    ensure!(matches!(
++        incumbent_result.recv_timeout(WAIT)?,
++        InvocationTerminal::Success(value) if value["value"] == "first"
++    ));
++    ensure!(matches!(
++        follower_result.recv_timeout(WAIT)?,
++        InvocationTerminal::Success(value) if value["value"] == "last"
++    ));
++    assert_clean(&state).context("queued rejection leaked invocation or callback budget")?;
++    ensure!(state.generation == 1);
++    state.reset_generation(ComponentFailure::Shutdown);
++    Ok(())
++}
++
++fn accept_barrier(listener: &TcpListener) -> Result<TcpStream> {
++    let deadline = Instant::now() + WAIT;
++    loop {
++        match listener.accept() {
++            Ok((stream, _)) => return Ok(stream),
++            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                ensure!(
++                    Instant::now() < deadline,
++                    "restart handshake did not reach barrier"
++                );
++                thread::sleep(Duration::from_millis(1));
++            }
++            Err(error) => return Err(error).context("accept restart handshake barrier"),
++        }
++    }
++}
+diff --git a/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py b/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
+--- a/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
++++ b/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
+@@ -19,16 +19,17 @@
+ The worker intentionally accepts any host request method with an ``h:*`` id:
+ the fixture exercises transport semantics rather than a particular slot method.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
+ import os
++import socket
+ import sys
+ import threading
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Dict, Optional
+ 
+ 
+ JSON = Dict[str, Any]
+@@ -108,16 +109,22 @@
+         """Answer the exact component-v3 manifest."""
+         request_id = frame.get("id")
+         params = frame.get("params")
+         if not isinstance(request_id, str) or not request_id.startswith("h:"):
+             return
+         if not isinstance(params, dict):
+             self.send_error(request_id, -32602, "initialize params must be an object")
+             return
++        barrier_port = os.environ.get("PROTEUS_TEST_RESTART_HANDSHAKE_PORT")
++        if request_id == "h:2:0" and barrier_port is not None:
++            with socket.create_connection(("127.0.0.1", int(barrier_port)), timeout=5.0) as barrier:
++                barrier.sendall(b"ready\n")
++                if barrier.recv(1) != b"1":
++                    raise RuntimeError("restart handshake barrier was not released")
+         protocol_version = params.get("protocol_version")
+         if protocol_version == "v3":
+             component_id = params.get("component_id")
+             exports = params.get("exports")
+             if not isinstance(component_id, str) or not isinstance(exports, list):
+                 self.send_error(request_id, -32602, "invalid component-v3 binding")
+                 return
+             manifest_exports = []
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -710,9 +710,22 @@
+ сохраняют `anyhow::Result`, но Core может различить module failure, cancel,
+ timeout и конкретный класс component loss без парсинга display text.
+ 
+-При cancel/timeout host отправляет `$/cancelRequest` и ждёт bounded grace
+-period. Cooperative terminal завершает только target invocation (и её nested
+-descendants). Если grace истёк, reset-ится **весь component**, потому что
++До постановки invocation в writer host повторно проверяет наблюдаемые
++отмену, потерю async terminal receiver и deadline; эта проверка действует
++также при продвижении queued roots. После блокирующего handshake потеря
++receiver проверяется повторно, а недоставленный admission ACK не допускает
++invocation к dispatch. Отмена queued parent сохраняет отмену её nested tree.
++Успешная отправка ACK не доказывает, что caller уже получил handle.
++
++Проверка до dispatch не устраняет гонку с более поздней отменой. Если writer
++ещё не забрал request, `cancel_before_write` может атомарно отменить запись.
++После начала записи cancel/timeout не гарантирует отсутствие или rollback
++эффектов module.
++
++При cancel/timeout уже отправленной invocation host отправляет
++`$/cancelRequest` и ждёт bounded grace period. Cooperative terminal завершает
++только target invocation (и её nested descendants). Если grace истёк,
++reset-ится **весь component**, потому что
+ неотвечающий trusted process является общим failure domain. Transport,
+ protocol и resource failure делают то же.
+ Следующая invocation любого export lazily запускает новый child и повторяет
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1321,16 +1321,22 @@
+ истории; при отсутствии свежей секции остаётся строгое чтение журнала.
+ 
+ `GET /history/page?session_dir=...` возвращает `{revision, start, total,
+ messages, base}` с последними 50 строками. Для предыдущей страницы используются
+ `before=<start>&revision=<revision>`. Позиции относятся только к указанной
+ ревизии: сервер отвергает несовпадение вместо смешивания страниц. Известная
+ клиенту завершённая ревизия остаётся пригодной для просмотра во время нового
+ turn, пока её индекс не заменён. Полный `/history` сохраняет прежнюю семантику.
++При утрате или повреждении индекса полный `/history` и страничное чтение
++делают одну попытку строгой проекции. Явно запрошенную ревизию разрешено
++восстановить только при совпадении fingerprint канонического источника до и
++после чтения; новые строки не выдаются под старой ревизией. При невозможности
++сохранить производный индекс проверенный результат возвращается из памяти,
++без цикла повторов.
+ Клиент заранее догружает страницы при приближении к краю окна в обе стороны.
+ Окно просмотра удерживает до 200 строк с бюджетом payload 8 MiB; видимые строки
+ и одна страница остаются целыми, даже когда они превышают бюджет. Дальний край
+ вытесняется, а обратная прокрутка читает его снова. Текущий хвост с live-событиями
+ хранится отдельно; текущий turn остаётся целиком до settlement. Переход к
+ последним сообщениям и отправка возвращают live-хвост. Смена ревизии сохраняет
+ только подтверждённый префикс, ответы от старого запроса игнорируются.
+ 

@@ -1,0 +1,394 @@
+diff --git a/crates/proteus-module-protocol/src/v3/frame.rs b/crates/proteus-module-protocol/src/v3/frame.rs
+--- a/crates/proteus-module-protocol/src/v3/frame.rs
++++ b/crates/proteus-module-protocol/src/v3/frame.rs
+@@ -237,3 +237,7 @@
+         assert_eq!(params, Value::Null);
+     }
+ }
++
++#[cfg(test)]
++#[path = "frame_owned_tests.rs"]
++mod owned_tests;
+diff --git a/crates/proteus-module-protocol/src/v3/frame_owned_tests.rs b/crates/proteus-module-protocol/src/v3/frame_owned_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-module-protocol/src/v3/frame_owned_tests.rs
+@@ -0,0 +1,378 @@
++//! Differential and ownership regressions for the component-v3 envelope parser.
++use super::{ComponentFrame, ProcessModuleRpcError, parse_component_frame};
++use anyhow::Result;
++use serde_json::{Map, Value, json};
++
++fn outcome(result: Result<ComponentFrame>) -> Result<Value, Vec<String>> {
++    result
++        .map(|frame| match frame {
++            ComponentFrame::Response {
++                id,
++                result: Ok(value),
++            } => {
++                json!({"kind":"success", "id":id, "value":value})
++            }
++            ComponentFrame::Response {
++                id,
++                result: Err(error),
++            } => {
++                json!({"kind":"error", "id":id, "error":error})
++            }
++            ComponentFrame::Request { id, method, params } => {
++                json!({"kind":"request", "id":id, "method":method, "params":params})
++            }
++            ComponentFrame::Notification { method, params } => {
++                json!({"kind":"notification", "method":method, "params":params})
++            }
++        })
++        .map_err(|error| error.chain().map(ToString::to_string).collect())
++}
++
++fn assert_equivalent(value: Value) {
++    let expected = outcome(borrowed_reference::parse_component_frame(value.clone()));
++    let actual = outcome(parse_component_frame(value.clone()));
++    assert_eq!(actual, expected, "different parser outcome for {value}");
++}
++
++#[test]
++fn owned_parser_matches_borrowed_reference_for_envelope_shapes() {
++    for value in [
++        json!(null),
++        json!(false),
++        json!(1),
++        json!("frame"),
++        json!([]),
++    ] {
++        assert_equivalent(value);
++    }
++    let fields = [
++        ("id", json!("h:1:1")),
++        ("method", json!("run")),
++        ("result", json!({"nested":[null, true, "payload"]})),
++        (
++            "error",
++            json!({"code":-32000, "message":"failed", "data":{"nested":["payload"]}}),
++        ),
++        ("params", json!({"nested":[null, true, "payload"]})),
++        ("unknown", json!(true)),
++    ];
++    for version in [
++        None,
++        Some(json!("2.0")),
++        Some(json!("1.0")),
++        Some(json!(null)),
++        Some(json!(2)),
++    ] {
++        for mask in 0..(1usize << fields.len()) {
++            let mut object = Map::new();
++            if let Some(version) = &version {
++                object.insert("jsonrpc".to_owned(), version.clone());
++            }
++            for (bit, (name, value)) in fields.iter().enumerate() {
++                if mask & (1usize << bit) != 0 {
++                    object.insert((*name).to_owned(), value.clone());
++                }
++            }
++            assert_equivalent(Value::Object(object));
++        }
++    }
++}
++
++#[test]
++fn owned_parser_matches_borrowed_reference_for_ids_methods_and_payload_values() {
++    let values = [
++        json!(null),
++        json!(false),
++        json!(true),
++        json!(0),
++        json!(-1),
++        json!(1.25),
++        json!(u64::MAX),
++        json!(""),
++        json!(" \t\n "),
++        json!("\u{2003}"),
++        json!("not-a-wire-id"),
++        json!(" run "),
++        json!("Unicode \u{1f680}\n\"\\"),
++        json!([]),
++        json!({}),
++        json!([null, false, 1, {"deep":["payload"]}]),
++        json!({"deep":[{"text":"payload", "empty":null}]}),
++    ];
++    for value in values {
++        for (template, field) in [
++            (json!({"jsonrpc":"2.0", "id":"h:1:1", "result":null}), "id"),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "error":{"code":-1, "message":"failed"}}),
++                "id",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "method":"run", "params":null}),
++                "id",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "method":"run", "params":null}),
++                "method",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "method":"run", "params":null}),
++                "method",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "method":"run", "params":null}),
++                "params",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "method":"run", "params":null}),
++                "params",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "result":null}),
++                "result",
++            ),
++            (
++                json!({"jsonrpc":"2.0", "id":"h:1:1", "error":{"code":-1, "message":"failed"}}),
++                "error",
++            ),
++        ] {
++            let mut frame = template;
++            frame[field] = value.clone();
++            assert_equivalent(frame);
++        }
++        assert_equivalent(json!({
++            "jsonrpc":"2.0", "id":"h:1:1",
++            "error":{"code":-32000, "message":"failed", "data":value}
++        }));
++    }
++}
++
++#[test]
++fn owned_parser_matches_borrowed_reference_for_error_bodies_and_error_precedence() {
++    for error in [
++        json!(null),
++        json!({}),
++        json!({"code":-1}),
++        json!({"message":"failed"}),
++        json!({"code":"-1", "message":"failed"}),
++        json!({"code":1.5, "message":"failed"}),
++        json!({"code":u64::MAX, "message":"failed"}),
++        json!({"code":-1, "message":null}),
++        json!({"code":-1, "message":false}),
++        json!({"code":-1, "message":""}),
++        json!({"code":i64::MIN, "message":"failed"}),
++        json!({"code":i64::MAX, "message":"failed"}),
++        json!({"code":-1, "message":"failed", "data":null}),
++        json!({"code":-1, "message":"failed", "data":{"nested":["payload"]}}),
++        json!({"code":-1, "message":"failed", "unknown":true}),
++    ] {
++        for id in [json!("h:1:1"), json!(null), json!(1)] {
++            for extra in [false, true] {
++                let mut frame = json!({"jsonrpc":"2.0", "id":id, "error":error});
++                if extra {
++                    frame["unknown"] = json!(true);
++                }
++                assert_equivalent(frame);
++            }
++        }
++    }
++
++    for (frame, expected) in [
++        (
++            json!({"jsonrpc":"1.0", "id":null, "method":0, "result":null, "error":null}),
++            "JSON-RPC frame must declare jsonrpc=\"2.0\"",
++        ),
++        (
++            json!({"jsonrpc":"2.0", "id":null, "method":0, "result":null, "params":null}),
++            "invalid or ambiguous JSON-RPC envelope",
++        ),
++        (
++            json!({"jsonrpc":"2.0", "id":null, "result":null, "unknown":true}),
++            "JSON-RPC envelope contains unknown or missing fields",
++        ),
++        (
++            json!({"jsonrpc":"2.0", "id":null, "method":0, "params":null}),
++            "component-v3 JSON-RPC id must be a string",
++        ),
++        (
++            json!({"jsonrpc":"2.0", "id":null, "error":null}),
++            "invalid JSON-RPC error body",
++        ),
++        (
++            json!({"jsonrpc":"2.0", "id":null, "error":{"code":-1, "message":"failed"}}),
++            "component-v3 JSON-RPC id must be a string",
++        ),
++    ] {
++        assert_equivalent(frame.clone());
++        assert_eq!(
++            parse_component_frame(frame).unwrap_err().to_string(),
++            expected
++        );
++    }
++}
++
++fn string_allocations(value: &Value, pointers: &mut Vec<usize>) {
++    match value {
++        Value::String(value) if !value.is_empty() => pointers.push(value.as_ptr() as usize),
++        Value::Array(values) => {
++            for value in values {
++                string_allocations(value, pointers);
++            }
++        }
++        Value::Object(values) => {
++            for value in values.values() {
++                string_allocations(value, pointers);
++            }
++        }
++        _ => {}
++    }
++}
++
++#[test]
++fn owned_parser_moves_nonempty_strings_instead_of_deep_cloning_payloads() {
++    let payload =
++        json!({"nested":["payload ".repeat(1024), {"text":"another payload".repeat(128)}]});
++    for frame in [
++        json!({"jsonrpc":"2.0", "id":"h:1:1", "result":payload}),
++        json!({"jsonrpc":"2.0", "id":"h:1:1", "method":" run ", "params":payload}),
++        json!({"jsonrpc":"2.0", "method":"run", "params":payload}),
++        json!({"jsonrpc":"2.0", "id":"h:1:1", "error":{"code":-1, "message":"failed", "data":payload}}),
++    ] {
++        let expected_id = frame
++            .get("id")
++            .map(|id| id.as_str().unwrap().as_ptr() as usize);
++        let expected_method = frame
++            .get("method")
++            .map(|method| method.as_str().unwrap().as_ptr() as usize);
++        let expected_message = frame
++            .get("error")
++            .map(|error| error["message"].as_str().unwrap().as_ptr() as usize);
++        let mut expected_payload = Vec::new();
++        let input_payload = frame
++            .get("params")
++            .or_else(|| frame.get("result"))
++            .unwrap_or(&frame["error"]["data"]);
++        string_allocations(input_payload, &mut expected_payload);
++
++        let (id, method, message, payload) = match parse_component_frame(frame).unwrap() {
++            ComponentFrame::Response {
++                id,
++                result: Ok(value),
++            } => (Some(id), None, None, value),
++            ComponentFrame::Response {
++                id,
++                result: Err(error),
++            } => (Some(id), None, Some(error.message), error.data.unwrap()),
++            ComponentFrame::Request { id, method, params } => {
++                (Some(id), Some(method), None, params)
++            }
++            ComponentFrame::Notification { method, params } => (None, Some(method), None, params),
++        };
++        assert_eq!(id.as_ref().map(|id| id.as_ptr() as usize), expected_id);
++        assert_eq!(
++            method.as_ref().map(|method| method.as_ptr() as usize),
++            expected_method
++        );
++        assert_eq!(
++            message.as_ref().map(|message| message.as_ptr() as usize),
++            expected_message
++        );
++        let mut actual_payload = Vec::new();
++        string_allocations(&payload, &mut actual_payload);
++        assert_eq!(actual_payload, expected_payload);
++    }
++}
++
++// Frozen borrowed parser from Core 63454d4e8b1e4e6b26d088fce2a17d46f30390ae,
++// frame.rs blob 2ef0216d2b3ecbf5e51776faedde48aed1b3b630. Do not rewrite
++// alongside the production parser: this oracle preserves its error precedence.
++mod borrowed_reference {
++    use super::*;
++    use anyhow::{Context, bail};
++
++    pub fn parse_component_frame(value: Value) -> Result<ComponentFrame> {
++        let object = value
++            .as_object()
++            .ok_or_else(|| anyhow::anyhow!("JSON-RPC frame must be an object"))?;
++        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
++            bail!("JSON-RPC frame must declare jsonrpc=\"2.0\"");
++        }
++
++        match (
++            object.contains_key("id"),
++            object.contains_key("method"),
++            object.contains_key("result"),
++            object.contains_key("error"),
++        ) {
++            (true, false, true, false) => parse_success(object),
++            (true, false, false, true) => parse_error(object),
++            (true, true, false, false) => parse_request(object),
++            (false, true, false, false) => parse_notification(object),
++            _ => bail!("invalid or ambiguous JSON-RPC envelope"),
++        }
++    }
++
++    fn parse_success(object: &Map<String, Value>) -> Result<ComponentFrame> {
++        require_exact_fields(object, &["jsonrpc", "id", "result"])?;
++        Ok(ComponentFrame::Response {
++            id: string_id(object.get("id").expect("checked id"))?,
++            result: Ok(object.get("result").expect("checked result").clone()),
++        })
++    }
++
++    fn parse_error(object: &Map<String, Value>) -> Result<ComponentFrame> {
++        require_exact_fields(object, &["jsonrpc", "id", "error"])?;
++        let error = serde_json::from_value::<ProcessModuleRpcError>(
++            object.get("error").expect("checked error").clone(),
++        )
++        .context("invalid JSON-RPC error body")?;
++        Ok(ComponentFrame::Response {
++            id: string_id(object.get("id").expect("checked id"))?,
++            result: Err(error),
++        })
++    }
++
++    fn parse_request(object: &Map<String, Value>) -> Result<ComponentFrame> {
++        require_exact_fields(object, &["jsonrpc", "id", "method", "params"])?;
++        Ok(ComponentFrame::Request {
++            id: string_id(object.get("id").expect("checked id"))?,
++            method: method(object)?,
++            params: object.get("params").expect("checked params").clone(),
++        })
++    }
++
++    fn parse_notification(object: &Map<String, Value>) -> Result<ComponentFrame> {
++        require_exact_fields(object, &["jsonrpc", "method", "params"])?;
++        Ok(ComponentFrame::Notification {
++            method: method(object)?,
++            params: object.get("params").expect("checked params").clone(),
++        })
++    }
++
++    fn method(object: &Map<String, Value>) -> Result<String> {
++        object
++            .get("method")
++            .and_then(Value::as_str)
++            .filter(|method| !method.trim().is_empty())
++            .map(str::to_owned)
++            .ok_or_else(|| anyhow::anyhow!("JSON-RPC method must be a non-empty string"))
++    }
++
++    fn string_id(value: &Value) -> Result<String> {
++        value
++            .as_str()
++            .map(str::to_owned)
++            .ok_or_else(|| anyhow::anyhow!("component-v3 JSON-RPC id must be a string"))
++    }
++
++    fn require_exact_fields(object: &Map<String, Value>, expected: &[&str]) -> Result<()> {
++        if object.len() != expected.len() {
++            bail!("JSON-RPC envelope contains unknown or missing fields");
++        }
++        for field in expected {
++            if !object.contains_key(*field) {
++                bail!("JSON-RPC envelope is missing field {field:?}");
++            }
++        }
++        Ok(())
++    }
++}

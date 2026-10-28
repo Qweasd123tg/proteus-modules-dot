@@ -1,0 +1,127 @@
+diff --git a/crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs b/crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs
+index e5ba28358d6402038eb204c26fc8002384df7518..53792452ae5666d994b7764b6a2c7645d6f0e238 100644
+--- a/crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs
++++ b/crates/proteus-core/src/core/bound_model_tests/terminal_suffix.rs
+@@ -50,31 +50,97 @@
+ 
+ #[tokio::test]
+ async fn valid_terminal_suffix_preserves_ids_without_extra_completions() {
+-    let prefix = completed("prefix", MessagePhase::Commentary);
+-    let suffix = completed("suffix", MessagePhase::FinalAnswer);
+-    let response = CanonicalModelResponse::from_messages(
+-        vec![prefix.clone(), suffix.clone()],
+-        vec![],
+-        FinishReason::Stop,
+-    );
+-    let (model, recorder) = recording_model(vec![
+-        ModelStreamEvent::MessageCompleted {
+-            message: prefix.clone(),
+-        },
+-        ModelStreamEvent::Response { response },
+-    ]);
+-    let events = model
+-        .stream(request("failure-progress", "suffix"))
+-        .await
+-        .unwrap()
+-        .collect::<Vec<_>>()
+-        .await;
+-    assert_eq!(events.len(), 2);
+-    let Ok(ModelStreamEvent::Response { response }) = &events[1] else {
+-        panic!("terminal response missing");
+-    };
+-    assert_eq!(response.messages, [prefix, suffix]);
+-    assert_eq!(recorder.facts.lock().await.responses.len(), 1);
++    for include_suffix in [false, true] {
++        let prefix = completed("prefix", MessagePhase::Commentary);
++        let mut expected = vec![prefix.clone()];
++        if include_suffix {
++            expected.push(completed("suffix", MessagePhase::FinalAnswer));
++        }
++        let mut terminal = expected.clone();
++        for part in &mut terminal[0].parts {
++            part.part_id = new_part_id();
++        }
++        let response = CanonicalModelResponse::from_messages(terminal, vec![], FinishReason::Stop);
++        let (model, recorder) = recording_model(vec![
++            ModelStreamEvent::MessageCompleted {
++                message: prefix.clone(),
++            },
++            ModelStreamEvent::Response { response },
++        ]);
++        let events = model
++            .stream(request("failure-progress", "suffix"))
++            .await
++            .unwrap()
++            .collect::<Vec<_>>()
++            .await;
++        assert_eq!(events.len(), 2);
++        let Ok(ModelStreamEvent::MessageCompleted { message }) = &events[0] else {
++            panic!("completed message missing");
++        };
++        assert_eq!(message, &prefix);
++        let Ok(ModelStreamEvent::Response { response }) = &events[1] else {
++            panic!("terminal response missing");
++        };
++        assert_eq!(response.messages, expected);
++        let facts = recorder.facts.lock().await;
++        assert_eq!(facts.responses.len(), 1);
++        assert_eq!(&facts.responses[0].1, response);
++        assert!(facts.errors.is_empty());
++    }
++}
++
++#[tokio::test]
++async fn empty_terminal_suffix_still_validates_response_envelope() {
++    let prefix = completed("accepted prefix", MessagePhase::Commentary);
++    let cases = [
++        (
++            vec![],
++            CanonicalModelResponse::from_messages(vec![], vec![], FinishReason::Stop),
++            "model response must contain at least one message",
++        ),
++        (
++            vec![prefix.clone()],
++            CanonicalModelResponse::new(prefix.clone(), vec![], FinishReason::ToolCalls),
++            "finish_reason=ToolCalls without tool calls",
++        ),
++        (
++            vec![prefix.clone()],
++            CanonicalModelResponse::new(prefix.clone(), vec![], FinishReason::Length),
++            "hit the length limit",
++        ),
++        (
++            vec![prefix.clone()],
++            CanonicalModelResponse::new(
++                prefix.clone(),
++                vec![ToolCall::new("stray_call", "probe", serde_json::json!({}))],
++                FinishReason::Stop,
++            ),
++            "included tool calls with finish_reason=Stop",
++        ),
++    ];
++    for (completed_messages, response, expected_error) in cases {
++        let mut events = completed_messages
++            .iter()
++            .cloned()
++            .map(|message| ModelStreamEvent::MessageCompleted { message })
++            .collect::<Vec<_>>();
++        events.push(ModelStreamEvent::Response { response });
++        let (model, recorder) = recording_model(events);
++        let error = model
++            .complete(request("failure-progress", "empty suffix envelope"))
++            .await
++            .unwrap_err();
++        let failure = ModelFailure::from_error(&error);
++        assert!(
++            failure.message.contains(expected_error),
++            "expected {expected_error:?}, got {failure:?}"
++        );
++        assert_eq!(failure.completed_messages, completed_messages);
++        let facts = recorder.facts.lock().await;
++        assert!(facts.responses.is_empty());
++        assert_eq!(facts.errors.len(), 1);
++        assert_eq!(facts.errors[0].2, completed_messages);
++    }
+ }
+ 
+ #[tokio::test]

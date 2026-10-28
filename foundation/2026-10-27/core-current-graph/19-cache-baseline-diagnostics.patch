@@ -1,0 +1,226 @@
+diff --git a/crates/proteus-core/src/core/session_store/read_cache.rs b/crates/proteus-core/src/core/session_store/read_cache.rs
+--- a/crates/proteus-core/src/core/session_store/read_cache.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache.rs
+@@ -162,18 +162,108 @@
+     Some((source, data, fresh))
+ }
+ 
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum SaveStage {
++    Start,
++    CachePath,
++    GateOpen,
++    GateAcquire,
++    SourceBefore,
++    TempCreate,
++    SqliteOpen,
++    SqliteBegin,
++    SqliteSchema,
++    SourceRow,
++    DataRow,
++    Commit,
++    Close,
++    Sync,
++    SourceAfter,
++    JournalCleanup,
++    Rename,
++    Complete,
++}
++
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum SaveOutcome {
++    InProgress,
++    Saved,
++    Failed,
++}
++
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct SaveDiagnostic {
++    stage: SaveStage,
++    outcome: SaveOutcome,
++}
++
++#[cfg(test)]
++std::thread_local! {
++    static SAVE_DIAGNOSTIC: std::cell::Cell<SaveDiagnostic> =
++        const { std::cell::Cell::new(SaveDiagnostic {
++            stage: SaveStage::Start,
++            outcome: SaveOutcome::InProgress,
++        }) };
++}
++
++#[cfg(test)]
++fn note_save_stage(stage: SaveStage) {
++    SAVE_DIAGNOSTIC.with(|slot| {
++        let mut diagnostic = slot.get();
++        diagnostic.stage = stage;
++        slot.set(diagnostic);
++    });
++}
++
++#[cfg(test)]
++fn note_save_outcome(outcome: SaveOutcome) {
++    SAVE_DIAGNOSTIC.with(|slot| {
++        let mut diagnostic = slot.get();
++        diagnostic.outcome = outcome;
++        slot.set(diagnostic);
++    });
++}
++
++/// Synchronous, thread-local test evidence only; not a production error API.
++#[cfg(test)]
++pub(crate) fn last_save_diagnostic() -> SaveDiagnostic {
++    SAVE_DIAGNOSTIC.with(std::cell::Cell::get)
++}
++
+ pub(crate) fn save<T: Serialize>(
+     dir: &Path,
+     name: &str,
+     source: &SourceFingerprint,
+     data: &T,
+ ) -> bool {
++    #[cfg(test)]
++    {
++        note_save_stage(SaveStage::Start);
++        note_save_outcome(SaveOutcome::InProgress);
++    }
+     let save = || {
+         let writer = Writer::new(dir, name, source)?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::DataRow);
+         writer.one("data", data)?;
+         writer.finish()
+     };
+-    save().is_some()
++    let saved = save().is_some();
++    #[cfg(test)]
++    {
++        if saved {
++            note_save_stage(SaveStage::Complete);
++        }
++        note_save_outcome(if saved {
++            SaveOutcome::Saved
++        } else {
++            SaveOutcome::Failed
++        });
++    }
++    saved
+ }
+ 
+ fn serialize_bounded<T: Serialize>(data: &T) -> Option<Vec<u8>> {
+diff --git a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+@@ -120,12 +120,18 @@
+         name: &str,
+         source: &SourceFingerprint,
+     ) -> Option<Self> {
++        #[cfg(test)]
++        note_save_stage(SaveStage::CachePath);
+         let path = cache_path(dir, name)?;
+         let lock = write_lock(dir, name)?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::SourceBefore);
+         if SourceFingerprint::read(dir, MAX_BLOBS).as_ref() != Some(source) {
+             return None;
+         }
+         let temp = dir.join(format!(".read-{name}.tmp.{}", new_record_id()));
++        #[cfg(test)]
++        note_save_stage(SaveStage::TempCreate);
+         OpenOptions::new()
+             .create_new(true)
+             .write(true)
+@@ -141,15 +147,23 @@
+             source: source.clone(),
+             _lock: lock,
+         };
++        #[cfg(test)]
++        note_save_stage(SaveStage::SqliteOpen);
+         writer.conn = Some(Connection::open(&writer.temp).ok()?);
+         let conn = writer.conn.as_ref()?;
+         // This is a replacement snapshot, not an append writer: no persistent WAL/SHM files.
++        #[cfg(test)]
++        note_save_stage(SaveStage::SqliteBegin);
+         conn.execute_batch(
+             "PRAGMA cache_size=-2048; PRAGMA mmap_size=0;
+             PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; BEGIN IMMEDIATE",
+         )
+         .ok()?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::SqliteSchema);
+         conn.execute_batch(SCHEMA).ok()?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::SourceRow);
+         writer.one(
+             "source",
+             &Source {
+@@ -188,9 +202,17 @@
+     }
+ 
+     pub(in crate::core::session_store) fn finish(mut self) -> Option<()> {
++        #[cfg(test)]
++        note_save_stage(SaveStage::Commit);
+         self.conn.as_ref()?.execute_batch("COMMIT").ok()?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::Close);
+         self.conn.take()?.close().ok()?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::Sync);
+         fs::File::open(&self.temp).ok()?.sync_all().ok()?;
++        #[cfg(test)]
++        note_save_stage(SaveStage::SourceAfter);
+         if SourceFingerprint::read(&self.dir, MAX_BLOBS).as_ref() != Some(&self.source) {
+             return None;
+         }
+@@ -200,11 +222,15 @@
+         // excludes another live writer while the generation is replaced.
+         let mut journal = self.path.as_os_str().to_owned();
+         journal.push("-journal");
++        #[cfg(test)]
++        note_save_stage(SaveStage::JournalCleanup);
+         match fs::remove_file(PathBuf::from(journal)) {
+             Ok(()) => {}
+             Err(error) if error.kind() == ErrorKind::NotFound => {}
+             Err(_) => return None,
+         }
++        #[cfg(test)]
++        note_save_stage(SaveStage::Rename);
+         fs::rename(&self.temp, &self.path).ok()?;
+         Some(())
+     }
+@@ -223,7 +249,11 @@
+ }
+ 
+ fn write_lock(dir: &Path, name: &str) -> Option<fs::File> {
++    #[cfg(test)]
++    note_save_stage(SaveStage::GateOpen);
+     let lock = lock_file(dir, name)?;
++    #[cfg(test)]
++    note_save_stage(SaveStage::GateAcquire);
+     lock.try_lock().ok()?;
+     Some(lock)
+ }
+diff --git a/crates/proteus-core/src/core/session_store/catalog/cache/tests.rs b/crates/proteus-core/src/core/session_store/catalog/cache/tests.rs
+--- a/crates/proteus-core/src/core/session_store/catalog/cache/tests.rs
++++ b/crates/proteus-core/src/core/session_store/catalog/cache/tests.rs
+@@ -345,12 +345,11 @@
+             "workspace_path" => wrong.workspace_path = root.path().join("wrong"),
+             _ => wrong.session_id = new_session_id(),
+         }
+-        assert!(read_cache::save(
+-            store.session_dir(),
+-            DISK_NAME,
+-            &source,
+-            &wrong
+-        ));
++        assert!(
++            read_cache::save(store.session_dir(), DISK_NAME, &source, &wrong),
++            "{field}: {:?}",
++            read_cache::last_save_diagnostic()
++        );
+         let reads = Cell::new(0);
+         let actual = counted(
+             &Mutex::new(SummaryCache::default()),
