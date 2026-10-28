@@ -1,0 +1,392 @@
+diff --git a/crates/proteus-core/src/core/session_store/read_model.rs b/crates/proteus-core/src/core/session_store/read_model.rs
+--- a/crates/proteus-core/src/core/session_store/read_model.rs
++++ b/crates/proteus-core/src/core/session_store/read_model.rs
+@@ -82,6 +82,8 @@
+         #[cfg(unix)]
+         let source = super::read_cache::SourceFingerprint::read(self.session_dir(), 8192);
+         let projection = self.load_projection()?;
++        #[cfg(all(test, unix))]
++        recovery_delete_control::after_projection(self)?;
+         let transcript = render(&projection);
+         let model = SessionReadModel::from_projection(self, projection, transcript)?;
+         #[cfg(unix)]
+@@ -172,3 +174,74 @@
+             .unwrap_or_else(|e| e.into_inner()) = Some(CachedReadMetadata { revision, usage });
+     }
+ }
++
++#[cfg(all(test, unix))]
++mod recovery_delete_control {
++    use super::SessionStore;
++    use std::{cell::RefCell, path::PathBuf, sync::mpsc, time::Duration};
++
++    struct Pause {
++        session_dir: PathBuf,
++        entered: tokio::sync::oneshot::Sender<()>,
++        resume: mpsc::Receiver<()>,
++    }
++
++    thread_local! {
++        static PAUSE: RefCell<Option<Pause>> = const { RefCell::new(None) };
++    }
++
++    pub(super) fn after_projection(store: &SessionStore) -> anyhow::Result<()> {
++        let pause = PAUSE.with(|slot| {
++            let mut slot = slot.borrow_mut();
++            if slot
++                .as_ref()
++                .is_some_and(|pause| pause.session_dir.as_path() == store.session_dir())
++            {
++                slot.take()
++            } else {
++                None
++            }
++        });
++        if let Some(pause) = pause {
++            pause
++                .entered
++                .send(())
++                .map_err(|_| anyhow::anyhow!("recovery control observer dropped"))?;
++            pause
++                .resume
++                .recv_timeout(Duration::from_secs(10))
++                .map_err(|error| anyhow::anyhow!("bounded recovery projection pause: {error}"))?;
++        }
++        Ok(())
++    }
++
++    impl SessionStore {
++        /// Arm only this blocking thread and exact session; cleanup also runs on panic.
++        pub(crate) fn with_project_read_model_pause_for_test<T>(
++            &self,
++            entered: tokio::sync::oneshot::Sender<()>,
++            resume: mpsc::Receiver<()>,
++            read: impl FnOnce() -> anyhow::Result<T>,
++        ) -> anyhow::Result<T> {
++            PAUSE.with(|slot| {
++                let mut slot = slot.borrow_mut();
++                assert!(slot.is_none(), "nested recovery control");
++                *slot = Some(Pause {
++                    session_dir: self.session_dir().to_owned(),
++                    entered,
++                    resume,
++                });
++            });
++            struct Reset;
++            impl Drop for Reset {
++                fn drop(&mut self) {
++                    PAUSE.with(|slot| {
++                        slot.borrow_mut().take();
++                    });
++                }
++            }
++            let _reset = Reset;
++            read()
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/deletion.rs b/crates/proteus-core/src/core/session_store/deletion.rs
+--- a/crates/proteus-core/src/core/session_store/deletion.rs
++++ b/crates/proteus-core/src/core/session_store/deletion.rs
+@@ -30,6 +30,27 @@
+     pub(crate) async fn delete_owned(&self, config_root: &Path, workspace: &Path) -> Result<bool> {
+         self.delete_owned_with(config_root, workspace, || Ok(()))
+             .await
++    }
++
++    /// Test-only access to the existing worker seam; no replacement deletion logic.
++    #[cfg(all(test, unix))]
++    pub(crate) async fn delete_owned_paused_for_test(
++        &self,
++        config_root: &Path,
++        workspace: &Path,
++        entered: tokio::sync::oneshot::Sender<()>,
++        resume: std::sync::mpsc::Receiver<()>,
++    ) -> Result<bool> {
++        self.delete_owned_with(config_root, workspace, move || {
++            entered
++                .send(())
++                .map_err(|_| anyhow!("delete control observer dropped"))?;
++            resume
++                .recv_timeout(std::time::Duration::from_secs(10))
++                .context("bounded owned deletion pause")?;
++            Ok(())
++        })
++        .await
+     }
+ 
+     async fn delete_owned_with(
+diff --git a/crates/proteus-core/src/app_server/read_model/tests.rs b/crates/proteus-core/src/app_server/read_model/tests.rs
+--- a/crates/proteus-core/src/app_server/read_model/tests.rs
++++ b/crates/proteus-core/src/app_server/read_model/tests.rs
+@@ -112,3 +112,270 @@
+     assert!(!index.exists());
+     assert_eq!(std::fs::read(store.journal_path()).unwrap(), damaged);
+ }
++
++/// One libtest case; four schedules, not four independently counted tests.
++#[tokio::test]
++async fn history_recovery_overlaps_owned_deletion_without_mutation_or_recreation() {
++    use std::{
++        collections::BTreeMap,
++        fs::{File, OpenOptions, TryLockError},
++        io::{Read, Seek, SeekFrom},
++        path::{Path, PathBuf},
++        sync::mpsc,
++        time::Duration,
++    };
++    const WATCHDOG: Duration = Duration::from_secs(10);
++
++    // Derived read indexes/locks may change. Everything else in this small
++    // fixture is canonical; retain open inodes to check bytes after unlink.
++    fn canonical_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
++        fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
++            for entry in std::fs::read_dir(dir).unwrap() {
++                let entry = entry.unwrap();
++                let path = entry.path();
++                if dir == root
++                    && entry
++                        .file_name()
++                        .to_str()
++                        .is_some_and(|name| name.starts_with(".read-"))
++                {
++                    continue;
++                }
++                let kind = entry.file_type().unwrap();
++                assert!(!kind.is_symlink(), "unexpected canonical symlink");
++                if kind.is_dir() {
++                    visit(root, &path, out);
++                } else {
++                    assert!(kind.is_file(), "unexpected canonical file kind");
++                    out.insert(
++                        path.strip_prefix(root).unwrap().to_owned(),
++                        std::fs::read(path).unwrap(),
++                    );
++                }
++            }
++        }
++        let mut out = BTreeMap::new();
++        visit(root, root, &mut out);
++        out
++    }
++
++    struct Release(Option<mpsc::Sender<()>>);
++    impl Drop for Release {
++        fn drop(&mut self) {
++            if let Some(sender) = self.0.take() {
++                let _ = sender.send(());
++            }
++        }
++    }
++
++    fn accept_read(result: anyhow::Result<AppTranscriptPage>, expected: &AppTranscriptPage) {
++        match result {
++            Ok(page) => {
++                assert_eq!(page.revision, expected.revision, "no relabeled revision");
++                assert_eq!((page.start, page.total), (expected.start, expected.total));
++                assert_eq!(
++                    serde_json::to_value(page.messages).unwrap(),
++                    serde_json::to_value(&expected.messages).unwrap()
++                );
++                assert!(
++                    page.base.is_none(),
++                    "recovery cannot invent a lost display base"
++                );
++            }
++            Err(error) => {
++                let missing = error.chain().any(|cause| {
++                    cause
++                        .downcast_ref::<std::io::Error>()
++                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
++                });
++                let explicit = matches!(
++                    error.to_string().as_str(),
++                    "history source cannot be fingerprinted"
++                        | "history source revision is unavailable"
++                        | "history revision changed; refresh the session snapshot"
++                        | "history source changed during recovery; refresh the session snapshot"
++                        | "session writer generation is retired"
++                );
++                assert!(
++                    missing || explicit,
++                    "unexpected recovery failure: {error:#}"
++                );
++            }
++        }
++    }
++
++    for damage in ["missing", "malformed"] {
++        for remove_first in [false, true] {
++            let (_root, _workspace, store, expected) = fixture(51).await;
++            let session_dir = store.session_dir().to_owned();
++            let index = session_dir.join(".read-view.sqlite");
++            match damage {
++                "missing" => std::fs::remove_file(index).unwrap(),
++                "malformed" => std::fs::write(index, b"not a SQLite database").unwrap(),
++                _ => unreachable!(),
++            }
++            assert!(
++                store
++                    .saved_transcript_page(None, Some(&expected.revision))
++                    .is_none()
++            );
++            let original = canonical_bytes(&session_dir);
++            assert!(original.contains_key(Path::new("journal.jsonl")));
++            assert!(original.contains_key(Path::new("session.json")));
++            let mut pinned: Vec<_> = original
++                .iter()
++                .map(|(path, bytes)| {
++                    (
++                        path.clone(),
++                        File::open(session_dir.join(path)).unwrap(),
++                        bytes.clone(),
++                    )
++                })
++                .collect();
++            let lease_path = session_dir.parent().unwrap().join(format!(
++                ".{}.write.lock",
++                session_dir.file_name().unwrap().to_str().unwrap()
++            ));
++            // Reopen the stable external inode: never dup the owner's descriptor.
++            let lease = OpenOptions::new()
++                .read(true)
++                .write(true)
++                .open(lease_path)
++                .unwrap();
++            assert!(matches!(lease.try_lock(), Err(TryLockError::WouldBlock)));
++
++            let (read_entered, read_ready) = tokio::sync::oneshot::channel();
++            let (read_release, read_resume) = mpsc::channel();
++            let read_release = Release(Some(read_release));
++            let read_store = store.clone();
++            let revision = expected.revision.clone();
++            let reading = tokio::task::spawn_blocking(move || {
++                read_store.with_project_read_model_pause_for_test(read_entered, read_resume, || {
++                    transcript_page(&read_store, None, Some(&revision))
++                })
++            });
++            tokio::time::timeout(WATCHDOG, read_ready)
++                .await
++                .expect("recovery reaches real projection")
++                .expect("projection worker signaled");
++
++            let (delete_entered, delete_ready) = tokio::sync::oneshot::channel();
++            let (delete_release, delete_resume) = mpsc::channel();
++            let delete_release = Release(Some(delete_release));
++            let delete_store = store.clone();
++            let config = _root.path().to_owned();
++            let workspace = _workspace.path().to_owned();
++            let deleting = tokio::spawn(async move {
++                delete_store
++                    .delete_owned_paused_for_test(
++                        &config,
++                        &workspace,
++                        delete_entered,
++                        delete_resume,
++                    )
++                    .await
++            });
++            tokio::time::timeout(WATCHDOG, delete_ready)
++                .await
++                .expect("delete reaches actual retired worker")
++                .expect("delete worker signaled");
++
++            // Both handshakes came from real paths. No elapsed duration is used
++            // as overlap evidence: projection is parked and deletion owns the lease.
++            assert!(session_dir.is_dir());
++            assert!(
++                matches!(lease.try_lock(), Err(TryLockError::WouldBlock)),
++                "RECOVERY_OWNED_DELETE: worker must retain the actual OS lease"
++            );
++            let late = [CanonicalMessage::text(
++                MessageRole::User,
++                "late stale write",
++            )];
++            let error =
++                tokio::time::timeout(WATCHDOG, store.append_history(new_thread_id(), None, &late))
++                    .await
++                    .expect("retired append must not wait on removal")
++                    .expect_err("retired clone rejects a stale write");
++            assert_eq!(error.to_string(), "session writer generation is retired");
++            assert_eq!(canonical_bytes(&session_dir), original);
++
++            if remove_first {
++                drop(delete_release);
++                assert!(
++                    tokio::time::timeout(WATCHDOG, deleting)
++                        .await
++                        .expect("owned deletion terminates")
++                        .expect("delete task")
++                        .expect("owned deletion")
++                );
++                assert!(!session_dir.exists());
++                lease
++                    .try_lock()
++                    .expect("lease closes only after actual deletion");
++                drop(lease); // A competing probe must not mask a stale write as Busy.
++                drop(read_release);
++                let result = tokio::time::timeout(WATCHDOG, reading)
++                    .await
++                    .expect("recovery terminates after deletion")
++                    .expect("recovery worker");
++                accept_read(result, &expected);
++            } else {
++                drop(read_release);
++                let result = tokio::time::timeout(WATCHDOG, reading)
++                    .await
++                    .expect("recovery terminates while removal is paused")
++                    .expect("recovery worker");
++                // A coherent old page is allowed even though the generation is retired.
++                accept_read(result, &expected);
++                assert_eq!(canonical_bytes(&session_dir), original);
++                assert!(matches!(lease.try_lock(), Err(TryLockError::WouldBlock)));
++                drop(delete_release);
++                assert!(
++                    tokio::time::timeout(WATCHDOG, deleting)
++                        .await
++                        .expect("owned deletion terminates")
++                        .expect("delete task")
++                        .expect("owned deletion")
++                );
++                assert!(!session_dir.exists());
++                lease
++                    .try_lock()
++                    .expect("lease closes only after actual deletion");
++                drop(lease);
++            }
++
++            for (path, file, expected_bytes) in &mut pinned {
++                file.seek(SeekFrom::Start(0)).unwrap();
++                let mut observed = Vec::new();
++                file.read_to_end(&mut observed).unwrap();
++                assert_eq!(
++                    observed.as_slice(),
++                    expected_bytes.as_slice(),
++                    "canonical inode changed: {}",
++                    path.display()
++                );
++            }
++            let error =
++                tokio::time::timeout(WATCHDOG, store.append_history(new_thread_id(), None, &late))
++                    .await
++                    .expect("post-delete stale append terminates")
++                    .expect_err("retired generation must remain retired after lease release");
++            assert_eq!(error.to_string(), "session writer generation is retired");
++            assert!(
++                !session_dir.exists(),
++                "RECOVERY_OWNED_DELETE: no session recreation"
++            );
++            assert!(
++                SessionStore::open(session_dir.clone()).is_err(),
++                "deleted slot is not resumable"
++            );
++            assert!(
++                !session_dir.exists(),
++                "cold validation must not recreate the slot"
++            );
++            eprintln!(
++                "RECOVERY_OWNED_DELETE_SCHEDULE: damage={damage} remove_first={remove_first} PASS"
++            );
++        }
++    }
++}

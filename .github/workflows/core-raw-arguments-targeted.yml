@@ -1,0 +1,90 @@
+name: Core raw-argument targeted qualification
+
+on:
+  push:
+    branches: [ci/core-raw-arguments-targeted-20261027]
+    paths:
+      - 'foundation/2026-10-27/core-raw-arguments-targeted/**'
+      - '.github/workflows/core-raw-arguments-targeted.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-raw-arguments-targeted
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  RUST_TEST_THREADS: '4'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: '0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  targeted:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/core-raw-arguments-targeted-20261027'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Admit the standard runner with the existing disk reserve
+        run: python3 -c 'import os, shutil; assert shutil.disk_usage(os.environ["RUNNER_TEMP"]).free >= 8 * 1024 ** 3, "initial reserve below 8 GiB"'
+      - name: Install ordinary targeted compile dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev ripgrep curl
+      - name: Install the exact official Rust toolchain
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Fetch immutable PR35 support as inert data and verify before import
+        timeout-minutes: 3
+        run: |
+          mkdir "$RUNNER_TEMP/core-raw-arguments-support"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 --max-filesize 109703 \
+            --output "$RUNNER_TEMP/core-raw-arguments-support/check.py" \
+            https://raw.githubusercontent.com/Qweasd123tg/proteus-modules-dot/72aeaa37b1f81baf105a0ec09f337237dc0b2a7f/foundation/2026-10-27/core-composition/check.py
+          test "$(stat -c '%s' "$RUNNER_TEMP/core-raw-arguments-support/check.py")" -eq 109703
+          echo '2f917a4ca4dc71a3dfa8cf2dc376991a7ddf1580cd347aaff8cb6ccc50568147  '"$RUNNER_TEMP/core-raw-arguments-support/check.py" | sha256sum --check
+      - name: Verify exact package source before import or execution
+        run: |
+          echo '8ea47a1e08dba66437c57d69c2d3a4b2683795bb072575397b8ffb43217e0509  foundation/2026-10-27/core-raw-arguments-targeted/manifest.json' | sha256sum --check
+          echo '091a4e7f619e182b3760e3f9b74d179c6c6ebc953ef42ed5e482d45fa8925496  foundation/2026-10-27/core-raw-arguments-targeted/check.py' | sha256sum --check
+      - name: Reject malformed filtered evidence with pure controls
+        timeout-minutes: 2
+        run: |
+          python3 -B foundation/2026-10-27/core-raw-arguments-targeted/check.py \
+            --helper "$RUNNER_TEMP/core-raw-arguments-support/check.py" --self-test
+      - name: Qualify the three exact sequential source stages
+        run: |
+          python3 -B foundation/2026-10-27/core-raw-arguments-targeted/check.py \
+            --helper "$RUNNER_TEMP/core-raw-arguments-support/check.py" \
+            --work "$RUNNER_TEMP/core-raw-arguments-work" \
+            --evidence "$RUNNER_TEMP/core-raw-arguments-evidence"
+      - name: Independently rebind current-run raw target evidence
+        if: always()
+        run: |
+          echo '8ea47a1e08dba66437c57d69c2d3a4b2683795bb072575397b8ffb43217e0509  foundation/2026-10-27/core-raw-arguments-targeted/manifest.json' | sha256sum --check
+          echo '091a4e7f619e182b3760e3f9b74d179c6c6ebc953ef42ed5e482d45fa8925496  foundation/2026-10-27/core-raw-arguments-targeted/check.py' | sha256sum --check
+          python3 -B foundation/2026-10-27/core-raw-arguments-targeted/check.py \
+            --helper "$RUNNER_TEMP/core-raw-arguments-support/check.py" \
+            --evidence "$RUNNER_TEMP/core-raw-arguments-evidence" \
+            --audit-result "$RUNNER_TEMP/core-raw-arguments-audit.json"
+      - name: Retain bounded raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-raw-arguments-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/core-raw-arguments-evidence/result.json
+            ${{ runner.temp }}/core-raw-arguments-evidence/*.log
+            ${{ runner.temp }}/core-raw-arguments-audit.json
+          if-no-files-found: warn
+          retention-days: 7

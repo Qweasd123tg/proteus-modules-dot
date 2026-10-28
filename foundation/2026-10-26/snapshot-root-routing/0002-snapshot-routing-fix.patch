@@ -1,0 +1,27 @@
+diff --git a/src/ui/chat/session.rs b/src/ui/chat/session.rs
+--- a/src/ui/chat/session.rs
++++ b/src/ui/chat/session.rs
+@@ -61,6 +61,7 @@
+     ) -> (Change, bool) {
+         self.execution = snapshot.execution;
+         self.root_thread = snapshot.root_thread_id;
++        self.transcript.set_root_thread(snapshot.root_thread_id);
+         history.apply(&mut self.transcript, snapshot.transcript, snapshot.history)
+     }
+ 
+diff --git a/src/transcript/mod.rs b/src/transcript/mod.rs
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -58,6 +58,12 @@
+ }
+ 
+ impl Transcript {
++    /// Snapshots replace the routing baseline too: TurnStarted may already be
++    /// included in the snapshot and will not be replayed on this connection.
++    pub fn set_root_thread(&mut self, root: Option<ThreadId>) {
++        self.turn_thread = root;
++    }
++
+     pub fn entries(&self) -> &[Entry] {
+         &self.entries
+     }

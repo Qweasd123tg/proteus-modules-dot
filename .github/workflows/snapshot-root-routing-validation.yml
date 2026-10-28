@@ -1,0 +1,56 @@
+name: Desktop snapshot-root routing regressions
+
+# Isolated experiment in modules repository only; no upstream CI changes.
+on:
+  push:
+    branches: [ci/snapshot-root-routing-20261026]
+    paths:
+      - 'foundation/2026-10-26/snapshot-root-routing/**'
+      - '.github/workflows/snapshot-root-routing-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot-root-routing-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '4'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  regression:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/snapshot-root-routing-20261026'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, existing reviewed bundle pin
+        with:
+          persist-credentials: false
+      - name: Install compiler and native Desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev
+      - name: Install official pinned Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Verify composed source and behavioral fail-before/pass-after gates
+        run: |
+          python3 foundation/2026-10-26/snapshot-root-routing/run_validation.py \
+            --work-dir "$RUNNER_TEMP/proteus-snapshot-root-routing" \
+            --evidence-dir "$RUNNER_TEMP/snapshot-root-routing-evidence"
+      - name: Retain bounded non-sensitive evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: snapshot-root-routing-${{ github.sha }}
+          path: ${{ runner.temp }}/snapshot-root-routing-evidence/result.json
+          if-no-files-found: warn
+          retention-days: 7

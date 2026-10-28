@@ -1,0 +1,66 @@
+name: Desktop adjacent-text portable-fast qualification
+
+# Isolated modules-repository experiment; no upstream workflow or release changes.
+on:
+  push:
+    branches: [ci/adjacent-text-portable-fast-20261027]
+    paths:
+      - 'foundation/2026-10-27/adjacent-text-portable-fast/**'
+      - '.github/workflows/adjacent-text-portable-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adjacent-text-portable-fast-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+
+jobs:
+  qualify:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/adjacent-text-portable-fast-20261027'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pinned upstream v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # pinned upstream v7.0.0
+        with:
+          python-version: '3.12.15'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # pinned upstream v7.1.0
+        with:
+          node-version: '22.23.4'
+          package-manager-cache: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libxcb-randr0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libwayland-dev libvulkan-dev libegl1-mesa-dev
+      - name: Install official pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Prove bounded controller failure cleanup with synthetic processes
+        run: |
+          python3 foundation/2026-10-27/adjacent-text-portable-fast/test_controller.py \
+            --root "$RUNNER_TEMP/adjacent-text-portable-controller-fixtures" \
+            --report "$RUNNER_TEMP/adjacent-text-portable-controller.json"
+      - name: Reconstruct committed candidate, refresh portable-fast and probe the folder
+        run: |
+          python3 foundation/2026-10-27/adjacent-text-portable-fast/run_qualification.py \
+            --work-dir "$RUNNER_TEMP/adjacent-text-portable-work" \
+            --evidence-dir "$RUNNER_TEMP/adjacent-text-portable-evidence"
+      - name: Retain bounded non-sensitive qualification evidence, never binaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # existing reviewed v4.6.2
+        with:
+          name: adjacent-text-portable-fast-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/adjacent-text-portable-controller.json
+            ${{ runner.temp }}/adjacent-text-portable-evidence/result.json
+            ${{ runner.temp }}/adjacent-text-portable-evidence/portable-inventory.json
+            ${{ runner.temp }}/adjacent-text-portable-evidence/source-commit.txt
+          if-no-files-found: warn
+          retention-days: 7

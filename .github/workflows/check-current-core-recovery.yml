@@ -1,0 +1,57 @@
+name: Current Core recovery qualification
+
+# Isolated opt-in branch only; upstream/manual CI policies stay unchanged.
+on:
+  push:
+    branches: [ci/current-core-recovery-20261026]
+    paths:
+      - 'foundation/2026-10-26/current-core-recovery/**'
+      - '.github/workflows/check-current-core-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: current-core-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '4'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: '0'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  recovery:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/current-core-recovery-20261026'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, upstream Core pin
+        with:
+          persist-credentials: false
+      - name: Install compiler dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep
+      - name: Install official pinned Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Prove current-source failure and corrected app-server regressions
+        run: |
+          python3 -B foundation/2026-10-26/current-core-recovery/run_validation.py \
+            --work-dir "$RUNNER_TEMP/current-core-recovery" \
+            --evidence-dir "$RUNNER_TEMP/current-core-recovery-evidence"
+      - name: Retain bounded qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: current-core-recovery-${{ github.sha }}
+          path: ${{ runner.temp }}/current-core-recovery-evidence/result.json
+          if-no-files-found: warn
+          retention-days: 7

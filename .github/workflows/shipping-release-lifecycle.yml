@@ -1,0 +1,167 @@
+name: Private product-free shipping-wrapper lifecycle
+
+on:
+  push:
+    branches: [ci/shipping-smoke-lifecycle-20261028]
+    paths:
+      - '.github/workflows/shipping-release-lifecycle.yml'
+      - 'benchmarks/shipping-lifecycle-launch.py'
+      - 'benchmarks/shipping-lifecycle-admission/**'
+      - 'benchmarks/shipping-stdio-capture.py'
+      - 'benchmarks/shipping-smoke-supervisor.py'
+      - 'benchmarks/shipping-smoke-lifecycle-controls.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shipping-wrapper-lifecycle-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ROOT_AUTHORIZATION_SHA256: "3f09c13c0d6ee1611eec64f7ec8d2153ea65c4a768a5075f6266eced216f905e"
+  LAUNCHER_SHA256: "c62337cef3ffcef598ff4d3d0e58c117626c4cb692bbe7d9b7eba4f218201eb1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONOPTIMIZE: "0"
+
+jobs:
+  lifecycle-only:
+    if: github.event_name == 'push' && github.run_attempt == 1 && github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/shipping-smoke-lifecycle-20261028'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 12
+    steps:
+      - name: Read exact reviewed source publication
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: wrapper-source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Require explicit lifecycle-only authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$ROOT_AUTHORIZATION_SHA256" != "UNSEALED"
+          test "$(printf %s "$ROOT_AUTHORIZATION_SHA256" | wc -c)" -eq 64
+          case "$ROOT_AUTHORIZATION_SHA256" in *[!0-9a-f]*) exit 1;; esac
+          source="$GITHUB_WORKSPACE/wrapper-source"
+          admission="$source/benchmarks/shipping-lifecycle-admission"
+          echo "$ROOT_AUTHORIZATION_SHA256  $admission/authorization.json" | sha256sum --check
+          echo "$LAUNCHER_SHA256  $source/benchmarks/shipping-lifecycle-launch.py" | sha256sum --check
+          test "$(git -C "$source" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$admission/bindings.json"
+          # Exact GitHub head is independently admitted after publication.
+          # No self-referential future commit SHA is embedded in authorization.
+
+      - name: Product-free synthetic process and tiny evidence controls
+        id: lifecycle
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/proteus-shipping-lifecycle"
+          mkdir -m 700 "$root"
+          source="$GITHUB_WORKSPACE/wrapper-source"
+          admission="$source/benchmarks/shipping-lifecycle-admission"
+          exec python3 -I -B -S "$source/benchmarks/shipping-lifecycle-launch.py" \
+            --mode lifecycle-only \
+            --authorization "$admission/authorization.json" \
+            --authorization-sha256 "$ROOT_AUTHORIZATION_SHA256" \
+            --bindings "$admission/bindings.json" \
+            --workflow "$source/.github/workflows/shipping-release-lifecycle.yml" \
+            --work "$root/work" --evidence "$root/evidence" \
+            --terminal "$root/terminal-control.jsonl"
+
+      - name: Select one verified package or failure-prefix representative
+        id: transport
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          EXPECT_SUCCESS: ${{ steps.lifecycle.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -I -B -S - <<'PY'
+          import hashlib, json, os, stat
+          from pathlib import Path
+          expected_success = os.environ["EXPECT_SUCCESS"] == "true"
+          root = Path(os.environ["RUNNER_TEMP"])/"proteus-shipping-lifecycle"
+          terminal = root/"terminal-control.jsonl"
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as output:
+              output.write("terminal=\narchive=\n")
+              if not terminal.exists():
+                  assert not expected_success, "successful lifecycle lacks terminal receipt"
+                  raise SystemExit(0)
+              info=terminal.lstat()
+              assert stat.S_ISREG(info.st_mode) and info.st_size <= 1024**2
+              output.write("terminal="+str(terminal)+"\n")
+              raw=terminal.read_bytes()
+              if not raw.endswith(b"\n"):
+                  assert not expected_success, "successful lifecycle has torn terminal receipt"
+                  raise SystemExit(0)
+              try:
+                  last=json.loads(raw.splitlines()[-1])
+              except (ValueError,IndexError):
+                  assert not expected_success, "successful lifecycle has invalid terminal receipt"
+                  raise SystemExit(0)
+              if last.get("kind") != "terminal":
+                  assert not expected_success, "successful lifecycle has no terminal frame"
+                  raise SystemExit(0)
+              receipt=last["value"]
+              if expected_success:
+                  assert receipt["status"] == "LIFECYCLE_TERMINAL_COMPLETE_AWAITING_JOB_SUCCESS"
+                  assert receipt["owned_cleanup_complete"] is True and not receipt["forced_owned_pids"]
+              name=receipt.get("archive_path")
+              if name is None:
+                  assert not expected_success, "successful lifecycle lacks archive observation"
+                  raise SystemExit(0)
+              assert name in {str(root/"evidence.tar.gz"),str(root/"evidence.tar.gz.partial")}
+              path=Path(name)
+              before=path.lstat()
+              assert stat.S_ISREG(before.st_mode) and before.st_size <= 16*1024**2
+              digest,size=hashlib.sha256(),0
+              fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+              try:
+                  opened=os.fstat(fd)
+                  assert (opened.st_dev,opened.st_ino) == (before.st_dev,before.st_ino)
+                  while True:
+                      chunk=os.read(fd,65536)
+                      if not chunk:
+                          break
+                      size += len(chunk)
+                      assert size <= 16*1024**2
+                      digest.update(chunk)
+                  after=os.fstat(fd)
+                  assert (before.st_size,before.st_mtime_ns,before.st_ctime_ns) == \
+                         (after.st_size,after.st_mtime_ns,after.st_ctime_ns)
+              finally:
+                  os.close(fd)
+              assert size == before.st_size == receipt["archive"]["bytes"]
+              assert digest.hexdigest() == receipt["archive"]["sha256"]
+              assert size+len(raw)+65536 < 256*1024**2
+              # Never upload both complete/partial hardlink aliases.
+              output.write("archive="+name+"\n")
+          PY
+
+      - name: Retain one bounded artifact and terminal sidecar even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wrapper-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.transport.outputs.archive }}
+            ${{ steps.transport.outputs.terminal }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: External job terminal authority; shipping remains NOT RUN
+        if: always()
+        shell: bash
+        env:
+          LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
+          TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
+        run: |
+          test "$LIFECYCLE_OUTCOME" = "success"
+          test "$TRANSPORT_OUTCOME" = "success"
+          echo "Product-free lifecycle only; shipping builds, Core, Modules, seed and replay: NOT_RUN"

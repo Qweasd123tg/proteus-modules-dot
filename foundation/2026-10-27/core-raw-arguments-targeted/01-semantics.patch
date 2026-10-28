@@ -1,0 +1,631 @@
+diff --git a/crates/proteus-core/src/core/bound_tools_tests.rs b/crates/proteus-core/src/core/bound_tools_tests.rs
+index a8b8fd899ce3a0fcebe4b04e1c39a1b651c8fb95..9f9a1c499fc6efca18caee0366cbab52a4ad3f7e 100644
+--- a/crates/proteus-core/src/core/bound_tools_tests.rs
++++ b/crates/proteus-core/src/core/bound_tools_tests.rs
+@@ -63,3 +63,6 @@
+         false
+     ));
+ }
++
++#[path = "bound_tools/raw_arguments_tests.rs"]
++mod raw_arguments;
+diff --git a/crates/proteus-core/src/core/bound_tools/raw_arguments_tests.rs b/crates/proteus-core/src/core/bound_tools/raw_arguments_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..95bc76e86dac514591aed1abf1251114974dfcda
+--- /dev/null
++++ b/crates/proteus-core/src/core/bound_tools/raw_arguments_tests.rs
+@@ -0,0 +1,614 @@
++use super::super::*;
++use crate::{
++    contracts::{
++        ApprovalResponse, CancellationToken, HookEvent, HookHandler, HookInput, HookResponse,
++        NoopExecutionRecorder, OperationOwner, Tool,
++    },
++    core::RuntimeHookChain,
++    domain::ToolSafety,
++};
++use std::sync::Mutex;
++
++#[derive(Debug, Clone)]
++enum Step {
++    Call(&'static str, ToolCall),
++    Resolution(ToolCall, ToolCallResolution),
++    Result(&'static str, ToolResult),
++}
++
++type Trace = Arc<Mutex<Vec<Step>>>;
++
++fn call_step(trace: &Trace, stage: &'static str, call: &ToolCall) {
++    trace.lock().unwrap().push(Step::Call(stage, call.clone()));
++}
++
++fn stages(trace: &Trace) -> Vec<&'static str> {
++    trace
++        .lock()
++        .unwrap()
++        .iter()
++        .map(|step| match step {
++            Step::Call(stage, _) | Step::Result(stage, _) => *stage,
++            Step::Resolution(_, resolution) => match resolution {
++                ToolCallResolution::Allowed => "allowed",
++                ToolCallResolution::ValidationFailed { .. } => "validation-failed",
++                ToolCallResolution::PolicyDenied { .. } => "policy-denied",
++                ToolCallResolution::HookBlocked { .. } => "hook-blocked",
++                _ => "other-resolution",
++            },
++        })
++        .collect()
++}
++
++fn assert_call_snapshots(trace: &Trace, expected: &ToolCall) {
++    for step in trace.lock().unwrap().iter() {
++        match step {
++            Step::Call(_, call) | Step::Resolution(call, _) => assert_eq!(call, expected),
++            Step::Result(_, _) => {}
++        }
++    }
++}
++
++fn assert_result_snapshots(trace: &Trace, expected: &ToolResult) {
++    for step in trace.lock().unwrap().iter() {
++        if let Step::Result(_, result) = step {
++            assert_eq!(result, expected);
++        }
++    }
++}
++
++fn schema() -> Value {
++    json!({
++        "type": "object",
++        "properties": {"text": {"type": "string"}},
++        "required": ["text"],
++        "additionalProperties": false
++    })
++}
++
++fn spec(input_schema: Value) -> ToolSpec {
++    ToolSpec::new(
++        "probe",
++        "argument probe",
++        input_schema,
++        ToolSafety::ReadOnly,
++    )
++}
++
++struct ProbeTool {
++    trace: Trace,
++    input_schema: Arc<Mutex<Value>>,
++}
++
++#[async_trait]
++impl Tool for ProbeTool {
++    fn spec(&self) -> ToolSpec {
++        spec(self.input_schema.lock().unwrap().clone())
++    }
++
++    async fn invoke(&self, call: &ToolCall, _ctx: ToolContext) -> Result<ToolResult> {
++        call_step(&self.trace, "invoked", call);
++        Ok(ToolResult::ok(call.id.clone(), "ok"))
++    }
++}
++
++struct ProbePolicy(Trace);
++
++impl ApprovalPolicy for ProbePolicy {
++    fn evaluate(&self, call: &ToolCall, _ctx: &PolicyContext) -> PolicyDecision {
++        call_step(&self.0, "policy", call);
++        PolicyDecision::Allow
++    }
++
++    fn evaluate_visibility(&self, _ctx: &PolicyVisibilityContext) -> PolicyDecision {
++        PolicyDecision::Allow
++    }
++}
++
++struct NoApproval;
++
++#[async_trait]
++impl ApprovalTransport for NoApproval {
++    fn can_request_approval(&self) -> bool {
++        false
++    }
++
++    async fn request_approval(&self, _request: ApprovalRequest) -> Result<ApprovalResponse> {
++        panic!("argument fixtures must not request approval")
++    }
++}
++
++#[derive(Clone, Copy)]
++enum Fault {
++    None,
++    RequestedRecorder,
++    RequestedObserver,
++    CancelAfterRequested,
++    AlreadyCanceled,
++}
++
++struct Recorder {
++    trace: Trace,
++    fault: Fault,
++    cancellation: CancellationToken,
++}
++
++#[async_trait]
++impl ToolExecutionRecorder for Recorder {
++    async fn tool_call_requested(
++        &self,
++        _attribution: ExecutionAttribution,
++        _owner: OperationOwner,
++        call: &ToolCall,
++    ) -> Result<()> {
++        call_step(&self.trace, "requested", call);
++        match self.fault {
++            Fault::RequestedRecorder => anyhow::bail!("requested recorder failed"),
++            Fault::CancelAfterRequested => self.cancellation.cancel(),
++            _ => {}
++        }
++        Ok(())
++    }
++
++    async fn tool_call_resolved(
++        &self,
++        _attribution: ExecutionAttribution,
++        call: &ToolCall,
++        resolution: &ToolCallResolution,
++    ) -> Result<()> {
++        self.trace
++            .lock()
++            .unwrap()
++            .push(Step::Resolution(call.clone(), resolution.clone()));
++        Ok(())
++    }
++
++    async fn tool_approval_requested(
++        &self,
++        _attribution: ExecutionAttribution,
++        _call: &ToolCall,
++        _reason: &str,
++    ) -> Result<()> {
++        panic!("argument fixtures must not request approval")
++    }
++
++    async fn tool_effect_recorded(
++        &self,
++        _attribution: ExecutionAttribution,
++        result: &ToolResult,
++    ) -> Result<()> {
++        self.trace
++            .lock()
++            .unwrap()
++            .push(Step::Result("effect", result.clone()));
++        Ok(())
++    }
++
++    async fn tool_result_recorded(
++        &self,
++        _attribution: ExecutionAttribution,
++        result: &ToolResult,
++    ) -> Result<()> {
++        self.trace
++            .lock()
++            .unwrap()
++            .push(Step::Result("recorded", result.clone()));
++        Ok(())
++    }
++}
++
++struct Observer {
++    trace: Trace,
++    fault: Fault,
++}
++
++#[async_trait]
++impl ToolExecutionObserver for Observer {
++    async fn tool_call_requested(&self, call: &ToolCall) -> Result<()> {
++        call_step(&self.trace, "observed", call);
++        if matches!(self.fault, Fault::RequestedObserver) {
++            anyhow::bail!("requested observer failed");
++        }
++        Ok(())
++    }
++
++    async fn tool_call_resolved(&self, call: &ToolCall) -> Result<()> {
++        call_step(&self.trace, "observer-resolved", call);
++        Ok(())
++    }
++
++    async fn approval_requested(&self, _call: &ToolCall, _reason: &str) -> Result<()> {
++        panic!("argument fixtures must not request approval")
++    }
++
++    async fn approval_resolved(&self, _call: &ToolCall, _approved: bool) -> Result<()> {
++        panic!("argument fixtures must not resolve approval")
++    }
++
++    async fn tool_finished(&self, result: &ToolResult) -> Result<()> {
++        self.trace
++            .lock()
++            .unwrap()
++            .push(Step::Result("finished", result.clone()));
++        Ok(())
++    }
++}
++
++struct Harness {
++    bound: BoundTools,
++    observer: Observer,
++    trace: Trace,
++    input_schema: Arc<Mutex<Value>>,
++    scope: ExecutionScope,
++}
++
++impl Harness {
++    fn new(runtime_empty_chain: bool, fault: Fault) -> Self {
++        let trace: Trace = Arc::default();
++        let input_schema = Arc::new(Mutex::new(schema()));
++        let mut registry = ToolRegistry::new();
++        registry
++            .register(ProbeTool {
++                trace: trace.clone(),
++                input_schema: input_schema.clone(),
++            })
++            .unwrap();
++        let cancellation = CancellationToken::new();
++        if matches!(fault, Fault::AlreadyCanceled) {
++            cancellation.cancel();
++        }
++        let scope = ExecutionScope::fresh(cancellation.clone());
++        let recorder = Arc::new(Recorder {
++            trace: trace.clone(),
++            fault,
++            cancellation,
++        });
++        let mut bound = BoundTools::new(
++            registry,
++            Arc::new(ProbePolicy(trace.clone())),
++            Arc::new(NoApproval),
++            Arc::default(),
++            ToolExecutionBinding::detached(scope.clone()).with_recorder(recorder),
++        );
++        if runtime_empty_chain {
++            // RuntimeRegistry builds this real chain even with no configured handlers.
++            bound = bound.with_hooks(Arc::new(RuntimeHookChain::new(
++                vec![],
++                scope.clone(),
++                Arc::new(NoopExecutionRecorder),
++                None,
++            )));
++        }
++        Self {
++            bound,
++            observer: Observer {
++                trace: trace.clone(),
++                fault,
++            },
++            trace,
++            input_schema,
++            scope,
++        }
++    }
++
++    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
++        self.bound
++            .execute_enriched(PathBuf::from("."), call, &self.observer, |_| {})
++            .await
++    }
++
++    fn mutations(&mut self, arguments: Vec<Value>) {
++        let labels = ["hook-0", "hook-1", "hook-2"];
++        let handlers = arguments
++            .into_iter()
++            .enumerate()
++            .map(|(index, args)| {
++                (
++                    labels[index].to_owned(),
++                    Arc::new(Mutation {
++                        trace: self.trace.clone(),
++                        label: labels[index],
++                        args,
++                    }) as Arc<dyn HookHandler>,
++                )
++            })
++            .collect();
++        self.bound = self
++            .bound
++            .clone()
++            .with_hooks(Arc::new(RuntimeHookChain::new(
++                handlers,
++                self.scope.clone(),
++                Arc::new(NoopExecutionRecorder),
++                None,
++            )));
++    }
++}
++
++struct Mutation {
++    trace: Trace,
++    label: &'static str,
++    args: Value,
++}
++
++#[async_trait]
++impl HookHandler for Mutation {
++    async fn invoke(
++        &self,
++        input: HookInput,
++        _host: Arc<dyn crate::contracts::HookHost>,
++    ) -> Result<HookResponse> {
++        if let HookEvent::BeforeTool { call, .. } = input.event {
++            call_step(&self.trace, self.label, &call);
++            return Ok(HookResponse::ToolArguments {
++                args: self.args.clone(),
++            });
++        }
++        Ok(HookResponse::Continue)
++    }
++}
++
++fn normalized(mut call: ToolCall) -> ToolCall {
++    if let Some(raw) = call.raw_arguments.as_deref()
++        && let Ok(args) = serde_json::from_str(raw)
++    {
++        call.args = args;
++    }
++    call
++}
++
++#[tokio::test]
++async fn authoritative_raw_arguments_reach_every_boundary_without_changing_raw_text() {
++    for runtime_empty_chain in [false, true] {
++        for raw in [
++            None,
++            Some(" { \"text\" : \"raw\" } ".to_owned()),
++            Some(serde_json::to_string(&json!({"text": "x".repeat(65_536)})).unwrap()),
++        ] {
++            let harness = Harness::new(runtime_empty_chain, Fault::None);
++            let mut call = ToolCall::new("raw-boundary", "probe", json!({"text": "args"}));
++            call.raw_arguments = raw;
++            let expected = normalized(call.clone());
++            let result = harness.execute(call).await.unwrap();
++            assert!(result.ok, "{result:?}");
++            assert_eq!(
++                stages(&harness.trace),
++                [
++                    "requested",
++                    "observed",
++                    "policy",
++                    "allowed",
++                    "observer-resolved",
++                    "invoked",
++                    "recorded",
++                    "finished"
++                ]
++            );
++            assert_call_snapshots(&harness.trace, &expected);
++            assert_result_snapshots(&harness.trace, &result);
++        }
++    }
++}
++
++#[tokio::test]
++async fn malformed_and_schema_invalid_raw_arguments_preserve_validation_timing() {
++    for runtime_empty_chain in [false, true] {
++        for raw in [
++            Some("{bad"),
++            Some("false"),
++            Some("null"),
++            Some("[]"),
++            Some(r#"{"text":1}"#),
++            None,
++        ] {
++            let harness = Harness::new(runtime_empty_chain, Fault::None);
++            let args = if raw.is_some() {
++                json!({"text": "args"})
++            } else {
++                json!({})
++            };
++            let mut call = ToolCall::new("invalid-raw", "probe", args);
++            call.raw_arguments = raw.map(str::to_owned);
++            let expected_error = validate_tool_call_args(&call, &spec(schema())).unwrap();
++            let expected_call = normalized(call.clone());
++            let result = harness.execute(call).await.unwrap();
++            assert!(!result.ok);
++            assert_eq!(result.error.as_deref(), Some(expected_error.as_str()));
++            assert_eq!(
++                result.metadata,
++                json!({"tool": "probe", "validation_error": true})
++            );
++            assert_eq!(
++                stages(&harness.trace),
++                [
++                    "requested",
++                    "observed",
++                    "validation-failed",
++                    "recorded",
++                    "finished"
++                ]
++            );
++            assert_call_snapshots(&harness.trace, &expected_call);
++            assert_result_snapshots(&harness.trace, &result);
++            assert!(harness.trace.lock().unwrap().iter().any(|step| matches!(
++                step,
++                Step::Resolution(_, ToolCallResolution::ValidationFailed { reason })
++                    if reason == &expected_error
++            )));
++        }
++    }
++}
++
++#[tokio::test]
++async fn unknown_tools_keep_unknown_tool_resolution_even_with_malformed_raw_json() {
++    for raw in ["{bad", r#"{"text":"raw"}"#] {
++        let harness = Harness::new(true, Fault::None);
++        let call = ToolCall::new("unknown-raw", "missing", json!({"text": "args"}))
++            .with_raw_arguments(raw);
++        let expected_call = normalized(call.clone());
++        let result = harness.execute(call).await.unwrap();
++        assert_eq!(result.error.as_deref(), Some("unknown tool: missing"));
++        assert_eq!(result.metadata, Value::Null);
++        assert_eq!(
++            stages(&harness.trace),
++            [
++                "requested",
++                "observed",
++                "policy-denied",
++                "recorded",
++                "finished"
++            ]
++        );
++        assert_call_snapshots(&harness.trace, &expected_call);
++        assert_result_snapshots(&harness.trace, &result);
++    }
++}
++
++#[tokio::test]
++async fn raw_parse_error_precedes_a_dynamically_invalid_current_schema() {
++    for raw in ["{bad", r#"{"text":"raw"}"#] {
++        let harness = Harness::new(true, Fault::None);
++        let invalid_schema = json!({"type": "typo"});
++        *harness.input_schema.lock().unwrap() = invalid_schema.clone();
++        let call = ToolCall::new("changed-schema", "probe", json!({"text": "args"}))
++            .with_raw_arguments(raw);
++        let expected_error = validate_tool_call_args(&call, &spec(invalid_schema)).unwrap();
++        if raw == "{bad" {
++            assert!(expected_error.starts_with("failed to parse function arguments:"));
++        } else {
++            assert!(expected_error.starts_with("tool 'probe' has invalid input schema:"));
++        }
++        let expected_call = normalized(call.clone());
++        let result = harness.execute(call).await.unwrap();
++        assert_eq!(result.error.as_deref(), Some(expected_error.as_str()));
++        assert_eq!(
++            stages(&harness.trace),
++            [
++                "requested",
++                "observed",
++                "validation-failed",
++                "recorded",
++                "finished"
++            ]
++        );
++        assert_call_snapshots(&harness.trace, &expected_call);
++    }
++}
++
++#[tokio::test]
++async fn recorder_observer_and_cancellation_boundaries_still_precede_validation() {
++    for (fault, error, expected_stages) in [
++        (
++            Fault::RequestedRecorder,
++            "requested recorder failed",
++            vec!["requested"],
++        ),
++        (
++            Fault::RequestedObserver,
++            "requested observer failed",
++            vec!["requested", "observed"],
++        ),
++        (
++            Fault::CancelAfterRequested,
++            "tool execution canceled",
++            vec!["requested"],
++        ),
++        (Fault::AlreadyCanceled, "tool execution canceled", vec![]),
++    ] {
++        for raw in ["{bad", r#"{"text":"raw"}"#] {
++            let harness = Harness::new(true, fault);
++            let call = ToolCall::new("boundary-failure", "probe", json!({"text": "args"}))
++                .with_raw_arguments(raw);
++            let expected_call = normalized(call.clone());
++            assert_eq!(harness.execute(call).await.unwrap_err().to_string(), error);
++            assert_eq!(stages(&harness.trace), expected_stages);
++            assert_call_snapshots(&harness.trace, &expected_call);
++        }
++    }
++}
++
++#[tokio::test]
++async fn accepted_hook_arguments_clear_raw_before_policy_and_invocation() {
++    let mut harness = Harness::new(true, Fault::None);
++    harness.mutations(vec![json!({"text": "hook"})]);
++    let call = ToolCall::new("hook-raw", "probe", json!({"text": "args"}))
++        .with_raw_arguments(r#"{"text":"raw"}"#);
++    let requested = normalized(call.clone());
++    let mut effective = requested.clone();
++    effective.args = json!({"text": "hook"});
++    effective.raw_arguments = None;
++    let result = harness.execute(call).await.unwrap();
++    assert!(result.ok, "{result:?}");
++    assert_eq!(
++        stages(&harness.trace),
++        [
++            "requested",
++            "observed",
++            "hook-0",
++            "policy",
++            "allowed",
++            "observer-resolved",
++            "invoked",
++            "effect",
++            "recorded",
++            "finished"
++        ]
++    );
++    for step in harness.trace.lock().unwrap().iter() {
++        match step {
++            Step::Call("requested" | "observed" | "hook-0", call) => assert_eq!(call, &requested),
++            Step::Call(_, call) | Step::Resolution(call, _) => assert_eq!(call, &effective),
++            Step::Result(_, _) => {}
++        }
++    }
++    assert_result_snapshots(&harness.trace, &result);
++}
++
++#[tokio::test]
++async fn each_hook_argument_replacement_is_validated_before_the_next_handler() {
++    let mut harness = Harness::new(true, Fault::None);
++    harness.mutations(vec![
++        json!({"text": "first"}),
++        json!({"text": 7}),
++        json!({"text": "never"}),
++    ]);
++    let call = ToolCall::new("hook-invalid", "probe", json!({"text": "args"}))
++        .with_raw_arguments(r#"{"text":"raw"}"#);
++    let requested = normalized(call.clone());
++    let expected_error = format!(
++        "invalid hook tool arguments: {}",
++        validate_tool_call_args(
++            &ToolCall::new("hook-invalid", "probe", json!({"text": 7})),
++            &spec(schema()),
++        )
++        .unwrap()
++    );
++    assert_eq!(
++        harness.execute(call).await.unwrap_err().to_string(),
++        expected_error
++    );
++    assert_eq!(
++        stages(&harness.trace),
++        [
++            "requested",
++            "observed",
++            "hook-0",
++            "hook-1",
++            "hook-blocked",
++            "recorded",
++            "finished"
++        ]
++    );
++    for step in harness.trace.lock().unwrap().iter() {
++        match step {
++            Step::Call("hook-1", call) => {
++                assert_eq!(call.args, json!({"text": "first"}));
++                assert_eq!(call.raw_arguments, None);
++            }
++            Step::Call(_, call) | Step::Resolution(call, _) => assert_eq!(call, &requested),
++            Step::Result(_, result) => {
++                assert_eq!(result.error.as_deref(), Some(expected_error.as_str()))
++            }
++        }
++    }
++}

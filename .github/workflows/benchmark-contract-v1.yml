@@ -1,0 +1,46 @@
+name: Benchmark contract v1 consistency controls
+
+# This isolated experimental branch only; no upstream or existing CI changes.
+on:
+  push:
+    branches: [foundation/benchmark-contract-v1-20261026]
+    paths:
+      - 'foundation/2026-10-26/benchmark-contract-v1/**'
+      - '.github/workflows/benchmark-contract-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-contract-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  contract:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/foundation/benchmark-contract-v1-20261026'
+    name: Authored contract consistency controls, not harness benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: foundation/2026-10-26/benchmark-contract-v1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Show interpreter identity
+        run: python3 -B --version
+      - name: Verify source identity and run independent reviewer controls
+        run: python3 -B reviewer_controls.py
+      - name: Run authored consistency controls
+        run: python3 -B validator.py --self-test
+      - name: Check frozen synthetic example with separately pinned manifest
+        run: >-
+          python3 -B validator.py
+          --expected-manifest-sha256 b9fe8d3c152aa3c04536f448449d90c0e7201e8b24e2d76a5dc7f2473328a510
+          < example.json

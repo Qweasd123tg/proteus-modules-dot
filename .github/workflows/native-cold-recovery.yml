@@ -1,0 +1,96 @@
+name: Native cold recovery paired measurement
+on:
+  push:
+    branches: [ci/native-cold-recovery-20261027]
+permissions:
+  contents: read
+concurrency:
+  group: native-cold-recovery-20261027
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.ref == 'refs/heads/ci/native-cold-recovery-20261027'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: bundle
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Proteus-harness/Proteus-core
+          ref: e9d6bd06df78a5af85d055117a6697187730e30e
+          path: core-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Proteus-harness/Proteus-core
+          ref: 63454d4e8b1e4e6b26d088fce2a17d46f30390ae
+          path: core-b
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Proteus-harness/Proteus-modules
+          ref: 7fceaebc3bed8add9b0e3091110f59deca86ba46
+          path: modules
+          persist-credentials: false
+      - name: Require the exact qualified source parent
+        env:
+          QUALIFIED_HEAD: 32a9d1c4ac6eb7b70437025b3346a6f01b3630f4
+          QUALIFIED_TREE: 85b6fe4e69dfce771b4bf56cad930198b08fe607
+        run: |
+          test "$(git -C bundle rev-parse HEAD^)" = "$QUALIFIED_HEAD"
+          test "$(git -C bundle rev-parse "$QUALIFIED_HEAD^{tree}")" = "$QUALIFIED_TREE"
+          test "$(git -C bundle diff --name-only "$QUALIFIED_HEAD" HEAD)" = ".github/workflows/native-cold-recovery.yml"
+      - name: Build dependencies and pinned compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev time
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustup default 1.95.0
+          /usr/bin/time --version
+      - name: Locked builds and canonical focused gates on both pins
+        env:
+          BUILD: ${{ runner.temp }}/native-cold-build
+        run: |
+          python3 -B bundle/performance/2026-10-27/native-cold/prepare.py \
+            "$GITHUB_WORKSPACE/core-a" "$GITHUB_WORKSPACE/core-b" \
+            "$GITHUB_WORKSPACE/modules" "$BUILD"
+      - name: Requalify controls and run paired measurements
+        env:
+          BUILD: ${{ runner.temp }}/native-cold-build
+          RESULT: ${{ runner.temp }}/native-cold-result
+          EXPECTED_HEAD: ${{ github.sha }}
+          MEASURE: 'true'
+        run: |
+          python3 -B - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          build = Path(os.environ["BUILD"])
+          p = json.loads((build/"provenance.json").read_text())
+          command = ["python3", "-B", "bundle/performance/2026-10-27/native-cold/run.py",
+                     "--a",p["binary_a"],"--b",p["binary_b"],"--control",p["binary_control"],
+                     "--provenance",str(build/"provenance.json"),"--output",os.environ["RESULT"]]
+          if os.environ["MEASURE"] == "true":
+              if os.environ["EXPECTED_HEAD"] != os.environ["GITHUB_SHA"]:
+                  raise SystemExit("measurement requires the exact reviewed bundle head")
+              command.append("--measure")
+          subprocess.run(command, check=True, timeout=620)
+          PY
+      - name: Upload compact synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-cold-${{ github.sha }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-cold-build/provenance.json
+            ${{ runner.temp }}/native-cold-build/*.log
+            ${{ runner.temp }}/native-cold-result/report.json

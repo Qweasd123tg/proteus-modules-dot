@@ -1,0 +1,56 @@
+name: Core abandoned-invocation admission regressions
+
+# Isolated experiment in modules repository only; no upstream CI changes.
+on:
+  push:
+    branches: [ci/admission-guard-20261026]
+    paths:
+      - 'foundation/2026-10-26/admission-guard/**'
+      - '.github/workflows/admission-guard-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: admission-guard-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  RUST_TEST_THREADS: '4'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  RUSTUP_TOOLCHAIN: '1.95.0'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  regression:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/admission-guard-20261026'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, existing reviewed bundle pin
+        with:
+          persist-credentials: false
+      - name: Install compiler dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config clang lld libssl-dev bubblewrap ripgrep
+      - name: Install official pinned Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version --verbose
+      - name: Verify pinned source and behavioral fail-before/pass-after gates
+        run: |
+          python3 foundation/2026-10-26/admission-guard/run_validation.py \
+            --work-dir "$RUNNER_TEMP/proteus-admission-guard" \
+            --evidence-dir "$RUNNER_TEMP/admission-guard-evidence"
+      - name: Retain bounded non-sensitive evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: admission-guard-${{ github.sha }}
+          path: ${{ runner.temp }}/admission-guard-evidence/result.json
+          if-no-files-found: warn
+          retention-days: 7
