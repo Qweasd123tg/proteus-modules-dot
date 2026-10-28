@@ -18,7 +18,7 @@
 | [Resume manifest](modules/resume-manifest-prototype/README.md) | Каноническая identity и сравнение engine/workflow/state/artifact для холодного продолжения | Подключения к Core, миграции и автоматического resume |
 | [Resource admission](modules/resource-admission-policy/README.md) | Ограниченная очередь, FIFO/aging и цельный план распределения нескольких ресурсов | Резервирования реальных permits и исполнения этого плана |
 | [Mutation lease](modules/mutation-lease-state-machine-prototype/README.md) | Host-owned lease, который переживает отмену requester; barrier при неизвестном исходе | Общего workspace owner/IPC и подтверждения физического settlement |
-| [Skill index](modules/skill-index/README.md) | Ограниченный lexical search по metadata/разрешённым body prefixes с актуальным candidate scope | tool/v6 adapter; индекс не заменяет свежую загрузку skill |
+| [Skill index](modules/skill-index/README.md) | Ограниченный lexical search по metadata/разрешённым body prefixes с актуальным candidate scope | Adapter подготовлен отдельным patch, ещё не применён; индекс не заменяет свежую загрузку skill |
 | [Compaction candidate owner](modules/compaction-candidate/README.md) | Владение предварительно подготовленным контекстом, prefix/epoch CAS, отмена и uncertain-commit fence | Модельных задач, настоящего Core transaction и durable checkpoint |
 | [Output capture](modules/output-capture/README.md) | Streaming artifact tap до RPC, cap и отдельные статусы capture/команды | Файлового sink, общих квот и async reader adapter |
 | [Context segments](modules/context-segments/README.md) | Допустимые границы сокращения истории с целыми tool pairs/batches/provider groups | Адаптера canonical history и применения compaction |
@@ -42,7 +42,7 @@
 
 ## Следующие направления
 
-1. **Версионированный skill-каталог.** Первый patch со snapshot/cache уже написан для существующего importer. Теперь готов и bounded lexical index; ближайшее подключение — отдельный opt-in search tool поверх fresh discovery. Cache не заменяет проверку доступа. Межпроцессный shared cache не возникает от одного `Arc`.
+1. **Версионированный skill-каталог.** Первый patch со snapshot/cache уже написан для существующего importer. Теперь готов и bounded lexical index; подготовлен и [opt-in search tool adapter](runtime-fixes/skill-search-adapter/README.md) поверх fresh discovery. Cache не заменяет проверку доступа. Межпроцессный shared cache не возникает от одного `Arc`.
 2. **Координация file mutations.** State-machine прототип готов; следующий шаг — настоящий host-owned resource footprint и settlement adapter. Не включать parallel-флаг у write/edit до этой интеграции.
 3. **Resume manifest.** Диагностическая библиотека готова. Интеграция должна различать совместимость protocol/schema и workflow/state/artifact после рестарта, а не автоматически разрешать продолжение.
 4. **Speculative compaction.** Candidate owner уже реализован как библиотека. Следующий шаг — adapter настоящего session transaction и bounded worker snapshot; нельзя продолжать host callbacks после завершения hook invocation.
@@ -55,6 +55,10 @@
 ## Сопутствующие правки исходников
 
 В [runtime-fixes](runtime-fixes/README.md) лежат patches: cancellation во время admission/restart; публикация выбранного artifact с rollback и проверкой reuse metadata; snapshots существующего skill-каталога; устранение повторного разбора terminal SSE JSON. Дополнительно [четыре copy-reduction patches](runtime-fixes/model-copy-reductions/README.md) убирают глубокую копию stream request, повторную копию TextDelta, копирование instructions перед сортировкой и FileRef перед форматированием. Это исходники для отдельных копий, не автоматически применённые изменения.
+
+## Документация и разработка
+
+[Два docs-only patches](developer-docs-cleanup/README.md) исправляют 16 файлов Core/Modules: standalone-команды и config-примеры, рабочие каталоги, package/export имена и release-профиль вместо `--fast` для runtime/RAM-сравнений. Функциональный installer и config values не меняются.
 
 ## База Proteus
 

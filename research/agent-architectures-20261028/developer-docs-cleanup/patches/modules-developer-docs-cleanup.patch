@@ -1,0 +1,77 @@
+diff --git a/README.md b/README.md
+index 11c6e76..419dcd1 100644
+--- a/README.md
++++ b/README.md
+@@ -15,7 +15,7 @@ alpha-выпусками не обещана; потребитель закре
+ | `hook/` | Обработка истории, отбор инструментов |
+ | `tool/` | Файлы, shell, git, patch, plan, skills, Rust LSP |
+ | `context_provider/` | Поиск и память; некоторые также экспортируют tool |
+-| `components/` | Исполняемые сборки с несколькими exports |
++| `components/` | Самостоятельные process-пакеты, общая обвязка и тестовый aggregate fixture |
+ | `research/` | Эксперименты вне основного Cargo workspace |
+ 
+ Размещение не выбирает реализацию в профиле и не даёт ей дополнительных прав.
+@@ -77,6 +77,44 @@ Proteus-desktop и использует закреплённую ревизию
+ не зависят от приложения и его расширений. Конфигурация slots и примеры:
+ [документация harness](https://github.com/Proteus-harness/Proteus-core/blob/main/docs/architecture/modules.md).
+ 
++## Разработка: Где Менять И Какие Имена Использовать
++
++Не смешивайте четыре разных имени. На примере планирования:
++
++| Назначение | Имя и источник |
++|---|---|
++| ID для `package.py --package` | `plan-tool` из `package.metadata.proteus.id` в [manifest процесса](components/plan-tool-module/Cargo.toml) |
++| Cargo package и бинарник процесса | `proteus-plan-tool-module` из того же manifest |
++| Cargo package реализации | `plan-tool` в [tool/plan-tool/Cargo.toml](tool/plan-tool/Cargo.toml) |
++| Process export | `tool/plan_tool` из [exports.json](components/plan-tool-module/exports.json) |
++
++`components/*/Cargo.toml` и `exports.json` — источники состава пакетов;
++`package.py` читает их, отдельный вручную поддерживаемый реестр не нужен.
++Имена tools внутри export задаёт implementation. Имена `components.<id>`
++в профиле — локальные ключи запуска, не Cargo packages и не новые module ids.
++
++Для локальной правки алгоритма начните с каталога implementation, указанного
++в `package.metadata.proteus.implementation`. Например:
++
++```bash
++# Из корня Proteus-modules: проверить библиотечную реализацию.
++python3 scripts/test.py -p plan-tool --lib
++# Собрать только самостоятельный процесс и его зависимости.
++python3 package.py --package plan-tool
++```
++
++Тонкая точка входа процесса — `components/<id>-module/src/main.rs`;
++общая обвязка — `components/module-runtime`; публичные contracts и SDK —
++в Core. Изменение export/границы требует соответствующего process evidence,
++а не только библиотечного теста. Aggregate conformance и differential tests
++живут в `components/process-module/tests`; их runner дополнительно готовит
++standalone artifacts. Не заменяйте обычную сборку пакета сборкой aggregate.
++
++Семантика exports и fixture — в [reference.md](docs/reference.md),
++выбор проверок общей границы — в
++[Core testing.md](https://github.com/Proteus-harness/Proteus-core/blob/main/docs/development/testing.md).
++Эксперименты в `research/` не являются инструкцией штатной разработки.
++
+ ## Отложенные Эксперименты И Происхождение
+ 
+ [research/dcp](research/dcp/README.md) — отложенный эксперимент с отдельным
+diff --git a/docs/reference.md b/docs/reference.md
+index 777452a..0583441 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -15,10 +15,10 @@ config явно описывает process command и выбирает конк
+ fixture. Он нужен для проверки равенства manifests, tool catalogs и результатов
+ новых процессов, но не входит в стандартную сборку и поставку.
+ 
+-Reference-модуль использует тот же публичный process protocol, что и внешний
+-модуль, проходит тот же conformance gate и не получает исключений по имени или
+-расположению исходников. Каждый самостоятельный пакет использует тот же protocol/SDK и не получает
+-исключений по имени или расположению исходников.
++Самостоятельные пакеты и aggregate fixture используют тот же публичный
++process protocol/SDK, что и внешние модули, и не получают исключений по имени
++или расположению исходников. Сборка пакета, выбор implementation и различие
++package/export ids описаны в [руководстве разработки](../README.md#разработка-где-менять-и-какие-имена-использовать).
+ 
+ Model exports подтверждают только предложенные `model.catalog.v1` и
+ `model.quota.v1`. Неизвестные optional host features пропускаются; отсутствие

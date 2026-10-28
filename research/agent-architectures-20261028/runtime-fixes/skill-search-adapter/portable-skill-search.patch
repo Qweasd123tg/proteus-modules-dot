@@ -1,0 +1,422 @@
+diff --git a/examples/portable-skill-catalog/Cargo.lock b/examples/portable-skill-catalog/Cargo.lock
+--- a/examples/portable-skill-catalog/Cargo.lock
++++ b/examples/portable-skill-catalog/Cargo.lock
+@@ -675,6 +675,10 @@
+ ]
+ 
+ [[package]]
++name = "proteus-bounded-skill-index-prototype"
++version = "0.1.0"
++
++[[package]]
+ name = "proteus-contracts"
+ version = "0.1.0-alpha.2"
+ source = "git+https://github.com/Proteus-harness/Proteus-core.git?rev=3f36a003b4f3fde2242fc80f7aedac00dd127d1d#3f36a003b4f3fde2242fc80f7aedac00dd127d1d"
+@@ -698,6 +702,7 @@
+ dependencies = [
+  "anyhow",
+  "libc",
++ "proteus-bounded-skill-index-prototype",
+  "proteus-module-sdk",
+  "ring",
+  "serde",
+diff --git a/examples/portable-skill-catalog/Cargo.toml b/examples/portable-skill-catalog/Cargo.toml
+--- a/examples/portable-skill-catalog/Cargo.toml
++++ b/examples/portable-skill-catalog/Cargo.toml
+@@ -9,6 +9,7 @@
+ 
+ [dependencies]
+ anyhow = "1"
++proteus-bounded-skill-index-prototype = { path = "../../research/agent-architectures-20261028/modules/skill-index" }
+ proteus-module-sdk = { git = "https://github.com/Proteus-harness/Proteus-core.git", rev = "3f36a003b4f3fde2242fc80f7aedac00dd127d1d" }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+diff --git a/examples/portable-skill-catalog/README.md b/examples/portable-skill-catalog/README.md
+--- a/examples/portable-skill-catalog/README.md
++++ b/examples/portable-skill-catalog/README.md
+@@ -65,7 +65,41 @@
+ и disabled настройки согласованными; при несовпадении source load не проходит.
+ Native addon catalog доступен для отображения, но его текущий `SkillDescriptor`
+ не содержит параметры digest-bound activation. Поддерживаемый путь активации —
+-наши два tools, а не несуществующий автоматический native `/skill` routing.
++catalog/search → load, а не несуществующий автоматический native `/skill` routing.
++
++## Необязательный metadata search
++
++`host.search.example.toml` — **legacy integration fixture для SDK/Core
++`3f36a003`**, копия исходного offline sample с явным включением search. Он
++использует исторический aggregate `proteus-reference-module`, а не текущий
++standalone shipping profile. Совместимость с текущими Core/modules не подтверждена.
++
++`host.search.example.toml` явно добавляет `portable_skill_search` в host
++`tools.enabled`; исходный `host.example.toml` остаётся без него. Export объявляет
++три tools: opt-in обеспечивается allowlist host, не новым config-флагом. Host,
++который разрешает все объявленные tools, должен сам ограничить этот список.
++
++Вызов `portable_skill_search` с `{"query":"review","limit":8}` возвращает
++`results[]`: name/description/source, score, coverage и готовый `load_args`.
++Передайте выбранный `load_args` без изменений в `portable_skill_load`. При
++changed-file/source error повторите search/catalog и заново выберите результат.
++Query обязателен, до 1024 UTF-8 bytes и 32 разных lexical terms; limit — 1..32,
++по умолчанию 8. Неизвестные аргументы запрещены. Ранжирование: точное имя,
++число разных совпадений, вес name/description, затем ID; это не semantic search.
++
++Каждый вызов делает прежний свежий `discover` с текущими disabled IDs и read
++guards, затем строит bounded index **только name/description**. Cache и shared
++provider state нет. Полные SKILL.md всё ещё читаются для digest; снижения I/O
++не заявлено. `discovery_warnings` и coverage показывают неполноту; даже без
++warnings ноль hits не доказывает отсутствие подходящей инструкции. Body,
++references и scripts не индексируются и не исполняются; load-проверки не менялись.
++Overflow полного JSON — явная ошибка с просьбой уменьшить limit/roots. Меньший
++host output cap по-прежнему требует проверки `output_truncated` перед разбором.
++
++Зависимость хранится в `research/agent-architectures-20261028/modules/skill-index`
++того же checkout; переносите её вместе с примером. Adapter и изменение fixture
++просмотрены только как исходники: Rust, tests и CI не запускались. Старые
++`VALIDATION.md`/`SOURCES.json` не подтверждают эту новую интеграцию.
+ 
+ ## Границы формата и переносимости
+ 
+diff --git a/examples/portable-skill-catalog/host.search.example.toml b/examples/portable-skill-catalog/host.search.example.toml
+new file mode 100644
+--- /dev/null
++++ b/examples/portable-skill-catalog/host.search.example.toml
+@@ -0,0 +1,68 @@
++# Opt-in search host template. Replace BOTH absolute roots before use.
++# Legacy integration fixture pinned to SDK/Core 3f36a003, matching host.example.toml.
++# Uses the historical aggregate proteus-reference-module, not a current standalone
++# shipping profile; compatibility with current Core/modules is not established.
++# Default launch is trusted; separate processes do not themselves create a sandbox.
++active_provider = "fake"
++[profile]
++name = "portable-skills-search-offline"
++[providers.fake]
++provider = "fake"
++model = "fake"
++stream = true
++[modules]
++workflow = "coding.single_loop"
++context = "repo_aware"
++policy = "codex_policy"
++hooks = []
++[tools]
++enabled = ["portable_skill_catalog", "portable_skill_load", "portable_skill_search"]
++[agent_control]
++surface = "none"
++[components.reference]
++command = "proteus-reference-module"
++env_allowlist = []
++[components.reference.exports.model.fake]
++[components.reference.exports.workflow."coding.single_loop"]
++[components.reference.exports.context.repo_aware]
++[components.reference.exports.policy.codex_policy]
++[module_config.model.fake]
++implementation = "fake"
++[module_config.policy.codex_policy]
++[module_config.workflow."coding.single_loop"]
++[module_config.context.repo_aware]
++providers = ["portable.skills"]
++max_context_bytes = 65536
++max_search_results = 0
++
++# One executable can supply two slots. Here each process has ONE export, so a
++# separately configured restricted launch need not union slot authority.
++[components.portable-catalog]
++command = "proteus-example-portable-skill-catalog"
++env_allowlist = []
++handshake_timeout_ms = 10000
++[components.portable-catalog.exports.context_provider."portable.skills"]
++timeout_ms = 5000
++[components.portable-tools]
++command = "proteus-example-portable-skill-catalog"
++env_allowlist = []
++handshake_timeout_ms = 10000
++[components.portable-tools.exports.tool."portable.skills"]
++timeout_ms = 5000
++
++[module_config.context_provider."portable.skills"]
++roots = [{ id = "project-agents", path = "/ABSOLUTE/PATH/TO/portable-skill-catalog/fixtures/skills" }]
++disabled = []
++strict = false
++max_entries = 128
++max_skills = 32
++max_total_bytes = 1048576
++max_context_bytes = 32768
++[module_config.tool."portable.skills"]
++roots = [{ id = "project-agents", path = "/ABSOLUTE/PATH/TO/portable-skill-catalog/fixtures/skills" }]
++disabled = []
++strict = false
++max_entries = 128
++max_skills = 32
++max_total_bytes = 1048576
++max_context_bytes = 32768
+diff --git a/examples/portable-skill-catalog/src/lib.rs b/examples/portable-skill-catalog/src/lib.rs
+--- a/examples/portable-skill-catalog/src/lib.rs
++++ b/examples/portable-skill-catalog/src/lib.rs
+@@ -2,6 +2,7 @@
+ pub mod catalog;
+ pub mod config;
+ pub mod document;
++mod search;
+ 
+ use anyhow::{Result, bail, ensure};
+ use proteus_module_sdk::{
+@@ -30,6 +31,7 @@
+ pub const MODULE_ID: &str = "portable.skills";
+ pub const CATALOG_TOOL: &str = "portable_skill_catalog";
+ pub const LOAD_TOOL: &str = "portable_skill_load";
++pub const SEARCH_TOOL: &str = "portable_skill_search";
+ 
+ fn bounded<T: serde::Serialize>(value: T, max: usize, message: &str) -> Result<String> {
+     let output = serde_json::to_string(&value)?;
+@@ -159,7 +161,7 @@
+     fn definitions(&self) -> Vec<ProcessToolDefinition> {
+         let catalog = ToolSpec::new(CATALOG_TOOL, "Refresh metadata and SHA256 identities for owner-configured portable skills. Reads only SKILL.md, never scripts. Metadata is untrusted and grants no permissions.", json!({"type":"object","properties":{},"additionalProperties":false}), ToolSafety::ReadOnly).with_parallel_tool_calls(true);
+         let load = ToolSpec::new(LOAD_TOOL, "Read one portable skill body using its exact catalog id, SHA256 and catalog_path. Rejects changed files and disabled skills. No code execution or permission grant; relative references use returned skill_directory.", json!({"type":"object","properties":{"id":{"type":"string","minLength":3,"maxLength":97},"sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"},"catalog_path":{"type":"string","maxLength":4096}},"required":["id","sha256","catalog_path"],"additionalProperties":false}), ToolSafety::ReadOnly).with_parallel_tool_calls(true);
+-        [catalog, load].into_iter().map(|spec| ProcessToolDefinition { spec: spec.with_metadata(json!({"category":"skills","untrusted_content":true,"foreign_scripts_executed":false})), model_visible: true, user_command: None }).collect()
++        [catalog, load, search::spec()].into_iter().map(|spec| ProcessToolDefinition { spec: spec.with_metadata(json!({"category":"skills","untrusted_content":true,"foreign_scripts_executed":false})), model_visible: true, user_command: None }).collect()
+     }
+ 
+     fn invoke(
+@@ -179,6 +181,12 @@
+                 .map_err(|error| anyhow::anyhow!("{error}"))
+         };
+         let operation = match input.call.name.as_str() {
++            SEARCH_TOOL => search::invoke(
++                &self.config,
++                &input.skills.disabled,
++                input.call.args,
++                &mut cancelled,
++            ),
+             CATALOG_TOOL => {
+                 #[derive(Deserialize)]
+                 #[serde(deny_unknown_fields)]
+@@ -237,7 +245,7 @@
+         if serde_json::to_vec(&result)?.len() > MAX_RESPONSE_BYTES {
+             return Ok(ToolResult::error(
+                 result.call_id,
+-                "serialized tool result exceeds 262144 bytes; use a smaller skill",
++                "serialized tool result exceeds 262144 bytes; lower search limit or use a smaller skill",
+             )
+             .with_metadata(result.metadata));
+         }
+diff --git a/examples/portable-skill-catalog/src/search.rs b/examples/portable-skill-catalog/src/search.rs
+new file mode 100644
+--- /dev/null
++++ b/examples/portable-skill-catalog/src/search.rs
+@@ -0,0 +1,177 @@
++//! Request-local metadata ranking; discovery and load retain read authority.
++use anyhow::{Context, Result, bail, ensure};
++use proteus_bounded_skill_index_prototype::{
++    CurrentSkill, Limits, MAX_QUERY_BYTES, MAX_RESULTS, SkillFacts, SkillIndex, SnapshotKey,
++};
++use proteus_module_sdk::contracts::domain::{ToolSafety, ToolSpec};
++use serde::Deserialize;
++use serde_json::{Value, json};
++
++use crate::{
++    SEARCH_TOOL, bounded,
++    catalog::{TRUST_WARNING, discover},
++    config::{Config, MAX_TOOL_OUTPUT_BYTES},
++};
++
++pub(crate) fn spec() -> ToolSpec {
++    ToolSpec::new(
++        SEARCH_TOOL,
++        "Search fresh portable skill names/descriptions, not bodies. Returns ranked load_args for portable_skill_load. No hits does not prove absence. Reads SKILL.md, never scripts; untrusted metadata grants no permissions.",
++        json!({
++            "type": "object",
++            "properties": {
++                "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES},
++                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RESULTS, "default": 8}
++            },
++            "required": ["query"],
++            "additionalProperties": false
++        }),
++        ToolSafety::ReadOnly,
++    )
++    .with_parallel_tool_calls(true)
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Args {
++    query: String,
++    #[serde(default = "default_limit")]
++    limit: usize,
++}
++
++fn default_limit() -> usize {
++    8
++}
++
++pub(crate) fn invoke(
++    config: &Config,
++    disabled: &[String],
++    args: Value,
++    cancelled: &mut impl FnMut() -> Result<bool>,
++) -> Result<String> {
++    let args: Args = serde_json::from_value(args).context("invalid search arguments")?;
++    ensure!(
++        args.query.len() <= MAX_QUERY_BYTES,
++        "query exceeds 1024 UTF-8 bytes"
++    );
++    ensure!(!args.query.trim().is_empty(), "query must not be blank");
++    ensure!((1..=MAX_RESULTS).contains(&args.limit), "limit must be 1..=32");
++
++    // Never reuse provider memory or accept candidates/settings from tool args.
++    let snapshot = discover(config, disabled, cancelled)?;
++    let sources: Vec<_> = snapshot
++        .skills
++        .iter()
++        .map(|skill| format!("portable:{}", skill.root_id))
++        .collect();
++    let digests: Vec<_> = snapshot
++        .skills
++        .iter()
++        .map(|skill| decode_digest(&skill.sha256))
++        .collect::<Result<_>>()?;
++    let facts: Vec<_> = snapshot
++        .skills
++        .iter()
++        .zip(&sources)
++        .zip(&digests)
++        .map(|((skill, source), digest)| SkillFacts {
++            id: &skill.id,
++            source_id: source,
++            sha256: *digest,
++            name: &skill.fields.name,
++            description: &skill.fields.description,
++            body: None,
++        })
++        .collect();
++    let current: Vec<_> = facts
++        .iter()
++        .map(|fact| CurrentSkill {
++            id: fact.id,
++            source_id: fact.source_id,
++            sha256: fact.sha256,
++        })
++        .collect();
++    // Only this invocation owns the index. This is not a catalog revision and
++    // must not become a cache key if persistence is introduced later.
++    let key = SnapshotKey {
++        binding_epoch: 0,
++        catalog_revision: 0,
++    };
++    let index = SkillIndex::build(
++        key,
++        &facts,
++        Limits {
++            max_body_skills: 0,
++            max_body_prefix_bytes: 0,
++            max_body_total_bytes: 0,
++            ..Limits::default()
++        },
++    )?;
++    let ranked = index.search(key, &current, &args.query, args.limit)?;
++    let hits = ranked
++        .hits
++        .iter()
++        .map(|hit| {
++            let skill = snapshot
++                .skills
++                .iter()
++                .find(|skill| skill.id == hit.id)
++                .context("search hit missing from current discovery")?;
++            Ok(json!({
++                "name": skill.fields.name,
++                "description": skill.fields.description,
++                "source": hit.source_id,
++                "score": {
++                    "exact_name": hit.score.exact_name,
++                    "matched_query_terms": hit.score.matched_query_terms,
++                    "field_weight": hit.score.field_weight
++                },
++                "coverage": {
++                    "metadata_long_tokens_omitted": hit.coverage.metadata_long_tokens_omitted
++                },
++                "load_args": {
++                    "id": skill.id,
++                    "sha256": skill.sha256,
++                    "catalog_path": skill.path
++                }
++            }))
++        })
++        .collect::<Result<Vec<_>>>()?;
++
++    // Whole escaped JSON is bounded; never return a truncated successful page.
++    // The enclosing invoke checks cancellation after ranking/serialization.
++    bounded(
++        json!({
++            "warning": TRUST_WARNING,
++            "metadata_only": true,
++            "coverage_notice": "Lexical name/description matches only. Discovery warnings or omitted long tokens reduce coverage; even without them, no hits does not prove semantic absence.",
++            "coverage": {
++                "eligible_skills": ranked.coverage.eligible_skills,
++                "metadata_partial_skills": ranked.coverage.metadata_partial_skills,
++                "matched_skills": ranked.coverage.matched_skills,
++                "returned_skills": ranked.coverage.returned_skills
++            },
++            "discovery_warnings": snapshot.warnings,
++            "results": hits
++        }),
++        MAX_TOOL_OUTPUT_BYTES,
++        "search output exceeds 131072 bytes; lower limit or narrow configured roots",
++    )
++}
++
++fn decode_digest(hex: &str) -> Result<[u8; 32]> {
++    ensure!(
++        hex.len() == 64,
++        "discovered SHA256 must have 64 lowercase hex bytes"
++    );
++    let nibble = |byte| match byte {
++        b'0'..=b'9' => Ok(byte - b'0'),
++        b'a'..=b'f' => Ok(byte - b'a' + 10),
++        _ => bail!("discovered SHA256 must have 64 lowercase hex bytes"),
++    };
++    let mut digest = [0; 32];
++    for (slot, pair) in digest.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
++        *slot = nibble(pair[0])? * 16 + nibble(pair[1])?;
++    }
++    Ok(digest)
++}
+diff --git a/examples/portable-skill-catalog/tests/wire.rs b/examples/portable-skill-catalog/tests/wire.rs
+--- a/examples/portable-skill-catalog/tests/wire.rs
++++ b/examples/portable-skill-catalog/tests/wire.rs
+@@ -1,7 +1,7 @@
+ //! Actual authored executable and SDK framing; synthetic host, not Core e2e.
+ mod common;
+ use common::Fixture;
+-use proteus_example_portable_skill_catalog::{CATALOG_TOOL, LOAD_TOOL, MODULE_ID};
++use proteus_example_portable_skill_catalog::{CATALOG_TOOL, LOAD_TOOL, MODULE_ID, SEARCH_TOOL};
+ use proteus_module_sdk::contracts::{
+     contracts::{
+         ExecutionAttribution, ProcessComponentExportInitialize, ProcessComponentInitialize,
+@@ -182,7 +182,7 @@
+     );
+     let listed = w.invoke("tool", "list", Value::Null);
+     let definitions = tool_result(&listed).as_array().unwrap();
+-    assert_eq!(definitions.len(), 2);
++    assert_eq!(definitions.len(), 3);
+     assert!(
+         definitions
+             .iter()
+@@ -194,6 +194,16 @@
+     let data: Value = serde_json::from_str(refreshed["output"].as_str().unwrap()).unwrap();
+     let skill = &data["catalog"]["skills"][0];
+     let args = json!({"id":skill["id"],"sha256":skill["sha256"],"catalog_path":skill["path"]});
++    let searched = w.invoke(
++        "tool",
++        "invoke",
++        call(SEARCH_TOOL, json!({"query":"review"}), vec![]),
++    );
++    assert_eq!(tool_result(&searched)["ok"], true);
++    let shortlist: Value =
++        serde_json::from_str(tool_result(&searched)["output"].as_str().unwrap()).unwrap();
++    assert_eq!(shortlist["metadata_only"], true);
++    assert_eq!(shortlist["results"][0]["load_args"], args);
+     let input = call(LOAD_TOOL, args.clone(), vec![]);
+     let call_id = input["call"]["id"].clone();
+     let loaded = w.invoke("tool", "invoke", input);

@@ -11,6 +11,8 @@
 | Ускорить пересборку одного компонента | Cargo/package boundary и соответствующий launcher | `build-speed/desktop/`, `build-speed/extensions/` |
 | Изучить чужого агента | Отчёт по закреплённым первичным исходникам | `research/`; donor behavior и предложение для Proteus описываются отдельно |
 
+[Документационные patches для Core/Modules](../research/agent-architectures-20261028/developer-docs-cleanup/README.md) приводят примеры к standalone-пакетам и различают package, executable и export names.
+
 ## Минимальная поставка
 
 Для нового компонента достаточно кода, manifest и README с назначением, коротким примером подключения, ограничениями и статусом проверки. Дополнительные manifests и verification runners нужны только при конкретной задаче, а не автоматически для каждой библиотеки.

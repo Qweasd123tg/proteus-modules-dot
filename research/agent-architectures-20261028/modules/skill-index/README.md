@@ -83,7 +83,9 @@ settings, вычисленный path, full-file SHA-256 и read guards. Changed
 требует свежего каталога и нового выбора, не retry старого результата. Digest
 относится к полному SKILL.md, не body prefix и не references/assets.
 
-## Конкретные точки интеграции (не реализованы этим пакетом)
+## Конкретные точки интеграции
+
+Metadata-only tool/v6 adapter реализован как [отдельный source patch](../../runtime-fixes/skill-search-adapter/README.md), ещё не применённый к примеру автоматически. Ниже описан его контракт и возможное дальнейшее body/cache расширение.
 
 1. **Metadata-only, минимальный шаг:** после успешного `discover` либо при
    получении `PublishedSnapshot` создать `SkillFacts` из `PortableSkill`:
@@ -106,9 +108,9 @@ settings, вычисленный path, full-file SHA-256 и read guards. Changed
    накопления prefixes. Body bytes должны соответствовать тому же digest.
 4. **Search:** owner получает invocation settings и повторяет текущие source/read
    проверки, затем строит `CurrentSkill` только из допущенных entries текущего
-   снимка. После ошибки этих проверок не отдавать старые ranking results. Новый
-   `portable_skill_search` возможен как future `tool/v6` export/handler, но здесь
-   нет SDK wiring, descriptors, serde schema или нового автоматического routing.
+   снимка. После ошибки этих проверок не отдавать старые ranking results. Отдельный patch добавляет
+   `portable_skill_search` в существующий `tool/v6` export. В самой библиотеке
+   SDK wiring и автоматического routing нет.
 5. **Load:** resolve hit ID через тот же catalog snapshot в existing
    `id + sha256 + catalog_path`; не конструировать path из query/source label.
    Сам `load_skill` остаётся свежим и независимо проверенным. Не использовать

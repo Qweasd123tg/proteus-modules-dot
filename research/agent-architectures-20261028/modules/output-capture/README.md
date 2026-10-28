@@ -127,7 +127,7 @@ capture не растёт с объёмом потока; память/очер�
 - [Текущий shell output](https://github.com/Proteus-harness/Proteus-modules/blob/5fa8978684a37e8083c64f4d6cf0289e72450c6a/tool/shell-tool/src/unified_exec/output.rs).
 - [Предыдущий post-hoc artifact prototype](https://github.com/Proteus-harness/Proteus-modules/blob/5fa8978684a37e8083c64f4d6cf0289e72450c6a/research/tool-output-artifacts/src/lib.rs).
 - [Deep Agents source-side capture](https://github.com/langchain-ai/deepagents/blob/cd24d8c52849fdb24e0ac2cab2f909f8df6ba5ca/libs/deepagents/deepagents/backends/sandbox.py#L1367-L1461): идея seam, не буквальный перенос shell wrapper.
-- Локальный отчёт: `/workspace/shared/proteus-agent-research-20261028/reports/openhands-deepagents.md`.
+- Основание: [OpenHands / Deep Agents](../../reports/openhands-deepagents.md).
 
 Ниже — **план проверки, не результаты исполненных тестов**: пустой/нулевой/exact-cap/
 cap+1 поток; chunk больше cap; несколько read chunks; successful и uncertain partial

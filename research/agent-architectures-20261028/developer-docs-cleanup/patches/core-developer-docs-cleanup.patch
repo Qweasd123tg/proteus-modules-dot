@@ -1,0 +1,617 @@
+diff --git a/README.md b/README.md
+index a3e5b6b..7d10c13 100644
+--- a/README.md
++++ b/README.md
+@@ -63,7 +63,7 @@ SDK не требует зависимости от Core runtime или referenc
+ | Репозиторий | Ответственность |
+ |---|---|
+ | **Proteus-core** (этот) | Core, публичные контракты, process host, HTTP/SSE и CLI |
+-| [Proteus-modules](https://github.com/Proteus-harness/Proteus-modules) | Реализации по слотам и reference executable |
++| [Proteus-modules](https://github.com/Proteus-harness/Proteus-modules) | Реализации по слотам и самостоятельные process-пакеты |
+ | [Proteus-desktop](https://github.com/Proteus-harness/Proteus-desktop) | Приложение GPUI и общие правила клиента |
+ | [Proteus-desktop-extensions](https://github.com/Proteus-harness/Proteus-desktop-extensions) | Поставляемые по умолчанию процессные расширения приложения |
+ 
+@@ -75,9 +75,12 @@ cd Proteus-core
+ ./install.sh
+ ```
+ 
+-Установщик собирает harness и отдельный `proteus-reference-module` из
+-Proteus-modules, затем атомарно публикует их в `~/.proteus/current` и команды
+-в `~/.local/bin`. Исходники модулей выбираются через `repositories.json`:
++Установщик собирает harness и самостоятельные `proteus-<id>-module` из
++Proteus-modules, затем атомарно выбирает snapshot через `~/.proteus/current`.
++В snapshot `proteus` лежит в корне, модули — в `bin/`, их metadata —
++в `share/modules/`. В `~/.local/bin` устанавливаются launchers `proteus` и
++`proteus-model-pack-module`; aggregate `proteus-reference-module` не поставляется.
++Исходники модулей выбираются через `repositories.json`:
+ сначала явный `PROTEUS_MODULES_SOURCE`, затем соседний checkout
+ `../Proteus-modules` или загрузка зафиксированной ревизии в
+ `target/sources/modules`. `CARGO_TARGET_DIR`
+@@ -95,8 +98,11 @@ proteus --config codex "Расскажи о структуре этого про
+ 
+ Приложение собирается в репозитории
+ [Proteus-desktop](https://github.com/Proteus-harness/Proteus-desktop#portable):
+-`python3 scripts/portable.py --fast`. Готовая папка включает harness, модуль
+-и расширения и работает без исходных checkout.
++`python3 scripts/portable.py` создаёт release-сборку с архивом. Готовая папка
++включает harness, самостоятельные модули и расширения и работает без исходных checkout.
++Для поставки и сравнений runtime/RAM используйте этот release-профиль.
++`--fast` — отдельный профиль клиента для локальной пересборки без LTO и архива,
++а не замена release в таких сравнениях.
+ 
+ Для Linux есть отдельный рабочий профиль `restricted` с частичной изоляцией:
+ `proteus --config restricted` или `./proteus-native /path/to/project --config restricted`
+@@ -188,15 +194,21 @@ proteus --config codex inspect topology --format map
+ proteus --config codex server acp
+ ```
+ 
+-Для работы непосредственно из исходников можно собрать сервер и модуль:
++Для работы непосредственно из исходников соберите сервер и самостоятельные
++модули из корня Proteus-core:
+ 
+ ```bash
+-cargo build -p proteus-core
+-python3 scripts/build_module.py --target-dir target
+-PATH="$PWD/target/debug:$PATH" ./target/debug/proteus --config examples/configs/proteus.example.toml "Покажи пример ответа"
++cargo build --locked --target-dir target -p proteus-core
++python3 scripts/build_module.py --profile dev --target-dir "$PWD/target" --bundle "$PWD/target/dev-runtime"
++PATH="$PWD/target/dev-runtime/bin:$PWD/target/debug:$PATH" ./target/debug/proteus --config examples/configs/proteus.example.toml "Покажи пример ответа"
+ ```
+ 
+-Этот пример использует `fake` и не требует доступа к внешней модели.
++Абсолютный `--bundle` важен: helper запускает упаковку из каталога Modules.
++Без `--bundle` helper собирает только aggregate test fixture, которого
++недостаточно для этого standalone-профиля. Этот пример использует `fake`
++и не требует доступа к внешней модели. Для правки одного модуля используйте
++[его package workflow](https://github.com/Proteus-harness/Proteus-modules#разработка-где-менять-и-какие-имена-использовать),
++а не пересборку Core или всего набора.
+ 
+ ### Тестовые Длинные Чаты
+ 
+diff --git a/docs/guides/second-pc-bootstrap.md b/docs/guides/second-pc-bootstrap.md
+index 61440bd..5b7af25 100644
+--- a/docs/guides/second-pc-bootstrap.md
++++ b/docs/guides/second-pc-bootstrap.md
+@@ -21,16 +21,19 @@
+ Если нужны CLI и команды авторизации, установите их из репозитория:
+ 
+ ```bash
+-git clone <repo> Agent
+-cd Agent
++git clone https://github.com/Proteus-harness/Proteus-core.git
++cd Proteus-core
+ ./install.sh
+ proteus --config codex doctor
+ ```
+ 
+ Установщик принимает `PROTEUS_BIN_DIR`, `PROTEUS_HOME` и
+-`PROTEUS_CONFIG_HOME`. Он хранит `proteus` и `proteus-reference-module`
+-в `~/.proteus/releases/<snapshot-id>/` и атомарно переключает ссылку
+-`~/.proteus/current`. Команды в `~/.local/bin` используют выбранную сборку.
++`PROTEUS_CONFIG_HOME`. В `~/.proteus/releases/<snapshot-id>/` он хранит
++`proteus`, самостоятельные модули в `bin/` и metadata в `share/modules/`,
++затем атомарно переключает ссылку `~/.proteus/current`.
++Launchers `proteus` и `proteus-model-pack-module` в `~/.local/bin`
++используют выбранную сборку. Aggregate `proteus-reference-module` —
++только тестовый fixture, в установленный snapshot он не входит.
+ 
+ Поставляемые профили устанавливаются вместе с CLI. `proteus init coding`
+ создаёт новую конфигурацию, перезаписывая существующий `config.toml` и
+diff --git a/docs/development/testing.md b/docs/development/testing.md
+index c5e8587..8f5eca0 100644
+--- a/docs/development/testing.md
++++ b/docs/development/testing.md
+@@ -96,7 +96,11 @@ Runner готовит reference-модуль из отдельного Proteus-m
+ `PROTEUS_TEST_REFERENCE_MODULE`. Core fixtures не запускают Cargo и не
+ угадывают binary в target. Явный `PROTEUS_TEST_REFERENCE_MODULE` используется
+ и в полном gate; его свежесть обеспечивает вызывающий сценарий. Отсутствующий
+-файл — ошибка. Отложенный DCP не подготавливается общим runner.
++файл — ошибка. Для scopes, использующих standalone profiles, runner также
++готовит самостоятельные пакеты, передаёт `PROTEUS_TEST_MODULE_BINARIES`
++и добавляет каталоги artifacts в `PATH`. Это отдельные fixtures:
++aggregate не заменяет поставляемые `proteus-<id>-module`.
++Отложенный DCP не подготавливается общим runner.
+ 
+ `full` выбирает пять crates harness, включая worker SDK. Реализации проверяются
+ своим `python3 scripts/test.py full` в Proteus-modules. В приложении используется
+@@ -284,8 +288,10 @@ JSONL journal; его результаты не заменяют замеры HT
+ Изменённые configs должны загружаться через текущий reader. При изменении
+ schema обновляются все tracked producers/consumers/examples. Для проверки
+ сборки без model request используйте `doctor`, `modules list` или `tools list`
+-на representative profile; reference-модуль должен быть собран и доступен
+-в `PATH`.
++на representative profile; указанные в его `components.*.command`
++самостоятельные модули должны быть собраны и доступны в `PATH`.
++Сборка `proteus-reference-module` сама по себе их не подготавливает; рабочий
++пример — в [README](../../README.md#полезные-команды).
+ 
+ Tool проверяется по собственной semantics: input, safety, visibility,
+ allow/ask/deny, path, timeout/cancel или output limits — когда эта ветка
+@@ -317,7 +323,7 @@ client DTO в `proteus-contracts` клиент проверяется вмест
+ а не по факту запуска приложения.
+ 
+ - Изолированная проверка installer: `./scripts/install-smoke.sh`.
+-  Она сама собирает и устанавливает оба executable во временные каталоги,
++  Она сама собирает и устанавливает Core и самостоятельные модули во временные каталоги,
+   проверяет fake turn, внешний Python component и process peers. Отдельная
+   предварительная установка для этого smoke не нужна.
+   `sh scripts/install-smoke-env.sh` выполняет тот же сценарий с подставным
+diff --git a/docs/README.md b/docs/README.md
+index 09022c5..f2a29f6 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -30,6 +30,7 @@
+ | Разобрать взаимодействие агентов | [Взаимодействие агентов](architecture/subagents.md) |
+ | Разобрать историю, события и повтор выполнения | [Работа во время выполнения](guides/runtime-and-events.md), [данные хода агента](architecture/canonical-turn-data.md) |
+ | Разобрать инструменты и запросы разрешений | [Инструменты и разрешения](guides/security-and-policy.md) |
++| Изменить и собрать один модуль | [Package workflow и имена](https://github.com/Proteus-harness/Proteus-modules#разработка-где-менять-и-какие-имена-использовать); contracts/SDK остаются в Core |
+ | Проверить изменение | [Проверки](development/testing.md) |
+ | Сверить поведение с Codex | [База сравнения](development/codex-baseline.md) |
+ | Найти причину сбоя при запуске | [Диагностика](guides/inspect.md), [ручная проверка](development/dogfood-gate.md) |
+diff --git a/docs/architecture/architecture.md b/docs/architecture/architecture.md
+index 5395093..6e58d93 100644
+--- a/docs/architecture/architecture.md
++++ b/docs/architecture/architecture.md
+@@ -123,11 +123,12 @@ examples/                  configs, external modules, MCP smoke
+ 
+ Реализации вынесены в отдельный Proteus-modules и расположены по слотам;
+ это source organization, а не runtime trust tier.
+-`proteus-reference-module` линкует эти Rust crates в один executable для
+-удобства dogfood. На host boundary он ничем не отличается от модуля на Python.
++Каждая группа реализаций поставляется самостоятельным `proteus-<id>-module`;
++общий `proteus-reference-module` остался только aggregate test fixture.
++На host boundary ни один из них не отличается от модуля на Python.
+ 
+-Portable-сборка клиента поставляет согласованную пару `proteus`/
+-`proteus-reference-module`, но клиент не линкует Core.
++Portable-сборка клиента поставляет согласованные `proteus` и самостоятельные
++модули, но клиент не линкует Core.
+ Он владеет только окном, выбором проекта,
+ готовностью и завершением дочернего app-server. HTTP/SSE, session store,
+ approvals и process-module authority остаются за существующими границами.
+@@ -542,14 +543,17 @@ context = "simple"
+ [tools]
+ enabled = ["search"]
+ 
+-[components.reference-capabilities]
+-command = "proteus-reference-module"
++[components.rg-search]
++command = "proteus-rg-search-module"
+ 
+-[components.reference-capabilities.exports.tool.rg_search]
++[components.rg-search.exports.tool.rg_search]
+ 
+-[components.reference-capabilities.exports.context_provider.rg_search]
++[components.rg-search.exports.context_provider.rg_search]
+ 
+-[components.reference-capabilities.exports.context.simple]
++[components.reference-context]
++command = "proteus-context-pack-module"
++
++[components.reference-context.exports.context.simple]
+ 
+ [module_config.context.simple]
+ search_provider = "rg_search"
+diff --git a/docs/architecture/modules.md b/docs/architecture/modules.md
+index bd1b1ca..0346750 100644
+--- a/docs/architecture/modules.md
++++ b/docs/architecture/modules.md
+@@ -72,7 +72,7 @@ Wire shape и правила validation — в
+ | `workflow` | `select_one` | `modules.workflow` | да | `coding.single_loop`, `coding.codex_loop`, `coding.plan_execute_review`, `coding.project_check` |
+ | `context` | `select_one` | `modules.context` | да, `context/v3` | `simple`, `repo_aware`, `codex_context` |
+ | `policy` | `select_one` | `modules.policy` | да | `allow_all`, `ask_write`, `codex_policy`, `opencode_policy` |
+-| `tool` | `ordered_many` | предоставленные реализации + `tools.enabled` | да, `tool/v6` | `reference.tools` и узкие варианты |
++| `tool` | `ordered_many` | предоставленные реализации + `tools.enabled` | да, `tool/v6` | `file_tools`, `shell_tools`, `plan_tool`, `codex_patch` |
+ | `context_provider` | `ordered_many` | предоставленные реализации + настройки контекста | да, `context_provider/v4` | `skills`, `rg_search`, `jsonl_memory`, `sqlite_memory` |
+ | `model` | `select_one` | активный профиль модели | да, `model/v12` | `fake`, `openai`, `openai_compatible`, `openai_codex`, `anthropic` |
+ 
+@@ -125,14 +125,17 @@ context = "simple"
+ enabled = ["remember_fact", "recall_memory"]
+ 
+ [components.reference-memory]
+-command = "proteus-reference-module"
++command = "proteus-sqlite-memory-module"
+ 
+ [components.reference-memory.exports.tool.sqlite_memory]
+ timeout_ms = 30000
+ 
+ [components.reference-memory.exports.context_provider.sqlite_memory]
+ 
+-[components.reference-memory.exports.context.simple]
++[components.reference-context]
++command = "proteus-context-pack-module"
++
++[components.reference-context.exports.context.simple]
+ 
+ [module_config.context.simple]
+ memory_provider = "sqlite_memory"
+@@ -438,7 +441,7 @@ host-owned `ExecutionAttribution`: обязательный `ExecutionId` и opt
+ Любой вызов всё равно проходит
+ `ToolRegistry`, policy, approval и safety.
+ 
+-`reference.tools` агрегирует:
++В aggregate test fixture `reference.tools` агрегирует:
+ 
+ - file tools: `read_file`, `read_many_files`, `list_dir`, `find_files`,
+   `grep`, `write_file`, `edit_file`;
+@@ -449,10 +452,13 @@ host-owned `ExecutionAttribution`: обязательный `ExecutionId` и opt
+ - Rust LSP: `lsp_diagnostics`;
+ - policy grant request: `request_permissions`.
+ 
+-Для узкого профиля тот же модуль принимает selectors `file_tools`,
++В поставляемых профилях эти exports предоставляют самостоятельные пакеты:
++`file-tools`, `git-tools`, `shell-tool`, `plan-tool`, `skill-pack`,
++`rust-lsp` и `policy-pack` соответственно. Export ids — `file_tools`,
+ `git_tools`, `shell_tools`, `plan_tool`, `skill_tool`, `rust_lsp` и
+-`policy_tools`. Они используют тот же `tool/v6` contract; selector не
+-меняет authority.
++`policy_tools`. Они используют тот же `tool/v6` contract; package и export
++не меняют authority. Aggregate также поддерживает эти selectors для tests,
++но не является требуемой или поставляемой программой.
+ 
+ `apply_patch` предоставляется отдельным export `tool/direct_patch` или
+ `tool/codex_patch`, не входит в агрегат `reference.tools` и не имеет собственного
+@@ -571,16 +577,19 @@ service. `ModuleKind::Subagent`, `modules.subagent` и catalog implementation
+ 
+ ## Reference Process Module
+ 
+-`proteus-reference-module` содержит behavior selectors и model implementations
++Обычная поставка использует самостоятельные процессы из
++[Proteus-modules](https://github.com/Proteus-harness/Proteus-modules).
++`proteus-reference-module` — только aggregate fixture: он содержит behavior
++selectors и model implementations для conformance/differential tests
+ и может подтвердить несколько exports одного component. Он использует тот же
+ protocol, что внешний процессный модуль. Его Rust helper traits в
+ `proteus-contracts::process_module` действуют только внутри executable и не
+ являются host ABI.
+ 
+-Проверка всех identities:
++Проверка всех identities из корня Proteus-modules:
+ 
+ ```bash
+-cargo test -p proteus-reference-module --test conformance
++python3 scripts/test.py -p proteus-reference-module --test conformance
+ ```
+ 
+ Тест выполняет не только handshake: он вызывает реальные file/search/patch/
+diff --git a/docs/guides/configuration.md b/docs/guides/configuration.md
+index 84d5fa3..5f250c7 100644
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -164,7 +164,7 @@ model = "fake-tool-model"
+ stream = true
+ 
+ [components.reference-model]
+-command = "proteus-reference-module"
++command = "proteus-model-pack-module"
+ 
+ [components.reference-model.exports.model.fake]
+ 
+@@ -177,19 +177,19 @@ context = "simple"
+ policy = "ask_write"
+ 
+ [components.reference-workflow]
+-command = "proteus-reference-module"
++command = "proteus-coding-workflow-module"
+ 
+ [components.reference-workflow.exports.workflow."coding.single_loop"]
+ 
+ [components.reference-context]
+-command = "proteus-reference-module"
++command = "proteus-context-pack-module"
+ 
+ [components.reference-context.exports.context.simple]
+ 
+-[components.reference-capabilities]
+-command = "proteus-reference-module"
++[components.policy-pack]
++command = "proteus-policy-pack-module"
+ 
+-[components.reference-capabilities.exports.policy.ask_write]
++[components.policy-pack.exports.policy.ask_write]
+ 
+ [tools]
+ enabled = []
+@@ -198,8 +198,9 @@ enabled = []
+ mode = "normal"
+ ```
+ 
+-Reference-модуль должен находиться в `PATH`; `./install.sh` обеспечивает
+-это для установленного wrapper-а.
++Указанные самостоятельные модули должны находиться в `PATH`;
++`./install.sh` обеспечивает это для установленного wrapper-а `proteus`.
++Для запуска из checkout используйте [сборку пакетов из README](../../README.md#полезные-команды).
+ 
+ `active_provider` необязателен. Если его нет, Core не создаёт model adapter;
+ `providers` можно опустить или оставить с невыбранными profiles. Пустой или
+@@ -234,13 +235,13 @@ auth = "x-api-key"
+ api_version = "2023-06-01"
+ 
+ [components.reference-model]
+-command = "proteus-reference-module"
++command = "proteus-model-pack-module"
+ env_allowlist = ["HOME", "ANTHROPIC_API_KEY"]
+ 
+ [components.reference-model.exports.model.anthropic]
+ ```
+ 
+-Reference-модуль экспортирует следующие model implementations:
++Пакет `proteus-model-pack-module` предоставляет следующие model implementations:
+ 
+ - `fake`;
+ - `openai`;
+@@ -378,7 +379,7 @@ implementation = "openai_codex"
+ auth_file = "$HOME/.config/Proteus-agent/secrets/chatgpt.json"
+ 
+ [components.reference-model]
+-command = "proteus-reference-module"
++command = "proteus-model-pack-module"
+ env_allowlist = ["HOME"]
+ 
+ [components.reference-model.exports.model.openai_codex]
+@@ -796,12 +797,12 @@ launch paths без этой настройки.
+ exports этих slots являются contributions:
+ 
+ ```toml
+-[components.reference-capabilities]
+-command = "proteus-reference-module"
++[components.skill-pack]
++command = "proteus-skill-pack-module"
+ 
+-[components.reference-capabilities.exports.context_provider.skills]
++[components.skill-pack.exports.context_provider.skills]
+ 
+-[components.reference-capabilities.exports.tool."reference.tools"]
++[components.skill-pack.exports.tool.skill_tool]
+ ```
+ 
+ Map iteration даёт детерминированный key order, но не является пользовательской
+@@ -809,13 +810,13 @@ priority surface. Tool registration фильтруется `tools.enabled`; cont
+ builder запрашивает provider по id через `host.context.provide`, а нужный
+ порядок providers задаёт его собственный `module_config`.
+ 
+-Пак tools — один такой export, а не отдельная обязательная программа. Например,
+-`exports.tool.git_tools` и `exports.tool.file_tools` под одним `component`
+-предоставляют независимые паки в общем процессе. Codex-family fragments
+-выбирают узкие reference exports `file_tools`, `git_tools`, `shell_tools`,
+-`plan_tool`, `rust_lsp`, `skill_tool`, `policy_tools` вместо агрегата
+-`reference.tools`; состав tools и правила их исполнения сохранены. Агрегат
+-остаётся отдельным допустимым выбором для других сборок.
++Пак tools — один такой export, а не обязательная форма отдельной программы.
++В примере `skill-pack` предоставляет tool и context provider в одном процессе.
++Codex-family fragments подключают `file_tools`, `git_tools`, `shell_tools`,
++`plan_tool`, `rust_lsp`, `skill_tool`, `policy_tools` через самостоятельные
++пакеты; состав tools и правила их исполнения сохранены. Process contract
++по-прежнему допускает несколько exports в одном component. Общий
++`reference.tools` сохранён в aggregate test fixture, который не поставляется.
+ 
+ Tool export получает список specs с bootstrap timeout 30 000 мс. При исполнении
+ каждого tool process adapter использует его `ToolSpec.timeout_ms` (при отсутствии
+@@ -827,7 +828,7 @@ Tool export получает список specs с bootstrap timeout 30 000 мс
+ 
+ ## Reference Inventory
+ 
+-Удобный dogfood executable `proteus-reference-module` публикует:
++Aggregate test fixture `proteus-reference-module` публикует:
+ 
+ ```text
+ model:            fake, openai, openai_compatible, openai_codex, anthropic
+@@ -841,7 +842,11 @@ tool:             reference.tools и узкие selectors, direct_patch, codex_p
+                   rg_search, jsonl_memory, sqlite_memory
+ ```
+ 
+-Это reference/test inventory, не обязательный пакет. Любой другой executable,
++Это inventory aggregate fixture для tests, не инструкция по установке.
++Рабочие профили используют самостоятельные `proteus-<id>-module`; их точные
++exports задаются `components/*/exports.json` в
++[Proteus-modules](https://github.com/Proteus-harness/Proteus-modules).
++Fixture не входит в обычную сборку и поставку. Любой другой executable,
+ прошедший тот же contract, настраивается тем же способом.
+ 
+ Отдельных selections `modules.search`, `modules.memory` и `modules.patch` нет.
+@@ -865,8 +870,11 @@ tool:             reference.tools и узкие selectors, direct_patch, codex_p
+ получает отдельный config. Для общего хранилища задайте одинаковый `path`:
+ 
+ ```toml
+-[components.reference-capabilities.exports.tool.sqlite_memory]
+-[components.reference-capabilities.exports.context_provider.sqlite_memory]
++[components.sqlite-memory]
++command = "proteus-sqlite-memory-module"
++
++[components.sqlite-memory.exports.tool.sqlite_memory]
++[components.sqlite-memory.exports.context_provider.sqlite_memory]
+ 
+ [module_config.tool.sqlite_memory]
+ path = ".proteus/memory.sqlite"
+@@ -882,7 +890,7 @@ JSONL использует первые substring-совпадения, SQLite 
+ storage и их параметры принадлежат implementation, а не Core.
+ 
+ Codex-family fragments подключают exact tool export
+-`components.reference-capabilities.exports.tool.codex_patch`; остальные packaged
++`components.codex-patch.exports.tool.codex_patch`; остальные packaged
+ profiles подключают `tool.direct_patch`. Оба предоставляют `apply_patch`, который
+ включается через `tools.enabled`; одновременно подключать оба нельзя из-за
+ дублирующегося имени tool. Отдельной настройки выбора patch slot нет.
+@@ -1196,11 +1204,15 @@ Proteus, не копию upstream Codex `tool_search`:
+ [modules]
+ hooks = ["tool_selection.dynamic", "codex_compact"]
+ 
+-[components.reference-capabilities]
+-command = "proteus-reference-module"
++[components.tool-selection-hook]
++command = "proteus-tool-selection-hook-module"
++
++[components.tool-selection-hook.exports.hook."tool_selection.dynamic"]
++
++[components.codex-context-preparation]
++command = "proteus-codex-context-preparation-module"
+ 
+-[components.reference-capabilities.exports.hook."tool_selection.dynamic"]
+-[components.reference-capabilities.exports.hook.codex_compact]
++[components.codex-context-preparation.exports.hook.codex_compact]
+ 
+ [module_config.hook."tool_selection.dynamic"]
+ max_hot_tools = 16
+@@ -1312,7 +1324,7 @@ Zero `approval_timeout_ms` означает отсутствие server-side dea
+ hooks = ["hook.instructions", "hook.output_budget"]
+ 
+ [components.hooks]
+-command = "proteus-reference-module"
++command = "proteus-hook-pack-module"
+ 
+ [components.hooks.exports.hook."hook.instructions"]
+ timeout_ms = 5000
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index b79aa1f..6378d72 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -87,7 +87,10 @@ module semantics не протекают между репозиториями.
+ 
+ ## Config И Identity
+ 
+-Launch задаётся один раз, exports — вложенной картой:
++Launch задаётся один раз, exports — вложенной картой. Ниже намеренно показан
++aggregate test fixture для нескольких exports в одном процессе, а не
++поставляемый профиль. Для обычного запуска используйте самостоятельные пакеты
++из [руководства конфигурации](../guides/configuration.md#минимальная-форма):
+ 
+ ```toml
+ [components.reference-capabilities]
+@@ -651,7 +654,8 @@ dispatcher в task-local scope: повторный вход в export того 
+ использует broker-owned parent, а вызов другого component остаётся root. Это
+ одинаково действует для async adapters и callback-free blocking policy traits.
+ 
+-Для tracked reference profile безопасный разрез такой:
++Aggregate fixture позволяет проверить, например, такое разделение failure domains
++(это не состав текущего поставляемого Codex-профиля):
+ 
+ ```text
+ reference-workflow       workflow
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 62125be..b675d22 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -103,8 +103,8 @@ token и завершает его сигналом группе процесс
+ 
+ ```bash
+ proteus --config codex server acp
+-# из checkout после cargo build -p proteus-core -p proteus-reference-module:
+-target/debug/proteus --config /absolute/path/to/config.json server acp
++# Из checkout после сборки Core и standalone-пакетов по README:
++PATH="$PWD/target/dev-runtime/bin:$PATH" target/debug/proteus --config /absolute/path/to/config.json server acp
+ ```
+ 
+ `server acp` реализует стабильный **Agent Client Protocol v1** через официальный
+@@ -1767,7 +1767,7 @@ Core path:
+ 7. недоставленное queued сообщение может открыть follow-up с новым domain
+    `TurnId` в той же `run_reserved_chain`.
+ 
+-Baseline `coding.single_loop` экспортируется `proteus-reference-module` из
++Baseline `coding.single_loop` экспортируется `proteus-coding-workflow-module` из
+ crate `coding-workflow`. Внутри шага 5 он через process workflow callbacks:
+ 
+ 1. испускает `TaskReceived`;
+diff --git a/docs/guides/security-and-policy.md b/docs/guides/security-and-policy.md
+index d5d3544..07b481e 100644
+--- a/docs/guides/security-and-policy.md
++++ b/docs/guides/security-and-policy.md
+@@ -212,8 +212,10 @@ Process tools `search`, `recall_memory` и workflow-owned search/describe так
+ File I/O (`read_file`, `write_file`, `list_dir`, `grep`, `find_files`,
+ `read_many_files`), git helpers (`git_status`, `git_diff`) и `shell` вынесены
+ из ядра в process modules `file-tools`, `git-tools` и `shell-tool`
+-соответственно. Добавьте `tool/reference.tools` component export и нужные имена
+-в `tools.enabled`. Safety
++соответственно. Подключите их самостоятельные executable
++`proteus-file-tools-module`, `proteus-git-tools-module` и
++`proteus-shell-tool-module` с exports `tool/file_tools`, `tool/git_tools`
++и `tool/shell_tools`, затем добавьте нужные имена в `tools.enabled`. Safety
+ каждого process tool декларируется в его `ToolSpec` и проверяется тем же
+ механизмом, что и core facade tools.
+ 
+diff --git a/docs/development/codex-baseline.md b/docs/development/codex-baseline.md
+index 452bbf2..c2aba00 100644
+--- a/docs/development/codex-baseline.md
++++ b/docs/development/codex-baseline.md
+@@ -460,19 +460,31 @@ pre-turn compaction после успешного ответа с большим
+ 
+ ### Команды
+ 
++Выбирайте затронутый target, а не запускайте весь список после каждой правки.
++Из корня Proteus-core:
++
++```bash
++python3 scripts/test.py -p proteus-contracts canonical_response
++python3 scripts/test.py -p proteus-core --test module_swap
++```
++
++Из корня Proteus-modules (другой Cargo workspace):
++
+ ```bash
+-cargo test -p proteus-contracts canonical_response
+-cargo test -p model-pack codex_parity_preserves_ordered_commentary_and_final_messages
+-cargo test -p model-pack --lib adapters::openai::round_trip_tests
+-cargo test -p proteus-reference-module --test codex_model_resume
+-cargo test -p coding-workflow codex_loop_preserves_commentary_and_uses_the_last_message_as_final_output
++python3 scripts/test.py -p model-pack codex_parity_preserves_ordered_commentary_and_final_messages
++python3 scripts/test.py -p model-pack --lib adapters::openai::round_trip_tests
++python3 scripts/test.py -p proteus-reference-module --test codex_model_resume
++python3 scripts/test.py -p coding-workflow codex_loop_preserves_commentary_and_uses_the_last_message_as_final_output
+ python3 scripts/test.py -p codex-context-preparation
+-cargo test -p context-pack
+-cargo test -p proteus-reference-module --test codex_compaction --test context_preparation_interop
+-cargo test -p proteus-reference-module --test conformance
+-./scripts/test.py -p proteus-core --test module_swap
++python3 scripts/test.py -p context-pack
++python3 scripts/test.py -p proteus-reference-module --test codex_compaction --test context_preparation_interop
++python3 scripts/test.py -p proteus-reference-module --test conformance
+ ```
+ 
++Modules runner задаёт pinned harness root и готовит standalone artifacts для
++aggregate targets. `proteus-reference-module` в этих командах — тестовый fixture,
++а не пакет для установки.
++
+ После изменения применяются общие gates из [testing.md](testing.md).
+ 
+ ## Граница Evidence
+diff --git a/examples/modules/context-preparation-process/README.md b/examples/modules/context-preparation-process/README.md
+index c03883f..56db0ff 100644
+--- a/examples/modules/context-preparation-process/README.md
++++ b/examples/modules/context-preparation-process/README.md
+@@ -45,7 +45,8 @@ retain_user_turns = 2
+ числа сообщений из input/output, а исходную оценку токенов — из input, если
+ она была передана; module-specific `metadata` не переопределяет эти значения.
+ 
+-Проверка общей семантики с Rust compactor через реальные worker processes:
++Проверка общей семантики с Rust compactor через реальные worker processes
++запускается из корня **Proteus-modules**, а не Proteus-core:
+ 
+ ```bash
+ python3 scripts/test.py -p proteus-reference-module --test context_preparation_interop
+diff --git a/examples/modules/search-process/README.md b/examples/modules/search-process/README.md
+index cfacd66..07a93de 100644
+--- a/examples/modules/search-process/README.md
++++ b/examples/modules/search-process/README.md
+@@ -25,7 +25,7 @@ timeout_ms = 60000
+ timeout_ms = 60000
+ 
+ [components.reference-context]
+-command = "proteus-reference-module"
++command = "proteus-context-pack-module"
+ 
+ [components.reference-context.exports.context.simple]
+ 
+diff --git a/examples/configs/proteus.example.toml b/examples/configs/proteus.example.toml
+index ac9eb7f..de89e85 100644
+--- a/examples/configs/proteus.example.toml
++++ b/examples/configs/proteus.example.toml
+@@ -53,8 +53,8 @@ env_allowlist = ["HOME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HTTP_PROXY", "H
+ surface = "none"
+ 
+ [tools]
+-# Explicit process tools. Add a `tool/reference.tools` process
+-# export before enabling file, git, shell, plan, skill, or LSP tools.
++# Explicit process tools. Add the corresponding standalone component/export
++# before enabling file, git, shell, plan, skill, or LSP tools.
+ enabled = ["apply_patch", "remember_fact", "request_user_input", "search"]
+ 
+ [permissions]
