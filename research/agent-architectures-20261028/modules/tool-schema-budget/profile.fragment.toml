@@ -1,0 +1,30 @@
+# OPT-IN TEMPLATE, not a complete profile. Keep all your existing hooks.
+# Insert schema_budget AFTER tool_selection.dynamic in the existing hooks array.
+# This array is illustrative: importing a fragment must not erase other hooks.
+[modules]
+hooks = ["tool_selection.dynamic", "tool_selection.schema_budget"]
+
+[components.dynamic-tool-selection]
+command = "/ABSOLUTE/PATH/TO/proteus-tool-selection-hook-module"
+
+[components.dynamic-tool-selection.exports.hook."tool_selection.dynamic"]
+
+[components.tool-schema-budget]
+command = "/ABSOLUTE/PATH/TO/proteus-example-tool-schema-budget"
+
+[components.tool-schema-budget.exports.hook."tool_selection.schema_budget"]
+timeout_ms = 1000
+
+[module_config.hook."tool_selection.schema_budget"]
+max_schema_bytes = 32768
+# Preserve these when present; do not resurrect tools hidden earlier in the chain.
+always_include = ["request_user_input", "update_plan", "request_permissions", "apply_patch"]
+# Verified reference-workflow phases with search/describe/call discovery.
+# Plan has search/describe only; review has no discovery. Keep BOTH unchanged.
+# Missing/unlisted phase is a no-op.
+enabled_phases = ["codex_loop", "single_loop", "execute"]
+# Default: keep all mandatory tools even if they exceed the byte target.
+# Explicit alternative "error" fails the hook/turn; it does not deny a tool call.
+on_mandatory_overflow = "preserve"
+max_input_tools = 1024
+max_scan_bytes = 8388608
