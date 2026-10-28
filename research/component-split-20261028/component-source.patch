@@ -1,0 +1,1641 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1983,6 +1983,18 @@
+  "proteus-contracts",
+  "proteus-module-protocol",
+  "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "proteus-plan-module"
++version = "0.1.0-alpha.3"
++dependencies = [
++ "anyhow",
++ "plan-tool",
++ "proteus-contracts",
++ "proteus-module-sdk",
++ "proteus-tool-adapter",
+  "serde_json",
+ ]
+ 
+@@ -2019,6 +2031,7 @@
+  "proteus-module-protocol",
+  "proteus-module-sdk",
+  "proteus-process-host",
++ "proteus-tool-adapter",
+  "rg-search",
+  "rust-lsp",
+  "serde",
+@@ -2029,6 +2042,15 @@
+  "tempfile",
+  "tokio",
+  "tool-selection-hook",
++]
++
++[[package]]
++name = "proteus-tool-adapter"
++version = "0.1.0-alpha.3"
++dependencies = [
++ "anyhow",
++ "proteus-contracts",
++ "serde_json",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,8 @@
+     "context_provider/memory-pack",
+     "context_provider/sqlite-memory",
+     "components/process-module",
++    "components/tool-adapter",
++    "components/plan-module",
+ ]
+ 
+ [workspace.dependencies]
+diff --git a/components/plan-module/Cargo.toml b/components/plan-module/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/components/plan-module/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "proteus-plan-module"
++version = "0.1.0-alpha.3"
++edition = "2024"
++publish = false
++
++[[bin]]
++name = "proteus-plan-module"
++path = "src/main.rs"
++
++[dependencies]
++anyhow = "1"
++plan-tool = { path = "../../tool/plan-tool" }
++proteus-contracts = { workspace = true }
++proteus-module-sdk = { workspace = true }
++proteus-tool-adapter = { path = "../tool-adapter" }
++serde_json = "1"
+diff --git a/components/plan-module/src/main.rs b/components/plan-module/src/main.rs
+new file mode 100644
+--- /dev/null
++++ b/components/plan-module/src/main.rs
+@@ -0,0 +1,92 @@
++use anyhow::{Result, anyhow, bail};
++use proteus_contracts::{
++    contracts::{ProcessComponentExportInitialize, ProcessComponentExportManifest},
++    domain::ModuleConfigSchema,
++};
++use proteus_module_sdk::{
++    Export,
++    hosts::{HostBridge, ToolHostBridge},
++    protocol::process_contract_authority,
++};
++use proteus_tool_adapter::{ToolAdapter, collect_tools};
++use serde_json::Value;
++
++fn main() {
++    if let Err(error) = run() {
++        eprintln!("proteus-plan-module: {error:#}");
++        std::process::exit(1);
++    }
++}
++
++fn run() -> Result<()> {
++    let args = std::env::args_os().collect::<Vec<_>>();
++    if args.len() == 2 && args[1] == "--version" {
++        println!("proteus-plan-module {}", env!("CARGO_PKG_VERSION"));
++        return Ok(());
++    }
++    if args.len() != 1 {
++        bail!("usage: proteus-plan-module [--version]");
++    }
++    proteus_module_sdk::run(|binding| Ok(Box::new(PlanExport::load(binding)?)))
++}
++
++struct PlanExport {
++    binding: ProcessComponentExportInitialize,
++    tools: ToolAdapter,
++}
++
++impl PlanExport {
++    fn load(binding: ProcessComponentExportInitialize) -> Result<Self> {
++        if (binding.slot.as_str(), binding.module_id.as_str()) != ("tool", "plan_tool") {
++            bail!(
++                "plan module has no {} module {:?}",
++                binding.slot,
++                binding.module_id
++            );
++        }
++        process_contract_authority(&binding.slot, &binding.contract_version)
++            .ok_or_else(|| anyhow!("unsupported tool contract {}", binding.contract_version))?;
++        let tools = collect_tools(binding.module_config.clone(), plan_tool::register_modules)?;
++        Ok(Self {
++            binding,
++            tools: ToolAdapter::new(tools),
++        })
++    }
++}
++
++impl Export for PlanExport {
++    fn manifest(&self) -> ProcessComponentExportManifest {
++        let authority =
++            process_contract_authority(&self.binding.slot, &self.binding.contract_version)
++                .expect("validated process authority");
++        ProcessComponentExportManifest {
++            slot: self.binding.slot.clone(),
++            module_id: self.binding.module_id.clone(),
++            contract_version: self.binding.contract_version.clone(),
++            composition: authority.composition,
++            module_features: Vec::new(),
++            config_schema: Some(ModuleConfigSchema::default()),
++        }
++    }
++
++    fn invoke(&self, method: &str, params: Value, bridge: &HostBridge) -> Result<Value> {
++        let authority =
++            process_contract_authority(&self.binding.slot, &self.binding.contract_version)
++                .expect("validated process authority");
++        if !authority.allows_module_method(method) {
++            bail!(
++                "method {method:?} is not allowed for slot {}",
++                self.binding.slot
++            );
++        }
++        self.tools.invoke(
++            method,
++            params,
++            &self.binding.module_config,
++            &mut ToolHostBridge(bridge.clone()),
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/components/plan-module/src/tests.rs b/components/plan-module/src/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/components/plan-module/src/tests.rs
+@@ -0,0 +1,137 @@
++use proteus_contracts::{
++    contracts::{
++        ExecutionAttribution, PROCESS_TOOL_CONTRACT_VERSION, PROCESS_TOOL_INVOKE_METHOD,
++        PROCESS_TOOL_LIST_METHOD, ProcessToolInvokeInput,
++    },
++    domain::{ToolCall, new_execution_id},
++    process_module::{
++        ProcessModuleResult, ToolModule, ToolModuleHost, ToolModuleInvocationContext,
++    },
++};
++use serde_json::json;
++
++use super::*;
++
++struct NoHost;
++
++impl ToolModuleHost for NoHost {
++    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
++        Ok(false)
++    }
++}
++
++fn binding() -> ProcessComponentExportInitialize {
++    let authority = process_contract_authority("tool", PROCESS_TOOL_CONTRACT_VERSION).unwrap();
++    ProcessComponentExportInitialize::new(
++        "tool",
++        "plan_tool",
++        PROCESS_TOOL_CONTRACT_VERSION,
++        authority.composition,
++        json!({"opaque": "preserved"}),
++        ["unknown.optional.feature"],
++    )
++}
++
++#[test]
++fn factory_admits_only_the_explicit_plan_identity_and_contract() {
++    for (slot, id) in [
++        ("policy", "plan_tool"),
++        ("tool", "reference.tools"),
++        ("tool", "file_tools"),
++        ("tool", "Plan_tool"),
++    ] {
++        let mut binding = binding();
++        binding.slot = slot.into();
++        binding.module_id = id.into();
++        assert!(PlanExport::load(binding).is_err());
++    }
++    let mut wrong_version = binding();
++    wrong_version.contract_version = "unknown".into();
++    assert!(PlanExport::load(wrong_version).is_err());
++}
++
++#[test]
++fn manifest_and_catalog_match_the_existing_plan_registration() {
++    let binding = binding();
++    let export = PlanExport::load(binding.clone()).unwrap();
++    assert_eq!(
++        export.manifest(),
++        ProcessComponentExportManifest {
++            slot: binding.slot,
++            module_id: binding.module_id,
++            contract_version: binding.contract_version,
++            composition: binding.composition,
++            module_features: Vec::new(),
++            config_schema: Some(ModuleConfigSchema::default()),
++        }
++    );
++    let response = export
++        .tools
++        .invoke(
++            PROCESS_TOOL_LIST_METHOD,
++            Value::Null,
++            &export.binding.module_config,
++            &mut NoHost,
++        )
++        .unwrap();
++    let tool = plan_tool::PlanTool;
++    let expected: Value = serde_json::from_str(&tool.spec_json()).unwrap();
++    assert_eq!(response["result"].as_array().unwrap().len(), 1);
++    assert_eq!(response["result"][0]["spec"], expected);
++    assert_eq!(response["result"][0]["model_visible"], tool.model_visible());
++    assert_eq!(
++        response["result"][0]["user_command"],
++        serde_json::to_value(tool.user_command()).unwrap()
++    );
++}
++
++#[test]
++fn shared_adapter_preserves_plan_domain_results_and_legacy_validation() {
++    let export = PlanExport::load(binding()).unwrap();
++    for args in [
++        json!({"plan": []}),
++        json!({"plan": [
++            {"step": "", "status": "in_progress"},
++            {"step": "next", "status": "in_progress"}
++        ]}),
++        json!({"explanation": "done", "plan": [{"step": "read", "status": "completed"}]}),
++        json!({"plan": [{"step": "bad status", "status": "done"}]}),
++        json!({"plan": [], "unexpected": true}),
++    ] {
++        let mut input = ProcessToolInvokeInput {
++            call: ToolCall::new("plan-call", "update_plan", args),
++            cwd: std::path::PathBuf::from("workspace"),
++            attribution: ExecutionAttribution::detached(new_execution_id()),
++            skills: Default::default(),
++        };
++        // Deliberately contradictory raw input: the legacy module consumes
++        // call.args, and the adapter must not silently normalize it differently.
++        input.call.raw_arguments = Some("{not normalized here".into());
++        let context = ToolModuleInvocationContext {
++            cwd: input.cwd.clone(),
++            attribution: input.attribution,
++            skills: input.skills.clone(),
++            config: export.binding.module_config.clone(),
++        };
++        let expected: Value = serde_json::from_str(
++            &plan_tool::PlanTool
++                .invoke_json(
++                    serde_json::to_string(&input.call).unwrap(),
++                    serde_json::to_string(&context).unwrap(),
++                    &mut NoHost,
++                )
++                .unwrap(),
++        )
++        .unwrap();
++        let actual = export
++            .tools
++            .invoke(
++                PROCESS_TOOL_INVOKE_METHOD,
++                serde_json::to_value(input).unwrap(),
++                &export.binding.module_config,
++                &mut NoHost,
++            )
++            .unwrap();
++        assert_eq!(actual["result"], expected);
++    }
++}
+diff --git a/components/process-module/Cargo.toml b/components/process-module/Cargo.toml
+--- a/components/process-module/Cargo.toml
++++ b/components/process-module/Cargo.toml
+@@ -13,6 +13,7 @@
+ proteus-contracts = { workspace = true }
+ proteus-module-protocol = { workspace = true }
+ proteus-module-sdk = { workspace = true }
++proteus-tool-adapter = { path = "../tool-adapter" }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ 
+diff --git a/components/process-module/src/exports.rs b/components/process-module/src/exports.rs
+--- a/components/process-module/src/exports.rs
++++ b/components/process-module/src/exports.rs
+@@ -2,18 +2,18 @@
+ use proteus_contracts::{
+     contracts::{
+         PROCESS_POLICY_EVALUATE_METHOD, PROCESS_POLICY_VISIBILITY_METHOD,
+-        PROCESS_TOOL_INVOKE_METHOD, PROCESS_TOOL_LIST_METHOD, ProcessComponentExportInitialize,
+-        ProcessComponentExportManifest, ProcessContextChunksResponse, ProcessContextInput,
+-        ProcessContextResponse, ProcessPolicyEvaluateInput, ProcessPolicyResponse,
+-        ProcessPolicyVisibilityInput, ProcessToolInvokeInput, ProcessToolInvokeResponse,
+-        ProcessToolListResponse, ProcessWorkflowInput, ProcessWorkflowResponse, WorkflowOutput,
++        ProcessComponentExportInitialize, ProcessComponentExportManifest,
++        ProcessContextChunksResponse, ProcessContextInput, ProcessContextResponse,
++        ProcessPolicyEvaluateInput, ProcessPolicyResponse, ProcessPolicyVisibilityInput,
++        ProcessWorkflowInput, ProcessWorkflowResponse, WorkflowOutput,
+     },
+     process_module::{
+         ContextBuilderModuleInput, PolicyModuleInvocationContext, PolicyModuleVisibilityContext,
+-        ToolModuleInvocationContext, WorkflowModuleInput, WorkflowModuleOutput,
++        WorkflowModuleInput, WorkflowModuleOutput,
+     },
+ };
+ use proteus_module_protocol::process_contract_authority;
++use proteus_tool_adapter::ToolAdapter;
+ use serde_json::Value;
+ 
+ use crate::{
+@@ -21,31 +21,29 @@
+     registry::CollectedModules,
+ };
+ 
+-mod tools;
+-use tools::ToolCatalog;
+-
+ pub(crate) struct ModuleExport {
+     binding: ProcessComponentExportInitialize,
+     modules: CollectedModules,
+-    tool_catalog: ToolCatalog,
++    tool_adapter: ToolAdapter,
+ }
+ 
+ impl ModuleExport {
+     pub(crate) fn load(binding: ProcessComponentExportInitialize) -> Result<Self> {
+-        let modules = CollectedModules::load(
++        let mut modules = CollectedModules::load(
+             &binding.slot,
+             &binding.module_id,
+             binding.module_config.clone(),
+         )?;
+-        let tool_catalog = if binding.slot == "tool" {
+-            ToolCatalog::new(&modules.tools)
++        let tools = if binding.slot == "tool" {
++            std::mem::take(&mut modules.tools)
+         } else {
+-            ToolCatalog::default()
+-        };
++            Vec::new()
++        };
++        let tool_adapter = ToolAdapter::new(tools);
+         Ok(Self {
+             binding,
+             modules,
+-            tool_catalog,
++            tool_adapter,
+         })
+     }
+ 
+@@ -124,36 +122,12 @@
+     }
+ 
+     fn tool(&self, method: &str, params: Value, bridge: &HostBridge) -> Result<Value> {
+-        match method {
+-            PROCESS_TOOL_LIST_METHOD => {
+-                if !params.is_null() {
+-                    bail!("tool list params must be null");
+-                }
+-                encode(ProcessToolListResponse::new(
+-                    self.tool_catalog.definitions()?,
+-                ))
+-            }
+-            PROCESS_TOOL_INVOKE_METHOD => {
+-                let input: ProcessToolInvokeInput = decode(params)?;
+-                let index = self
+-                    .tool_catalog
+-                    .index(&input.call.name)
+-                    .ok_or_else(|| anyhow!("tool module does not provide {}", input.call.name))?;
+-                let tool = &self.modules.tools[index];
+-                let call_json = serde_json::to_string(&input.call)?;
+-                let context_json = serde_json::to_string(&ToolModuleInvocationContext {
+-                    cwd: input.cwd,
+-                    attribution: input.attribution,
+-                    skills: input.skills,
+-                    config: self.binding.module_config.clone(),
+-                })?;
+-                let mut host = ToolHostBridge(bridge.clone());
+-                let output = tool.invoke_json(call_json, context_json, &mut host)?;
+-                let result = serde_json::from_str(output.as_str())?;
+-                encode(ProcessToolInvokeResponse::new(result))
+-            }
+-            _ => unreachable!(),
+-        }
++        self.tool_adapter.invoke(
++            method,
++            params,
++            &self.binding.module_config,
++            &mut ToolHostBridge(bridge.clone()),
++        )
+     }
+ 
+     fn model(&self, method: &str, params: Value, bridge: &HostBridge) -> Result<Value> {
+diff --git a/components/process-module/src/exports/tools.rs b/components/process-module/src/exports/tools.rs
+deleted file mode 100644
+--- a/components/process-module/src/exports/tools.rs
++++ /dev/null
+@@ -1,61 +0,0 @@
+-use std::collections::HashMap;
+-
+-use anyhow::{Result, anyhow};
+-use proteus_contracts::{
+-    contracts::ProcessToolDefinition, domain::ToolSpec, process_module::ToolModuleObject,
+-};
+-
+-/// One immutable catalog per loaded tool export; never shared across bindings.
+-/// The ordered definitions remain authoritative for list, including duplicates.
+-/// Core still owns duplicate-name and schema validation before registration.
+-#[derive(Default)]
+-pub(super) struct ToolCatalog {
+-    definitions: Vec<std::result::Result<ProcessToolDefinition, String>>,
+-    first_by_name: HashMap<String, usize>,
+-}
+-
+-impl ToolCatalog {
+-    pub(super) fn new(tools: &[ToolModuleObject]) -> Self {
+-        let mut definitions = Vec::with_capacity(tools.len());
+-        let mut first_by_name = HashMap::with_capacity(tools.len());
+-        for (index, tool) in tools.iter().enumerate() {
+-            let definition = serde_json::from_str::<ToolSpec>(&tool.spec_json())
+-                .map(|spec| ProcessToolDefinition {
+-                    spec,
+-                    model_visible: tool.model_visible(),
+-                    user_command: tool.user_command(),
+-                })
+-                .map_err(|error| error.to_string());
+-            if let Ok(definition) = &definition {
+-                // Match the previous linear find: exact name, first valid spec.
+-                first_by_name
+-                    .entry(definition.spec.name.clone())
+-                    .or_insert(index);
+-            }
+-            // Retain parse failures: list must not silently omit invalid tools,
+-            // while invocation lookup previously skipped their invalid specs.
+-            definitions.push(definition);
+-        }
+-        Self {
+-            definitions,
+-            first_by_name,
+-        }
+-    }
+-
+-    pub(super) fn definitions(&self) -> Result<Vec<ProcessToolDefinition>> {
+-        self.definitions
+-            .iter()
+-            .map(|definition| match definition {
+-                Ok(definition) => Ok(definition.clone()),
+-                Err(error) => Err(anyhow!(error.clone())),
+-            })
+-            .collect()
+-    }
+-
+-    pub(super) fn index(&self, name: &str) -> Option<usize> {
+-        self.first_by_name.get(name).copied()
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests;
+diff --git a/components/process-module/src/exports/tools/tests.rs b/components/process-module/src/exports/tools/tests.rs
+deleted file mode 100644
+--- a/components/process-module/src/exports/tools/tests.rs
++++ /dev/null
+@@ -1,284 +0,0 @@
+-use std::sync::{
+-    Arc,
+-    atomic::{AtomicUsize, Ordering},
+-};
+-
+-use proteus_contracts::{
+-    contracts::{ProcessToolDefinition, ToolUserCommand},
+-    domain::{ToolResult, ToolSafety, ToolSpec},
+-    process_module::{ProcessModuleResult, ToolModule, ToolModuleHost, ToolModuleObject},
+-};
+-use serde_json::json;
+-
+-use super::ToolCatalog;
+-
+-struct Probe {
+-    definition: ProcessToolDefinition,
+-    raw_spec: Option<String>,
+-    reads: Arc<AtomicUsize>,
+-}
+-
+-impl ToolModule for Probe {
+-    fn spec_json(&self) -> String {
+-        self.reads.fetch_add(1, Ordering::Relaxed);
+-        self.raw_spec
+-            .clone()
+-            .unwrap_or_else(|| serde_json::to_string(&self.definition.spec).unwrap())
+-    }
+-
+-    fn model_visible(&self) -> bool {
+-        self.definition.model_visible
+-    }
+-
+-    fn user_command(&self) -> Option<ToolUserCommand> {
+-        self.definition.user_command.clone()
+-    }
+-
+-    fn invoke_json(
+-        &self,
+-        _call_json: String,
+-        _context_json: String,
+-        _host: &mut dyn ToolModuleHost,
+-    ) -> ProcessModuleResult<String> {
+-        Ok(serde_json::to_string(&ToolResult::ok(
+-            "probe-call".into(),
+-            self.definition.spec.description.clone(),
+-        ))
+-        .unwrap())
+-    }
+-}
+-
+-struct NoHost;
+-
+-impl ToolModuleHost for NoHost {
+-    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
+-        Ok(false)
+-    }
+-}
+-
+-fn invoke_at(tools: &[ToolModuleObject], index: usize) -> ToolResult {
+-    let output = tools[index]
+-        .invoke_json("{}".into(), "{}".into(), &mut NoHost)
+-        .unwrap();
+-    serde_json::from_str(&output).unwrap()
+-}
+-
+-fn definition(name: &str, description: &str) -> ProcessToolDefinition {
+-    ProcessToolDefinition {
+-        spec: ToolSpec::new(
+-            name,
+-            description,
+-            json!({"type": "object"}),
+-            ToolSafety::ReadOnly,
+-        ),
+-        model_visible: true,
+-        user_command: None,
+-    }
+-}
+-
+-fn probe(
+-    definition: ProcessToolDefinition,
+-    raw_spec: Option<String>,
+-    reads: &Arc<AtomicUsize>,
+-) -> ToolModuleObject {
+-    Box::new(Probe {
+-        definition,
+-        raw_spec,
+-        reads: Arc::clone(reads),
+-    })
+-}
+-
+-fn uncached_index(tools: &[ToolModuleObject], name: &str) -> Option<usize> {
+-    // The previous dispatch algorithm, retained only for deterministic work
+-    // comparison. This is not a wall-clock benchmark.
+-    tools.iter().position(|tool| {
+-        serde_json::from_str::<ToolSpec>(&tool.spec_json()).is_ok_and(|spec| spec.name == name)
+-    })
+-}
+-
+-#[test]
+-fn catalog_preserves_order_metadata_and_exact_name_lookup() {
+-    let reads = Arc::new(AtomicUsize::new(0));
+-    let mut hidden = definition("zeta", "hidden user command");
+-    hidden.model_visible = false;
+-    hidden.spec.input_schema = json!({
+-        "type": "object",
+-        "properties": {"arguments": {"type": "string"}},
+-        "required": ["arguments"]
+-    });
+-    hidden.user_command = Some(ToolUserCommand {
+-        name: "zeta".into(),
+-        description: "Run zeta".into(),
+-        arguments: "[ARGS]".into(),
+-    });
+-    hidden.spec = hidden.spec.with_parallel_tool_calls(true);
+-    let expected = vec![
+-        hidden,
+-        definition("Alpha", "case sensitive"),
+-        definition("alpha", "lowercase"),
+-        definition(" alpha", "not trimmed"),
+-    ];
+-    let tools = expected
+-        .iter()
+-        .cloned()
+-        .map(|definition| probe(definition, None, &reads))
+-        .collect::<Vec<_>>();
+-    let catalog = ToolCatalog::new(&tools);
+-
+-    assert_eq!(catalog.definitions().unwrap(), expected);
+-    assert_eq!(catalog.definitions().unwrap(), expected);
+-    for (index, definition) in expected.iter().enumerate() {
+-        assert_eq!(catalog.index(&definition.spec.name), Some(index));
+-    }
+-    assert_eq!(catalog.index("ALPHA"), None);
+-    assert_eq!(catalog.index("alpha "), None);
+-    assert_eq!(catalog.index("missing"), None);
+-    assert_eq!(reads.load(Ordering::Relaxed), expected.len());
+-}
+-
+-#[test]
+-fn duplicates_remain_in_list_and_dispatch_keeps_the_first_match() {
+-    let reads = Arc::new(AtomicUsize::new(0));
+-    let expected = vec![
+-        definition("repeat", "first handler"),
+-        definition("other", "middle handler"),
+-        definition("repeat", "last handler"),
+-    ];
+-    let tools = expected
+-        .iter()
+-        .cloned()
+-        .map(|definition| probe(definition, None, &reads))
+-        .collect::<Vec<_>>();
+-    let catalog = ToolCatalog::new(&tools);
+-
+-    // Do not hide duplicates from Core's existing registration rejection.
+-    assert_eq!(catalog.definitions().unwrap(), expected);
+-    assert_eq!(catalog.index("repeat"), Some(0));
+-    assert_eq!(catalog.index("repeat"), uncached_index(&tools, "repeat"));
+-    assert_eq!(catalog.index("other"), Some(1));
+-    let selected = catalog.index("repeat").unwrap();
+-    assert_eq!(invoke_at(&tools, selected).output, "first handler");
+-}
+-
+-#[test]
+-fn malformed_specs_still_fail_list_but_are_not_dispatch_candidates() {
+-    for raw_spec in [
+-        "{".to_owned(),
+-        {
+-            let mut value = serde_json::to_value(definition("repeat", "invalid").spec).unwrap();
+-            value
+-                .as_object_mut()
+-                .unwrap()
+-                .remove("supports_parallel_tool_calls");
+-            value.to_string()
+-        },
+-        {
+-            let mut value = serde_json::to_value(definition("repeat", "invalid").spec).unwrap();
+-            value["unexpected"] = json!(true);
+-            value.to_string()
+-        },
+-    ] {
+-        let reads = Arc::new(AtomicUsize::new(0));
+-        let expected_error = serde_json::from_str::<ToolSpec>(&raw_spec)
+-            .unwrap_err()
+-            .to_string();
+-        let tools = vec![
+-            probe(definition("repeat", "invalid"), Some(raw_spec), &reads),
+-            probe(definition("repeat", "valid"), None, &reads),
+-            probe(
+-                definition("other", "later invalid"),
+-                Some("null".into()),
+-                &reads,
+-            ),
+-        ];
+-        let catalog = ToolCatalog::new(&tools);
+-
+-        assert_eq!(
+-            catalog.definitions().unwrap_err().to_string(),
+-            expected_error
+-        );
+-        assert_eq!(
+-            catalog.definitions().unwrap_err().to_string(),
+-            expected_error
+-        );
+-        assert_eq!(catalog.index("repeat"), Some(1));
+-        assert_eq!(catalog.index("repeat"), uncached_index(&tools, "repeat"));
+-    }
+-}
+-
+-#[test]
+-fn cache_does_not_relocate_host_schema_validation() {
+-    let reads = Arc::new(AtomicUsize::new(0));
+-    let mut invalid_schema = definition("probe", "host rejects this schema");
+-    invalid_schema.spec.input_schema = json!({"type": "not-a-schema-type"});
+-    let tools = vec![probe(invalid_schema.clone(), None, &reads)];
+-    let catalog = ToolCatalog::new(&tools);
+-
+-    assert_eq!(catalog.definitions().unwrap(), vec![invalid_schema.clone()]);
+-    assert_eq!(catalog.index("probe"), Some(0));
+-    let validation = proteus_contracts::domain::tool_validation::validate_tool_input_schema(
+-        &invalid_schema.spec,
+-    );
+-    assert!(validation.is_err());
+-}
+-
+-#[test]
+-fn each_loaded_export_owns_its_catalog() {
+-    let reads = Arc::new(AtomicUsize::new(0));
+-    let first = definition("same", "first config");
+-    let mut second = definition("same", "second config");
+-    second.model_visible = false;
+-    second.spec = second.spec.with_parallel_tool_calls(true);
+-    let first_tools = vec![probe(first.clone(), None, &reads)];
+-    let second_tools = vec![probe(second.clone(), None, &reads)];
+-    let first_catalog = ToolCatalog::new(&first_tools);
+-    let second_catalog = ToolCatalog::new(&second_tools);
+-
+-    assert_eq!(first_catalog.definitions().unwrap(), vec![first]);
+-    assert_eq!(second_catalog.definitions().unwrap(), vec![second]);
+-    assert_eq!(first_catalog.index("same"), Some(0));
+-    assert_eq!(second_catalog.index("same"), Some(0));
+-    assert_eq!(reads.load(Ordering::Relaxed), 2);
+-}
+-
+-#[test]
+-fn repeated_lookup_and_list_do_not_regenerate_or_reparse_specs() {
+-    const WIDTH: usize = 32;
+-    const REPEATS: usize = 100;
+-    let reads = Arc::new(AtomicUsize::new(0));
+-    let tools = (0..WIDTH)
+-        .map(|index| probe(definition(&format!("tool-{index}"), "probe"), None, &reads))
+-        .collect::<Vec<_>>();
+-    let last = format!("tool-{}", WIDTH - 1);
+-
+-    // One original list plus a last-entry hit and a miss per iteration.
+-    for tool in &tools {
+-        serde_json::from_str::<ToolSpec>(&tool.spec_json()).unwrap();
+-    }
+-    for _ in 0..REPEATS {
+-        let selected = uncached_index(&tools, &last).unwrap();
+-        assert_eq!(selected, WIDTH - 1);
+-        assert_eq!(invoke_at(&tools, selected).output, "probe");
+-        assert_eq!(uncached_index(&tools, "missing"), None);
+-    }
+-    let uncached_reads = reads.swap(0, Ordering::Relaxed);
+-    assert_eq!(uncached_reads, WIDTH * (1 + 2 * REPEATS));
+-
+-    let catalog = ToolCatalog::new(&tools);
+-    assert_eq!(catalog.definitions().unwrap().len(), WIDTH);
+-    for _ in 0..REPEATS {
+-        let selected = catalog.index(&last).unwrap();
+-        assert_eq!(selected, WIDTH - 1);
+-        assert_eq!(invoke_at(&tools, selected).output, "probe");
+-        assert_eq!(catalog.index("missing"), None);
+-    }
+-    assert_eq!(catalog.definitions().unwrap().len(), WIDTH);
+-    assert_eq!(reads.load(Ordering::Relaxed), WIDTH);
+-}
+-
+-#[test]
+-fn empty_catalog_remains_empty() {
+-    let catalog = ToolCatalog::new(&[]);
+-    assert!(catalog.definitions().unwrap().is_empty());
+-    assert_eq!(catalog.index("missing"), None);
+-}
+diff --git a/components/tool-adapter/Cargo.toml b/components/tool-adapter/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/Cargo.toml
+@@ -0,0 +1,10 @@
++[package]
++name = "proteus-tool-adapter"
++version = "0.1.0-alpha.3"
++edition = "2024"
++publish = false
++
++[dependencies]
++anyhow = "1"
++proteus-contracts = { workspace = true }
++serde_json = "1"
+diff --git a/components/tool-adapter/src/catalog.rs b/components/tool-adapter/src/catalog.rs
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/src/catalog.rs
+@@ -0,0 +1,61 @@
++use std::collections::HashMap;
++
++use anyhow::{Result, anyhow};
++use proteus_contracts::{
++    contracts::ProcessToolDefinition, domain::ToolSpec, process_module::ToolModuleObject,
++};
++
++/// One immutable catalog per loaded tool export; never shared across bindings.
++/// The ordered definitions remain authoritative for list, including duplicates.
++/// Core still owns duplicate-name and schema validation before registration.
++#[derive(Default)]
++pub(super) struct ToolCatalog {
++    definitions: Vec<std::result::Result<ProcessToolDefinition, String>>,
++    first_by_name: HashMap<String, usize>,
++}
++
++impl ToolCatalog {
++    pub(super) fn new(tools: &[ToolModuleObject]) -> Self {
++        let mut definitions = Vec::with_capacity(tools.len());
++        let mut first_by_name = HashMap::with_capacity(tools.len());
++        for (index, tool) in tools.iter().enumerate() {
++            let definition = serde_json::from_str::<ToolSpec>(&tool.spec_json())
++                .map(|spec| ProcessToolDefinition {
++                    spec,
++                    model_visible: tool.model_visible(),
++                    user_command: tool.user_command(),
++                })
++                .map_err(|error| error.to_string());
++            if let Ok(definition) = &definition {
++                // Match the previous linear find: exact name, first valid spec.
++                first_by_name
++                    .entry(definition.spec.name.clone())
++                    .or_insert(index);
++            }
++            // Retain parse failures: list must not silently omit invalid tools,
++            // while invocation lookup previously skipped their invalid specs.
++            definitions.push(definition);
++        }
++        Self {
++            definitions,
++            first_by_name,
++        }
++    }
++
++    pub(super) fn definitions(&self) -> Result<Vec<ProcessToolDefinition>> {
++        self.definitions
++            .iter()
++            .map(|definition| match definition {
++                Ok(definition) => Ok(definition.clone()),
++                Err(error) => Err(anyhow!(error.clone())),
++            })
++            .collect()
++    }
++
++    pub(super) fn index(&self, name: &str) -> Option<usize> {
++        self.first_by_name.get(name).copied()
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/components/tool-adapter/src/catalog/tests.rs b/components/tool-adapter/src/catalog/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/src/catalog/tests.rs
+@@ -0,0 +1,284 @@
++use std::sync::{
++    Arc,
++    atomic::{AtomicUsize, Ordering},
++};
++
++use proteus_contracts::{
++    contracts::{ProcessToolDefinition, ToolUserCommand},
++    domain::{ToolResult, ToolSafety, ToolSpec},
++    process_module::{ProcessModuleResult, ToolModule, ToolModuleHost, ToolModuleObject},
++};
++use serde_json::json;
++
++use super::ToolCatalog;
++
++struct Probe {
++    definition: ProcessToolDefinition,
++    raw_spec: Option<String>,
++    reads: Arc<AtomicUsize>,
++}
++
++impl ToolModule for Probe {
++    fn spec_json(&self) -> String {
++        self.reads.fetch_add(1, Ordering::Relaxed);
++        self.raw_spec
++            .clone()
++            .unwrap_or_else(|| serde_json::to_string(&self.definition.spec).unwrap())
++    }
++
++    fn model_visible(&self) -> bool {
++        self.definition.model_visible
++    }
++
++    fn user_command(&self) -> Option<ToolUserCommand> {
++        self.definition.user_command.clone()
++    }
++
++    fn invoke_json(
++        &self,
++        _call_json: String,
++        _context_json: String,
++        _host: &mut dyn ToolModuleHost,
++    ) -> ProcessModuleResult<String> {
++        Ok(serde_json::to_string(&ToolResult::ok(
++            "probe-call".into(),
++            self.definition.spec.description.clone(),
++        ))
++        .unwrap())
++    }
++}
++
++struct NoHost;
++
++impl ToolModuleHost for NoHost {
++    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
++        Ok(false)
++    }
++}
++
++fn invoke_at(tools: &[ToolModuleObject], index: usize) -> ToolResult {
++    let output = tools[index]
++        .invoke_json("{}".into(), "{}".into(), &mut NoHost)
++        .unwrap();
++    serde_json::from_str(&output).unwrap()
++}
++
++fn definition(name: &str, description: &str) -> ProcessToolDefinition {
++    ProcessToolDefinition {
++        spec: ToolSpec::new(
++            name,
++            description,
++            json!({"type": "object"}),
++            ToolSafety::ReadOnly,
++        ),
++        model_visible: true,
++        user_command: None,
++    }
++}
++
++fn probe(
++    definition: ProcessToolDefinition,
++    raw_spec: Option<String>,
++    reads: &Arc<AtomicUsize>,
++) -> ToolModuleObject {
++    Box::new(Probe {
++        definition,
++        raw_spec,
++        reads: Arc::clone(reads),
++    })
++}
++
++fn uncached_index(tools: &[ToolModuleObject], name: &str) -> Option<usize> {
++    // The previous dispatch algorithm, retained only for deterministic work
++    // comparison. This is not a wall-clock benchmark.
++    tools.iter().position(|tool| {
++        serde_json::from_str::<ToolSpec>(&tool.spec_json()).is_ok_and(|spec| spec.name == name)
++    })
++}
++
++#[test]
++fn catalog_preserves_order_metadata_and_exact_name_lookup() {
++    let reads = Arc::new(AtomicUsize::new(0));
++    let mut hidden = definition("zeta", "hidden user command");
++    hidden.model_visible = false;
++    hidden.spec.input_schema = json!({
++        "type": "object",
++        "properties": {"arguments": {"type": "string"}},
++        "required": ["arguments"]
++    });
++    hidden.user_command = Some(ToolUserCommand {
++        name: "zeta".into(),
++        description: "Run zeta".into(),
++        arguments: "[ARGS]".into(),
++    });
++    hidden.spec = hidden.spec.with_parallel_tool_calls(true);
++    let expected = vec![
++        hidden,
++        definition("Alpha", "case sensitive"),
++        definition("alpha", "lowercase"),
++        definition(" alpha", "not trimmed"),
++    ];
++    let tools = expected
++        .iter()
++        .cloned()
++        .map(|definition| probe(definition, None, &reads))
++        .collect::<Vec<_>>();
++    let catalog = ToolCatalog::new(&tools);
++
++    assert_eq!(catalog.definitions().unwrap(), expected);
++    assert_eq!(catalog.definitions().unwrap(), expected);
++    for (index, definition) in expected.iter().enumerate() {
++        assert_eq!(catalog.index(&definition.spec.name), Some(index));
++    }
++    assert_eq!(catalog.index("ALPHA"), None);
++    assert_eq!(catalog.index("alpha "), None);
++    assert_eq!(catalog.index("missing"), None);
++    assert_eq!(reads.load(Ordering::Relaxed), expected.len());
++}
++
++#[test]
++fn duplicates_remain_in_list_and_dispatch_keeps_the_first_match() {
++    let reads = Arc::new(AtomicUsize::new(0));
++    let expected = vec![
++        definition("repeat", "first handler"),
++        definition("other", "middle handler"),
++        definition("repeat", "last handler"),
++    ];
++    let tools = expected
++        .iter()
++        .cloned()
++        .map(|definition| probe(definition, None, &reads))
++        .collect::<Vec<_>>();
++    let catalog = ToolCatalog::new(&tools);
++
++    // Do not hide duplicates from Core's existing registration rejection.
++    assert_eq!(catalog.definitions().unwrap(), expected);
++    assert_eq!(catalog.index("repeat"), Some(0));
++    assert_eq!(catalog.index("repeat"), uncached_index(&tools, "repeat"));
++    assert_eq!(catalog.index("other"), Some(1));
++    let selected = catalog.index("repeat").unwrap();
++    assert_eq!(invoke_at(&tools, selected).output, "first handler");
++}
++
++#[test]
++fn malformed_specs_still_fail_list_but_are_not_dispatch_candidates() {
++    for raw_spec in [
++        "{".to_owned(),
++        {
++            let mut value = serde_json::to_value(definition("repeat", "invalid").spec).unwrap();
++            value
++                .as_object_mut()
++                .unwrap()
++                .remove("supports_parallel_tool_calls");
++            value.to_string()
++        },
++        {
++            let mut value = serde_json::to_value(definition("repeat", "invalid").spec).unwrap();
++            value["unexpected"] = json!(true);
++            value.to_string()
++        },
++    ] {
++        let reads = Arc::new(AtomicUsize::new(0));
++        let expected_error = serde_json::from_str::<ToolSpec>(&raw_spec)
++            .unwrap_err()
++            .to_string();
++        let tools = vec![
++            probe(definition("repeat", "invalid"), Some(raw_spec), &reads),
++            probe(definition("repeat", "valid"), None, &reads),
++            probe(
++                definition("other", "later invalid"),
++                Some("null".into()),
++                &reads,
++            ),
++        ];
++        let catalog = ToolCatalog::new(&tools);
++
++        assert_eq!(
++            catalog.definitions().unwrap_err().to_string(),
++            expected_error
++        );
++        assert_eq!(
++            catalog.definitions().unwrap_err().to_string(),
++            expected_error
++        );
++        assert_eq!(catalog.index("repeat"), Some(1));
++        assert_eq!(catalog.index("repeat"), uncached_index(&tools, "repeat"));
++    }
++}
++
++#[test]
++fn cache_does_not_relocate_host_schema_validation() {
++    let reads = Arc::new(AtomicUsize::new(0));
++    let mut invalid_schema = definition("probe", "host rejects this schema");
++    invalid_schema.spec.input_schema = json!({"type": "not-a-schema-type"});
++    let tools = vec![probe(invalid_schema.clone(), None, &reads)];
++    let catalog = ToolCatalog::new(&tools);
++
++    assert_eq!(catalog.definitions().unwrap(), vec![invalid_schema.clone()]);
++    assert_eq!(catalog.index("probe"), Some(0));
++    let validation = proteus_contracts::domain::tool_validation::validate_tool_input_schema(
++        &invalid_schema.spec,
++    );
++    assert!(validation.is_err());
++}
++
++#[test]
++fn each_loaded_export_owns_its_catalog() {
++    let reads = Arc::new(AtomicUsize::new(0));
++    let first = definition("same", "first config");
++    let mut second = definition("same", "second config");
++    second.model_visible = false;
++    second.spec = second.spec.with_parallel_tool_calls(true);
++    let first_tools = vec![probe(first.clone(), None, &reads)];
++    let second_tools = vec![probe(second.clone(), None, &reads)];
++    let first_catalog = ToolCatalog::new(&first_tools);
++    let second_catalog = ToolCatalog::new(&second_tools);
++
++    assert_eq!(first_catalog.definitions().unwrap(), vec![first]);
++    assert_eq!(second_catalog.definitions().unwrap(), vec![second]);
++    assert_eq!(first_catalog.index("same"), Some(0));
++    assert_eq!(second_catalog.index("same"), Some(0));
++    assert_eq!(reads.load(Ordering::Relaxed), 2);
++}
++
++#[test]
++fn repeated_lookup_and_list_do_not_regenerate_or_reparse_specs() {
++    const WIDTH: usize = 32;
++    const REPEATS: usize = 100;
++    let reads = Arc::new(AtomicUsize::new(0));
++    let tools = (0..WIDTH)
++        .map(|index| probe(definition(&format!("tool-{index}"), "probe"), None, &reads))
++        .collect::<Vec<_>>();
++    let last = format!("tool-{}", WIDTH - 1);
++
++    // One original list plus a last-entry hit and a miss per iteration.
++    for tool in &tools {
++        serde_json::from_str::<ToolSpec>(&tool.spec_json()).unwrap();
++    }
++    for _ in 0..REPEATS {
++        let selected = uncached_index(&tools, &last).unwrap();
++        assert_eq!(selected, WIDTH - 1);
++        assert_eq!(invoke_at(&tools, selected).output, "probe");
++        assert_eq!(uncached_index(&tools, "missing"), None);
++    }
++    let uncached_reads = reads.swap(0, Ordering::Relaxed);
++    assert_eq!(uncached_reads, WIDTH * (1 + 2 * REPEATS));
++
++    let catalog = ToolCatalog::new(&tools);
++    assert_eq!(catalog.definitions().unwrap().len(), WIDTH);
++    for _ in 0..REPEATS {
++        let selected = catalog.index(&last).unwrap();
++        assert_eq!(selected, WIDTH - 1);
++        assert_eq!(invoke_at(&tools, selected).output, "probe");
++        assert_eq!(catalog.index("missing"), None);
++    }
++    assert_eq!(catalog.definitions().unwrap().len(), WIDTH);
++    assert_eq!(reads.load(Ordering::Relaxed), WIDTH);
++}
++
++#[test]
++fn empty_catalog_remains_empty() {
++    let catalog = ToolCatalog::new(&[]);
++    assert!(catalog.definitions().unwrap().is_empty());
++    assert_eq!(catalog.index("missing"), None);
++}
+diff --git a/components/tool-adapter/src/lib.rs b/components/tool-adapter/src/lib.rs
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/src/lib.rs
+@@ -0,0 +1,75 @@
++//! Shared adapter for existing registered tools, not a new runtime or ABI.
++//! The caller retains slot authority checks and supplies the invocation host.
++
++use anyhow::{Result, anyhow, bail};
++use proteus_contracts::{
++    contracts::{
++        PROCESS_TOOL_INVOKE_METHOD, PROCESS_TOOL_LIST_METHOD, ProcessToolInvokeInput,
++        ProcessToolInvokeResponse, ProcessToolListResponse,
++    },
++    process_module::{ToolModuleHost, ToolModuleInvocationContext, ToolModuleObject},
++};
++use serde_json::Value;
++
++mod catalog;
++mod registry;
++
++pub use registry::collect_tools;
++
++use catalog::ToolCatalog;
++
++/// One independent catalog and implementation set for one loaded tool export.
++pub struct ToolAdapter {
++    tools: Vec<ToolModuleObject>,
++    catalog: ToolCatalog,
++}
++
++impl ToolAdapter {
++    pub fn new(tools: Vec<ToolModuleObject>) -> Self {
++        let catalog = ToolCatalog::new(&tools);
++        Self { tools, catalog }
++    }
++
++    pub fn invoke(
++        &self,
++        method: &str,
++        params: Value,
++        module_config: &Value,
++        host: &mut dyn ToolModuleHost,
++    ) -> Result<Value> {
++        match method {
++            PROCESS_TOOL_LIST_METHOD => {
++                if !params.is_null() {
++                    bail!("tool list params must be null");
++                }
++                Ok(serde_json::to_value(ProcessToolListResponse::new(
++                    self.catalog.definitions()?,
++                ))?)
++            }
++            PROCESS_TOOL_INVOKE_METHOD => {
++                let input: ProcessToolInvokeInput = serde_json::from_value(params)?;
++                let index = self
++                    .catalog
++                    .index(&input.call.name)
++                    .ok_or_else(|| anyhow!("tool module does not provide {}", input.call.name))?;
++                let tool = &self.tools[index];
++                let call_json = serde_json::to_string(&input.call)?;
++                let context_json = serde_json::to_string(&ToolModuleInvocationContext {
++                    cwd: input.cwd,
++                    attribution: input.attribution,
++                    skills: input.skills,
++                    config: module_config.clone(),
++                })?;
++                let output = tool.invoke_json(call_json, context_json, host)?;
++                let result = serde_json::from_str(output.as_str())?;
++                Ok(serde_json::to_value(ProcessToolInvokeResponse::new(
++                    result,
++                ))?)
++            }
++            _ => bail!("unsupported tool method {method:?}"),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/components/tool-adapter/src/registry.rs b/components/tool-adapter/src/registry.rs
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/src/registry.rs
+@@ -0,0 +1,91 @@
++use anyhow::Result;
++use proteus_contracts::process_module::{
++    ContextBuilderModuleObject, ContextProviderModuleObject, HookModuleObject, ModelModuleObject,
++    ModuleRegistry, PolicyModuleObject, ProcessModuleError, ProcessModuleResult, ToolModuleObject,
++    WorkflowModuleObject,
++};
++use serde_json::Value;
++
++/// Use an implementation's existing registration function without linking an
++/// aggregate registry. This collector admits only tool-only implementations.
++pub fn collect_tools(
++    module_config: Value,
++    register: fn(&mut dyn ModuleRegistry) -> ProcessModuleResult<()>,
++) -> Result<Vec<ToolModuleObject>> {
++    let mut registry = ToolRegistry {
++        module_config,
++        tools: Vec::new(),
++    };
++    register(&mut registry)?;
++    Ok(registry.tools)
++}
++
++struct ToolRegistry {
++    module_config: Value,
++    tools: Vec<ToolModuleObject>,
++}
++
++fn unsupported(slot: &str) -> ProcessModuleResult<()> {
++    Err(ProcessModuleError::new(format!(
++        "tool-only component cannot register {slot}"
++    )))
++}
++
++impl ModuleRegistry for ToolRegistry {
++    fn module_config(&self) -> &Value {
++        &self.module_config
++    }
++
++    fn register_tool(&mut self, tool: ToolModuleObject) -> ProcessModuleResult<()> {
++        self.tools.push(tool);
++        Ok(())
++    }
++
++    fn register_model(
++        &mut self,
++        _module_id: String,
++        _model: ModelModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("model")
++    }
++
++    fn register_policy(
++        &mut self,
++        _module_id: String,
++        _policy: PolicyModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("policy")
++    }
++
++    fn register_context_provider(
++        &mut self,
++        _provider_id: String,
++        _provider: ContextProviderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("context_provider")
++    }
++
++    fn register_context(
++        &mut self,
++        _module_id: String,
++        _builder: ContextBuilderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("context")
++    }
++
++    fn register_hook(
++        &mut self,
++        _module_id: String,
++        _hook: HookModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("hook")
++    }
++
++    fn register_workflow(
++        &mut self,
++        _module_id: String,
++        _workflow: WorkflowModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unsupported("workflow")
++    }
++}
+diff --git a/components/tool-adapter/src/tests.rs b/components/tool-adapter/src/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/components/tool-adapter/src/tests.rs
+@@ -0,0 +1,201 @@
++use std::sync::{Arc, Mutex};
++
++use proteus_contracts::{
++    contracts::{
++        ExecutionAttribution, PROCESS_TOOL_INVOKE_METHOD, PROCESS_TOOL_LIST_METHOD,
++        ProcessToolInvokeInput,
++    },
++    domain::{ToolCall, ToolResult, ToolSafety, ToolSpec, new_execution_id},
++    process_module::{
++        HookModule, HookModuleHost, ModuleRegistry, ProcessModuleError, ProcessModuleResult,
++        ToolModule, ToolModuleHost, ToolModuleInvocationContext,
++    },
++};
++use serde_json::{Value, json};
++
++use super::{ToolAdapter, collect_tools};
++
++type CapturedCalls = Arc<Mutex<Vec<(Value, Value, bool)>>>;
++
++struct Probe {
++    calls: CapturedCalls,
++    output: Result<String, ProcessModuleError>,
++}
++
++impl ToolModule for Probe {
++    fn spec_json(&self) -> String {
++        serde_json::to_string(&ToolSpec::new(
++            "probe",
++            "adapter probe",
++            json!({"type": "object"}),
++            ToolSafety::ReadOnly,
++        ))
++        .unwrap()
++    }
++
++    fn invoke_json(
++        &self,
++        call: String,
++        context: String,
++        host: &mut dyn ToolModuleHost,
++    ) -> ProcessModuleResult<String> {
++        self.calls.lock().unwrap().push((
++            serde_json::from_str(&call).unwrap(),
++            serde_json::from_str(&context).unwrap(),
++            host.is_cancelled()?,
++        ));
++        self.output.clone()
++    }
++}
++
++struct Host;
++
++impl ToolModuleHost for Host {
++    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
++        Ok(true)
++    }
++}
++
++fn input(name: &str) -> ProcessToolInvokeInput {
++    ProcessToolInvokeInput {
++        call: ToolCall::new("call-probe", name, json!({"value": 7})),
++        cwd: std::path::PathBuf::from("workspace"),
++        attribution: ExecutionAttribution::detached(new_execution_id()),
++        skills: Default::default(),
++    }
++}
++
++fn adapter(output: Result<String, ProcessModuleError>) -> (ToolAdapter, CapturedCalls) {
++    let calls = Arc::new(Mutex::new(Vec::new()));
++    (
++        ToolAdapter::new(vec![Box::new(Probe {
++            calls: Arc::clone(&calls),
++            output,
++        })]),
++        calls,
++    )
++}
++
++#[test]
++fn invocation_preserves_raw_arguments_context_result_and_host() {
++    // The shared adapter must not acquire typed SDK ToolExport validation:
++    // Core remains responsible for input validation and output identity.
++    let result = ToolResult::ok("legacy-result-id".into(), "legacy output");
++    let (adapter, calls) = adapter(Ok(serde_json::to_string(&result).unwrap()));
++    let mut input = input("probe");
++    input.call.raw_arguments = Some("{not parsed by this adapter".into());
++    let config = json!({"opaque": {"value": 3}});
++    let expected_call = serde_json::to_value(&input.call).unwrap();
++    let expected_context = serde_json::to_value(ToolModuleInvocationContext {
++        cwd: input.cwd.clone(),
++        attribution: input.attribution,
++        skills: input.skills.clone(),
++        config: config.clone(),
++    })
++    .unwrap();
++
++    let response = adapter
++        .invoke(
++            PROCESS_TOOL_INVOKE_METHOD,
++            serde_json::to_value(input).unwrap(),
++            &config,
++            &mut Host,
++        )
++        .unwrap();
++    assert_eq!(response["result"], serde_json::to_value(result).unwrap());
++    assert_eq!(
++        *calls.lock().unwrap(),
++        vec![(expected_call, expected_context, true)]
++    );
++}
++
++#[test]
++fn list_requires_null_and_invocation_keeps_exact_name_errors() {
++    let (adapter, calls) = adapter(Ok("null".into()));
++    let list = adapter
++        .invoke(PROCESS_TOOL_LIST_METHOD, Value::Null, &json!({}), &mut Host)
++        .unwrap();
++    assert_eq!(list["result"][0]["spec"]["name"], "probe");
++    assert_eq!(
++        adapter
++            .invoke(PROCESS_TOOL_LIST_METHOD, json!({}), &json!({}), &mut Host)
++            .unwrap_err()
++            .to_string(),
++        "tool list params must be null"
++    );
++    for name in ["Probe", " probe", "probe ", "missing"] {
++        assert_eq!(
++            adapter
++                .invoke(
++                    PROCESS_TOOL_INVOKE_METHOD,
++                    serde_json::to_value(input(name)).unwrap(),
++                    &json!({}),
++                    &mut Host,
++                )
++                .unwrap_err()
++                .to_string(),
++            format!("tool module does not provide {name}")
++        );
++    }
++    assert!(calls.lock().unwrap().is_empty());
++}
++
++#[test]
++fn module_failures_and_malformed_results_stay_errors() {
++    let (failed, _) = adapter(Err(ProcessModuleError::new("probe failed")));
++    assert_eq!(
++        failed
++            .invoke(
++                PROCESS_TOOL_INVOKE_METHOD,
++                serde_json::to_value(input("probe")).unwrap(),
++                &json!({}),
++                &mut Host,
++            )
++            .unwrap_err()
++            .to_string(),
++        "probe failed"
++    );
++    let (malformed, _) = adapter(Ok("{".into()));
++    assert!(
++        malformed
++            .invoke(
++                PROCESS_TOOL_INVOKE_METHOD,
++                serde_json::to_value(input("probe")).unwrap(),
++                &json!({}),
++                &mut Host,
++            )
++            .is_err()
++    );
++    assert!(
++        malformed
++            .invoke(PROCESS_TOOL_INVOKE_METHOD, json!({}), &json!({}), &mut Host)
++            .is_err()
++    );
++}
++
++struct HookProbe;
++
++impl HookModule for HookProbe {
++    fn invoke_json(
++        &self,
++        _input_json: String,
++        _host: &mut dyn HookModuleHost,
++    ) -> ProcessModuleResult<String> {
++        unreachable!("collector must not invoke registrations")
++    }
++}
++
++#[test]
++fn registration_passes_config_and_does_not_admit_other_slots() {
++    fn register(registry: &mut dyn ModuleRegistry) -> ProcessModuleResult<()> {
++        assert_eq!(registry.module_config(), &json!({"probe": true}));
++        registry.register_hook("hook.probe".into(), Box::new(HookProbe))
++    }
++    let error = collect_tools(json!({"probe": true}), register)
++        .err()
++        .expect("tool-only collector rejects non-tool registration");
++    assert_eq!(
++        error.to_string(),
++        "tool-only component cannot register hook"
++    );
++}
+diff --git a/docs/reference.md b/docs/reference.md
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -4,7 +4,7 @@
+ текущие dogfood profiles. Это не стандартная библиотека модулей, не набор
+ обязательных defaults и не привилегированный слой runtime.
+ 
+-Все реализации экспортируются через один исполняемый
++По умолчанию реализации экспортируются через один исполняемый
+ `proteus-reference-module`. Наличие crate в этой папке само по себе не означает
+ активацию: config явно описывает process command и выбирает конкретный
+ `module_id`.
+@@ -28,3 +28,80 @@
+ проверки Core, а внутренний поиск сохраняет первый совпавший корректный spec.
+ Ошибочный ToolSpec по-прежнему приводит к ошибке list; проверка schema,
+ policy/approval и authority остаётся на прежних границах.
++
++## Отдельный Plan Component
++
++Первый необязательный самостоятельный executable — `proteus-plan-module`.
++Он экспортирует только `tool/plan_tool` (`update_plan`) и собирается без
++`proteus-reference-module`, бинарников Core и Desktop и остальных implementation
++crates. Библиотеки contracts, module SDK, protocol и process host из закреплённой
++ревизии Core остаются обычными зависимостями: независимая сборка не означает
++отсутствие общих Rust-библиотек.
++
++Выбор `-p proteus-plan-module --bin proteus-plan-module` исключает aggregate,
++Core/Desktop executable и соседние implementation crates из этой сборки.
++Cargo всё равно собирает необходимые общие зависимости, если кэш отсутствует
++или устарел. Aggregate сохраняет собственную связанную копию `plan-tool` для
++обратной совместимости: после изменения реализации ранее собранный aggregate
++не обновляется сам, и при его дальнейшем использовании требуется отдельная
++пересборка. Изменение общего adapter или contracts затрагивает обоих consumers.
++
++```bash
++cargo build --locked --release -p proteus-plan-module --bin proteus-plan-module
++cargo test --locked -p proteus-tool-adapter --lib
++cargo test --locked -p proteus-plan-module --bin proteus-plan-module
++```
++
++Полученный executable задаётся обычным `components.<id>.command`; export —
++`components.<id>.exports.tool.plan_tool`. Формат профиля, `module_config.tool.plan_tool`,
++выбор инструментов и права процесса не меняются. Ни этот executable, ни SDK не
++скачивают зависимости, не выбирают defaults и не переключаются на aggregate при
++ошибке. Установка нового файла и явная замена команды выполняются отдельно.
++Существующие профили автоматически не изменяются.
++
++Если существующий component **уже экспортирует только `tool/plan_tool`**, меняется
++только его команда. Например, до замены:
++
++```toml
++[components.plan]
++command = "/absolute/path/proteus-reference-module"
++
++[components.plan.exports.tool.plan_tool]
++```
++
++После замены (то же имя component, тот же единственный export):
++
++```toml
++[components.plan]
++command = "/absolute/path/proteus-plan-module"
++
++[components.plan.exports.tool.plan_tool]
++```
++
++Это фрагменты одной конфигурации до/после, а не два включаемых component.
++Сохраните прежние `tools.enabled` (включая `update_plan`), module config и launch
++policies; пример их не переопределяет. Если прежний component экспортирует также
++другие модули, не меняйте его команду на plan-only executable: сначала требуется
++явная переразметка профиля и проверка итоговых owners.
++
++Это **замена владельца**, а не добавление второго `update_plan`: прежде чем
++включить отдельный component, уберите `tool/plan_tool` из предыдущего component.
++Если профиль использует `reference.tools`, он уже содержит `update_plan`; нельзя
++оставлять его вместе с standalone. Сначала явно разложите aggregate на нужные
++individual exports без прежнего `plan_tool`. Учитывайте, что profile merge может
++объединять maps; отсутствие ключа в overlay не доказывает его удаление. Проверяйте
++итоговую конфигурацию: один export и один tool name имеют одного владельца.
++Некорректная композиция должна завершаться ошибкой, без скрытого fallback.
++
++Оба executable используют один `proteus-tool-adapter`: тот же каталог ToolSpec,
++тот же вызов существующего `plan_tool::register_modules`, legacy invocation
++context и canonical envelopes. Adapter не вводит новую проверку или нормализацию
++аргументов; policy/approval и slot authority остаются на прежних границах.
++Manifest сохраняет пустую config schema (не `null`) и отсутствие module features.
++Wire runtime и invocation-scoped host bridges остаются в закреплённом SDK.
++
++План stateless: состояние по-прежнему принадлежит transcript, не процессу.
++Выделение opt-in component не означает перенос остальных модулей в отдельные
++процессы и не обещает уменьшение памяти или ускорение без измерений. Обновление
++установленного файла само по себе не означает hot reload: используется штатный
++reload/restart потребителя, с прежними правилами ownership активных turns.
