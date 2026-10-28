@@ -1,0 +1,24 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -433,7 +433,7 @@
+                     "role": "user",
+                     "content": [{
+                         "type": "input_text",
+-                        "text": format!("File reference: {}\n{}", path.display(), content.clone().unwrap_or_default())
++                        "text": format!("File reference: {}\n{}", path.display(), content.as_deref().unwrap_or_default())
+                     }]
+                 })),
+                 ContentPart::Patch { patch } => input.push(json!({
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -259,7 +259,7 @@
+                 "text": format!(
+                     "File reference: {}\n{}",
+                     path.display(),
+-                    content.clone().unwrap_or_default()
++                    content.as_deref().unwrap_or_default()
+                 )
+             })),
+             ContentPart::Patch { patch } => blocks.push(json!({
