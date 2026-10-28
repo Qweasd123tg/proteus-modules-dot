@@ -1,0 +1,52 @@
+name: Selected extension package Python controls
+
+# Exact branch and paths only. No PR trigger or upstream/native checkout/build.
+on:
+  push:
+    branches: [ci/extension-selected-package-20261028]
+    paths:
+      - 'build-speed/extensions/selected-package/**'
+      - '.github/workflows/check-extension-selected-package.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-selected-package-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_TERMINAL_PROMPT: '0'
+
+jobs:
+  python-controls:
+    if: github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/extension-selected-package-20261028' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: build-speed/extensions/selected-package
+      - name: Check strict reconstruction rejection controls
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/extension-selected-package-evidence"
+          python3 -B -m unittest discover -s build-speed/extensions/selected-package -p test_check.py -v 2>&1 | tee "$RUNNER_TEMP/extension-selected-package-evidence/reconstruction.log"
+      - name: Reconstruct pinned candidate and run only mocked Python packaging controls
+        run: |
+          set -euo pipefail
+          python3 -I -B build-speed/extensions/selected-package/check.py --output "$RUNNER_TEMP/extension-selected-package-evidence" 2>&1 | tee "$RUNNER_TEMP/extension-selected-package-evidence/stage.log"
+      - name: Retain only text qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: extension-selected-package-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/extension-selected-package-evidence/result.json
+            ${{ runner.temp }}/extension-selected-package-evidence/tests.log
+            ${{ runner.temp }}/extension-selected-package-evidence/reconstruction.log
+            ${{ runner.temp }}/extension-selected-package-evidence/stage.log
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,606 @@
+--- a/package.py
++++ b/package.py
+@@ -7,8 +7,10 @@
+ import argparse
+ import json
+ import os
++import re
+ import shutil
+ import subprocess
++import sys
+ import tempfile
+ import zipfile
+ from pathlib import Path
+@@ -60,12 +62,156 @@
+         place(built, package, package)
+ 
+ 
++def selected_package(name):
++    """Validate a single shipped package before invoking Cargo or writing files."""
++    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", name):
++        raise SystemExit(f"invalid package id: {name!r}")
++    package = PACKAGES / name
++    if package.is_symlink() or not package.is_dir():
++        raise SystemExit(f"unknown package: {name}")
++    for filename in ("Cargo.toml", "extension.json"):
++        path = package / filename
++        if path.is_symlink() or not path.is_file():
++            raise SystemExit(f"{name}: missing regular {filename}")
++    try:
++        manifest = json.loads((package / "extension.json").read_text())
++    except (OSError, ValueError) as error:
++        raise SystemExit(f"{name}: invalid extension.json: {error}") from error
++    if not isinstance(manifest, dict) or manifest.get("id") != name:
++        raise SystemExit(f"{name}: manifest id must equal the package folder")
++    command = manifest.get("command")
++    if (not isinstance(command, list) or not command
++            or not all(isinstance(argument, str) for argument in command)
++            or command[0] != f"bin/{name}"):
++        raise SystemExit(f"{name}: expected command bin/{name}")
++    if not any(path.is_file() for path in package.glob("LICENSE*")):
++        raise SystemExit(f"{name}: no LICENSE-GPL or LICENSE-APACHE")
++    return package
++
++
++def selected_binary(package):
++    """Use only the selected bin artifact reported by this successful build."""
++    name = package.name
++    result = subprocess.run(
++        ["cargo", "build", "--release", "--locked", "--quiet",
++         "-p", f"extension-{name}", "--bin", name,
++         "--message-format=json-render-diagnostics"],
++        cwd=ROOT, check=False, stdout=subprocess.PIPE, text=True)
++    artifacts = []
++    finished = []
++    invalid_json = False
++    for line in result.stdout.splitlines():
++        # Cargo permits unrelated tool output. JSON-looking damaged records
++        # are not treated as harmless log lines or replaced by stale files.
++        if not line.lstrip().startswith("{"):
++            continue
++        try:
++            message = json.loads(line)
++        except ValueError:
++            invalid_json = True
++            continue
++        if not isinstance(message, dict):
++            continue
++        diagnostic = message.get("message")
++        if message.get("reason") == "compiler-message" and isinstance(diagnostic, dict):
++            rendered = diagnostic.get("rendered")
++            if isinstance(rendered, str):
++                sys.stderr.write(rendered)
++        if message.get("reason") == "build-finished":
++            finished.append(message.get("success"))
++        target = message.get("target", {})
++        profile = message.get("profile", {})
++        if (message.get("reason") == "compiler-artifact"
++                and message.get("manifest_path") == str((package / "Cargo.toml").resolve())
++                and isinstance(target, dict) and target.get("kind") == ["bin"]
++                and target.get("name") == name
++                and isinstance(profile, dict) and profile.get("test") is False
++                and isinstance(message.get("executable"), str)
++                and message["executable"]):
++            artifacts.append(Path(message["executable"]))
++    if result.returncode != 0:
++        raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout)
++    if invalid_json:
++        raise SystemExit(f"{name}: invalid Cargo JSON output")
++    if len(finished) != 1 or finished[0] is not True or len(artifacts) != 1:
++        raise SystemExit(f"{name}: expected one executable from one successful Cargo build")
++    binary = artifacts[0]
++    if not binary.is_absolute() or not binary.is_file():
++        raise SystemExit(f"{name}: Cargo executable is not an existing absolute file: {binary}")
++    return binary
++
++
++def atomic_copy(binary, destination):
++    """Publish a complete file on the same filesystem; leave the old file on error."""
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
++    os.close(descriptor)
++    try:
++        shutil.copy2(binary, temporary)
++        os.replace(temporary, destination)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
++
++
++def selected_develop(package, binary):
++    destination = package / "bin" / package.name
++    if destination.parent.is_symlink():
++        raise SystemExit(f"{package.name}: bin must not be a symlink")
++    atomic_copy(binary, destination)
++
++
++def selected_archive(package, binary, output):
++    """Stage one complete package and atomically publish only its ZIP."""
++    with tempfile.TemporaryDirectory() as directory:
++        staged = Path(directory) / package.name
++        shutil.copytree(package, staged, ignore=shutil.ignore_patterns(*SOURCE))
++        place({package: (binary, f"bin/{package.name}")}, package, staged)
++        if not any(path.is_file() for path in staged.glob("LICENSE*")):
++            raise SystemExit(f"{package.name}: no LICENSE-GPL or LICENSE-APACHE")
++        output.mkdir(parents=True, exist_ok=True)
++        archive = output / (package.name + ".zip")
++        descriptor, temporary = tempfile.mkstemp(prefix=f".{archive.name}.", dir=output)
++        os.close(descriptor)
++        try:
++            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as zipped:
++                for path in sorted(staged.rglob("*")):
++                    if path.is_file():
++                        info = zipfile.ZipInfo.from_file(path, path.relative_to(staged))
++                        info.compress_type = zipfile.ZIP_DEFLATED
++                        zipped.writestr(info, path.read_bytes())
++            with zipfile.ZipFile(temporary) as zipped:
++                if zipped.testzip() is not None:
++                    raise SystemExit(f"{package.name}: failed ZIP validation")
++            os.replace(temporary, archive)
++        finally:
++            Path(temporary).unlink(missing_ok=True)
++        print(archive)
++
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--output", type=Path, default=ROOT / "dist")
++    parser.add_argument("--output", type=Path, help="ZIP directory (default: dist)")
+     parser.add_argument("--bundle", type=Path, help="assemble packages into a new directory instead of ZIPs")
+     parser.add_argument("--dev", action="store_true", help="build binaries into the source packages")
++    parser.add_argument("--package", action="append", metavar="ID", help="build only one package, without rebuilding the client")
+     args = parser.parse_args()
++    if args.package:
++        if len(args.package) != 1:
++            parser.error("--package must be supplied exactly once")
++        if args.bundle:
++            parser.error("--package cannot be combined with --bundle; use a selected ZIP or --dev")
++        if args.dev and args.output is not None:
++            parser.error("--output cannot be combined with --package --dev")
++        package = selected_package(args.package[0])
++        if args.dev and (package / "bin").is_symlink():
++            parser.error("the selected package bin directory must not be a symlink")
++        binary = selected_binary(package)
++        if args.dev:
++            selected_develop(package, binary)
++        else:
++            selected_archive(package, binary, args.output or ROOT / "dist")
++        return
++    args.output = args.output or ROOT / "dist"
+     if args.dev:
+         develop()
+         return
+--- a/README.md
++++ b/README.md
+@@ -43,9 +43,25 @@
+ python3 package.py --output /tmp/packages
+ python3 package.py --bundle /tmp/extensions # новая папка для portable
+ python3 package.py --dev                   # бинарники в packages/<id>/bin для запуска из исходников
++python3 package.py --package quota         # только dist/quota.zip
++python3 package.py --package quota --dev   # только packages/quota/bin/quota
+ cargo test --workspace
+ python3 -m unittest discover -s tests -p 'test_*.py'
+ ```
++
++`--package <id>` выбирает ровно один пакет из `packages/`. Cargo собирает
++только его бинарную цель и необходимые зависимости (в том числе SDK), без
++сборки Core, Desktop и остальных расширений. Упаковщик берёт точный путь
++исполняемого файла из результата этой сборки Cargo, а не из предполагаемой
++папки `target/release`. Без `--package` по-прежнему собирается весь набор.
++Выбранный ZIP или бинарник для `--dev` заменяется целым файлом после успешной
++подготовки; ошибка сборки или упаковки сохраняет прежний файл. Остальные
++пакеты не перезаписываются. Это атомарная видимость замены файла, не гарантия
++сохранности при сбое питания. `--package` нельзя повторять или совмещать
++с `--bundle`; для ZIP доступен `--output`, но не вместе с `--dev`.
++Для установки выбранного ZIP используйте существующий раздел
++«Клиент → Расширения»: клиент проверит архив и перезапустит процессы пакета.
++Пересборка Core или Desktop для этого не нужна.
+ 
+ Тесты запускают реальные процессы и локальный HTTP-сервер с синтетическими
+ данными. `tests/wire.py --wire` отдаёт реальные ответы всех пакетов для
+--- /dev/null
++++ b/tests/test_package_selection.py
+@@ -0,0 +1,404 @@
++"""Independent synthetic-IO regression tests; never starts Cargo or an extension.
++
++The default target is ../package.py; CANDIDATE_PACKAGE can override it.
++Every subprocess entrypoint is replaced with a bounded fake and socket network
++connections are denied; all writable content is a tiny temporary fixture.
++"""
++from contextlib import ExitStack, redirect_stderr, redirect_stdout
++import copy
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++import socket
++import subprocess
++import sys
++import tempfile
++import unittest
++from unittest.mock import patch
++import zipfile
++
++
++CANDIDATE = Path(os.environ.get(
++    "CANDIDATE_PACKAGE",
++    Path(__file__).resolve().parents[1] / "package.py",
++))
++
++
++class SelectedPackageReview(unittest.TestCase):
++    def setUp(self):
++        self.directory = tempfile.TemporaryDirectory(prefix="proteus-selection-review-")
++        self.addCleanup(self.directory.cleanup)
++        self.root = Path(self.directory.name)
++        self.packages = self.root / "packages"
++        self.dist = self.root / "dist"
++        self.dist.mkdir()
++        for name in ("plan", "files"):
++            package = self.packages / name
++            (package / "src").mkdir(parents=True)
++            (package / "bin").mkdir()
++            (package / "extension.json").write_text(json.dumps({
++                "protocol": 3, "id": name, "command": [f"bin/{name}"],
++            }))
++            (package / "Cargo.toml").write_text(
++                f'[package]\nname = "extension-{name}"\nversion = "0.1.0"\n'
++                f'[[bin]]\nname = "{name}"\npath = "src/main.rs"\n')
++            (package / "src/main.rs").write_text("// fixture data; never compiled\n")
++            (package / "LICENSE-GPL").write_text("license fixture\n")
++            (package / "asset.txt").write_text(f"{name} asset\n")
++            (package / "bin" / name).write_bytes(f"old-{name}".encode())
++            (self.dist / f"{name}.zip").write_bytes(f"old-{name}-zip".encode())
++        self.package = self.packages / "plan"
++        self.binary = self.root / "custom-target/aarch64-unknown-linux-gnu/release/plan"
++        self.binary.parent.mkdir(parents=True)
++        self.binary.write_bytes(b"selected binary fixture; NOT EXECUTABLE")
++        self.binary.chmod(0o755)
++        self.event = {
++            "reason": "compiler-artifact",
++            "package_id": f"path+file://{self.package}#extension-plan@0.1.0",
++            "manifest_path": str(self.package / "Cargo.toml"),
++            "target": {"kind": ["bin"], "name": "plan", "crate_types": ["bin"]},
++            "profile": {"test": False, "opt_level": "3"},
++            "executable": str(self.binary),
++            "fresh": False,
++        }
++        self.finished = {"reason": "build-finished", "success": True}
++        self.calls = []
++        spec = importlib.util.spec_from_file_location("candidate_package_review", CANDIDATE)
++        self.module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(self.module)
++        self.module.ROOT = self.root
++        self.module.PACKAGES = self.packages
++        self.sibling_before = self.snapshot(self.packages / "files")
++
++    def snapshot(self, root):
++        return {str(path.relative_to(root)): path.read_bytes()
++                for path in root.rglob("*") if path.is_file()}
++
++    def invoke(self, *args, events=None, status=0, raw=None):
++        events = [self.event, self.finished] if events is None else events
++        output = raw if raw is not None else "".join(json.dumps(e) + "\n" for e in events)
++        owner = self
++
++        def record(command, **kwargs):
++            owner.assertIsInstance(command, (list, tuple))
++            owner.assertEqual(list(command[:2]), ["cargo", "build"],
++                              "Only a fake Cargo build is permitted")
++            owner.calls.append((list(command), kwargs))
++
++        def fake_run(command, **kwargs):
++            record(command, **kwargs)
++            if status and kwargs.get("check"):
++                raise subprocess.CalledProcessError(status, command, output=output)
++            return subprocess.CompletedProcess(command, status, stdout=output, stderr="")
++
++        class FakePopen:
++            def __init__(self, command, **kwargs):
++                record(command, **kwargs)
++                self.stdout = io.StringIO(output)
++                self.stderr = io.StringIO("")
++                self.returncode = status
++
++            def wait(self, *args, **kwargs):
++                return self.returncode
++
++            def communicate(self, *args, **kwargs):
++                return output, ""
++
++            def poll(self):
++                return self.returncode
++
++            def kill(self):
++                pass
++
++            def terminate(self):
++                pass
++
++            def __enter__(self):
++                return self
++
++            def __exit__(self, *args):
++                self.stdout.close()
++                self.stderr.close()
++
++        def forbidden(*args, **kwargs):
++            raise AssertionError("Unexpected real-process API attempted")
++
++        self.stdout = io.StringIO()
++        self.stderr = io.StringIO()
++        with ExitStack() as stack:
++            stack.enter_context(patch.object(sys, "argv", [str(CANDIDATE), *args]))
++            stack.enter_context(patch.object(subprocess, "run", fake_run))
++            stack.enter_context(patch.object(subprocess, "Popen", FakePopen))
++            for name in ("call", "check_call", "check_output"):
++                stack.enter_context(patch.object(subprocess, name, forbidden))
++            stack.enter_context(patch.object(os, "system", forbidden))
++            stack.enter_context(patch.object(socket, "create_connection", forbidden))
++            stack.enter_context(patch.object(socket.socket, "connect", forbidden))
++            stack.enter_context(patch.object(socket.socket, "connect_ex", forbidden))
++            stack.enter_context(redirect_stdout(self.stdout))
++            stack.enter_context(redirect_stderr(self.stderr))
++            return self.module.main()
++
++    def assert_untouched(self, *, selected_archive=True):
++        self.assertEqual(self.snapshot(self.packages / "files"), self.sibling_before)
++        self.assertEqual((self.dist / "files.zip").read_bytes(), b"old-files-zip")
++        if selected_archive:
++            self.assertEqual((self.dist / "plan.zip").read_bytes(), b"old-plan-zip")
++
++    def assert_selection_failure(self, *, events=None, status=0, raw=None, dev=False):
++        args = ["--package", "plan"]
++        args += ["--dev"] if dev else ["--output", str(self.dist)]
++        with self.assertRaises((SystemExit, RuntimeError, ValueError, subprocess.CalledProcessError)):
++            self.invoke(*args, events=events, status=status, raw=raw)
++        self.assert_untouched()
++        self.assertEqual((self.package / "bin/plan").read_bytes(), b"old-plan")
++
++    def test_selected_zip_uses_one_exact_build_and_actual_artifact(self):
++        self.invoke("--package", "plan", "--output", str(self.dist))
++        self.assertEqual(len(self.calls), 1)
++        command, options = self.calls[0]
++        self.assertEqual(command, ["cargo", "build", "--release", "--locked", "--quiet",
++                                   "-p", "extension-plan", "--bin", "plan",
++                                   "--message-format=json-render-diagnostics"])
++        self.assertEqual(options["cwd"], self.root)
++        self.assertFalse(options.get("shell", False))
++        self.assertNotIn("env", options, "Do not inject optimization/profile overrides")
++        with zipfile.ZipFile(self.dist / "plan.zip") as archive:
++            self.assertEqual(set(archive.namelist()),
++                             {"extension.json", "LICENSE-GPL", "asset.txt", "bin/plan"})
++            self.assertEqual(archive.read("bin/plan"), self.binary.read_bytes())
++        self.assert_untouched(selected_archive=False)
++        self.assertEqual((self.package / "bin/plan").read_bytes(), b"old-plan")
++
++    def test_fresh_true_is_a_valid_selected_artifact(self):
++        self.event["fresh"] = True
++        self.invoke("--package", "plan", "--dev")
++        self.assertEqual((self.package / "bin/plan").read_bytes(), self.binary.read_bytes())
++        self.assert_untouched()
++
++    def test_unrelated_artifacts_do_not_override_selected(self):
++        other = copy.deepcopy(self.event)
++        other["manifest_path"] = str(self.packages / "files/Cargo.toml")
++        other["package_id"] = "path+file:///different#extension-files@0.1.0"
++        other["executable"] = str(self.packages / "files/bin/files")
++        self.invoke("--package", "plan", "--dev", events=[other, self.event, other, self.finished])
++        self.assertEqual((self.package / "bin/plan").read_bytes(), self.binary.read_bytes())
++        self.assert_untouched()
++
++    def test_wrong_manifest_cannot_impersonate_same_named_bin(self):
++        self.event["manifest_path"] = str(self.packages / "files/Cargo.toml")
++        self.assert_selection_failure()
++
++    def test_wrong_name_is_rejected(self):
++        self.event["target"]["name"] = "files"
++        self.assert_selection_failure()
++
++    def test_wrong_target_kind_is_rejected(self):
++        for kind in (["lib"], ["example"], ["test"], ["custom-build"], ["bin", "example"]):
++            with self.subTest(kind=kind):
++                self.event["target"]["kind"] = kind
++                self.assert_selection_failure()
++
++    def test_test_profile_is_rejected(self):
++        self.event["profile"]["test"] = True
++        self.assert_selection_failure()
++
++    def test_missing_profile_test_identity_is_rejected(self):
++        del self.event["profile"]["test"]
++        self.assert_selection_failure()
++
++    def test_missing_executable_is_rejected(self):
++        self.event["executable"] = None
++        self.assert_selection_failure()
++
++    def test_nonexistent_executable_is_rejected(self):
++        self.event["executable"] = str(self.binary.parent / "missing")
++        self.assert_selection_failure()
++
++    def test_executable_directory_is_rejected(self):
++        self.event["executable"] = str(self.binary.parent)
++        self.assert_selection_failure()
++
++    def test_two_distinct_matching_outputs_are_rejected(self):
++        other = copy.deepcopy(self.event)
++        other_binary = self.binary.with_name("other-plan")
++        other_binary.write_bytes(b"second artifact")
++        other["executable"] = str(other_binary)
++        self.assert_selection_failure(events=[self.event, other, self.finished])
++
++    def test_successful_json_does_not_override_nonzero_cargo_exit(self):
++        self.assert_selection_failure(status=9)
++
++    def test_failed_build_finished_is_rejected(self):
++        self.finished["success"] = False
++        self.assert_selection_failure()
++
++    def test_numeric_truthy_build_finished_is_rejected(self):
++        self.finished["success"] = 1
++        self.assert_selection_failure()
++
++    def test_failed_build_forwards_compiler_diagnostics(self):
++        diagnostic = {"reason": "compiler-message", "message": {"rendered": "error: fixture compiler failure\n"}}
++        self.assert_selection_failure(events=[diagnostic, self.event, self.finished], status=9)
++        self.assertIn("error: fixture compiler failure\n", self.stderr.getvalue())
++
++    def test_malformed_json_fails_but_later_diagnostic_is_preserved(self):
++        diagnostic = {"reason": "compiler-message", "message": {"rendered": "warning: fixture diagnostic\n"}}
++        raw = "{malformed\n" + "\n".join(json.dumps(e) for e in (diagnostic, self.event, self.finished))
++        self.assert_selection_failure(raw=raw)
++        self.assertIn("warning: fixture diagnostic\n", self.stderr.getvalue())
++
++    def test_non_json_tool_log_does_not_break_valid_build(self):
++        raw = "unstructured build-tool log\n" + "\n".join(json.dumps(e) for e in (self.event, self.finished))
++        self.invoke("--package", "plan", "--dev", raw=raw)
++        self.assertEqual((self.package / "bin/plan").read_bytes(), self.binary.read_bytes())
++        self.assert_untouched()
++
++    def test_missing_build_finished_is_rejected(self):
++        self.assert_selection_failure(events=[self.event])
++
++    def test_duplicate_build_finished_is_rejected(self):
++        self.assert_selection_failure(events=[self.event, self.finished, self.finished])
++
++    def test_missing_artifact_is_rejected(self):
++        self.assert_selection_failure(events=[self.finished])
++
++    def test_empty_cargo_stream_is_rejected(self):
++        self.assert_selection_failure(events=[])
++
++    def test_unknown_and_traversal_selection_fail_before_subprocess(self):
++        for name in ("unknown", "../plan", ".", "", "plan/../files", "plan*", "[pf]*"):
++            with self.subTest(name=name):
++                self.calls.clear()
++                with self.assertRaises((SystemExit, ValueError)):
++                    self.invoke("--package", name, "--output", str(self.dist))
++                self.assertEqual(self.calls, [])
++                self.assert_untouched()
++
++    def test_bundle_plus_selection_fails_before_subprocess(self):
++        with self.assertRaises(SystemExit):
++            self.invoke("--package", "plan", "--bundle", str(self.root / "bundle"))
++        self.assertEqual(self.calls, [])
++        self.assertFalse((self.root / "bundle").exists())
++
++    def test_symlink_package_cannot_escape_packages(self):
++        outside = self.root / "outside"
++        outside.mkdir()
++        (outside / "extension.json").write_text('{"id":"escape","command":["bin/escape"]}')
++        (self.packages / "escape").symlink_to(outside, target_is_directory=True)
++        with self.assertRaises((SystemExit, ValueError)):
++            self.invoke("--package", "escape", "--output", str(self.dist))
++        self.assertEqual(self.calls, [])
++        self.assert_untouched()
++
++    def test_missing_license_preserves_previous_archive(self):
++        (self.package / "LICENSE-GPL").unlink()
++        self.assert_selection_failure()
++
++    def test_dev_build_failure_preserves_previous_binary(self):
++        self.assert_selection_failure(events=[self.event], dev=True)
++
++    def test_invalid_command_cannot_escape_selected_package(self):
++        for command in (["bin/../../escape"], ["/absolute/program"], [], ["bin/*"]):
++            with self.subTest(command=command):
++                self.calls.clear()
++                (self.package / "extension.json").write_text(json.dumps({"id":"plan", "command":command}))
++                with self.assertRaises((SystemExit, ValueError)):
++                    self.invoke("--package", "plan", "--output", str(self.dist))
++                self.assertEqual(self.calls, [])
++                self.assert_untouched()
++
++    def test_duplicate_selection_fails_before_subprocess(self):
++        with self.assertRaises(SystemExit):
++            self.invoke("--package", "plan", "--package", "files", "--output", str(self.dist))
++        self.assertEqual(self.calls, [])
++        self.assert_untouched()
++
++    def test_dev_output_conflict_fails_before_subprocess(self):
++        with self.assertRaises(SystemExit):
++            self.invoke("--package", "plan", "--dev", "--output", str(self.dist))
++        self.assertEqual(self.calls, [])
++        self.assert_untouched()
++
++    def test_dev_bin_directory_symlink_fails_before_subprocess(self):
++        outside = self.root / "outside"
++        (self.package / "bin").rename(outside)
++        (self.package / "bin").symlink_to(outside, target_is_directory=True)
++        with self.assertRaises(SystemExit):
++            self.invoke("--package", "plan", "--dev")
++        self.assertEqual(self.calls, [])
++        self.assertEqual((outside / "plan").read_bytes(), b"old-plan")
++        self.assert_untouched()
++
++    def test_manifest_symlinks_fail_before_subprocess(self):
++        for filename in ("Cargo.toml", "extension.json"):
++            with self.subTest(filename=filename):
++                target = self.root / f"outside-{filename}"
++                original = self.package / filename
++                original.rename(target)
++                original.symlink_to(target)
++                try:
++                    with self.assertRaises(SystemExit):
++                        self.invoke("--package", "plan", "--dev")
++                    self.assertEqual(self.calls, [])
++                finally:
++                    original.unlink()
++                    target.rename(original)
++
++    def test_dev_partial_copy_failure_preserves_old_binary(self):
++        def partial_copy(source, destination, *args, **kwargs):
++            Path(destination).write_bytes(b"partial output")
++            raise OSError("injected copy failure")
++        with patch.object(self.module.shutil, "copy2", partial_copy):
++            with self.assertRaises(OSError):
++                self.invoke("--package", "plan", "--dev")
++        self.assertEqual((self.package / "bin/plan").read_bytes(), b"old-plan")
++        self.assertEqual(sorted(p.name for p in (self.package / "bin").iterdir()), ["plan"])
++        self.assert_untouched()
++
++    def test_zip_partial_write_failure_preserves_old_archive(self):
++        original = zipfile.ZipFile.writestr
++        def partial_write(archive, *args, **kwargs):
++            original(archive, *args, **kwargs)
++            raise OSError("injected ZIP failure")
++        with patch.object(zipfile.ZipFile, "writestr", partial_write):
++            with self.assertRaises(OSError):
++                self.invoke("--package", "plan", "--output", str(self.dist))
++        self.assert_untouched()
++        self.assertEqual(sorted(p.name for p in self.dist.iterdir()), ["files.zip", "plan.zip"])
++
++    def test_failed_atomic_replace_preserves_old_outputs(self):
++        for dev in (False, True):
++            with self.subTest(dev=dev):
++                with patch.object(os, "replace", side_effect=OSError("injected replace failure")):
++                    with self.assertRaises(OSError):
++                        self.invoke("--package", "plan", *(["--dev"] if dev else ["--output", str(self.dist)]))
++                self.assert_untouched()
++                self.assertEqual((self.package / "bin/plan").read_bytes(), b"old-plan")
++                self.assertEqual(sorted(p.name for p in self.dist.iterdir()), ["files.zip", "plan.zip"])
++                self.assertEqual(sorted(p.name for p in (self.package / "bin").iterdir()), ["plan"])
++
++    def test_source_archive_retains_binary_executable_mode(self):
++        self.invoke("--package", "plan", "--output", str(self.dist))
++        with zipfile.ZipFile(self.dist / "plan.zip") as archive:
++            mode = archive.getinfo("bin/plan").external_attr >> 16
++            self.assertEqual(mode & 0o111, 0o111)
++
++    def test_default_mode_still_builds_all_once(self):
++        target = self.root / "target"
++        (target / "release").mkdir(parents=True)
++        for name in ("plan", "files"):
++            (target / "release" / name).write_bytes(f"new default {name}".encode())
++        with patch.dict(os.environ, {"CARGO_TARGET_DIR": str(target)}):
++            self.invoke("--output", str(self.dist))
++        self.assertEqual(len(self.calls), 1)
++        self.assertEqual(self.calls[0][0], ["cargo", "build", "--release", "--locked", "--quiet"])
++        for name in ("plan", "files"):
++            with zipfile.ZipFile(self.dist / f"{name}.zip") as archive:
++                self.assertEqual(archive.read(f"bin/{name}"), f"new default {name}".encode())
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
