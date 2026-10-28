@@ -81,6 +81,17 @@ def parse_graph(raw, expected_root):
             "claim": "Cargo selected normal/build dependency graph; not exact compiled build-unit proof"}
 
 
+def parse_changed_paths(raw):
+    if not raw.endswith("\0"):
+        raise ValueError("staged path list is not NUL-terminated")
+    paths = raw[:-1].split("\0")
+    if any(not path or path.startswith("/") or any(part in (".", "..") for part in path.split("/")) for path in paths):
+        raise ValueError("invalid staged path")
+    if len(paths) != len(set(paths)):
+        raise ValueError("duplicate staged path")
+    return paths
+
+
 class Validation:
     def __init__(self, work, evidence):
         self.work = work.resolve()
@@ -234,13 +245,18 @@ class Validation:
         self.command("source", ["git", "apply", "--check", "--index", str(HERE / "component-source.patch")], self.module)
         self.command("source", ["git", "apply", "--index", str(HERE / "component-source.patch")], self.module)
         self.command("source", ["git", "diff", "--cached", "--check"], self.module)
-        changed = self.command("source", ["git", "diff", "--cached", "--name-only"], self.module).splitlines()
+        changed = self.staged_paths()
         if sorted(changed) != sorted(item["path"] for item in manifest["files"]):
             raise ValueError("applied path set mismatch")
         applied_tree = self.command("source", ["git", "write-tree"], self.module).strip()
         if applied_tree != manifest["candidate_tree"]:
             raise ValueError("applied full source tree mismatch")
         return {"before": before, "after": self.verify_source_files(manifest, "after"), "applied_tree": applied_tree}
+
+    def staged_paths(self):
+        # Compare add/delete paths, not Git's heuristic rename presentation.
+        raw = self.command("source", ["git", "diff", "--cached", "--name-only", "--no-renames", "-z"], self.module)
+        return parse_changed_paths(raw)
 
     def cargo(self, stage, args, timeout=360):
         return self.command(stage, ["cargo", f"+{TOOLCHAIN}", *args], self.module, timeout)

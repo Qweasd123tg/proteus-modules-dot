@@ -1,8 +1,9 @@
-"""Controller-only synthetic checks; never invoke Cargo, Git or product code."""
+"""Controller-only synthetic checks; tiny authored Git fixtures, no Cargo/product code."""
 import importlib.util
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -137,6 +138,32 @@ class Controls(unittest.TestCase):
                 with self.subTest(key=key), mock.patch.object(validation, "cargo", side_effect=["synthetic-exact-package-id\n", transcript()]), self.assertRaises(ValueError):
                     invoke()
                 message[key] = previous
+
+    def test_nul_changed_path_list_fails_closed(self):
+        self.assertEqual(controller.parse_changed_paths("a.rs\0folder/b.rs\0"), ["a.rs", "folder/b.rs"])
+        for raw in ("", "a.rs\n", "a.rs\0\0", "a.rs\0a.rs\0", "../a.rs\0", "/a.rs\0"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                controller.parse_changed_paths(raw)
+
+    def test_identical_git_rename_preserves_both_required_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            validation = controller.Validation(root / "work", root / "evidence")
+            validation.module.mkdir(parents=True)
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=validation.module, check=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode()
+            git("init", "--quiet")
+            (validation.module / "original.rs").write_text("// Synthetic rename fixture, never compiled.\n")
+            git("add", "original.rs")
+            git("-c", "user.name=Controller Test", "-c", "user.email=controller@example.invalid", "commit", "--quiet", "-m", "synthetic baseline")
+            (validation.module / "original.rs").rename(validation.module / "adapter.rs")
+            git("add", "-A")
+            # Reproduce attempt1: rename presentation omits the deleted preimage.
+            self.assertEqual(git("-c", "diff.renames=true", "diff", "--cached", "--name-only").splitlines(), ["adapter.rs"])
+            self.assertEqual(sorted(validation.staged_paths()), ["adapter.rs", "original.rs"])
+            self.assertEqual(validation.report["commands"][0]["argv"],
+                             ["git", "diff", "--cached", "--name-only", "--no-renames", "-z"])
 
 
 if __name__ == "__main__":
