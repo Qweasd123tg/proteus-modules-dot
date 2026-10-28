@@ -1,0 +1,175 @@
+name: Bounded host-admission validation only
+
+on:
+  push:
+    branches: [ci/shipping-host-admission-20261028]
+    paths:
+      - '.github/workflows/shipping-host-admission.yml'
+      - 'benchmarks/shipping-smoke-*.py'
+      - 'benchmarks/shipping-wrapper-primitives.py'
+      - 'benchmarks/shipping-stdio-*.py'
+      - 'benchmarks/shipping-smoke-admission/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shipping-host-admission-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ROOT_AUTHORIZATION_SHA256: "adf4b4f2d3e7bc7703be20bcd1059199a7fccf70892a7693a88ee5fa54ffd2d3"
+  LAUNCHER_SHA256: "770aff007dc91ce15f0c9422c923c0621ed5e5abfc2637eb3b51f41896bcc965"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONOPTIMIZE: "0"
+
+jobs:
+  host-admission:
+    if: github.event_name == 'push' && github.run_attempt == 1 && github.repository == 'Qweasd123tg/proteus-modules-dot' && github.ref == 'refs/heads/ci/shipping-host-admission-20261028'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Read exact reviewed source publication
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: wrapper-source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Require separate exact host-only authority
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$ROOT_AUTHORIZATION_SHA256" != "UNSEALED"
+          test "$(printf %s "$ROOT_AUTHORIZATION_SHA256" | wc -c)" -eq 64
+          case "$ROOT_AUTHORIZATION_SHA256" in *[!0-9a-f]*) exit 1;; esac
+          source="$GITHUB_WORKSPACE/wrapper-source"
+          admission="$source/benchmarks/shipping-smoke-admission"
+          echo "$ROOT_AUTHORIZATION_SHA256  $admission/authorization.json" | sha256sum --check
+          echo "$LAUNCHER_SHA256  $source/benchmarks/shipping-smoke-launch.py" | sha256sum --check
+          test "$(git -C "$source" rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f "$admission/bindings.json"
+          # Exact GitHub head is independently admitted after publication.
+          # No self-referential future commit SHA is embedded in authorization.
+
+      - name: Read immutable qualified publication inputs (setup only)
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Qweasd123tg/proteus-modules-dot
+          ref: e3b3dccb608de9c978ba9f7eba69d3a066e5c8a3
+          path: qualification-source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read separately pinned PR35 source helper (setup only)
+        timeout-minutes: 5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Qweasd123tg/proteus-modules-dot
+          ref: 72aeaa37b1f81baf105a0ec09f337237dc0b2a7f
+          path: pr35-source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Provision pinned toolchain and system build prerequisites (not product work)
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          setup_started="$(date -u +%FT%TZ)"
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config clang lld libssl-dev
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup_home="$(realpath "${RUSTUP_HOME:-$HOME/.rustup}")"
+          test -d "$rustup_home/toolchains/1.95.0-x86_64-unknown-linux-gnu"
+          printf 'RUSTUP_HOME=%s\n' "$rustup_home" >> "$GITHUB_ENV"
+          /usr/bin/python3 -I -B -S -c 'import sys; assert sys.version_info[:2] == (3,10)'
+          printf 'Infrastructure-only setup start=%s end=%s; no product build/run.\n' "$setup_started" "$(date -u +%FT%TZ)"
+
+      - name: Observe and recheck bounded host admission only
+        id: host
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SHIPPING_START_MONOTONIC="$(/usr/bin/python3 -I -B -S -c 'import time; print(time.monotonic())')"
+          root="$RUNNER_TEMP/proteus-host-admission"
+          mkdir -m 700 "$root"
+          source="$GITHUB_WORKSPACE/wrapper-source"
+          admission="$source/benchmarks/shipping-smoke-admission"
+          exec /usr/bin/python3 -I -B -S "$source/benchmarks/shipping-smoke-launch.py" \
+            --mode host-admission-only \
+            --authorization "$admission/authorization.json" \
+            --authorization-sha256 "$ROOT_AUTHORIZATION_SHA256" \
+            --bindings "$admission/bindings.json" \
+            --workflow "$source/.github/workflows/shipping-host-admission.yml" \
+            --work "$root/work" --evidence "$root/evidence" \
+            --terminal "$root/terminal-control.jsonl"
+
+      - name: Select the bounded host-only terminal receipt
+        id: transport
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          EXPECT_SUCCESS: ${{ steps.host.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 -I -B -S - <<'PY'
+          import json, os, stat
+          from pathlib import Path
+          expected_success = os.environ["EXPECT_SUCCESS"] == "true"
+          root = Path(os.environ["RUNNER_TEMP"])/"proteus-host-admission"
+          terminal = root/"terminal-control.jsonl"
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as output:
+              output.write("terminal=\n")
+              if not terminal.exists():
+                  assert not expected_success, "successful host admission lacks terminal receipt"
+                  raise SystemExit(0)
+              info=terminal.lstat()
+              assert stat.S_ISREG(info.st_mode) and info.st_size <= 1024**2
+              output.write("terminal="+str(terminal)+"\n")
+              raw=terminal.read_bytes()
+              if not raw.endswith(b"\n"):
+                  assert not expected_success, "successful host admission has torn receipt"
+                  raise SystemExit(0)
+              try:
+                  last=json.loads(raw.splitlines()[-1])
+              except (ValueError,IndexError):
+                  assert not expected_success, "successful host admission has invalid receipt"
+                  raise SystemExit(0)
+              if last.get("kind") != "terminal":
+                  assert not expected_success, "successful host admission lacks terminal frame"
+                  raise SystemExit(0)
+              receipt=last["value"]
+              if expected_success:
+                  assert receipt["status"] == "HOST_ADMISSION_TERMINAL_COMPLETE_AWAITING_JOB_SUCCESS"
+                  assert receipt["owned_cleanup_complete"] is True and not receipt["forced_owned_pids"]
+                  assert receipt["phase_receipts"] == [] and receipt["excluded_noncontrol_seconds"] == 0
+                  assert receipt["performance_claim"] is None
+              # The host-only scope uploads this one sidecar, never a product archive.
+          PY
+
+      - name: Retain the bounded host-only sidecar even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: shipping-host-admission-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.transport.outputs.terminal }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: External exact-job host-only authority
+        if: always()
+        shell: bash
+        env:
+          HOST_OUTCOME: ${{ steps.host.outcome }}
+          TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
+        run: |
+          test "$HOST_OUTCOME" = "success"
+          test "$TRANSPORT_OUTCOME" = "success"
+          echo "Host admission only; shipping builds, resource cells and replay were not run. No performance claim."
