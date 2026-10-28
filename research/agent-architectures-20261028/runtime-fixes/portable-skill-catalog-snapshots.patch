@@ -1,0 +1,428 @@
+--- a/examples/portable-skill-catalog/src/catalog.rs
++++ b/examples/portable-skill-catalog/src/catalog.rs
+@@ -50,7 +50,7 @@
+ }
+ impl std::error::Error for CancellationFailure {}
+ 
+-fn check(check_cancelled: &mut impl FnMut() -> Result<bool>) -> Result<()> {
++pub(crate) fn check(check_cancelled: &mut impl FnMut() -> Result<bool>) -> Result<()> {
+     match check_cancelled() {
+         Ok(false) => Ok(()),
+         Ok(true) => Err(CancellationFailure("skill operation canceled".into()).into()),
+@@ -64,7 +64,7 @@
+     config.disabled.contains(id) || runtime.iter().any(|value| value == id)
+ }
+ 
+-fn root_path(path: &Path) -> Result<PathBuf> {
++pub(crate) fn root_path(path: &Path) -> Result<PathBuf> {
+     let metadata = fs::symlink_metadata(path).context("cannot inspect configured root")?;
+     ensure!(
+         !metadata.file_type().is_symlink() && metadata.is_dir(),
+@@ -95,13 +95,11 @@
+     Ok(())
+ }
+ 
+-fn read_document(
++pub(crate) fn open_document(
+     root: &Path,
+     name: &str,
+-    byte_budget: usize,
+-    read_bytes: &mut usize,
+     cancelled: &mut impl FnMut() -> Result<bool>,
+-) -> Result<(PortableSkill, String)> {
++) -> Result<(fs::File, PathBuf, PathBuf)> {
+     check(cancelled)?;
+     valid_name(name)?;
+     let directory = root.join(name);
+@@ -131,11 +129,22 @@
+         // replacement remains a documented trusted-root race, not a sandbox.
+         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+     }
+-    let mut file = options.open(&canonical).context("cannot open SKILL.md")?;
++    let file = options.open(&canonical).context("cannot open SKILL.md")?;
+     ensure!(
+         file.metadata()?.is_file(),
+         "opened SKILL.md is not a regular file"
+     );
++    Ok((file, canonical, directory))
++}
++
++fn read_document(
++    root: &Path,
++    name: &str,
++    byte_budget: usize,
++    read_bytes: &mut usize,
++    cancelled: &mut impl FnMut() -> Result<bool>,
++) -> Result<(PortableSkill, String)> {
++    let (mut file, canonical, directory) = open_document(root, name, cancelled)?;
+     let allowance = MAX_FILE_BYTES.min(byte_budget.saturating_sub(*read_bytes));
+     let mut bytes = Vec::new();
+     let mut block = [0_u8; 4096];
+--- a/examples/portable-skill-catalog/src/lib.rs
++++ b/examples/portable-skill-catalog/src/lib.rs
+@@ -1,4 +1,5 @@
+ //! Explicit-root, read-only foreign skill import using existing Proteus slots.
++mod cache;
+ pub mod catalog;
+ pub mod config;
+ pub mod document;
+@@ -24,6 +25,7 @@
+ use serde::Deserialize;
+ use serde_json::{Value, json};
+ 
++use cache::SnapshotCache;
+ use catalog::{Snapshot, TRUST_WARNING, discover, load_skill};
+ use config::{Config, MAX_RESPONSE_BYTES, MAX_TOOL_OUTPUT_BYTES};
+ 
+@@ -73,7 +75,12 @@
+                 binding.contract_version == PROCESS_CONTEXT_PROVIDER_CONTRACT_VERSION,
+                 "requires context_provider/v4"
+             );
+-            Ok(Box::new(Provider { binding, config }))
++            let cache = SnapshotCache::new(config.clone());
++            Ok(Box::new(Provider {
++                binding,
++                config,
++                cache,
++            }))
+         }
+         "tool" => Ok(Box::new(ToolExport::new(binding, SkillTools { config })?)),
+         _ => bail!("supports only context_provider/v4 and tool/v6"),
+@@ -83,6 +90,7 @@
+ struct Provider {
+     binding: ProcessComponentExportInitialize,
+     config: Config,
++    cache: SnapshotCache,
+ }
+ 
+ impl Export for Provider {
+@@ -108,33 +116,45 @@
+                     input.input.metadata.is_null(),
+                     "request metadata cannot override configured roots"
+                 );
+-                let snapshot = discover(&self.config, &input.skills.disabled, || {
+-                    Ok(host.is_cancelled())
+-                })?;
+-                serde_json::to_value(ProcessContextChunksResponse::new(render_context(
+-                    &snapshot,
+-                    self.config.max_context_bytes,
+-                )?))?
++                let (published, cache_hit) =
++                    self.cache.get(&input.skills.disabled, false, || {
++                        Ok(host.is_cancelled())
++                    })?;
++                let mut chunks =
++                    render_context(&published.snapshot, self.config.max_context_bytes)?;
++                for chunk in &mut chunks {
++                    chunk.metadata["catalog_revision"] = json!(published.revision);
++                    chunk.metadata["catalog_cache_hit"] = json!(cache_hit);
++                    chunk.metadata["catalog_document_read_bytes_this_call"] = json!(if cache_hit {
++                        0
++                    } else {
++                        published.snapshot.read_bytes
++                    });
++                }
++                serde_json::to_value(ProcessContextChunksResponse::new(chunks))?
+             }
+             PROCESS_CONTEXT_PROVIDER_CATALOG_METHOD => {
+                 let input: ProcessSkillCatalogInput = serde_json::from_value(params)?;
+-                let snapshot = discover(&self.config, &input.skills.disabled, || {
++                // This refreshes only this provider export. The tool export may
++                // run in another process and keeps its own fresh-read behavior.
++                let (published, _) = self.cache.get(&input.skills.disabled, true, || {
+                     Ok(host.is_cancelled())
+                 })?;
++                let snapshot = &published.snapshot;
+                 let catalog = SkillCatalog {
+                     skills: snapshot
+                         .skills
+-                        .into_iter()
++                        .iter()
+                         .map(|skill| SkillDescriptor {
+-                            id: skill.id,
+-                            name: skill.fields.name,
+-                            description: skill.fields.description,
+-                            path: skill.path,
++                            id: skill.id.clone(),
++                            name: skill.fields.name.clone(),
++                            description: skill.fields.description.clone(),
++                            path: skill.path.clone(),
+                             source: format!("portable:{}", skill.root_id),
+                             enabled: true,
+                         })
+                         .collect(),
+-                    warnings: snapshot.warnings,
++                    warnings: snapshot.warnings.clone(),
+                 };
+                 catalog.validate().map_err(anyhow::Error::msg)?;
+                 serde_json::to_value(ProcessSkillCatalogResponse::new(Some(catalog)))?
+--- /dev/null
++++ b/examples/portable-skill-catalog/src/cache.rs
+@@ -0,0 +1,186 @@
++//! One metadata snapshot per provider export, never a permission/body cache.
++use std::{
++    fs,
++    path::PathBuf,
++    sync::{Arc, Mutex, TryLockError},
++    time::{Duration, Instant},
++};
++
++use anyhow::{Result, ensure};
++
++use crate::{
++    catalog::{CancellationFailure, Snapshot, check, discover, open_document, root_path},
++    config::Config,
++};
++
++// This is a bounded metadata freshness policy, not a filesystem watcher. Age is
++// measured from the start of discovery, not its completion or last cache hit.
++pub(crate) const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(30);
++
++pub(crate) struct PublishedSnapshot {
++    // Local publication sequence; resets with this export. Not a content hash,
++    // cross-process revision, permission token, or evidence of current file bytes.
++    pub revision: u64,
++    pub snapshot: Snapshot,
++}
++
++struct CachedSnapshot {
++    runtime_disabled: Vec<String>,
++    roots: Vec<PathBuf>,
++    started: Instant,
++    published: Arc<PublishedSnapshot>,
++}
++
++#[derive(Default)]
++struct State {
++    revision: u64,
++    cached: Option<CachedSnapshot>,
++}
++
++pub(crate) struct SnapshotCache {
++    // Immutable config belongs to exactly one export. Rebinding constructs a
++    // new cache; no process-global/config-hash registry can cross authorities.
++    config: Config,
++    state: Mutex<State>,
++}
++
++impl SnapshotCache {
++    pub fn new(config: Config) -> Self {
++        Self {
++            config,
++            state: Mutex::new(State::default()),
++        }
++    }
++
++    /// `refresh` always rescans, including after another caller refreshed.
++    /// Otherwise concurrent misses share the completed scan for matching settings.
++    pub fn get(
++        &self,
++        runtime_disabled: &[String],
++        refresh: bool,
++        mut cancelled: impl FnMut() -> Result<bool>,
++    ) -> Result<(Arc<PublishedSnapshot>, bool)> {
++        check(&mut cancelled)?;
++        self.config.validate()?;
++        // Keep only one bounded snapshot and serialize discovery/publication.
++        // A caller waiting behind another scan still checks its own cancellation;
++        // this does not make filesystem syscalls inside that scan interruptible.
++        let mut state = loop {
++            check(&mut cancelled)?;
++            match self.state.try_lock() {
++                Ok(state) => break state,
++                Err(TryLockError::Poisoned(_)) => {
++                    return Err(anyhow::anyhow!("skill snapshot cache lock poisoned"));
++                }
++                Err(TryLockError::WouldBlock) => {
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++            }
++        };
++        check(&mut cancelled)?;
++        let mut disabled = runtime_disabled.to_vec();
++        disabled.sort();
++        disabled.dedup();
++        let roots = self.source_roots(&mut cancelled)?;
++        if !refresh {
++            if let (Some(cached), Some(roots)) = (&state.cached, &roots) {
++                if cached.runtime_disabled == disabled
++                    && cached.roots == *roots
++                    && cached.started.elapsed() < MAX_SNAPSHOT_AGE
++                    && self.sources_readable(&cached.published.snapshot, roots, &mut cancelled)?
++                    && cached.started.elapsed() < MAX_SNAPSHOT_AGE
++                {
++                    check(&mut cancelled)?;
++                    return Ok((Arc::clone(&cached.published), true));
++                }
++            }
++        }
++
++        // No stale-on-error fallback after an explicit refresh, changed settings,
++        // root failure, cancellation during a scan, or an expired snapshot.
++        state.cached = None;
++        let revision = state
++            .revision
++            .checked_add(1)
++            .ok_or_else(|| anyhow::anyhow!("skill snapshot revision exhausted"))?;
++        let started = Instant::now();
++        let snapshot = discover(&self.config, &disabled, &mut cancelled)?;
++        let after = self.source_roots(&mut cancelled)?;
++        ensure!(
++            roots == after,
++            "configured skill roots changed during discovery; refresh the catalog"
++        );
++        check(&mut cancelled)?;
++        let published = Arc::new(PublishedSnapshot { revision, snapshot });
++        state.revision = revision;
++        // A lenient diagnostic can include parsed untrusted text without a
++        // retained skill/source entry to revalidate. Never cache such warnings.
++        if let Some(roots) = after.filter(|_| published.snapshot.warnings.is_empty()) {
++            state.cached = Some(CachedSnapshot {
++                runtime_disabled: disabled,
++                roots,
++                started,
++                published: Arc::clone(&published),
++            });
++        }
++        Ok((published, false))
++    }
++
++    fn sources_readable(
++        &self,
++        snapshot: &Snapshot,
++        roots: &[PathBuf],
++        cancelled: &mut impl FnMut() -> Result<bool>,
++    ) -> Result<bool> {
++        for skill in &snapshot.skills {
++            check(cancelled)?;
++            let Some((_, root)) = self
++                .config
++                .roots
++                .iter()
++                .zip(roots)
++                .find(|(configured, _)| configured.id == skill.root_id)
++            else {
++                return Ok(false);
++            };
++            // Reuse the actual reader's path/regular-file/open checks, including
++            // current OS read permissions. No SKILL.md bytes are read here.
++            // Opening is not proof that content is unchanged, nor a capability
++            // for a later load: that operation must open and verify again.
++            match open_document(root, &skill.fields.name, cancelled) {
++                Ok((_file, path, directory)) => {
++                    if path != skill.path || directory != skill.skill_directory {
++                        return Ok(false);
++                    }
++                }
++                Err(error) if error.is::<CancellationFailure>() => return Err(error),
++                // Re-enter normal discovery to preserve strict/lenient behavior,
++                // rather than returning cached facts after an authority failure.
++                Err(_) => return Ok(false),
++            }
++        }
++        check(cancelled)?;
++        Ok(true)
++    }
++
++    fn source_roots(
++        &self,
++        cancelled: &mut impl FnMut() -> Result<bool>,
++    ) -> Result<Option<Vec<PathBuf>>> {
++        let mut roots = Vec::with_capacity(self.config.roots.len());
++        for root in &self.config.roots {
++            check(cancelled)?;
++            let Ok(canonical) = root_path(&root.path) else {
++                // Let discover retain the existing strict/lenient diagnostics.
++                // Inaccessible roots are never a cache hit or retained snapshot.
++                return Ok(None);
++            };
++            if fs::read_dir(&canonical).is_err() {
++                return Ok(None);
++            }
++            roots.push(canonical);
++        }
++        check(cancelled)?;
++        Ok(Some(roots))
++    }
++}
+--- a/examples/portable-skill-catalog/README.md
++++ b/examples/portable-skill-catalog/README.md
+@@ -67,6 +67,69 @@
+ не содержит параметры digest-bound activation. Поддерживаемый путь активации —
+ наши два tools, а не несуществующий автоматический native `/skill` routing.
+ 
++## Неизменяемый metadata snapshot provider
++
++Повторный `context_provider.provide` использует один `Arc`-снимок **внутри
++конкретного provider export**. Холодный запрос выполняет прежний `discover`;
++следующий запрос с тем же набором runtime disabled IDs использует его metadata
++без повторного чтения и YAML-разбора SKILL.md. Фиксированная конфигурация export
++(roots, config disabled IDs, budgets, strict) не меняется в течение жизни cache.
++Runtime disabled IDs нормализуются и входят в ключ: изменение настроек вызывает
++новое обнаружение, а не выдачу старого результата. Перед cache hit проверяются
++config и доступность/canonical paths roots, а каждый сохранённый SKILL.md заново
++открывается **без чтения body** тем же shared opener, который использует load.
++Сохраняются проверки directory/file symlink, containment, regular file и Unix
++O_NOFOLLOW/O_NONBLOCK; path сравнивается с сохранённым источником. Отказ открытия,
++удаление файла или смена пути приводят к обычному discover с прежними
++strict/lenient diagnostics, не к выдаче cached metadata. Снимки с warnings не
++кешируются: diagnostic может содержать parsed text файла без сохранённой skill
++entry, для которой удалось бы повторить проверки доступа.
++
++Снимок имеет локальную монотонную `catalog_revision` и повторно используется
++только в течение **30 секунд от начала scan**, не от последнего использования.
++`catalog_cache_hit` и
++`catalog_document_read_bytes_this_call` добавляются в metadata context chunk.
++Последний счётчик учитывает только bytes SKILL.md, не directory/metadata/open syscalls;
++прежний `read_bytes` внутри снимка по-прежнему относится к построившему его scan.
++Revision начинается заново с новым export, меняется при каждой успешной
++публикации, даже если факты совпали, и не является global/content revision.
++
++Один mutex сериализует scan/publication; совпадающие concurrent misses используют
++готовый результат. Сохраняется только один снимок, а выполняющийся renderer может
++удерживать старый `Arc`. Разные disabled-наборы не накапливают отдельные cache
++entries. Ошибка нового scan не возвращает прежний снимок; cancellation не
++превращается в cache hit. Ожидающий mutex запрос проверяет собственную cancellation
++перед каждой `try_lock` и после захвата; между неудачными попытками делает sleep
++10 ms без новых threads. Это не жёсткая гарантия latency планировщика. Blocking
++filesystem syscalls внутри scan по-прежнему не прерываются callback:
++hard timeout/termination остаётся за host.
++
++Provider `catalog` **всегда** делает свежий scan и заменяет только свой snapshot.
++`portable_skill_catalog` также всегда читает свежие файлы, но не инвалидирует
++provider cache: sample запускает provider и tool **разными процессами**, а даже
++в одном process exports не делят эту память. После changed-file error используйте
++id/digest/path из свежего tool-ответа, а не повторно выбирайте старый digest из
++provider context. Snapshot provider обновится при следующем запросе после expiry
++либо при явном provider `catalog`; фонового таймера или watcher нет.
++
++Cache хранит только уже прочитанные факты, не body и не разрешение на чтение.
++В течение окна свежести возможны старые names/descriptions/digests и отсутствие
++новых skills; содержимое отдельного файла не перепроверяется до нового scan.
++Успешное повторное открытие подтверждает read/path проверки только в тот момент,
++не неизменность bytes и не защиту от последующего hostile rename. Каждый
++`portable_skill_load` остался **без cache**: снова проверяет текущие config/runtime
++disabled IDs, root и вычисленный path, открывает файл с прежними ограничениями,
++читает полный bounded документ, сверяет SHA256 и `disable-model-invocation`.
++Старый metadata snapshot не разрешает этот read и не обходит host OS-grants.
++References/assets по-прежнему не входят в digest или snapshot.
++
++Публичные `Snapshot`, `discover`, `load_skill`, `render_context` и конструкция
++`SkillTools { config }` не изменены; новых dependencies/config fields/tools нет.
++Это source-only оптимизация, без результатов запуска или измеренного ускорения.
++SDK pin оставлен `3f36a003`; совместимость запуска на Core `125a9eb` этим patch
++не подтверждается. Старые `VALIDATION.md`/`SOURCES.json` относятся к исходной
++версии, а не являются проверкой или hashes нового cache.
++
+ ## Границы формата и переносимости
+ 
+ | Поддерживается | Не заявляется |
+@@ -94,7 +157,7 @@
+   инструкция/JSON. **Host с меньшим max_output_bytes всё ещё может обрезать ответ**:
+   потребитель обязан учитывать `output_truncated`/`max_output_bytes` metadata.
+   Модуль не может отменить общую host output policy.
+-- Каталог читает bounded **весь SKILL.md**, чтобы посчитать SHA256, затем
++- Свежий scan каталога читает bounded **весь SKILL.md**, чтобы посчитать SHA256, затем
+   отбрасывает body. Это model-context progressive disclosure, **не** обещание
+   filesystem metadata-only I/O. References/assets/scripts не читаются.
+ - Cancellation проверяется между entries и блоками чтения. Блокирующий filesystem

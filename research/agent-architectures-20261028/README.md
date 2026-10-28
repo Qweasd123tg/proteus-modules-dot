@@ -11,7 +11,17 @@
 - По умолчанию сохраняет обязательную группу при переполнении и сообщает исключение; строгий отказ включается отдельно.
 - Шаблон не меняет `plan` и `review`. Бюджет не включает добавляемые workflow meta-tools и не является точным token budget провайдера.
 
-Исходники прошли чтение на совместимость с закреплённым SDK. Компиляция, запуск и измерения не выполнялись; пример предназначен для отдельной проверки и явного подключения.
+Также написаны три независимые Rust-библиотеки для экспериментов с архитектурой host:
+
+| Прототип | Что реализует | Чего пока нет |
+|---|---|---|
+| [Resume manifest](modules/resume-manifest-prototype/README.md) | Каноническая identity и сравнение engine/workflow/state/artifact для холодного продолжения | Подключения к Core, миграции и автоматического resume |
+| [Resource admission](modules/resource-admission-policy/README.md) | Ограниченная очередь, FIFO/aging и цельный план распределения нескольких ресурсов | Резервирования реальных permits и исполнения этого плана |
+| [Mutation lease](modules/mutation-lease-state-machine-prototype/README.md) | Host-owned lease, который переживает отмену requester; barrier при неизвестном исходе | Общего workspace owner/IPC и подтверждения физического settlement |
+
+Это заменяемые policy/state-machine библиотеки, не три новых самостоятельно разрешающих действия runtime. При интеграции остаётся один владелец authority и ресурсов.
+
+Исходники просмотрены на согласованность с описанными контрактами. Компиляция, запуск и измерения не выполнялись; примеры предназначены для отдельной проверки и явного подключения.
 
 ## Исследования
 
@@ -21,24 +31,25 @@
 | Codex и Claude Agent SDK | Ограничение объёма tool-каталога; immutable descriptor reuse; session-owned speculative compaction; адаптер внешнего harness | [Codex / Claude](reports/codex-claude.md) |
 | Hermes и OpenClaw | Immutable skill snapshots и lexical index; стабильный prompt prefix; restart budgets; data-only delegation; доверенные effect receipts | [Hermes / OpenClaw](reports/hermes-openclaw.md) |
 | LangGraph и Microsoft Agent Framework | Неопределённый исход внешних действий; semantic resume manifest; атомарное резервирование нескольких ресурсов | [Durable workflows](reports/durable-workflows.md) |
+| OpenHands SDK и Deep Agents | Безопасные границы сокращения истории; capture-at-source; skill-anchored tool visibility; границы subagent handoff | [OpenHands / Deep Agents](reports/openhands-deepagents.md) |
 
 В отчётах закреплены первичные источники и ревизии. Реализованные у донора механизмы отделены от наших проектных предложений. Архивный AutoGen и unreleased durable extension не выдаются за рекомендуемые production-зависимости.
 
 ## Следующие направления
 
-1. **Версионированный skill-каталог.** Расширить существующий importer снимками metadata и ограниченным индексом. Cache не заменяет проверку доступа. Межпроцессный shared cache не возникает от одного `Arc`.
-2. **Координация file mutations.** Ввести host-owned resource footprint и lease, который не освобождается раньше фактического окончания эффекта. Не включать parallel-флаг у write/edit без этого контракта.
-3. **Resume manifest.** Отличать совместимость protocol/schema от совместимости workflow, состояния и выбранного artifact после рестарта.
+1. **Версионированный skill-каталог.** Первый patch со snapshot/cache уже написан для существующего importer. Далее — bounded lexical index. Cache не заменяет проверку доступа. Межпроцессный shared cache не возникает от одного `Arc`.
+2. **Координация file mutations.** State-machine прототип готов; следующий шаг — настоящий host-owned resource footprint и settlement adapter. Не включать parallel-флаг у write/edit до этой интеграции.
+3. **Resume manifest.** Диагностическая библиотека готова. Интеграция должна различать совместимость protocol/schema и workflow/state/artifact после рестарта, а не автоматически разрешать продолжение.
 4. **Speculative compaction.** Готовить кандидат заранее, применять только к подходящему prefix/epoch. Нужен workflow/session-owned lifetime; нельзя продолжать host callbacks после завершения hook invocation.
-5. **Совокупный admission.** Резервировать provider/process/write ресурсы целиком, поверх существующего scheduler. Наблюдаемая quota не равна reservation.
+5. **Совокупный admission.** Policy-прототип готов. Host должен резервировать provider/process/write ресурсы целиком поверх существующего scheduler; наблюдаемая quota не равна reservation.
 
 ## Что не нужно дублировать
 
 В Proteus уже есть typed hooks, bounded data/control lanes с byte limits, process generations, cancellation, canonical journal/replay, snapshot epochs, role process permits и освобождение decoded history в idle. Бесконечные очереди или timeout, который лишь прекращает ожидание, не являются улучшением этих механизмов.
 
-## Две сопутствующие правки исходников
+## Сопутствующие правки исходников
 
-В [runtime-fixes](runtime-fixes/README.md) лежат небольшие patches: наблюдение cancellation во время admission/restart и согласованная публикация выбранного module artifact с rollback и проверкой reuse metadata. Это исходники для отдельных upstream-копий, не автоматически применённые изменения.
+В [runtime-fixes](runtime-fixes/README.md) лежат patches: cancellation во время admission/restart; публикация выбранного artifact с rollback и проверкой reuse metadata; snapshots существующего skill-каталога; устранение повторного разбора terminal SSE JSON. Это исходники для отдельных копий, не автоматически применённые изменения.
 
 ## База Proteus
 
