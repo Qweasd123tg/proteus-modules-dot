@@ -10,8 +10,8 @@ the explicit component-command replacement; it does not silently change existing
 
 - Modules: `56571639c804443dbca58e054fff8631ecb8b312`, tree `93d0c3eb6fbd6a94c03d2abb88a6bd37e7eb287a`.
 - SDK/Core dependency: `1f533a13f20a93bf164f7c8a169553b0b219bb51` (unchanged).
-- Patch SHA-256: `64256b16831f6c90830972b1cdbae7e516c3e6a85b57bf377d2100d13c55ade8`.
-- Expected full post-apply tree: `a92bef78473d4a735c2cf5e68b0c739099beedca`.
+- Patch SHA-256: `f41c36ff8105d2b69126edeccd5a969a4c8eadadd12219bf5e4c268392563aaa`.
+- Expected full post-apply tree: `c9cd2dba678bdda0c405ec2a04a7f26483de3e71`.
 
 The full candidate tree was computed from the exact untruncated upstream tree and the frozen
 16-path source delta; recomputing the baseline yielded the pinned upstream tree. CI must verify

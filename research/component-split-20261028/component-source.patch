@@ -179,14 +179,16 @@ diff --git a/components/plan-module/src/tests.rs b/components/plan-module/src/te
 new file mode 100644
 --- /dev/null
 +++ b/components/plan-module/src/tests.rs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +use proteus_contracts::{
 +    contracts::{
 +        ExecutionAttribution, PROCESS_TOOL_CONTRACT_VERSION, PROCESS_TOOL_INVOKE_METHOD,
 +        PROCESS_TOOL_LIST_METHOD, ProcessToolInvokeInput,
 +    },
 +    domain::{ToolCall, new_execution_id},
-+    process_module::{ProcessModuleResult, ToolModule, ToolModuleHost, ToolModuleInvocationContext},
++    process_module::{
++        ProcessModuleResult, ToolModule, ToolModuleHost, ToolModuleInvocationContext,
++    },
 +};
 +use serde_json::json;
 +
@@ -329,7 +331,7 @@ diff --git a/components/process-module/Cargo.toml b/components/process-module/Ca
 diff --git a/components/process-module/src/exports.rs b/components/process-module/src/exports.rs
 --- a/components/process-module/src/exports.rs
 +++ b/components/process-module/src/exports.rs
-@@ -2,18 +2,17 @@
+@@ -2,18 +2,18 @@
  use proteus_contracts::{
      contracts::{
          PROCESS_POLICY_EVALUATE_METHOD, PROCESS_POLICY_VISIBILITY_METHOD,
@@ -338,9 +340,10 @@ diff --git a/components/process-module/src/exports.rs b/components/process-modul
 -        ProcessContextResponse, ProcessPolicyEvaluateInput, ProcessPolicyResponse,
 -        ProcessPolicyVisibilityInput, ProcessToolInvokeInput, ProcessToolInvokeResponse,
 -        ProcessToolListResponse, ProcessWorkflowInput, ProcessWorkflowResponse, WorkflowOutput,
-+        ProcessComponentExportInitialize, ProcessComponentExportManifest, ProcessContextChunksResponse,
-+        ProcessContextInput, ProcessContextResponse, ProcessPolicyEvaluateInput, ProcessPolicyResponse,
-+        ProcessPolicyVisibilityInput, ProcessWorkflowInput, ProcessWorkflowResponse, WorkflowOutput,
++        ProcessComponentExportInitialize, ProcessComponentExportManifest,
++        ProcessContextChunksResponse, ProcessContextInput, ProcessContextResponse,
++        ProcessPolicyEvaluateInput, ProcessPolicyResponse, ProcessPolicyVisibilityInput,
++        ProcessWorkflowInput, ProcessWorkflowResponse, WorkflowOutput,
      },
      process_module::{
          ContextBuilderModuleInput, PolicyModuleInvocationContext, PolicyModuleVisibilityContext,
@@ -353,7 +356,7 @@ diff --git a/components/process-module/src/exports.rs b/components/process-modul
  use serde_json::Value;
  
  use crate::{
-@@ -21,31 +20,29 @@
+@@ -21,31 +21,29 @@
      registry::CollectedModules,
  };
  
@@ -393,7 +396,7 @@ diff --git a/components/process-module/src/exports.rs b/components/process-modul
          })
      }
  
-@@ -124,36 +121,12 @@
+@@ -124,36 +122,12 @@
      }
  
      fn tool(&self, method: &str, params: Value, bridge: &HostBridge) -> Result<Value> {
@@ -1165,7 +1168,7 @@ diff --git a/components/tool-adapter/src/lib.rs b/components/tool-adapter/src/li
 new file mode 100644
 --- /dev/null
 +++ b/components/tool-adapter/src/lib.rs
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,75 @@
 +//! Shared adapter for existing registered tools, not a new runtime or ABI.
 +//! The caller retains slot authority checks and supplies the invocation host.
 +
@@ -1230,7 +1233,9 @@ new file mode 100644
 +                })?;
 +                let output = tool.invoke_json(call_json, context_json, host)?;
 +                let result = serde_json::from_str(output.as_str())?;
-+                Ok(serde_json::to_value(ProcessToolInvokeResponse::new(result))?)
++                Ok(serde_json::to_value(ProcessToolInvokeResponse::new(
++                    result,
++                ))?)
 +            }
 +            _ => bail!("unsupported tool method {method:?}"),
 +        }
@@ -1349,7 +1354,7 @@ new file mode 100644
 +    },
 +    domain::{ToolCall, ToolResult, ToolSafety, ToolSpec, new_execution_id},
 +    process_module::{
-+        HookModule, HookModuleHostMut, ModuleRegistry, ProcessModuleError, ProcessModuleResult,
++        HookModule, HookModuleHost, ModuleRegistry, ProcessModuleError, ProcessModuleResult,
 +        ToolModule, ToolModuleHost, ToolModuleInvocationContext,
 +    },
 +};
@@ -1521,7 +1526,7 @@ new file mode 100644
 +    fn invoke_json(
 +        &self,
 +        _input_json: String,
-+        _host: &mut HookModuleHostMut<'_>,
++        _host: &mut dyn HookModuleHost,
 +    ) -> ProcessModuleResult<String> {
 +        unreachable!("collector must not invoke registrations")
 +    }
