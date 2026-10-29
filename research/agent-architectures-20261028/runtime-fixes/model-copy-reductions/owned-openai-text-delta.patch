@@ -1,0 +1,18 @@
+diff --git a/model/model-pack/src/adapters/openai/stream_state.rs b/model/model-pack/src/adapters/openai/stream_state.rs
+--- a/model/model-pack/src/adapters/openai/stream_state.rs
++++ b/model/model-pack/src/adapters/openai/stream_state.rs
+@@ -126,12 +126,12 @@
+                 if emitted.is_empty() {
+                     return Vec::new();
+                 }
+-                let text = emitted.as_str();
++                let text = emitted;
+                 let previous = self.text_parts.insert(key, part);
+                 let text = if previous.is_some_and(|previous| previous != part) {
+                     format!("\n{text}")
+                 } else {
+-                    text.to_owned()
++                    text
+                 };
+                 vec![ModelStreamEvent::TextDelta {
+                     message_id,

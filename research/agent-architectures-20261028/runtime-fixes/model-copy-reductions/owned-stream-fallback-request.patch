@@ -1,0 +1,24 @@
+diff --git a/model/model-pack/src/adapters/openai.rs b/model/model-pack/src/adapters/openai.rs
+--- a/model/model-pack/src/adapters/openai.rs
++++ b/model/model-pack/src/adapters/openai.rs
+@@ -261,7 +261,7 @@
+         // State-parser хранит накопленные text parts / tool_calls / usage и
+         // выплёвывает финальный `Response` на event `response.completed`.
+         let client = self.clone();
+-        let fallback_request = request.clone();
++        let fallback_request = request;
+         let mut sse = response.bytes_stream().eventsource();
+         let events = async_stream::stream! {
+             let mut state = OpenAiStreamState::default();
+diff --git a/model/model-pack/src/adapters/anthropic.rs b/model/model-pack/src/adapters/anthropic.rs
+--- a/model/model-pack/src/adapters/anthropic.rs
++++ b/model/model-pack/src/adapters/anthropic.rs
+@@ -211,7 +211,7 @@
+         // закрывает. Для tool_use input_json_delta приходит инкрементально;
+         // собираем всё в state и на message_stop отдаём Response.
+         let client = self.clone();
+-        let fallback_request = request.clone();
++        let fallback_request = request;
+         let state = Arc::new(Mutex::new(AnthropicStreamState::default()));
+         let mut sse = response.bytes_stream().eventsource();
+         let events = async_stream::stream! {
