@@ -1,0 +1,486 @@
+diff --git a/crates/proteus-core/src/core/session_journal/history_capture/tests.rs b/crates/proteus-core/src/core/session_journal/history_capture/tests.rs
+new file mode 100644
+index 0000000..4d32730
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_journal/history_capture/tests.rs
+@@ -0,0 +1,275 @@
++use super::*;
++use crate::model_standard::MessageRole;
++use serde_json::json;
++
++fn call_history(calls: &[ToolCall]) -> Vec<CanonicalMessage> {
++    vec![CanonicalMessage::new(
++        MessageRole::Assistant,
++        calls
++            .iter()
++            .cloned()
++            .map(|call| ContentPart::ToolCall { call })
++            .collect(),
++    )]
++}
++
++fn capture_error(history: &[CanonicalMessage], bindings: &[WorkflowToolResultBinding]) -> String {
++    HistoryCapture::new(history, bindings).unwrap_err().to_string()
++}
++
++#[test]
++fn history_lookup_retains_missing_ambiguous_and_result_checks() {
++    let call = ToolCall::new("bound", "probe", json!({}));
++    let binding = WorkflowToolResultBinding::new(call.clone());
++    let mut history = call_history(std::slice::from_ref(&call));
++    let result = CanonicalMessage::new(
++        MessageRole::Tool,
++        vec![ContentPart::ToolResult {
++            result: ToolResult::ok(call.id.clone(), "recorded"),
++        }],
++    );
++    assert_eq!(
++        capture_error(std::slice::from_ref(&result), std::slice::from_ref(&binding)),
++        "checkpoint binding bound has no history call"
++    );
++    history.push(result);
++    assert_eq!(
++        capture_error(&history, std::slice::from_ref(&binding)),
++        "checkpoint binding already has a history result"
++    );
++    // A duplicate in a different message must not be overwritten by the index;
++    // ambiguity still takes precedence over an already-present result.
++    history.extend(call_history(&[ToolCall::new(
++        "bound",
++        "other",
++        json!({"x": 1}),
++    )]));
++    assert_eq!(
++        capture_error(&history, std::slice::from_ref(&binding)),
++        "checkpoint binding has ambiguous history call"
++    );
++    let repeated = call_history(&[call.clone(), call.clone(), call]);
++    assert_eq!(
++        capture_error(&repeated, std::slice::from_ref(&binding)),
++        "checkpoint binding has ambiguous history call"
++    );
++
++    let unrelated = ToolCall::new("unbound", "probe", json!({}));
++    let mut unrelated_history = call_history(&[unrelated.clone(), unrelated]);
++    unrelated_history.push(CanonicalMessage::new(
++        MessageRole::Tool,
++        vec![ContentPart::ToolResult {
++            result: ToolResult::ok("unbound".into(), "not selected"),
++        }],
++    ));
++    unrelated_history.extend(call_history(std::slice::from_ref(
++        &binding.execution_call,
++    )));
++    assert!(HistoryCapture::new(&unrelated_history, &[binding]).is_ok());
++    assert!(HistoryCapture::new(&history, &[]).is_ok());
++}
++
++#[test]
++fn binding_validation_keeps_precedence_and_reserved_identity_checks() {
++    let calls = [
++        ToolCall::new("a", "probe", json!({})),
++        ToolCall::new("b", "probe", json!({})),
++    ];
++    let history = call_history(&calls);
++    let bindings = calls.map(WorkflowToolResultBinding::new);
++    let mut changed = bindings[0].clone();
++    changed.execution_call.id = "different".into();
++    changed.message_id = history[0].id;
++    assert_eq!(
++        capture_error(&history, &[changed]),
++        "checkpoint execution call id disagrees with history binding"
++    );
++    assert_eq!(
++        capture_error(&history, &[bindings[0].clone(), bindings[0].clone()]),
++        "duplicate checkpoint tool binding a"
++    );
++    for collide_message in [false, true] {
++        let mut changed = bindings.clone();
++        if collide_message {
++            changed[1].message_id = changed[0].message_id;
++        } else {
++            changed[1].part_id = changed[0].part_id;
++        }
++        assert_eq!(
++            capture_error(&history, &changed),
++            "checkpoint result identities are not unique"
++        );
++        let mut changed = bindings[0].clone();
++        if collide_message {
++            changed.message_id = history[0].id;
++        } else {
++            changed.part_id = history[0].parts[0].part_id;
++        }
++        // Identity validation precedes even a missing history call.
++        changed.call_id = "missing".into();
++        changed.execution_call.id = changed.call_id.clone();
++        assert_eq!(
++            capture_error(&history, &[changed]),
++            "checkpoint result identities are not unique"
++        );
++    }
++    let missing = WorkflowToolResultBinding::new(ToolCall::new("missing", "probe", json!({})));
++    assert_eq!(
++        capture_error(
++            &history,
++            &[missing, bindings[0].clone(), bindings[0].clone()]
++        ),
++        "checkpoint binding missing has no history call"
++    );
++}
++
++#[test]
++fn execution_binding_is_exact_but_does_not_replace_the_model_call() {
++    let model_call = ToolCall::new("a", "shell", json!({"command": "apply_patch"}));
++    let execution_call = ToolCall::new("a", "apply_patch", json!({"patch": "..."}))
++        .with_raw_arguments("original execution arguments");
++    let history = call_history(std::slice::from_ref(&model_call));
++    let binding = WorkflowToolResultBinding::new(execution_call.clone());
++    let capture = HistoryCapture::new(&history, std::slice::from_ref(&binding)).unwrap();
++    capture.validate_call(&execution_call).unwrap();
++    assert!(capture.validate_call(&model_call).is_err());
++    // Reused call IDs still require the complete binding, including execution
++    // payload and both reserved IDs, even on either early-return path.
++    let mut changes = vec![binding.clone(); 3];
++    changes[0].execution_call.raw_arguments = None;
++    changes[1].message_id = crate::domain::new_message_id();
++    changes[2].part_id = crate::domain::new_part_id();
++    for changed in changes {
++        for compacted in [false, true] {
++            assert_eq!(
++                capture
++                    .rebase(&history, &history, std::slice::from_ref(&changed), compacted)
++                    .unwrap_err()
++                    .to_string(),
++                "checkpoint changed a pending tool result binding"
++            );
++        }
++    }
++}
++
++#[test]
++fn rebase_preserves_partial_ack_and_reordered_pending_bindings() {
++    let calls = [
++        ToolCall::new("a", "probe", json!({})),
++        ToolCall::new("b", "probe", json!({})),
++        ToolCall::new("c", "probe", json!({})),
++    ];
++    let prefix = call_history(&calls);
++    let bindings = calls.map(WorkflowToolResultBinding::new);
++    let mut capture = HistoryCapture::new(&prefix, &bindings).unwrap();
++    let mut current = prefix.clone();
++    for id in ["c", "a", "b"] {
++        capture
++            .record(
++                &mut current,
++                &ToolResult::ok(id.into(), format!("result {id}")),
++            )
++            .unwrap();
++    }
++    let mut proposed = prefix;
++    proposed.push(current[1].clone());
++    proposed.push(CanonicalMessage::text(
++        MessageRole::Assistant,
++        "more model output",
++    ));
++    let pending = [bindings[2].clone(), bindings[1].clone()];
++    let (_, rebased) = capture.rebase(&current, &proposed, &pending, false).unwrap();
++    assert_eq!(&rebased[..proposed.len()], &proposed);
++    assert_eq!(
++        &rebased[proposed.len()..],
++        &[current[3].clone(), current[2].clone()]
++    );
++}
++
++#[test]
++fn rebase_message_index_keeps_the_first_equal_id_not_the_last() {
++    let call = ToolCall::new("a", "probe", json!({}));
++    let prefix = call_history(std::slice::from_ref(&call));
++    let binding = WorkflowToolResultBinding::new(call);
++    let mut capture = HistoryCapture::new(&prefix, &[binding]).unwrap();
++    let mut current = prefix.clone();
++    capture
++        .record(&mut current, &ToolResult::ok("a".into(), "exact result"))
++        .unwrap();
++    let exact = current[1].clone();
++    let mut changed = exact.clone();
++    changed.parts[0].payload = ContentPart::Text {
++        text: "changed".into(),
++    };
++    let mut proposed = prefix;
++    // Force suffix rebasing rather than the starts_with(current) fast path.
++    proposed.push(CanonicalMessage::text(
++        MessageRole::Assistant,
++        "new prefix item",
++    ));
++    proposed.extend([exact.clone(), changed.clone()]);
++    let (_, rebased) = capture.rebase(&current, &proposed, &[], false).unwrap();
++    assert_eq!(rebased, proposed);
++    let len = proposed.len();
++    proposed[len - 2] = changed;
++    proposed[len - 1] = exact;
++    assert_eq!(
++        capture
++            .rebase(&current, &proposed, &[], false)
++            .unwrap_err()
++            .to_string(),
++        "checkpoint changed a committed tool result"
++    );
++}
++
++#[test]
++fn rebasing_preserves_exact_results_and_bindings_in_call_order() {
++    let calls = [
++        ToolCall::new("a", "probe", json!({})),
++        ToolCall::new("b", "probe", json!({})),
++    ];
++    let mut prefix = vec![CanonicalMessage::new(
++        MessageRole::Assistant,
++        calls
++            .iter()
++            .cloned()
++            .map(|call| ContentPart::ToolCall { call })
++            .collect(),
++    )];
++    let bindings = calls
++        .into_iter()
++        .map(WorkflowToolResultBinding::new)
++        .collect::<Vec<_>>();
++    let mut capture = HistoryCapture::new(&prefix, &bindings).unwrap();
++    let mut history = prefix.clone();
++    let results = [
++        ToolResult::ok("a".into(), "first"),
++        ToolResult::ok("b".into(), "second"),
++    ];
++    capture.record(&mut history, &results[1]).unwrap();
++    capture.record(&mut history, &results[0]).unwrap();
++    prefix.push(CanonicalMessage::text(
++        MessageRole::Assistant,
++        "later model item",
++    ));
++    let (capture, rebased) = capture.rebase(&history, &prefix, &bindings, false).unwrap();
++    assert_eq!(&rebased[..prefix.len()], &prefix);
++    assert_eq!(
++        &rebased[prefix.len()..],
++        &[
++            bindings[0].message(results[0].clone()),
++            bindings[1].message(results[1].clone())
++        ]
++    );
++    assert!(
++        capture
++            .rebase(&rebased, &prefix, &bindings[..1], false)
++            .is_err()
++    );
++    let mut changed = bindings.clone();
++    changed[0].part_id = crate::domain::new_part_id();
++    assert!(capture.rebase(&rebased, &prefix, &changed, false).is_err());
++    let (_, drained) = capture.rebase(&rebased, &rebased, &[], false).unwrap();
++    assert_eq!(drained, rebased);
++    assert!(capture.rebase(&rebased, &[], &[], false).is_err());
++}
+diff --git a/crates/proteus-core/src/core/session_journal/history_capture.rs b/crates/proteus-core/src/core/session_journal/history_capture.rs
+index d541f01..1318305 100644
+--- a/crates/proteus-core/src/core/session_journal/history_capture.rs
++++ b/crates/proteus-core/src/core/session_journal/history_capture.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ 
+ use anyhow::{Result, ensure};
+ 
+@@ -42,10 +42,16 @@ impl HistoryCapture {
+     ) -> Result<(Self, Vec<CanonicalMessage>)> {
+         let mut next = Self::new(proposed, bindings)?;
+         let mut history = proposed.to_vec();
++        // new() has already rejected duplicate call IDs. Borrow this checkpoint's
++        // bindings only; the ordered calls vector remains the result authority.
++        let bindings_by_call = bindings
++            .iter()
++            .map(|binding| (binding.call_id.as_str(), binding))
++            .collect::<HashMap<_, _>>();
+         for (_, binding, _) in &self.calls {
+-            if let Some(reused) = bindings.iter().find(|item| item.call_id == binding.call_id) {
++            if let Some(reused) = bindings_by_call.get(binding.call_id.as_str()) {
+                 ensure!(
+-                    reused == binding,
++                    *reused == binding,
+                     "checkpoint changed a pending tool result binding"
+                 );
+             }
+@@ -62,6 +68,11 @@ impl HistoryCapture {
+             self.base + recorded == current.len() && proposed.starts_with(&current[..self.base]),
+             "checkpoint discarded committed history without a new compaction"
+         );
++        let mut proposed_by_id = HashMap::new();
++        for message in proposed {
++            // Preserve iter().find()'s first match even for repeated message IDs.
++            proposed_by_id.entry(message.id).or_insert(message);
++        }
+         for ((_, binding, _), message) in self
+             .calls
+             .iter()
+@@ -73,15 +84,17 @@ impl HistoryCapture {
+             // acknowledged messages are now part of the proposed prefix; only
+             // the still-pending suffix needs to be carried over. Keep exact
+             // canonical identities and payloads rather than synthesizing them.
+-            if let Some(accepted) = proposed.iter().find(|item| item.id == message.id) {
++            if let Some(accepted) = proposed_by_id.get(&message.id) {
+                 ensure!(
+-                    accepted == message,
++                    *accepted == message,
+                     "checkpoint changed a committed tool result"
+                 );
+                 continue;
+             }
+             ensure!(
+-                next.has_binding(binding),
++                bindings_by_call
++                    .get(binding.call_id.as_str())
++                    .is_some_and(|existing| *existing == binding),
+                 "checkpoint discarded a committed tool result"
+             );
+             let result = message
+@@ -105,6 +118,12 @@ impl HistoryCapture {
+         history: &[CanonicalMessage],
+         bindings: &[WorkflowToolResultBinding],
+     ) -> Result<Self> {
++        if bindings.is_empty() {
++            return Ok(Self {
++                base: history.len(),
++                calls: Vec::new(),
++            });
++        }
+         let mut message_ids = history
+             .iter()
+             .map(|message| message.id)
+@@ -113,6 +132,24 @@ impl HistoryCapture {
+             .iter()
+             .flat_map(|message| message.parts.iter().map(|part| part.part_id))
+             .collect::<HashSet<_>>();
++        let mut history_calls = HashMap::new();
++        let mut history_results = HashSet::new();
++        for part in history.iter().flat_map(|message| &message.parts) {
++            match &part.payload {
++                ContentPart::ToolCall { call } => {
++                    // Presence alone would hide ambiguous calls. Only the second
++                    // occurrence matters, so no count or payload copy is needed.
++                    history_calls
++                        .entry(call.id.as_str())
++                        .and_modify(|ambiguous| *ambiguous = true)
++                        .or_insert(false);
++                }
++                ContentPart::ToolResult { result } => {
++                    history_results.insert(result.call_id.as_str());
++                }
++                _ => {}
++            }
++        }
+         let mut seen = HashSet::new();
+         let mut calls = Vec::new();
+         for binding in bindings {
+@@ -129,21 +166,14 @@ impl HistoryCapture {
+                 message_ids.insert(binding.message_id) && part_ids.insert(binding.part_id),
+                 "checkpoint result identities are not unique"
+             );
+-            let mut matching = history
+-                .iter()
+-                .flat_map(|message| &message.parts)
+-                .filter_map(|part| match &part.payload {
+-                    ContentPart::ToolCall { call } if call.id == binding.call_id => Some(call),
+-                    _ => None,
+-                });
+-            matching.next().ok_or_else(|| {
++            let ambiguous = history_calls.get(binding.call_id.as_str()).ok_or_else(|| {
+                 anyhow::anyhow!("checkpoint binding {} has no history call", binding.call_id)
+             })?;
++            ensure!(!*ambiguous, "checkpoint binding has ambiguous history call");
+             ensure!(
+-                matching.next().is_none(),
+-                "checkpoint binding has ambiguous history call"
++                !history_results.contains(binding.call_id.as_str()),
++                "checkpoint binding already has a history result"
+             );
+-            ensure!(!history.iter().flat_map(|message| &message.parts).any(|part| matches!(&part.payload, ContentPart::ToolResult { result } if result.call_id == binding.call_id)), "checkpoint binding already has a history result");
+             calls.push((binding.execution_call.clone(), binding.clone(), false));
+         }
+         Ok(Self {
+@@ -195,60 +225,4 @@ impl HistoryCapture {
+ }
+ 
+ #[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use crate::model_standard::MessageRole;
+-    use serde_json::json;
+-
+-    #[test]
+-    fn rebasing_preserves_exact_results_and_bindings_in_call_order() {
+-        let calls = [
+-            ToolCall::new("a", "probe", json!({})),
+-            ToolCall::new("b", "probe", json!({})),
+-        ];
+-        let mut prefix = vec![CanonicalMessage::new(
+-            MessageRole::Assistant,
+-            calls
+-                .iter()
+-                .cloned()
+-                .map(|call| ContentPart::ToolCall { call })
+-                .collect(),
+-        )];
+-        let bindings = calls
+-            .into_iter()
+-            .map(WorkflowToolResultBinding::new)
+-            .collect::<Vec<_>>();
+-        let mut capture = HistoryCapture::new(&prefix, &bindings).unwrap();
+-        let mut history = prefix.clone();
+-        let results = [
+-            ToolResult::ok("a".into(), "first"),
+-            ToolResult::ok("b".into(), "second"),
+-        ];
+-        capture.record(&mut history, &results[1]).unwrap();
+-        capture.record(&mut history, &results[0]).unwrap();
+-        prefix.push(CanonicalMessage::text(
+-            MessageRole::Assistant,
+-            "later model item",
+-        ));
+-        let (capture, rebased) = capture.rebase(&history, &prefix, &bindings, false).unwrap();
+-        assert_eq!(&rebased[..prefix.len()], &prefix);
+-        assert_eq!(
+-            &rebased[prefix.len()..],
+-            &[
+-                bindings[0].message(results[0].clone()),
+-                bindings[1].message(results[1].clone())
+-            ]
+-        );
+-        assert!(
+-            capture
+-                .rebase(&rebased, &prefix, &bindings[..1], false)
+-                .is_err()
+-        );
+-        let mut changed = bindings.clone();
+-        changed[0].part_id = crate::domain::new_part_id();
+-        assert!(capture.rebase(&rebased, &prefix, &changed, false).is_err());
+-        let (_, drained) = capture.rebase(&rebased, &rebased, &[], false).unwrap();
+-        assert_eq!(drained, rebased);
+-        assert!(capture.rebase(&rebased, &[], &[], false).is_err());
+-    }
+-}
++mod tests;
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 62125be..7999776 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1498,6 +1498,12 @@ stream. Model IO и UI deltas продолжаются во время испо
+ их точные canonical messages в своём prefix и объявляет bindings только для ещё
+ ожидаемых результатов. Core переносит оставшийся durable suffix отдельно:
+ частичный ACK не требует повторной регистрации завершённого вызова.
++Временные lookup-индексы checkpoint строятся заново для его snapshot и не
++подменяют ordered bindings: повторный history call остаётся неоднозначным,
++уже существующий result запрещает новый binding, а перенос требует полного
++равенства binding и canonical message. Индекс по message id сохраняет первое
++совпадение, как последовательный поиск; порядок suffix задаётся bindings,
++не порядком hash map. Индексы не сохраняются в journal или между checkpoints.
+ Выбранный результат tool попадает
+ в history вместе с `tool_result_recorded`; потеря ответа между Core и workflow
+ его не удаляет. Подтверждённый результат сохраняется и при Cancel, внешнем
