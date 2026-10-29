@@ -1,0 +1,541 @@
+--- a/crates/proteus-contracts/src/contracts/tool.rs
++++ b/crates/proteus-contracts/src/contracts/tool.rs
+@@ -274,6 +274,7 @@
+ #[derive(Clone, Default)]
+ pub struct ToolRegistry {
+     tools: HashMap<String, ToolEntry>,
++    schema_caches: HashMap<String, Arc<crate::domain::tool_validation::ToolSchemaCache>>,
+ }
+ 
+ impl ToolRegistry {
+@@ -296,6 +297,33 @@
+     }
+ 
+     pub fn register_arc(&mut self, source: ToolSource, tool: Arc<dyn Tool>) -> Result<()> {
++        self.register_arc_with_cache(source, tool, Arc::default())
++    }
++
++    /// Re-register the same tool identity while sharing its bounded schema cache.
++    /// All registration checks, including a fresh Tool::spec(), still apply.
++    pub fn register_from(&mut self, registry: &Self, name: &str) -> Result<()> {
++        let entry = registry
++            .tools
++            .get(name)
++            .ok_or_else(|| anyhow!("unknown tool: {name}"))?;
++        let cache = registry
++            .schema_caches
++            .get(name)
++            .expect("registered tool schema cache");
++        self.register_arc_with_cache(
++            entry.source.clone(),
++            Arc::clone(&entry.tool),
++            Arc::clone(cache),
++        )
++    }
++
++    fn register_arc_with_cache(
++        &mut self,
++        source: ToolSource,
++        tool: Arc<dyn Tool>,
++        cache: Arc<crate::domain::tool_validation::ToolSchemaCache>,
++    ) -> Result<()> {
+         let spec = tool.spec();
+         anyhow::ensure!(
+             !matches!(
+@@ -313,8 +341,7 @@
+                 existing.source.label()
+             ));
+         }
+-        crate::domain::tool_validation::validate_tool_input_schema(&spec)
+-            .map_err(anyhow::Error::msg)?;
++        cache.validator(&spec).map_err(anyhow::Error::msg)?;
+         if let Some(command) = tool.user_command() {
+             super::validate_command_name(&command.name)?;
+             anyhow::ensure!(
+@@ -325,7 +352,7 @@
+                 "duplicate user command: /{}",
+                 command.name
+             );
+-            if let Some(error) = crate::domain::validate_tool_call_args(
++            if let Some(error) = cache.validate_call_args(
+                 &ToolCall::new(
+                     "command-validation",
+                     &spec.name,
+@@ -336,8 +363,18 @@
+                 return Err(anyhow!("invalid command tool: {error}"));
+             }
+         }
++        self.schema_caches.insert(spec.name.clone(), cache);
+         self.tools.insert(spec.name, ToolEntry { source, tool });
+         Ok(())
++    }
++
++    /// Validate fresh arguments against the caller's current captured spec.
++    /// Cached schema compilation is not visibility or execution authority.
++    pub fn validate_call_args(&self, call: &ToolCall, spec: &ToolSpec) -> Option<String> {
++        match self.schema_caches.get(&call.name) {
++            Some(cache) => cache.validate_call_args(call, spec),
++            None => crate::domain::validate_tool_call_args(call, spec),
++        }
+     }
+ 
+     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+@@ -397,3 +434,7 @@
+             .ok_or_else(|| anyhow!("unknown tool: {name}"))
+     }
+ }
++
++#[cfg(test)]
++#[path = "tool/schema_cache_tests.rs"]
++mod schema_cache_tests;
+--- /dev/null
++++ b/crates/proteus-contracts/src/contracts/tool/schema_cache_tests.rs
+@@ -0,0 +1,113 @@
++use super::*;
++use crate::domain::ToolSafety;
++use serde_json::{Value, json};
++
++struct ChangingTool(Arc<Mutex<ToolSpec>>);
++
++#[async_trait]
++impl Tool for ChangingTool {
++    fn spec(&self) -> ToolSpec {
++        self.0.lock().unwrap().clone()
++    }
++
++    async fn invoke(&self, call: &ToolCall, _ctx: ToolContext) -> Result<ToolResult> {
++        Ok(ToolResult::ok(call.id.clone(), "not invoked by these tests"))
++    }
++}
++
++fn registry(schema: Value) -> (ToolRegistry, Arc<Mutex<ToolSpec>>) {
++    let state = Arc::new(Mutex::new(ToolSpec::new(
++        "probe",
++        "original",
++        schema,
++        ToolSafety::ReadOnly,
++    )));
++    let mut registry = ToolRegistry::new();
++    registry.register(ChangingTool(Arc::clone(&state))).unwrap();
++    (registry, state)
++}
++
++#[test]
++fn reselection_shares_compilation_but_does_not_freeze_dynamic_specs() {
++    let (source, state) = registry(json!({"type": "integer", "minimum": 1}));
++    let original = source.spec("probe").unwrap();
++    let cache = &source.schema_caches["probe"];
++    let compiled = cache.validator(&original).unwrap();
++    let cloned = source.clone();
++    assert!(Arc::ptr_eq(cache, &cloned.schema_caches["probe"]));
++
++    let mut selected = ToolRegistry::new();
++    selected.register_from(&source, "probe").unwrap();
++    assert!(Arc::ptr_eq(cache, &selected.schema_caches["probe"]));
++    assert!(Arc::ptr_eq(&compiled, &cache.validator(&original).unwrap()));
++
++    {
++        let mut current = state.lock().unwrap();
++        current.input_schema = json!({"type": "integer", "minimum": 5});
++        current.description = "current".into();
++        current.safety = ToolSafety::Dangerous;
++    }
++    let current = selected.spec("probe").unwrap();
++    assert_eq!(current.description, "current");
++    assert_eq!(current.safety, ToolSafety::Dangerous);
++    let call = ToolCall::new("call", "probe", json!(2));
++    assert!(selected.validate_call_args(&call, &current).is_some());
++    assert!(selected.validate_call_args(&call, &original).is_none());
++
++    state.lock().unwrap().input_schema = json!({"type": "invalid-type"});
++    let mut invalid_selection = ToolRegistry::new();
++    assert!(invalid_selection.register_from(&source, "probe").is_err());
++    assert!(invalid_selection.get("probe").is_none());
++    assert!(
++        selected
++            .validate_call_args(&call, &selected.spec("probe").unwrap())
++            .is_some()
++    );
++}
++
++#[test]
++fn independent_registrations_do_not_share_by_name_and_duplicates_still_fail() {
++    let (source, _) = registry(json!({"type": "integer"}));
++    let (other, _) = registry(json!({"type": "string"}));
++    assert!(!Arc::ptr_eq(
++        &source.schema_caches["probe"],
++        &other.schema_caches["probe"]
++    ));
++    let call = ToolCall::new("call", "probe", json!(2));
++    assert!(
++        source
++            .validate_call_args(&call, &source.spec("probe").unwrap())
++            .is_none()
++    );
++    assert!(
++        other
++            .validate_call_args(&call, &other.spec("probe").unwrap())
++            .is_some()
++    );
++
++    let mut selected = ToolRegistry::new();
++    selected.register_from(&source, "probe").unwrap();
++    assert!(selected.register_from(&other, "probe").is_err());
++    assert!(
++        selected
++            .validate_call_args(&call, &selected.spec("probe").unwrap())
++            .is_none()
++    );
++    assert!(selected.register_from(&source, "missing").is_err());
++}
++
++#[test]
++fn unknown_name_keeps_standalone_validation_behavior() {
++    let (registry, _) = registry(json!({"type": "integer"}));
++    let spec = ToolSpec::new(
++        "unregistered",
++        "test",
++        json!({"type": "string"}),
++        ToolSafety::ReadOnly,
++    );
++    let call = ToolCall::new("call", "unregistered", json!(1));
++    assert_eq!(
++        registry.validate_call_args(&call, &spec),
++        crate::domain::validate_tool_call_args(&call, &spec)
++    );
++}
+--- a/crates/proteus-contracts/src/domain/tool_validation.rs
++++ b/crates/proteus-contracts/src/domain/tool_validation.rs
+@@ -1,6 +1,10 @@
+ //! Shared JSON Schema validation for tool execution and every hook contribution.
+ use super::{ToolCall, ToolSpec};
+ use serde_json::Value;
++use std::borrow::Cow;
++
++mod cache;
++pub(crate) use cache::ToolSchemaCache;
+ 
+ /// Schemas are self-contained; local `$ref` is supported, external retrieval is
+ /// disabled. This validation never adds filesystem/network capabilities.
+@@ -16,20 +20,27 @@
+ }
+ 
+ pub fn validate_tool_call_args(call: &ToolCall, spec: &ToolSpec) -> Option<String> {
+-    let parsed;
+-    let args = if let Some(raw_arguments) = call.raw_arguments.as_deref() {
+-        parsed = match serde_json::from_str::<Value>(raw_arguments) {
+-            Ok(value) => value,
+-            Err(error) => return Some(format!("failed to parse function arguments: {error}")),
+-        };
+-        &parsed
+-    } else {
+-        &call.args
++    let args = match tool_call_args(call) {
++        Ok(args) => args,
++        Err(error) => return Some(error),
+     };
+     let validator = match compile_schema(spec) {
+         Ok(validator) => validator,
+         Err(error) => return Some(error),
+     };
++    validate_args(call, &validator, &args)
++}
++
++fn tool_call_args(call: &ToolCall) -> Result<Cow<'_, Value>, String> {
++    match call.raw_arguments.as_deref() {
++        Some(raw_arguments) => serde_json::from_str::<Value>(raw_arguments)
++            .map(Cow::Owned)
++            .map_err(|error| format!("failed to parse function arguments: {error}")),
++        None => Ok(Cow::Borrowed(&call.args)),
++    }
++}
++
++fn validate_args(call: &ToolCall, validator: &jsonschema::Validator, args: &Value) -> Option<String> {
+     validator.validate(args).err().map(|error| {
+         format!(
+             "tool '{}' arguments violate schema at '{}': {} (schema '{}')",
+--- /dev/null
++++ b/crates/proteus-contracts/src/domain/tool_validation/cache.rs
+@@ -0,0 +1,79 @@
++//! One schema slot owned by a registered tool, not an authorization cache.
++use std::sync::{Arc, Mutex};
++
++use serde_json::Value;
++
++use super::{ToolCall, ToolSpec, compile_schema, tool_call_args, validate_args};
++
++#[derive(Default)]
++pub(crate) struct ToolSchemaCache {
++    current: Mutex<Option<CompiledSchema>>,
++}
++
++struct CompiledSchema {
++    schema: Value,
++    validator: Arc<jsonschema::Validator>,
++}
++
++impl ToolSchemaCache {
++    pub(crate) fn validator(&self, spec: &ToolSpec) -> Result<Arc<jsonschema::Validator>, String> {
++        let mut current = self
++            .current
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner());
++        if let Some(compiled) = current.as_ref()
++            && same_schema(&compiled.schema, &spec.input_schema)
++        {
++            return Ok(Arc::clone(&compiled.validator));
++        }
++        // Tool::spec may change. Never freeze it, key by name alone, or fall
++        // back to a previous schema when compilation of the current one fails.
++        // The lock coalesces concurrent compilation for this one tool only.
++        *current = None;
++        let validator = Arc::new(compile_schema(spec)?);
++        *current = Some(CompiledSchema {
++            schema: spec.input_schema.clone(),
++            validator: Arc::clone(&validator),
++        });
++        Ok(validator)
++    }
++
++    pub(crate) fn validate_call_args(&self, call: &ToolCall, spec: &ToolSpec) -> Option<String> {
++        // Raw provider arguments remain authoritative and are parsed afresh.
++        // In particular, a cache hit must not reuse a previous argument result.
++        let args = match tool_call_args(call) {
++            Ok(args) => args,
++            Err(error) => return Some(error),
++        };
++        let validator = match self.validator(spec) {
++            Ok(validator) => validator,
++            Err(error) => return Some(error),
++        };
++        validate_args(call, &validator, &args)
++    }
++}
++
++fn same_schema(left: &Value, right: &Value) -> bool {
++    match (left, right) {
++        (Value::Object(left), Value::Object(right)) => {
++            // serde_json/preserve_order may be enabled by another crate.
++            // Value equality ignores map order, but the compiler's first-error
++            // diagnostic can depend on traversal order, including nested maps.
++            left.len() == right.len()
++                && left.iter().zip(right.iter()).all(|((lk, lv), (rk, rv))| {
++                    lk == rk && same_schema(lv, rv)
++                })
++        }
++        (Value::Array(left), Value::Array(right)) => {
++            left.len() == right.len()
++                && left.iter().zip(right.iter()).all(|(l, r)| same_schema(l, r))
++        }
++        // Equal floats can have different diagnostic spellings (e.g. -0.0).
++        // Compare only these small scalar renderings, not whole encoded schemas.
++        (Value::Number(left), Value::Number(right)) => left.to_string() == right.to_string(),
++        _ => left == right,
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/crates/proteus-contracts/src/domain/tool_validation/cache/tests.rs
+@@ -0,0 +1,140 @@
++use super::*;
++use crate::domain::ToolSafety;
++use serde_json::json;
++
++fn spec(schema: Value) -> ToolSpec {
++    ToolSpec::new("probe", "probe", schema, ToolSafety::ReadOnly)
++}
++
++#[test]
++fn unchanged_schema_reuses_validator_but_changed_schema_replaces_it() {
++    let cache = ToolSchemaCache::default();
++    let original = spec(json!({"type": "integer", "minimum": 1}));
++    let first = cache.validator(&original).unwrap();
++    let mut renamed = original.clone();
++    renamed.name = "other-name".into();
++    renamed.description = "changed description".into();
++    renamed.safety = ToolSafety::Dangerous;
++    assert!(Arc::ptr_eq(&first, &cache.validator(&renamed).unwrap()));
++
++    let changed = spec(json!({"type": "integer", "minimum": 5}));
++    let second = cache.validator(&changed).unwrap();
++    assert!(!Arc::ptr_eq(&first, &second));
++    let call = ToolCall::new("call", "probe", json!(2));
++    assert!(cache.validate_call_args(&call, &changed).is_some());
++    assert!(cache.validate_call_args(&call, &original).is_none());
++    // Only the current schema is retained, not a map of historical variants.
++    assert!(!Arc::ptr_eq(&first, &cache.validator(&original).unwrap()));
++}
++
++#[test]
++fn invalid_current_schema_never_falls_back_and_external_refs_stay_offline() {
++    let cache = ToolSchemaCache::default();
++    let valid = spec(json!({"type": "object"}));
++    let first = cache.validator(&valid).unwrap();
++    let call = ToolCall::new("call", "probe", json!({}));
++    for schema in [
++        json!({"type": "invalid-type"}),
++        json!({"$ref": "https://example.com/tool-schema"}),
++        json!({"$ref": "file:///not-a-tool-schema.json"}),
++    ] {
++        let invalid = spec(schema);
++        assert_eq!(
++            cache.validate_call_args(&call, &invalid),
++            super::super::validate_tool_call_args(&call, &invalid)
++        );
++        assert!(cache.validate_call_args(&call, &invalid).is_some());
++    }
++    assert!(!Arc::ptr_eq(&first, &cache.validator(&valid).unwrap()));
++}
++
++#[test]
++fn cached_validation_preserves_fresh_raw_arguments_and_error_precedence() {
++    let cache = ToolSchemaCache::default();
++    let spec = spec(json!({
++        "$defs": {"count": {"type": "integer", "minimum": 1}},
++        "type": "object", "properties": {"count": {"$ref": "#/$defs/count"}},
++        "required": ["count"], "additionalProperties": false
++    }));
++    cache.validator(&spec).unwrap();
++    for call in [
++        ToolCall::new("ok", "probe", json!({"count": 2})),
++        ToolCall::new("bad", "probe", json!({"count": 0})),
++        ToolCall::new("raw-bad", "probe", json!({"count": 2}))
++            .with_raw_arguments("{\"count\":0}"),
++        ToolCall::new("raw-good", "probe", json!({"count": 0}))
++            .with_raw_arguments("{\"count\":2}"),
++        ToolCall::new("malformed", "probe", json!({"count": 2}))
++            .with_raw_arguments("{"),
++    ] {
++        assert_eq!(
++            cache.validate_call_args(&call, &spec),
++            super::super::validate_tool_call_args(&call, &spec)
++        );
++    }
++    let invalid = self::spec(json!({"type": "invalid-type"}));
++    let malformed = ToolCall::new("malformed", "probe", json!({})).with_raw_arguments("{");
++    let error = cache.validate_call_args(&malformed, &invalid).unwrap();
++    assert!(error.starts_with("failed to parse function arguments:"));
++    assert_eq!(
++        Some(error),
++        super::super::validate_tool_call_args(&malformed, &invalid)
++    );
++}
++
++#[test]
++fn concurrent_unchanged_schema_requests_share_one_validator() {
++    let cache = Arc::new(ToolSchemaCache::default());
++    let barrier = Arc::new(std::sync::Barrier::new(4));
++    let handles = (0..4)
++        .map(|_| {
++            let cache = Arc::clone(&cache);
++            let barrier = Arc::clone(&barrier);
++            std::thread::spawn(move || {
++                barrier.wait();
++                cache.validator(&spec(json!({"type": "object"}))).unwrap()
++            })
++        })
++        .collect::<Vec<_>>();
++    let validators = handles
++        .into_iter()
++        .map(|handle| handle.join().unwrap())
++        .collect::<Vec<_>>();
++    assert!(validators.iter().all(|item| Arc::ptr_eq(item, &validators[0])));
++}
++
++#[test]
++fn changed_map_order_keeps_current_first_error_diagnostics() {
++    let cache = ToolSchemaCache::default();
++    let original = spec(serde_json::from_str(
++        r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}}}"#,
++    ).unwrap());
++    let reordered = spec(serde_json::from_str(
++        r#"{"type":"object","properties":{"b":{"type":"string"},"a":{"type":"integer"}}}"#,
++    ).unwrap());
++    let first = cache.validator(&original).unwrap();
++    let call = ToolCall::new("call", "probe", json!({"a": false, "b": 1}));
++    assert_eq!(
++        cache.validate_call_args(&call, &reordered),
++        super::super::validate_tool_call_args(&call, &reordered)
++    );
++    // Works with either feature set: sorted maps canonicalize both orders;
++    // preserve_order maps keep them distinct, including nested properties.
++    assert_eq!(
++        Arc::ptr_eq(&first, &cache.validator(&reordered).unwrap()),
++        original.input_schema.to_string() == reordered.input_schema.to_string()
++    );
++}
++
++#[test]
++fn schema_identity_preserves_numeric_spelling_and_nested_array_maps() {
++    let negative_zero = json!({"const": -0.0});
++    let positive_zero = json!({"const": 0.0});
++    assert_eq!(
++        same_schema(&negative_zero, &positive_zero),
++        negative_zero.to_string() == positive_zero.to_string()
++    );
++    let left: Value = serde_json::from_str(r#"{"allOf":[{"type":"string","minLength":3}]}"#).unwrap();
++    let right: Value = serde_json::from_str(r#"{"allOf":[{"minLength":3,"type":"string"}]}"#).unwrap();
++    assert_eq!(same_schema(&left, &right), left.to_string() == right.to_string());
++}
+--- a/crates/proteus-core/src/core/bound_tools.rs
++++ b/crates/proteus-core/src/core/bound_tools.rs
+@@ -13,9 +13,7 @@
+         ExecutionPermissionGrants, ExecutionScope, NoopToolExecutionRecorder, PolicyContext,
+         PolicyVisibilityContext, RequestOrigin, ToolContext, ToolExecutionRecorder, ToolRegistry,
+     },
+-    domain::{
+-        PolicyDecision, ToolCall, ToolCallResolution, ToolResult, ToolSpec, validate_tool_call_args,
+-    },
++    domain::{PolicyDecision, ToolCall, ToolCallResolution, ToolResult, ToolSpec},
+ };
+ 
+ use self::support::{metadata_with, truncate_utf8, visibility_decision_allows};
+@@ -311,7 +309,7 @@
+ 
+         let tool_spec = self.registry.spec(&call.name).ok();
+         if let Some(spec) = tool_spec.as_ref()
+-            && let Some(error) = validate_tool_call_args(&call, spec)
++            && let Some(error) = self.registry.validate_call_args(&call, spec)
+         {
+             self.record_resolution(
+                 &call,
+--- a/crates/proteus-core/src/core/registry.rs
++++ b/crates/proteus-core/src/core/registry.rs
+@@ -290,12 +290,12 @@
+ 
+     pub(crate) fn tools_for_model(&self, model: Option<&ModelRef>) -> Result<ToolRegistry> {
+         let mut tools = ToolRegistry::new();
+-        for (source, spec) in self.tools.entries() {
++        for (_source, spec) in self.tools.entries() {
+             if !matches!(
+                 spec.surface,
+                 crate::domain::ToolSurface::ProviderHosted { .. }
+             ) {
+-                tools.register_arc(source, self.tools.get(&spec.name).expect("registered tool"))?;
++                tools.register_from(&self.tools, &spec.name)?;
+             }
+         }
+         if let Some(model) = model {
+--- a/docs/guides/security-and-policy.md
++++ b/docs/guides/security-and-policy.md
+@@ -16,6 +16,18 @@
+ Dialect выбирается по `$schema`; стандартные annotation keywords не задают
+ дополнительных ограничений. Ошибка аргументов показывает JSON Pointer и
+ условие schema, без вывода самого ошибочного значения.
++
++Зарегистрированный tool владеет одним кешем скомпилированной schema. Клоны
++registry и повторный отбор той же tool identity используют этот кеш, но
++`Tool::spec()` по-прежнему читается заново: изменившаяся `input_schema`
++сравнивается целиком с сохранением порядка обхода объектов (включая вложенные)
++и представления чисел, затем компилируется offline при изменении. Это сохраняет
++текущий порядок diagnostics при `serde_json/preserve_order`. Неуспешная
++компиляция не использует предыдущую schema. Кеш хранит только текущий вариант,
++а не историю schemas; отдельная регистрация получает отдельный кеш.
++Аргументы (включая authoritative `raw_arguments`), hooks, policy и approval
++проверяются для каждого вызова, их результаты не кешируются. Самостоятельные
++validation helpers без registry сохраняют прежнюю проверку без кеша.
+ 
+ `workflow_function` явно обозначает локальный handler выбранного workflow.
+ Model boundary проверяет его schema и visibility policy и запрещает shadowing

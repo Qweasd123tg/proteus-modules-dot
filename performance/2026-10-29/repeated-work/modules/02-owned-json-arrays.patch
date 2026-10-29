@@ -1,0 +1,145 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 963d66ecbe56470a261ca0e07654022729e69d87..f86129e430985fa9e9b7e5165b78e553b5494eb3 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -34,7 +34,7 @@
+ ) -> Result<Value> {
+     let mut body = json!({
+         "model": request.model.model,
+-        "input": to_openai_input(&request.messages)?,
++        "input": [],
+         "tool_choice": match &request.tool_choice {
+             ToolChoice::None => "none",
+             ToolChoice::Auto => "auto",
+@@ -45,6 +45,9 @@
+         "parallel_tool_calls": profile.supports_parallel_tool_calls,
+         "store": profile.store,
+     });
++    // Replace the existing slot to preserve key order without reserializing
++    // the already-built JSON array through json!.
++    body["input"] = Value::Array(to_openai_input(&request.messages)?);
+ 
+     if let Some(instructions) = joined_instructions(request) {
+         body["instructions"] = Value::String(instructions);
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+index accc61b631411bf6f8e01b4266882ff2831cabc2..f96f141e286b8ef3be8def1c079b2d6b39a99366 100644
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -20,8 +20,11 @@
+     let mut body = json!({
+         "model": request.model.model,
+         "max_tokens": request.limits.max_output_tokens.unwrap_or(2048),
+-        "messages": to_anthropic_messages(&request.messages)?,
++        "messages": [],
+     });
++    // Replace the existing slot to preserve key order without reserializing
++    // the already-built JSON array through json!.
++    body["messages"] = Value::Array(to_anthropic_messages(&request.messages)?);
+ 
+     let cache_control = anthropic_cache_control(request, prompt_cache);
+     let system = joined_instructions(request);
+@@ -301,5 +304,7 @@
+         }
+     }
+ 
+-    out.push(json!({ "role": role, "content": blocks }));
+-}
++    let mut message = json!({ "role": role, "content": [] });
++    message["content"] = Value::Array(blocks);
++    out.push(message);
++}
+diff --git a/model/model-pack/src/adapters/openai/request_tests.rs b/model/model-pack/src/adapters/openai/request_tests.rs
+index 1ef90e56df607fcf1c05608a366ed2b57d461778..852f451dc4c65641285d6a223b1b2700ff59aca9 100644
+--- a/model/model-pack/src/adapters/openai/request_tests.rs
++++ b/model/model-pack/src/adapters/openai/request_tests.rs
+@@ -1,5 +1,48 @@
+ use super::*;
+ use crate::model_standard::{InstructionBlock, InstructionKind};
++
++#[test]
++fn moved_input_array_preserves_provider_json_bytes_and_order() {
++    let mut request = CanonicalModelRequest::new(
++        ModelRef::new("openai", "fixture"),
++        vec![
++            CanonicalMessage::new(
++                MessageRole::User,
++                vec![
++                    ContentPart::Text {
++                        text: " first\n".into(),
++                    },
++                    ContentPart::Text {
++                        text: "second".into(),
++                    },
++                ],
++            ),
++            CanonicalMessage::text(MessageRole::Assistant, "reply"),
++        ],
++    );
++    request.tool_choice = ToolChoice::None;
++    request.limits.max_output_tokens = None;
++    let expected = json!({
++        "model": "fixture",
++        "input": [
++            {"type": "message", "role": "user", "content": [
++                {"type": "input_text", "text": " first\n"},
++                {"type": "input_text", "text": "second"},
++            ]},
++            {"type": "message", "role": "assistant", "content": [
++                {"type": "output_text", "text": "reply"},
++            ]},
++        ],
++        "tool_choice": "none",
++        "parallel_tool_calls": true,
++        "store": false,
++        "include": [],
++    });
++    let body = to_openai_request(&request).unwrap();
++    assert_eq!(body, expected);
++    // Value equality alone does not check key order with preserve_order enabled.
++    assert_eq!(body.to_string(), expected.to_string());
++}
+ 
+ #[test]
+ fn request_preserves_instruction_order_and_file_content_without_mutating_source() {
+diff --git a/model/model-pack/src/adapters/anthropic/request_tests.rs b/model/model-pack/src/adapters/anthropic/request_tests.rs
+index 32cb0d5db7005f64813ac8c571a81656c586f8e5..b9979d41d0d43f47cd3fbae223efcc585808b9fb 100644
+--- a/model/model-pack/src/adapters/anthropic/request_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/request_tests.rs
+@@ -1,5 +1,37 @@
+ use super::*;
+ use crate::model_standard::{InstructionBlock, InstructionKind};
++
++#[test]
++fn moved_message_arrays_preserve_provider_json_bytes_and_merged_roles() {
++    let mut request = CanonicalModelRequest::new(
++        ModelRef::new("anthropic", "fixture"),
++        vec![
++            CanonicalMessage::text(MessageRole::User, " first\n"),
++            CanonicalMessage::text(MessageRole::User, "second"),
++            CanonicalMessage::text(MessageRole::Assistant, "reply"),
++            CanonicalMessage::text(MessageRole::User, "last"),
++        ],
++    );
++    request.limits.max_output_tokens = None;
++    request.sampling.temperature = None;
++    request.sampling.top_p = None;
++    let expected = json!({
++        "model": "fixture",
++        "max_tokens": 2048,
++        "messages": [
++            {"role": "user", "content": [
++                {"type": "text", "text": " first\n"},
++                {"type": "text", "text": "second"},
++            ]},
++            {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
++            {"role": "user", "content": [{"type": "text", "text": "last"}]},
++        ],
++    });
++    let body = to_anthropic_request(&request).unwrap();
++    assert_eq!(body, expected);
++    // Value equality alone does not check key order with preserve_order enabled.
++    assert_eq!(body.to_string(), expected.to_string());
++}
+ 
+ #[test]
+ fn request_preserves_instruction_order_and_file_content_without_mutating_source() {
