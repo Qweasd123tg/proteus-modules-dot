@@ -6,9 +6,11 @@
 - **`modules/02-skill-metadata-no-body-copy.patch`**: provider/catalog native skill-pack не создают ненужный owned body. Полный ограниченный read, UTF-8/YAML/path/name/size validation, настройки, warnings, precedence и свежий discovery сохранены. Tool load по-прежнему получает полный body. Нет TTL, второго каталога, persistent cache или пропуска чтения файлов.
 - **`desktop/01-empty-expanded-diff-preparation.patch`**: если нет развёрнутых строк, prepare_tool_diffs сразу возвращается вместо обхода transcript. Старый loop не имел эффектов в этом случае; cleanup остаётся в прежнем owner. При наличии раскрытых строк подготовка, source comparison и lifecycle не меняются; DiffView при folding по-прежнему удерживается.
 
+Desktop regression обновлён под обязательный `timestamp_ms`; production guard прежний. [Следующие семь патчей и общая сверка](../borrowed-payloads-and-build-inputs/README.md).
+
 ## Применение и ограничения
 
-Точные refs, Git blob identities и контрольные суммы находятся в `SOURCES.json`/`SHA256SUMS`. Папки относятся к отдельным upstream checkout. Проверить `git apply --check --whitespace=error-all <patch>`, затем применять; внутри папки порядок числовой. Совместное применение с пакетами #58, #59 и шестью патчами #60 проверено статически. Upstream-репозитории этим delivery commit не изменяются.
+Точные refs, Git blob identities и контрольные суммы находятся в `SOURCES.json`/`SHA256SUMS`. Папки относятся к отдельным upstream checkout. Проверить `git apply --check --whitespace=error-all <patch>`, затем применять; внутри папки порядок числовой. Базы обновлены до свежих commits из SOURCES.json; соответствующие #58/#59 уже upstream, повторно их применять не нужно. Совместное применение всех 16 текущих патчей PR60 проверено статически. Upstream-репозитории этим delivery commit не изменяются.
 
 Авторское и независимое source review, baseline hashes, strict whitespace, patch application и candidate byte checks выполнены. Добавлены unrun regression sources для JSON byte/rounding/error parity, skill metadata/error/freshness parity и выбора актуального patch source после snapshots. Последнее **не является** проверкой GPUI render/unfold/animation: native UI сценарии остаются непроверенными.
 

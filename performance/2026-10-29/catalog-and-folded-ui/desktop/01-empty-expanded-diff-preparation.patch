@@ -1,5 +1,5 @@
 diff --git a/src/ui/chat/snapshot_tests.rs b/src/ui/chat/snapshot_tests.rs
-index 9bf8aa7..f10d93a 100644
+index b6a696b..2974ab7 100644
 --- a/src/ui/chat/snapshot_tests.rs
 +++ b/src/ui/chat/snapshot_tests.rs
 @@ -2,7 +2,7 @@
@@ -11,7 +11,7 @@ index 9bf8aa7..f10d93a 100644
  };
  use proteus_contracts::domain::{Event, EventContext, EventEnvelope, MessageId, ThreadId};
  use uuid::Uuid;
-@@ -319,3 +319,114 @@
+@@ -320,3 +320,115 @@ fn rejected_snapshot_cannot_change_root_routing() {
          Some(Change::Pushed),
      );
  }
@@ -21,6 +21,7 @@ index 9bf8aa7..f10d93a 100644
 +    effective_args: Option<serde_json::Value>,
 +) -> AppTranscriptMessage {
 +    AppTranscriptMessage {
++        timestamp_ms: None,
 +        message_id: None,
 +        phase: None,
 +        role: "system".into(),
@@ -127,10 +128,10 @@ index 9bf8aa7..f10d93a 100644
 +    }
 +}
 diff --git a/src/ui/chat/thread.rs b/src/ui/chat/thread.rs
-index dc0462f..0e80706 100644
+index 3f4c9d3..68e1db3 100644
 --- a/src/ui/chat/thread.rs
 +++ b/src/ui/chat/thread.rs
-@@ -220,6 +220,10 @@
+@@ -225,6 +225,10 @@ impl Chat {
      }
  
      pub(super) fn prepare_tool_diffs(&mut self, cx: &mut Context<Self>) {
