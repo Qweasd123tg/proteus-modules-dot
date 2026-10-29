@@ -1,0 +1,103 @@
+--- a/crates/proteus-core/tests/config_profiles.rs
++++ b/crates/proteus-core/tests/config_profiles.rs
+@@ -164,27 +164,67 @@
+     let bin = state.path().join("bin");
+     std::fs::create_dir(&workspace).unwrap();
+     std::fs::create_dir(&bin).unwrap();
+-    // Resolve the shipped command against a private child PATH. No mutation of
+-    // the test process environment or dependency on an installed reference binary.
+-    std::fs::copy(
+-        std::env::current_exe().unwrap(),
+-        bin.join("proteus-reference-module"),
+-    )
+-    .unwrap();
+     let workspace = workspace.canonicalize().unwrap();
+     let restricted = [
+-        ("reference-workflow", "workflow", "coding.codex_loop", false),
+-        ("reference-context", "context", "codex_context", true),
+-        ("reference-policy", "policy", "codex_policy", false),
+-        ("reference-compact", "hook", "codex_compact", false),
+-        ("reference-search-tool", "tool", "rg_search", true),
++        (
++            "reference-workflow",
++            "proteus-coding-workflow-module",
++            "workflow",
++            "coding.codex_loop",
++            false,
++        ),
++        (
++            "reference-context",
++            "proteus-context-pack-module",
++            "context",
++            "codex_context",
++            true,
++        ),
++        (
++            "reference-policy",
++            "proteus-policy-pack-module",
++            "policy",
++            "codex_policy",
++            false,
++        ),
++        (
++            "reference-compact",
++            "proteus-codex-context-preparation-module",
++            "hook",
++            "codex_compact",
++            false,
++        ),
++        (
++            "reference-search-tool",
++            "proteus-rg-search-module",
++            "tool",
++            "rg_search",
++            true,
++        ),
+         (
+             "reference-search-provider",
++            "proteus-rg-search-module",
+             "context_provider",
+             "rg_search",
+             true,
+         ),
+     ];
++    // Resolve each shipped command against a private child PATH without changing
++    // the test process environment or requiring installed module binaries.
++    // These ELF fixtures are only validated, never executed. Copy once and use
++    // same-directory hard links so independent names do not multiply disk usage.
++    let fixture = bin.join(restricted[0].1);
++    std::fs::copy(std::env::current_exe().unwrap(), &fixture).unwrap();
++    let commands = restricted
++        .iter()
++        .map(|(_, command, _, _, _)| *command)
++        .collect::<std::collections::BTreeSet<_>>();
++    for command in commands {
++        let path = bin.join(command);
++        if path != fixture {
++            std::fs::hard_link(&fixture, path).unwrap();
++        }
++    }
+     assert_eq!(
+         config
+             .components
+@@ -195,9 +235,9 @@
+             .count(),
+         restricted.len()
+     );
+-    for (id, slot, module, workspace_access) in restricted {
++    for (id, command, slot, module, workspace_access) in restricted {
+         let component = &config.components[id];
+-        assert_eq!(component.command(), "proteus-reference-module");
++        assert_eq!(component.command(), command);
+         assert_eq!(
+             component
+                 .exports()
+@@ -211,7 +251,7 @@
+         value["env"]["PATH"] = json!(bin);
+         let component: ProcessComponentConfig = serde_json::from_value(value).unwrap();
+         let spec = component.process_spec(&workspace).unwrap();
+-        assert_eq!(spec.command, "proteus-reference-module");
++        assert_eq!(spec.command, command);
+         assert!(spec.args.is_empty());
+         assert_eq!(
+             spec.resolved_environment()
