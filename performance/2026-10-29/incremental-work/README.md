@@ -2,7 +2,7 @@
 
 Шесть source-only патчей к четырём upstream-репозиториям. Продолжение [схем/ownership](../repeated-work/) и [истории/UI](../history-and-ui/); прежние патчи здесь не дублируются.
 
-Обновлено по свежим upstream commits 29 октября: Markdown patch согласован с новыми math/source-preview regressions. [Следующие семь патчей и общая сверка](../borrowed-payloads-and-build-inputs/README.md).
+Обновлено по свежим upstream commits 29 октября: Markdown patch согласован с новыми math/source-preview regressions. [Следующие восемь патчей и общая сверка](../borrowed-payloads-and-build-inputs/README.md).
 
 ## Патчи
 
@@ -15,7 +15,7 @@
 
 ## Проверка и применение
 
-Точные upstream commits, исходные Git blob SHA и хеши патчей — в `SOURCES.json`; контрольные суммы доставки — в `SHA256SUMS`. Каждая папка относится к отдельному upstream checkout. Сначала `git apply --check --whitespace=error-all <patch>`, затем `git apply <patch>`; не применять вслепую к другой базе. Внутри папки порядок числовой. На обновлённых базах из SOURCES.json соответствующие изменения PR #58/#59 уже upstream; повторно их не применять. Совместное применение всех 16 текущих патчей PR60 проверено. Патч core/03 требует core/02 и проверен после него; обратный текстовый порядок не поддерживается. Остальные патчи независимы. SOURCES.json для core/03 отдельно фиксирует upstream и производную patch-base identity.
+Точные upstream commits, исходные Git blob SHA и хеши патчей — в `SOURCES.json`; контрольные суммы доставки — в `SHA256SUMS`. Каждая папка относится к отдельному upstream checkout. Сначала `git apply --check --whitespace=error-all <patch>`, затем `git apply <patch>`; не применять вслепую к другой базе. Внутри папки порядок числовой. На обновлённых базах из SOURCES.json соответствующие изменения PR #58/#59 уже upstream; повторно их не применять. Совместное применение всех 17 текущих патчей PR60 проверено. Патч core/03 требует core/02 и проверен после него; обратный текстовый порядок не поддерживается. Остальные патчи независимы. SOURCES.json для core/03 отдельно фиксирует upstream и производную patch-base identity.
 
 Выполнены source review автором и независимым reviewer, проверка исходных blobs, strict whitespace и patch application, сравнение candidate bytes и композиция патчей. Регрессионные Rust-исходники добавлены для history capture/COW, cancellation/admission/terminal, terminal reconstruction и Markdown refresh. Для notification-only изменения проверены callsites; native сценарии target/other view, stale response, error recovery, ACK/latest, resize/scroll и restart **не запускались**.
 

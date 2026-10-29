@@ -1,6 +1,6 @@
 # Меньше копирования и корректная инкрементальная сборка
 
-Семь новых source-only patches для актуального фундамента Proteus. Они не
+Восемь новых source-only patches для актуального фундамента Proteus. Они не
 добавляют второй runtime, persistent cache или общий compatibility layer.
 Авторский и независимый source review выполнены; **код, тесты, сборки, UI,
 CI и benchmarks не запускались**. Static application не является compile pass.
@@ -104,6 +104,22 @@ worktree stores. HEAD, detached/worktree behavior и no-Git path сохраня�
 выбор компонентов, compiler flags и link profile не меняются. Шесть regression
 сценариев в каждом репозитории используют маленький offline Cargo fixture,
 но здесь не исполнялись. Общего нового build framework нет.
+
+### Files: освобождение закрытых предпросмотров
+
+`extensions/02-release-closed-previews.patch` привязывает существующий cache
+ответов к живым Document views. Один Files instance обслуживает все окна
+сессии: закрытие одного окна сохраняет обе file/diff версии, пока тот же
+исходный path открыт в другом view. Закрытие последнего владельца либо замена
+его argument освобождает эти payloads. Режим просмотра и прежние event/write/
+explicit-show правила инвалидации остаются. Повторное открытие после ухода
+последнего владельца снова запрашивает содержимое, а не использует старый cache.
+
+Новая небольшая map хранит только view→path, не копию ответа; это не общий
+лимит RAM и не удаление данных файла. Шесть regression sources покрывают
+multiwindow ownership, argument/surface replacement, режимы, ошибку загрузки,
+повторный close, событие и session reset. Lifecycle-инвариант закреплён рядом
+с `closed` в существующем PROTOCOL.md. Нативные UI/network сценарии не запускались.
 
 ## Проверка и следующие границы
 
