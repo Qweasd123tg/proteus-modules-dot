@@ -1,0 +1,416 @@
+diff --git a/src/ui/extensions/declarative/content/tests.rs b/src/ui/extensions/declarative/content/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/src/ui/extensions/declarative/content/tests.rs
+@@ -0,0 +1,82 @@
++use super::{Content, updated_content};
++use serde_json::json;
++
++fn current(revision: Option<u64>) -> Content {
++    Content {
++        language: "fixture".into(),
++        source: "original source\n".into(),
++        context: json!({"languages": ["fixture"], "custom": {"preserve": true}}),
++        source_revision: revision,
++    }
++}
++
++#[test]
++fn unchanged_borrowed_source_keeps_the_current_snapshot_and_revision() {
++    let current = current(Some(7));
++    let source_pointer = current.source.as_ptr();
++    assert!(
++        updated_content(
++            &current,
++            &current.language,
++            &current.source,
++            current.context.clone(),
++        )
++        .is_none()
++    );
++    assert_eq!(current.source.as_ptr(), source_pointer);
++    assert_eq!(current.source_revision, Some(7));
++}
++
++#[test]
++fn changed_source_is_owned_once_then_shared_without_a_payload_clone() {
++    let current = current(Some(7));
++    let source = "αβ\n😀\0tail\r\n".repeat(4096);
++    let next = updated_content(&current, "fixture", &source, current.context.clone()).unwrap();
++    let runtime = std::sync::Arc::clone(&next);
++    assert!(std::sync::Arc::ptr_eq(&next, &runtime));
++    assert_eq!(next.source.as_ptr(), runtime.source.as_ptr());
++    assert_eq!(next.source, source);
++    assert_eq!(next.source_revision, Some(8));
++    assert_eq!(next.context, current.context);
++    assert_eq!(current.source, "original source\n");
++    assert_eq!(
++        serde_json::to_value(next.as_ref()).unwrap(),
++        json!({
++            "language": "fixture",
++            "source": source,
++            "context": current.context,
++            "source_revision": 8,
++        })
++    );
++}
++
++#[test]
++fn language_and_context_changes_still_advance_the_revision() {
++    let current = current(Some(7));
++    let language = updated_content(
++        &current,
++        "other",
++        &current.source,
++        current.context.clone(),
++    )
++    .unwrap();
++    assert_eq!(language.source_revision, Some(8));
++    assert_eq!(language.language, "other");
++    assert_eq!(language.source, current.source);
++
++    let context = json!({"languages": ["fixture", "new"], "custom": {"preserve": true}});
++    let next = updated_content(&current, "fixture", &current.source, context.clone()).unwrap();
++    assert_eq!(next.source_revision, Some(8));
++    assert_eq!(next.context, context);
++    assert_eq!(next.source, current.source);
++}
++
++#[test]
++fn absent_and_wrapping_revisions_keep_existing_semantics() {
++    for (before, after) in [(None, Some(1)), (Some(u64::MAX), Some(0))] {
++        let current = current(before);
++        let next = updated_content(&current, "fixture", "", current.context.clone()).unwrap();
++        assert_eq!(next.source_revision, after);
++        assert!(next.source.is_empty());
++    }
++}
+diff --git a/src/ui/extensions/declarative/content.rs b/src/ui/extensions/declarative/content.rs
+--- a/src/ui/extensions/declarative/content.rs
++++ b/src/ui/extensions/declarative/content.rs
+@@ -61,8 +61,8 @@
+         })
+ }
+ 
+-fn populate_context(content: &mut Content, cx: &App) {
+-    let mut context = content.context.as_object().cloned().unwrap_or_default();
++fn populate_context(value: &mut serde_json::Value, cx: &App) {
++    let mut context = value.as_object().cloned().unwrap_or_default();
+     let languages = languages(cx);
+     let mut contributors = serde_json::Map::new();
+     for (language, id) in &languages {
+@@ -80,7 +80,26 @@
+         ),
+     );
+     context.insert("contributors".into(), contributors.into());
+-    content.context = context.into();
++    *value = context.into();
++}
++
++/// Keep one immutable latest payload shared by the shell and runtime. Compare
++/// borrowed text before allocating; the wire copy belongs after queue admission.
++fn updated_content(
++    current: &Content,
++    language: &str,
++    source: &str,
++    context: serde_json::Value,
++) -> Option<Arc<Content>> {
++    if current.language == language && current.source == source && current.context == context {
++        return None;
++    }
++    Some(Arc::new(Content {
++        language: language.into(),
++        source: source.into(),
++        context,
++        source_revision: Some(current.source_revision.unwrap_or_default().wrapping_add(1)),
++    }))
+ }
+ 
+ pub(in crate::ui) struct WillResize;
+@@ -89,7 +108,7 @@
+ 
+ pub(in crate::ui) struct ContentView {
+     rendered: Entity<DeclarativeView>,
+-    content: Content,
++    content: Arc<Content>,
+     extension: &'static str,
+     show_source: bool,
+     body: bool,
+@@ -106,7 +125,8 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) -> Self {
+-        populate_context(&mut content, cx);
++        populate_context(&mut content.context, cx);
++        let content = Arc::new(content);
+         let extension = host.extension();
+         let runtime = super::runtime(&host, window, cx).expect("registered content extension");
+         let rendered = cx.new(|cx| {
+@@ -173,22 +193,11 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+-        let mut content = Content {
+-            language: language.into(),
+-            source: source.into(),
+-            context: self.content.context.clone(),
+-            source_revision: self.content.source_revision,
++        let mut context = self.content.context.clone();
++        populate_context(&mut context, cx);
++        let Some(content) = updated_content(&self.content, language, source, context) else {
++            return;
+         };
+-        populate_context(&mut content, cx);
+-        if content == self.content {
+-            return;
+-        }
+-        content.source_revision = Some(
+-            self.content
+-                .source_revision
+-                .unwrap_or_default()
+-                .wrapping_add(1),
+-        );
+         self.content = content.clone();
+         self.rendered
+             .update(cx, |view, cx| view.set_content(content, window, cx));
+@@ -206,6 +215,9 @@
+         cx.notify();
+     }
+ }
++
++#[cfg(test)]
++mod tests;
+ 
+ impl Render for ContentView {
+     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+diff --git a/src/ui/extensions/declarative/runtime/content_queue.rs b/src/ui/extensions/declarative/runtime/content_queue.rs
+--- a/src/ui/extensions/declarative/runtime/content_queue.rs
++++ b/src/ui/extensions/declarative/runtime/content_queue.rs
+@@ -8,7 +8,17 @@
+ }
+ 
+ impl ContentQueue {
+-    pub(super) fn begin(&mut self, revision: Option<u64>) -> bool {
++    /// Materialize an owned wire payload only for an admitted request. The
++    /// caller keeps its shared latest snapshot when an intermediate edit waits.
++    pub(super) fn begin_with<T>(
++        &mut self,
++        revision: Option<u64>,
++        materialize: impl FnOnce() -> T,
++    ) -> Option<T> {
++        self.begin(revision).then(materialize)
++    }
++
++    fn begin(&mut self, revision: Option<u64>) -> bool {
+         if self.inflight.is_some() {
+             self.pending = true;
+             return false;
+@@ -34,6 +44,91 @@
+ #[cfg(test)]
+ mod tests {
+     use super::ContentQueue;
++    use crate::declarative::protocol::Content;
++    use std::{cell::Cell, sync::Arc};
++
++    fn snapshot(revision: u64) -> Arc<Content> {
++        Arc::new(Content {
++            language: "fixture".into(),
++            source: format!("revision {revision}\n{}", "αβ😀\n".repeat(1024)),
++            context: serde_json::json!({"custom": "preserved"}),
++            source_revision: Some(revision),
++        })
++    }
++
++    #[test]
++    fn coalesced_sources_are_shared_and_only_admitted_payloads_are_materialized() {
++        let mut queue = ContentQueue::default();
++        let materializations = Cell::new(0);
++        let materialize = |source: &Content| {
++            materializations.set(materializations.get() + 1);
++            source.clone()
++        };
++        let mut latest = snapshot(1);
++        let first = queue
++            .begin_with(latest.source_revision, || materialize(&latest))
++            .unwrap();
++        assert_eq!(first, *latest);
++
++        for revision in 2..=300 {
++            let obsolete = Arc::downgrade(&latest);
++            latest = snapshot(revision);
++            assert!(obsolete.upgrade().is_none(), "obsolete source was retained");
++            let shell = Arc::clone(&latest);
++            assert!(Arc::ptr_eq(&shell, &latest));
++            assert!(
++                queue
++                    .begin_with(latest.source_revision, || materialize(&latest))
++                    .is_none()
++            );
++        }
++        assert_eq!(materializations.get(), 1);
++        assert!(!queue.finish(Some(0), latest.source_revision));
++        assert!(queue.finish(first.source_revision, latest.source_revision));
++        let final_payload = queue
++            .begin_with(latest.source_revision, || materialize(&latest))
++            .unwrap();
++        assert_eq!(final_payload, *latest);
++        assert_eq!(final_payload.source_revision, Some(300));
++        assert_eq!(materializations.get(), 2);
++        assert!(!queue.finish(first.source_revision, latest.source_revision));
++        assert!(!queue.finish(final_payload.source_revision, latest.source_revision));
++    }
++
++    #[test]
++    fn reset_admits_the_retained_latest_source_and_drops_pending_work() {
++        let mut queue = ContentQueue::default();
++        let first = snapshot(1);
++        assert!(
++            queue
++                .begin_with(first.source_revision, || first.as_ref().clone())
++                .is_some()
++        );
++        let latest = snapshot(2);
++        assert!(
++            queue
++                .begin_with(latest.source_revision, || panic!("busy queue materialized source"))
++                .is_none()
++        );
++        queue.reset();
++        let restarted = queue
++            .begin_with(latest.source_revision, || latest.as_ref().clone())
++            .unwrap();
++        assert_eq!(restarted, *latest);
++        assert!(!queue.finish(first.source_revision, latest.source_revision));
++        assert!(!queue.finish(restarted.source_revision, latest.source_revision));
++    }
++
++    #[test]
++    fn absent_payload_is_an_admitted_request_not_a_busy_queue() {
++        let mut queue = ContentQueue::default();
++        assert_eq!(queue.begin_with(None, || None::<Content>), Some(None));
++        assert!(queue.begin_with(None, || None::<Content>).is_none());
++        assert!(queue.finish(None, None));
++        assert_eq!(queue.begin_with(None, || None::<Content>), Some(None));
++        assert!(!queue.finish(None, None));
++    }
++
+     #[test]
+     fn slow_render_coalesces_hundreds_of_edits_to_the_latest_source() {
+         let mut queue = ContentQueue::default();
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -9,6 +9,7 @@
+ 
+ use std::collections::{HashMap, VecDeque};
+ use std::path::PathBuf;
++use std::sync::Arc;
+ 
+ use gpui_kit::*;
+ 
+@@ -42,7 +43,7 @@
+     view: WeakEntity<DeclarativeView>,
+     surface: SurfaceKind,
+     argument: Option<String>,
+-    content: Option<Content>,
++    content: Option<Arc<Content>>,
+     context: String,
+     host: Host,
+     window: AnyWindowHandle,
+@@ -99,7 +100,7 @@
+         view: String,
+         surface: SurfaceKind,
+         argument: Option<String>,
+-        content: Option<Content>,
++        content: Option<Arc<Content>>,
+         entity: WeakEntity<DeclarativeView>,
+         host: Host,
+         window: AnyWindowHandle,
+@@ -240,28 +241,31 @@
+         let Some(attached) = self.views.get_mut(view) else {
+             return;
+         };
+-        if attached.surface == SurfaceKind::Content
+-            && !attached.queue.begin(
+-                attached
+-                    .content
+-                    .as_ref()
+-                    .and_then(|content| content.source_revision),
+-            )
+-        {
+-            return;
+-        }
++        let latest = attached.content.as_deref();
++        let materialize = || {
++            latest.cloned().map(|mut content| {
++                if !content.context.is_object() {
++                    content.context = serde_json::json!({});
++                }
++                content.context["theme"] = theme["theme"].clone();
++                content
++            })
++        };
++        let content = if attached.surface == SurfaceKind::Content {
++            let revision = latest.and_then(|content| content.source_revision);
++            let Some(content) = attached.queue.begin_with(revision, materialize) else {
++                return;
++            };
++            content
++        } else {
++            materialize()
++        };
+         let message = Outgoing::Render {
+             context: attached.context.clone(),
+             view: view.into(),
+             surface: attached.surface,
+             argument: attached.argument.clone(),
+-            content: attached.content.clone().map(|mut content| {
+-                if !content.context.is_object() {
+-                    content.context = serde_json::json!({});
+-                }
+-                content.context["theme"] = theme["theme"].clone();
+-                content
+-            }),
++            content,
+             session_dir: self
+                 .scopes
+                 .get(&attached.context)
+@@ -270,7 +274,7 @@
+         self.send(&message);
+     }
+ 
+-    pub(super) fn set_content(&mut self, view: &str, content: Content, cx: &App) {
++    pub(super) fn set_content(&mut self, view: &str, content: Arc<Content>, cx: &App) {
+         if let Some(attached) = self.views.get_mut(view) {
+             attached.content = Some(content);
+         }
+diff --git a/src/ui/extensions/declarative/view.rs b/src/ui/extensions/declarative/view.rs
+--- a/src/ui/extensions/declarative/view.rs
++++ b/src/ui/extensions/declarative/view.rs
+@@ -1,7 +1,7 @@
+ //! A surface of an installed extension: panel, document or icon.
+ 
+ use crate::ui::kit::{ButtonLabel as _, Frame as _};
+-use std::{collections::HashMap, rc::Rc};
++use std::{collections::HashMap, rc::Rc, sync::Arc};
+ 
+ mod preparation;
+ use preparation::Preparation;
+@@ -65,7 +65,7 @@
+         host: crate::ui::extensions::Host,
+         surface: SurfaceKind,
+         argument: Option<String>,
+-        content: Option<Content>,
++        content: Option<Arc<Content>>,
+         window: &Window,
+         cx: &mut Context<Self>,
+     ) -> Self {
+@@ -122,7 +122,7 @@
+ 
+     pub(super) fn set_content(
+         &mut self,
+-        content: Content,
++        content: Arc<Content>,
+         _window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
