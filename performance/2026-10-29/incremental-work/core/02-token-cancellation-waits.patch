@@ -1,0 +1,605 @@
+diff --git a/crates/proteus-core/src/process_adapters/client/cancellation.rs b/crates/proteus-core/src/process_adapters/client/cancellation.rs
+new file mode 100644
+index 0000000..167e9d1
+--- /dev/null
++++ b/crates/proteus-core/src/process_adapters/client/cancellation.rs
+@@ -0,0 +1,48 @@
++use std::time::Duration;
++
++use tokio::time::{Interval, MissedTickBehavior, interval};
++
++use crate::contracts::CancellationToken;
++
++/// Invocation-local wait policy; never owns cancellation or execution authority.
++pub(super) enum CancellationSource<'a, F> {
++    Token(&'a CancellationToken),
++    Check { check: F, poll: Option<Interval> },
++}
++
++impl<F: Fn() -> bool> CancellationSource<'_, F> {
++    pub(super) fn is_cancelled(&self) -> bool {
++        match self {
++            Self::Token(token) => token.is_cancelled(),
++            Self::Check { check, .. } => check(),
++        }
++    }
++
++    pub(super) fn begin_wait(&mut self) {
++        if let Self::Check { poll, .. } = self {
++            // Bool-only hosts have no wake source. Preserve their immediate
++            // first check and fresh 10 ms polling interval in each phase.
++            let mut interval = interval(Duration::from_millis(10));
++            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            *poll = Some(interval);
++        }
++    }
++
++    pub(super) async fn observe(&mut self) -> bool {
++        match self {
++            Self::Token(token) => {
++                token.cancelled().await;
++                true
++            }
++            Self::Check { check, poll } => {
++                poll.as_mut()
++                    .expect("cancellation wait not started")
++                    .tick()
++                    .await;
++                // Return after one tick so the outer select re-polls admission
++                // or terminal even when a slow/stateful predicate returns false.
++                check()
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/process_adapters/client/cancellation_tests.rs b/crates/proteus-core/src/process_adapters/client/cancellation_tests.rs
+index 6727557..a9821c4 100644
+--- a/crates/proteus-core/src/process_adapters/client/cancellation_tests.rs
++++ b/crates/proteus-core/src/process_adapters/client/cancellation_tests.rs
+@@ -1,11 +1,4 @@
+-use std::{
+-    path::Path,
+-    sync::{
+-        Arc,
+-        atomic::{AtomicBool, Ordering},
+-    },
+-    time::Duration,
+-};
++use std::{path::Path, sync::Arc, time::Duration};
+ 
+ use proteus_module_protocol::{ProcessExportBinding, v3::NoAsyncHostRequests};
+ use serde_json::{Value, json};
+@@ -17,7 +10,9 @@ use tokio::{
+ 
+ use super::{ProcessExportClient, ProcessInvocationError, ProcessInvocationFailure};
+ use crate::{
+-    contracts::{PROCESS_CONTEXT_BUILD_METHOD, PROCESS_CONTEXT_CONTRACT_VERSION},
++    contracts::{
++        CancellationToken, PROCESS_CONTEXT_BUILD_METHOD, PROCESS_CONTEXT_CONTRACT_VERSION,
++    },
+     process_adapters::{ProcessComponentConfig, ProcessComponentLauncher},
+ };
+ 
+@@ -54,6 +49,15 @@ fn client(workspace: &Path, env: Value) -> Arc<ProcessExportClient> {
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn cancellation_during_restart_admission_returns_before_handshake_and_never_dispatches() {
++    restart_admission_cancellation(false).await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn token_cancellation_during_restart_admission_never_dispatches() {
++    restart_admission_cancellation(true).await;
++}
++
++async fn restart_admission_cancellation(event_driven: bool) {
+     let workspace = tempfile::tempdir().unwrap();
+     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+     let client = client(
+@@ -62,20 +66,19 @@ async fn cancellation_during_restart_admission_returns_before_handshake_and_neve
+     );
+     client.reset();
+     let started = workspace.path().join("abandoned-started");
+-    let cancellation = Arc::new(AtomicBool::new(false));
++    let cancellation = CancellationToken::new();
+     let mut invocation = {
+         let client = Arc::clone(&client);
+-        let cancellation = Arc::clone(&cancellation);
++        let cancellation = cancellation.clone();
+         let started = started.clone();
+         tokio::spawn(async move {
+-            client
+-                .invoke_with_dispatcher_and_cancel_check::<_, Value, _>(
+-                    PROCESS_CONTEXT_BUILD_METHOD,
+-                    &json!({"started_path": started}),
+-                    Arc::new(NoAsyncHostRequests),
+-                    || cancellation.load(Ordering::SeqCst),
+-                )
+-                .await
++            invoke_cancellable(
++                &client,
++                &json!({"started_path": started}),
++                &cancellation,
++                event_driven,
++            )
++            .await
+         })
+     };
+     let (mut gate, _) = timeout(Duration::from_secs(2), listener.accept())
+@@ -88,7 +91,7 @@ async fn cancellation_during_restart_admission_returns_before_handshake_and_neve
+         .unwrap()
+         .unwrap();
+     assert_eq!(&ready, b"ready\n");
+-    cancellation.store(true, Ordering::SeqCst);
++    cancellation.cancel();
+     let canceled = timeout(Duration::from_millis(500), &mut invocation).await;
+     // Always release the worker, including the pre-fix timeout failure path.
+     gate.write_all(b"1").await.unwrap();
+@@ -111,6 +114,15 @@ async fn cancellation_during_restart_admission_returns_before_handshake_and_neve
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn cancellation_after_admission_preserves_typed_terminal_and_component() {
++    active_cancellation(false).await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn token_cancellation_after_admission_preserves_typed_terminal_and_component() {
++    active_cancellation(true).await;
++}
++
++async fn active_cancellation(event_driven: bool) {
+     let workspace = tempfile::tempdir().unwrap();
+     let client = client(workspace.path(), json!({}));
+     let before: Value = client
+@@ -118,20 +130,19 @@ async fn cancellation_after_admission_preserves_typed_terminal_and_component() {
+         .await
+         .unwrap();
+     let started = workspace.path().join("active-started");
+-    let cancellation = Arc::new(AtomicBool::new(false));
++    let cancellation = CancellationToken::new();
+     let invocation = {
+         let client = Arc::clone(&client);
+-        let cancellation = Arc::clone(&cancellation);
++        let cancellation = cancellation.clone();
+         let started = started.clone();
+         tokio::spawn(async move {
+-            client
+-                .invoke_with_dispatcher_and_cancel_check::<_, Value, _>(
+-                    PROCESS_CONTEXT_BUILD_METHOD,
+-                    &json!({"op": "wait_cancel", "started_path": started}),
+-                    Arc::new(NoAsyncHostRequests),
+-                    || cancellation.load(Ordering::SeqCst),
+-                )
+-                .await
++            invoke_cancellable(
++                &client,
++                &json!({"op": "wait_cancel", "started_path": started}),
++                &cancellation,
++                event_driven,
++            )
++            .await
+         })
+     };
+     timeout(Duration::from_secs(1), async {
+@@ -141,7 +152,7 @@ async fn cancellation_after_admission_preserves_typed_terminal_and_component() {
+     })
+     .await
+     .expect("worker must start before cancellation");
+-    cancellation.store(true, Ordering::SeqCst);
++    cancellation.cancel();
+     let error = timeout(Duration::from_secs(1), invocation)
+         .await
+         .unwrap()
+@@ -164,3 +175,177 @@ async fn cancellation_after_admission_preserves_typed_terminal_and_component() {
+     );
+     assert_eq!(after["value"], "after");
+ }
++
++async fn invoke_cancellable(
++    client: &ProcessExportClient,
++    request: &Value,
++    cancellation: &CancellationToken,
++    event_driven: bool,
++) -> anyhow::Result<Value> {
++    if event_driven {
++        client
++            .invoke_with_dispatcher_and_cancellation(
++                PROCESS_CONTEXT_BUILD_METHOD,
++                request,
++                Arc::new(NoAsyncHostRequests),
++                cancellation,
++            )
++            .await
++    } else {
++        client
++            .invoke_with_dispatcher_and_cancel_check(
++                PROCESS_CONTEXT_BUILD_METHOD,
++                request,
++                Arc::new(NoAsyncHostRequests),
++                || cancellation.is_cancelled(),
++            )
++            .await
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn already_canceled_token_does_not_serialize_or_dispatch() {
++    struct MustNotSerialize;
++    impl serde::Serialize for MustNotSerialize {
++        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
++            panic!("pre-canceled invocation must not encode params");
++        }
++    }
++
++    let workspace = tempfile::tempdir().unwrap();
++    let client = client(workspace.path(), json!({}));
++    let cancellation = CancellationToken::new();
++    cancellation.cancel();
++    let result: anyhow::Result<Value> = client
++        .invoke_with_dispatcher_and_cancellation(
++            PROCESS_CONTEXT_BUILD_METHOD,
++            &MustNotSerialize,
++            Arc::new(NoAsyncHostRequests),
++            &cancellation,
++        )
++        .await;
++    let error = result.expect_err("pre-canceled invocation");
++    assert!(format!("{error:#}").contains("was canceled"));
++}
++
++#[test]
++fn token_wait_needs_no_timer_and_observes_cancel_between_phases() {
++    use super::cancellation::CancellationSource;
++    use std::task::Poll;
++
++    // A token wait must work with no time driver. A periodic cancellation
++    // timer here would panic rather than silently adding wakeups again.
++    tokio::runtime::Builder::new_current_thread()
++        .build()
++        .unwrap()
++        .block_on(async {
++            let cancellation = CancellationToken::new();
++            let mut source = CancellationSource::<fn() -> bool>::Token(&cancellation);
++            source.begin_wait();
++            {
++                let pending = source.observe();
++                tokio::pin!(pending);
++                assert!(matches!(futures_util::poll!(&mut pending), Poll::Pending));
++                // Admission completed; its cancellation waiter is dropped.
++            }
++            cancellation.cancel();
++            // The terminal phase must observe cancellation even though no
++            // waiter existed at the moment it happened.
++            source.begin_wait();
++            assert!(source.observe().await);
++        });
++}
++
++#[tokio::test]
++async fn bool_wait_returns_each_false_observation_to_the_outer_select() {
++    use super::cancellation::CancellationSource;
++    use std::cell::Cell;
++
++    // Cell also retains the old Fn-only API: a local caller need not provide
++    // a Sync predicate merely because token callers use async_trait adapters.
++    let observations = Cell::new(0);
++    let mut source = CancellationSource::Check {
++        check: || {
++            observations.set(observations.get() + 1);
++            false
++        },
++        poll: None,
++    };
++    source.begin_wait();
++    assert!(
++        !timeout(Duration::from_millis(500), source.observe())
++            .await
++            .expect("a false observation must not wait for cancellation")
++    );
++    assert_eq!(observations.get(), 1);
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn token_cancel_grace_preserves_uncanceled_sibling_component_loss() {
++    use proteus_module_protocol::v3::ComponentFailure;
++
++    let workspace = tempfile::tempdir().unwrap();
++    let client = client(workspace.path(), json!({}));
++    let cancellation = CancellationToken::new();
++    let started = workspace.path().join("uncooperative-started");
++    let sibling_started = workspace.path().join("sibling-started");
++    let target = {
++        let client = client.clone();
++        let cancellation = cancellation.clone();
++        let started = started.clone();
++        tokio::spawn(async move {
++            invoke_cancellable(
++                &client,
++                &json!({"op": "ignore_cancel", "started_path": started}),
++                &cancellation,
++                true,
++            )
++            .await
++        })
++    };
++    let sibling = {
++        let client = client.clone();
++        let started = sibling_started.clone();
++        tokio::spawn(async move {
++            invoke_cancellable(
++                &client,
++                &json!({"op": "wait_cancel", "started_path": started}),
++                &CancellationToken::new(),
++                true,
++            )
++            .await
++        })
++    };
++    timeout(Duration::from_secs(1), async {
++        while !started.exists() || !sibling_started.exists() {
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++    })
++    .await
++    .expect("both invocations must be dispatched before cancellation");
++    cancellation.cancel();
++    let target_error = timeout(Duration::from_secs(2), target)
++        .await
++        .unwrap()
++        .unwrap()
++        .expect_err("uncooperative target");
++    assert_eq!(
++        target_error
++            .downcast_ref::<ProcessInvocationError>()
++            .unwrap()
++            .failure(),
++        &ProcessInvocationFailure::Canceled
++    );
++    let sibling_error = timeout(Duration::from_secs(2), sibling)
++        .await
++        .unwrap()
++        .unwrap()
++        .expect_err("sibling shares the lost generation");
++    assert_eq!(
++        sibling_error
++            .downcast_ref::<ProcessInvocationError>()
++            .unwrap()
++            .failure(),
++        &ProcessInvocationFailure::ComponentLost(ComponentFailure::CancelGrace)
++    );
++}
+diff --git a/crates/proteus-core/src/process_adapters/client.rs b/crates/proteus-core/src/process_adapters/client.rs
+index 7be439c..0c61062 100644
+--- a/crates/proteus-core/src/process_adapters/client.rs
++++ b/crates/proteus-core/src/process_adapters/client.rs
+@@ -7,14 +7,17 @@ use proteus_module_protocol::v3::{
+ };
+ use serde::{Serialize, de::DeserializeOwned};
+ use serde_json::Value;
+-use tokio::time::{MissedTickBehavior, interval};
++
++use crate::contracts::CancellationToken;
+ 
+ use super::{
+     ProcessExportConfig, ProcessInvocationError, ProcessInvocationFailure,
+     invocation_scope::{current_parent, scoped_dispatcher},
+ };
+ 
+-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
++mod cancellation;
++
++use cancellation::CancellationSource;
+ 
+ /// Typed view of one export on a shared multiplexed process component broker.
+ pub struct ProcessExportClient {
+@@ -87,22 +90,66 @@ impl ProcessExportClient {
+         R: DeserializeOwned,
+         F: Fn() -> bool,
+     {
+-        if is_cancelled() {
++        self.invoke_with_cancellation_source(
++            method,
++            params,
++            dispatcher,
++            CancellationSource::Check {
++                check: is_cancelled,
++                poll: None,
++            },
++        )
++        .await
++    }
++
++    /// Reuse the invocation's token rather than waking periodically to poll it.
++    pub async fn invoke_with_dispatcher_and_cancellation<P, R>(
++        &self,
++        method: &str,
++        params: &P,
++        dispatcher: Arc<dyn AsyncHostRequestDispatcher>,
++        cancellation: &CancellationToken,
++    ) -> Result<R>
++    where
++        P: Serialize,
++        R: DeserializeOwned,
++    {
++        self.invoke_with_cancellation_source(
++            method,
++            params,
++            dispatcher,
++            CancellationSource::<fn() -> bool>::Token(cancellation),
++        )
++        .await
++    }
++
++    async fn invoke_with_cancellation_source<P, R, F>(
++        &self,
++        method: &str,
++        params: &P,
++        dispatcher: Arc<dyn AsyncHostRequestDispatcher>,
++        mut cancellation: CancellationSource<'_, F>,
++    ) -> Result<R>
++    where
++        P: Serialize,
++        R: DeserializeOwned,
++        F: Fn() -> bool,
++    {
++        if cancellation.is_cancelled() {
+             bail!("process module {:?}: {method} was canceled", self.module_id);
+         }
+         let value = self.encode(method, params)?;
+         let mut handle = {
+             let start = self.start(method, value, dispatcher);
+             tokio::pin!(start);
+-            let mut cancellation_poll = interval(CANCEL_POLL_INTERVAL);
+-            cancellation_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            cancellation.begin_wait();
+             // Dropping pending admission closes its terminal receiver, including
+             // while the broker is waiting for a restarted worker's handshake.
+             loop {
+                 tokio::select! {
+                     result = &mut start => break result,
+-                    _ = cancellation_poll.tick() => {
+-                        if is_cancelled() {
++                    canceled = cancellation.observe() => {
++                        if canceled {
+                             bail!("process module {:?}: {method} was canceled", self.module_id);
+                         }
+                     }
+@@ -112,13 +159,12 @@ impl ProcessExportClient {
+         .with_context(|| self.invocation_context(method))?;
+         let cancel = handle.cancel_handle();
+         let mut terminal = Box::pin(handle.result());
+-        let mut cancellation_poll = interval(CANCEL_POLL_INTERVAL);
+-        cancellation_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        cancellation.begin_wait();
+         let terminal = loop {
+             tokio::select! {
+                 result = &mut terminal => break result,
+-                _ = cancellation_poll.tick() => {
+-                    if is_cancelled() {
++                canceled = cancellation.observe() => {
++                    if canceled {
+                         cancel.cancel(CancelCause::User)
+                             .with_context(|| self.invocation_context(method))?;
+                         break terminal.await;
+@@ -290,7 +336,7 @@ mod tests {
+     };
+     use crate::{
+         contracts::{
+-            PROCESS_CONTEXT_BUILD_METHOD, PROCESS_CONTEXT_CONTRACT_VERSION,
++            CancellationToken, PROCESS_CONTEXT_BUILD_METHOD, PROCESS_CONTEXT_CONTRACT_VERSION,
+             PROCESS_CONTEXT_PROVIDER_CONTRACT_VERSION, PROCESS_CONTEXT_PROVIDER_METHOD,
+             PROCESS_POLICY_CONTRACT_VERSION, PROCESS_POLICY_EVALUATE_METHOD,
+         },
+@@ -448,15 +494,16 @@ mod tests {
+             .expect("policy client"),
+         );
+ 
++        let cancellation = CancellationToken::new();
+         let response: Value = context
+-            .invoke_with_dispatcher_and_cancel_check(
++            .invoke_with_dispatcher_and_cancellation(
+                 PROCESS_CONTEXT_BUILD_METHOD,
+                 &json!({"op": "callback"}),
+                 Arc::new(NestedProbeDispatcher {
+                     search: Arc::clone(&search),
+                     policy,
+                 }),
+-                || false,
++                &cancellation,
+             )
+             .await
+             .expect("outer invocation");
+diff --git a/crates/proteus-core/src/process_adapters/context.rs b/crates/proteus-core/src/process_adapters/context.rs
+index 5b471dc..1a23b59 100644
+--- a/crates/proteus-core/src/process_adapters/context.rs
++++ b/crates/proteus-core/src/process_adapters/context.rs
+@@ -68,11 +68,11 @@ impl ContextBuilder for ProcessContextBuilder {
+         });
+         let response: ProcessContextResponse = self
+             .client
+-            .invoke_with_dispatcher_and_cancel_check(
++            .invoke_with_dispatcher_and_cancellation(
+                 PROCESS_CONTEXT_BUILD_METHOD,
+                 &request,
+                 dispatcher,
+-                || cancellation.is_cancelled(),
++                &cancellation,
+             )
+             .await?;
+         Ok(response.result)
+@@ -158,11 +158,11 @@ impl RepoAwareContextProvider for ProcessContextProvider {
+         };
+         let response: ProcessContextChunksResponse = self
+             .client
+-            .invoke_with_dispatcher_and_cancel_check(
++            .invoke_with_dispatcher_and_cancellation(
+                 PROCESS_CONTEXT_PROVIDER_METHOD,
+                 &request,
+                 Arc::new(NoAsyncHostRequests),
+-                || context.scope.cancellation.is_cancelled(),
++                &context.scope.cancellation,
+             )
+             .await?;
+         Ok(response.result)
+diff --git a/crates/proteus-core/src/process_adapters/tool.rs b/crates/proteus-core/src/process_adapters/tool.rs
+index 9c4bf47..fa119a4 100644
+--- a/crates/proteus-core/src/process_adapters/tool.rs
++++ b/crates/proteus-core/src/process_adapters/tool.rs
+@@ -108,7 +108,7 @@ impl Tool for ProcessTool {
+         let cancellation = ctx.cancellation;
+         let response: ProcessToolInvokeResponse = self
+             .client
+-            .invoke_with_dispatcher_and_cancel_check(
++            .invoke_with_dispatcher_and_cancellation(
+                 PROCESS_TOOL_INVOKE_METHOD,
+                 &request,
+                 Arc::new(host::ToolHost {
+@@ -118,7 +118,7 @@ impl Tool for ProcessTool {
+                     call: call.clone(),
+                     cancellation: cancellation.clone(),
+                 }),
+-                || cancellation.is_cancelled(),
++                &cancellation,
+             )
+             .await?;
+         Ok(response.result)
+diff --git a/crates/proteus-core/src/process_adapters/workflow.rs b/crates/proteus-core/src/process_adapters/workflow.rs
+index b1654cd..f8a6d40 100644
+--- a/crates/proteus-core/src/process_adapters/workflow.rs
++++ b/crates/proteus-core/src/process_adapters/workflow.rs
+@@ -88,11 +88,11 @@ impl Workflow for ProcessWorkflowAdapter {
+ 
+         let response: Result<ProcessWorkflowResponse> = self
+             .client
+-            .invoke_with_dispatcher_and_cancel_check(
++            .invoke_with_dispatcher_and_cancellation(
+                 PROCESS_WORKFLOW_METHOD,
+                 &input,
+                 dispatcher,
+-                || cancellation.is_cancelled(),
++                &cancellation,
+             )
+             .await;
+         let unfinished = runtime.close_model_stream().await;
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 2f61675..a102ec2 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -720,6 +720,17 @@ Slot adapter проверяет отмену также во время ожид
+ handshake перезапущенного worker: caller освобождается, не ожидая handshake,
+ а закрытый terminal receiver предотвращает последующий dispatch запроса.
+ 
++Adapters `workflow`, `tool`, `context` и `context_provider` ожидают
++`CancellationToken::cancelled()` из уже связанного invocation scope без
++периодического опроса. Для `HookHost`, который предоставляет только
++`is_cancelled()`, сохраняется опрос раз в 10 мс; новый token или отдельный
++источник authority ради оптимизации не создаётся. Обе формы используют один
++admission/terminal path: после получения handle отмена отправляет control
++request; после его подтверждения ожидается исходный terminal, а не локальный
++синтетический `Canceled`. Ошибка control ACK сохраняет прежний error path.
++При добавлении ожидания отмены используйте доступный wake source, сохраняя
++проверку до encode/admission, закрытие pending receiver и владение terminal.
++
+ Проверка до dispatch не устраняет гонку с более поздней отменой. Если writer
+ ещё не забрал request, `cancel_before_write` может атомарно отменить запись.
+ После начала записи cancel/timeout не гарантирует отсутствие или rollback
