@@ -1,0 +1,417 @@
+diff --git a/crates/proteus-core/src/process_adapters/client.rs b/crates/proteus-core/src/process_adapters/client.rs
+index 0c61062..3af87be 100644
+--- a/crates/proteus-core/src/process_adapters/client.rs
++++ b/crates/proteus-core/src/process_adapters/client.rs
+@@ -165,7 +165,8 @@ impl ProcessExportClient {
+                 result = &mut terminal => break result,
+                 canceled = cancellation.observe() => {
+                     if canceled {
+-                        cancel.cancel(CancelCause::User)
++                        cancel.cancel_async(CancelCause::User)
++                            .await
+                             .with_context(|| self.invocation_context(method))?;
+                         break terminal.await;
+                     }
+diff --git a/crates/proteus-module-protocol/Cargo.toml b/crates/proteus-module-protocol/Cargo.toml
+index b54bc13..d0c747f 100644
+--- a/crates/proteus-module-protocol/Cargo.toml
++++ b/crates/proteus-module-protocol/Cargo.toml
+@@ -10,7 +10,7 @@ anyhow = "1"
+ clap = { version = "4", features = ["derive"] }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+-tokio = { version = "1", features = ["rt", "sync"] }
++tokio = { version = "1", features = ["rt", "sync", "time"] }
+ 
+ [dev-dependencies]
+ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+diff --git a/crates/proteus-module-protocol/src/v3/broker.rs b/crates/proteus-module-protocol/src/v3/broker.rs
+index 5c2ec1c..cdfb850 100644
+--- a/crates/proteus-module-protocol/src/v3/broker.rs
++++ b/crates/proteus-module-protocol/src/v3/broker.rs
+@@ -58,6 +58,20 @@ impl StartAck {
+     }
+ }
+ 
++pub(crate) enum CancelAck {
++    Async(oneshot::Sender<Result<(), ComponentBrokerError>>),
++    Blocking(mpsc::Sender<Result<(), ComponentBrokerError>>),
++}
++
++impl CancelAck {
++    pub(super) fn send(self, result: Result<(), ComponentBrokerError>) -> bool {
++        match self {
++            Self::Async(sender) => sender.send(result).is_ok(),
++            Self::Blocking(sender) => sender.send(result).is_ok(),
++        }
++    }
++}
++
+ pub(crate) enum ControlCommand {
+     EnsureInitialized {
+         ack: mpsc::Sender<Result<proteus_contracts::contracts::ProcessComponentManifest, String>>,
+@@ -67,7 +81,7 @@ pub(crate) enum ControlCommand {
+         id: String,
+         generation: u64,
+         cause: CancelCause,
+-        ack: mpsc::Sender<Result<(), ComponentBrokerError>>,
++        ack: CancelAck,
+     },
+     CallbackComplete {
+         generation: u64,
+diff --git a/crates/proteus-module-protocol/src/v3/invocation/cancellation_tests.rs b/crates/proteus-module-protocol/src/v3/invocation/cancellation_tests.rs
+new file mode 100644
+index 0000000..b5f280c
+--- /dev/null
++++ b/crates/proteus-module-protocol/src/v3/invocation/cancellation_tests.rs
+@@ -0,0 +1,197 @@
++use std::{future::poll_fn, task::Poll};
++
++use super::*;
++use crate::v3::signal;
++
++fn invocation(
++    capacity: usize,
++) -> (
++    InvocationHandle,
++    mpsc::Receiver<ControlCommand>,
++    oneshot::Sender<InvocationTerminal>,
++) {
++    let wake = proteus_process_host::ProcessWake::default();
++    let (control_tx, commands) = signal::channel(capacity, &wake);
++    let (terminal_tx, terminal_rx) = oneshot::channel();
++    let handle = InvocationHandle {
++        invocation: InvocationRef {
++            id: "h:3:7".to_owned(),
++            generation: 3,
++            target: ProcessComponentExportRef::new("context", "ack-probe"),
++            root_id: "h:3:7".to_owned(),
++            parent_id: None,
++            depth: 0,
++            deadline: Instant::now() + Duration::from_secs(10),
++        },
++        pid: 1,
++        control_tx,
++        terminal_rx: Some(TerminalReceiver::new(terminal_rx, wake)),
++        notifications: None,
++        dropped_notifications: Arc::new(AtomicU64::new(0)),
++    };
++    (handle, commands, terminal_tx)
++}
++
++async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
++    poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
++}
++
++fn cancel_ack(command: ControlCommand, expected_cause: CancelCause) -> CancelAck {
++    let ControlCommand::Cancel {
++        id,
++        generation,
++        cause,
++        ack,
++    } = command
++    else {
++        panic!("expected the admitted cancellation command");
++    };
++    assert_eq!(id, "h:3:7");
++    assert_eq!(generation, 3);
++    assert_eq!(cause, expected_cause);
++    ack
++}
++
++fn assert_ack_missing(error: ComponentBrokerError) {
++    assert_eq!(error.kind, ComponentBrokerErrorKind::Stopped);
++    assert_eq!(error.message, "component broker did not acknowledge cancel");
++}
++
++#[tokio::test]
++async fn async_ack_allows_current_thread_progress_without_consuming_terminal() {
++    let (mut handle, commands, terminal_tx) = invocation(1);
++    let cancel = handle.cancel_handle();
++    let mut waiting = Box::pin(cancel.cancel_async(CancelCause::User));
++    assert!(matches!(poll_once(waiting.as_mut()).await, Poll::Pending));
++
++    // This task cannot run if awaiting ACK blocks the current-thread executor.
++    let responder = tokio::spawn(async move {
++        let ack = cancel_ack(commands.try_recv().unwrap(), CancelCause::User);
++        assert!(ack.send(Ok(())));
++    });
++    waiting.await.unwrap();
++    responder.await.unwrap();
++
++    let mut terminal = Box::pin(handle.result());
++    assert!(matches!(poll_once(terminal.as_mut()).await, Poll::Pending));
++    terminal_tx
++        .send(InvocationTerminal::ComponentLost(ComponentFailure::Protocol))
++        .unwrap();
++    assert_eq!(
++        terminal.await.unwrap(),
++        InvocationTerminal::ComponentLost(ComponentFailure::Protocol)
++    );
++}
++
++#[test]
++fn full_and_disconnected_errors_do_not_require_a_time_driver() {
++    tokio::runtime::Builder::new_current_thread()
++        .build()
++        .unwrap()
++        .block_on(async {
++            let (handle, commands, _terminal) = invocation(1);
++            assert!(handle.control_tx.try_send(ControlCommand::Shutdown).is_ok());
++            let cancel = handle.cancel_handle();
++            let expected = ComponentBrokerError::new(
++                ComponentBrokerErrorKind::Admission,
++                "component broker control queue is full; cancel was not admitted",
++            );
++            assert_eq!(
++                cancel.cancel_async(CancelCause::User).await.unwrap_err(),
++                expected
++            );
++            assert_eq!(cancel.cancel(CancelCause::User).unwrap_err(), expected);
++            assert!(matches!(
++                commands.try_recv().unwrap(),
++                ControlCommand::Shutdown
++            ));
++
++            drop(commands);
++            let expected = ComponentBrokerError::stopped("component broker is stopped");
++            assert_eq!(
++                cancel.cancel_async(CancelCause::User).await.unwrap_err(),
++                expected
++            );
++            assert_eq!(cancel.cancel(CancelCause::User).unwrap_err(), expected);
++        });
++}
++
++#[tokio::test]
++async fn broker_rejection_is_returned_unchanged() {
++    let (handle, commands, _terminal) = invocation(1);
++    let cancel = handle.cancel_handle();
++    let mut waiting = Box::pin(cancel.cancel_async(CancelCause::Timeout));
++    assert!(matches!(poll_once(waiting.as_mut()).await, Poll::Pending));
++    let ack = cancel_ack(commands.try_recv().unwrap(), CancelCause::Timeout);
++    let expected = ComponentBrokerError::new(
++        ComponentBrokerErrorKind::ParentInactive,
++        "invocation h:3:7 belongs to stale generation 3, current is 4",
++    );
++    assert!(ack.send(Err(expected.clone())));
++    assert_eq!(waiting.await.unwrap_err(), expected);
++}
++
++#[tokio::test]
++async fn closed_ack_sender_keeps_the_existing_stopped_error() {
++    let (handle, commands, _terminal) = invocation(1);
++    let cancel = handle.cancel_handle();
++    let mut waiting = Box::pin(cancel.cancel_async(CancelCause::Shutdown));
++    assert!(matches!(poll_once(waiting.as_mut()).await, Poll::Pending));
++    drop(cancel_ack(commands.try_recv().unwrap(), CancelCause::Shutdown));
++    assert_ack_missing(waiting.await.unwrap_err());
++}
++
++#[test]
++fn dropping_unpolled_cancel_does_not_enqueue() {
++    let (handle, commands, _terminal) = invocation(1);
++    let cancel = handle.cancel_handle();
++    drop(cancel.cancel_async(CancelCause::User));
++    assert!(matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty)));
++}
++
++#[tokio::test]
++async fn dropping_ack_wait_does_not_retract_command_or_drop_terminal() {
++    let (mut handle, commands, terminal_tx) = invocation(1);
++    let cancel = handle.cancel_handle();
++    let mut waiting = Box::pin(cancel.cancel_async(CancelCause::User));
++    assert!(matches!(poll_once(waiting.as_mut()).await, Poll::Pending));
++    drop(waiting);
++
++    // The command is still delivered, even though its ACK receiver is gone.
++    let ack = cancel_ack(commands.try_recv().unwrap(), CancelCause::User);
++    assert!(!ack.send(Ok(())));
++    terminal_tx.send(InvocationTerminal::Canceled).unwrap();
++    assert_eq!(handle.result().await.unwrap(), InvocationTerminal::Canceled);
++}
++
++#[tokio::test]
++async fn ack_timeout_does_not_retract_the_admitted_command() {
++    let (handle, commands, _terminal) = invocation(1);
++    let cancel = handle.cancel_handle();
++    let error = tokio::time::timeout(
++        CONTROL_ACK_TIMEOUT + Duration::from_secs(1),
++        cancel.cancel_async(CancelCause::User),
++    )
++    .await
++    .expect("the ACK wait must retain its bounded deadline")
++    .unwrap_err();
++    assert_ack_missing(error);
++    let ack = cancel_ack(commands.try_recv().unwrap(), CancelCause::User);
++    assert!(!ack.send(Ok(())));
++}
++
++#[tokio::test]
++async fn observed_ready_ack_is_not_replaced_by_an_elapsed_timer() {
++    let (sender, receiver) = oneshot::channel();
++    let mut waiting = Box::pin(wait_for_cancel_ack(receiver));
++    assert!(matches!(poll_once(waiting.as_mut()).await, Poll::Pending));
++    // Do not poll the waiter while its timer expires. If ACK is ready on the
++    // next poll, retain the received broker result rather than invent timeout.
++    tokio::time::sleep(CONTROL_ACK_TIMEOUT + Duration::from_millis(20)).await;
++    let expected = ComponentBrokerError::new(
++        ComponentBrokerErrorKind::ParentInactive,
++        "invocation h:3:7 is not active",
++    );
++    sender.send(Err(expected.clone())).unwrap();
++    assert_eq!(waiting.await.unwrap_err(), expected);
++}
+diff --git a/crates/proteus-module-protocol/src/v3/invocation.rs b/crates/proteus-module-protocol/src/v3/invocation.rs
+index 53aa9b4..d88e235 100644
+--- a/crates/proteus-module-protocol/src/v3/invocation.rs
++++ b/crates/proteus-module-protocol/src/v3/invocation.rs
+@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
+ use crate::ProcessModuleRpcError;
+ 
+ use super::{
+-    broker::ControlCommand,
++    broker::{CancelAck, ControlCommand},
+     notification::{InvocationNotificationReceiver, NotificationSink},
+ };
+ 
+@@ -200,6 +200,24 @@ impl InvocationCancelHandle {
+     pub fn cancel(&self, cause: CancelCause) -> Result<(), ComponentBrokerError> {
+         cancel_invocation(&self.control_tx, &self.id, self.generation, cause)
+     }
++
++    /// Wait for the broker's cancellation ACK without blocking the executor.
++    ///
++    /// Requires a Tokio runtime with time enabled. The same two-second ACK
++    /// budget starts after enqueue; a successful ACK is not the invocation's
++    /// terminal result. Dropping this future after enqueue only abandons its
++    /// ACK receiver: it does not retract the admitted cancellation command.
++    pub async fn cancel_async(&self, cause: CancelCause) -> Result<(), ComponentBrokerError> {
++        let (ack_tx, ack_rx) = oneshot::channel();
++        enqueue_cancel(
++            &self.control_tx,
++            &self.id,
++            self.generation,
++            cause,
++            CancelAck::Async(ack_tx),
++        )?;
++        wait_for_cancel_ack(ack_rx).await
++    }
+ }
+ 
+ impl fmt::Debug for InvocationHandle {
+@@ -290,26 +308,45 @@ fn cancel_invocation(
+     cause: CancelCause,
+ ) -> Result<(), ComponentBrokerError> {
+     let (ack_tx, ack_rx) = mpsc::channel();
++    enqueue_cancel(control_tx, id, generation, cause, CancelAck::Blocking(ack_tx))?;
++    ack_rx
++        .recv_timeout(CONTROL_ACK_TIMEOUT)
++        .map_err(|_| ComponentBrokerError::stopped("component broker did not acknowledge cancel"))?
++}
++
++fn enqueue_cancel(
++    control_tx: &super::signal::CommandSender<ControlCommand>,
++    id: &str,
++    generation: u64,
++    cause: CancelCause,
++    ack: CancelAck,
++) -> Result<(), ComponentBrokerError> {
+     match control_tx.try_send(ControlCommand::Cancel {
+         id: id.to_owned(),
+         generation,
+         cause,
+-        ack: ack_tx,
++        ack,
+     }) {
+-        Ok(()) => {}
+-        Err(mpsc::TrySendError::Full(_)) => {
+-            return Err(ComponentBrokerError::new(
+-                ComponentBrokerErrorKind::Admission,
+-                "component broker control queue is full; cancel was not admitted",
+-            ));
+-        }
++        Ok(()) => Ok(()),
++        Err(mpsc::TrySendError::Full(_)) => Err(ComponentBrokerError::new(
++            ComponentBrokerErrorKind::Admission,
++            "component broker control queue is full; cancel was not admitted",
++        )),
+         Err(mpsc::TrySendError::Disconnected(_)) => {
+-            return Err(ComponentBrokerError::stopped("component broker is stopped"));
++            Err(ComponentBrokerError::stopped("component broker is stopped"))
+         }
+     }
+-    ack_rx
+-        .recv_timeout(CONTROL_ACK_TIMEOUT)
+-        .map_err(|_| ComponentBrokerError::stopped("component broker did not acknowledge cancel"))?
++}
++
++async fn wait_for_cancel_ack(
++    receiver: oneshot::Receiver<Result<(), ComponentBrokerError>>,
++) -> Result<(), ComponentBrokerError> {
++    match tokio::time::timeout(CONTROL_ACK_TIMEOUT, receiver).await {
++        Ok(Ok(result)) => result,
++        Ok(Err(_)) | Err(_) => Err(ComponentBrokerError::stopped(
++            "component broker did not acknowledge cancel",
++        )),
++    }
+ }
+ 
+ impl InvocationHandle {
+@@ -367,3 +404,7 @@ impl Drop for TerminalReceiver {
+         self.wake.notify();
+     }
+ }
++
++#[cfg(test)]
++#[path = "invocation/cancellation_tests.rs"]
++mod cancellation_tests;
+diff --git a/crates/proteus-module-protocol/tests/broker_v3.rs b/crates/proteus-module-protocol/tests/broker_v3.rs
+index 4880607..eb607f0 100644
+--- a/crates/proteus-module-protocol/tests/broker_v3.rs
++++ b/crates/proteus-module-protocol/tests/broker_v3.rs
+@@ -222,7 +222,7 @@ async fn targeted_cancel_keeps_sibling_and_generation() -> Result<()> {
+             INVOCATION_TIMEOUT,
+         )
+         .await?;
+-    target.cancel(CancelCause::User)?;
++    target.cancel_handle().cancel_async(CancelCause::User).await?;
+ 
+     ensure!(target.result().await? == InvocationTerminal::Canceled);
+     ensure!(value(sibling.result().await?)? == json!("sibling"));
+@@ -398,7 +398,7 @@ async fn parent_cancel_cascades_during_callback() -> Result<()> {
+         )
+         .await?;
+     wait_for_pending(&broker, 2)?;
+-    root.cancel(CancelCause::User)?;
++    root.cancel_handle().cancel_async(CancelCause::User).await?;
+     ensure!(root.result().await? == InvocationTerminal::Canceled);
+     wait_for_pending(&broker, 0)?;
+     ensure!(broker.snapshot()?.pending_callbacks == 0);
+@@ -454,7 +454,7 @@ async fn uncooperative_cancel_resets_failure_domain() -> Result<()> {
+             .ok_or_else(|| anyhow::anyhow!("worker did not confirm invocation start"))?;
+         ensure!(started.params["value"]["started"] == json!(true));
+     }
+-    target.cancel(CancelCause::Timeout)?;
++    target.cancel_handle().cancel_async(CancelCause::Timeout).await?;
+     ensure!(target.result().await? == InvocationTerminal::TimedOut);
+     ensure!(
+         sibling.result().await? == InvocationTerminal::ComponentLost(ComponentFailure::CancelGrace)
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index a102ec2..64db9ac 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -728,6 +728,13 @@ Adapters `workflow`, `tool`, `context` и `context_provider` ожидают
+ admission/terminal path: после получения handle отмена отправляет control
+ request; после его подтверждения ожидается исходный terminal, а не локальный
+ синтетический `Canceled`. Ошибка control ACK сохраняет прежний error path.
++Async slot adapter ожидает этот ACK через `InvocationCancelHandle::cancel_async`
++на Tokio runtime с включённым time driver. Таймер ACK ограничен прежними 2 с
++после enqueue; это не grace period и не доказательство завершения invocation.
++Очередь, broker validation и точка отправки ACK не меняются. Timeout или drop
++ACK waiter не отзывает уже принятый cancel; после успешного ACK по-прежнему
++ожидается terminal. Синхронный `cancel` остаётся для sync callers и Drop guards;
++в async flow не блокируйте executor ожиданием sync ACK.
+ При добавлении ожидания отмены используйте доступный wake source, сохраняя
+ проверку до encode/admission, закрытие pending receiver и владение terminal.
+ 
