@@ -45,12 +45,36 @@ Source-only изменения Core на
   accumulation path. UTF-8→from_str, consumption при ошибке, CR/LF/EOF и
   exact limit precedence сохранены; это не zero-copy JSON decoder.
 
+- `06-reset-scoped-timestamps.patch`: после reset message/part date indexes
+  заранее содержат только нужные suffix identities; заполнение первых дат
+  всё ещё читает весь journal. Нет второго wanted set или второго date index;
+  no-reset путь прежний, call dates остаются глобальными. Vacant slots явно
+  отличаются от valid nonzero sequence. Это сокращение временных date keys,
+  а не обещание общего RAM bound.
+- `07-consuming-read-model-renderer.patch`: renderer получает records по
+  владению. Usage/context готовятся до него, history переносится один раз;
+  вся fallible summary logic (включая filesystem наблюдения) остаётся после
+  renderer. Erased prefix payloads освобождаются до первой строки, затем
+  освобождается payload каждого пройденного record. Буфер Vec с headers и
+  исходный full-parse peak остаются; это не streaming recovery. Generic
+  callbacks сохраняют FnOnce без новых Send/Sync/'static требований.
+- `08-session-mode-profile-baseline.patch`: временный permission mode больше
+  не переписывает опубликованный AppConfig. Несвязанное изменение профиля
+  не сбрасывает session override; первый Config Builder save не записывает
+  временный Plan как profile default. Runtime остаётся единственным владельцем
+  effective mode, UI продолжает читать его. Propagation между сессиями остаётся
+  предусмотренным per-session eventual reload, не общей транзакцией.
+
 ## Применение
 
 `SOURCES.json` фиксирует исходные Git blobs, candidate hashes и порядок
 проверенной композиции. Патчи относятся к Core checkout, а не к delivery repo.
 Сначала проверяйте `git apply --check --whitespace=error-all`, затем применяйте
-в числовом порядке. Они не зависят от ещё не опубликованного Core API/фиктивного
+в числовом порядке. Патч 06 требует 02. Патч 07 дополнительно требует
+PR60 `core/01-borrowed-transcript-parts.patch` из пакета
+`performance/2026-10-29/borrowed-payloads-and-build-inputs/` (точный SHA в
+SOURCES.json); не применяйте его отдельно к чистому upstream. Патчи не зависят
+от ещё не опубликованного Core API/фиктивного
 Cargo pin. Внешние upstream репозитории этой доставкой не меняются.
 
 Для совместного применения с [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60)
@@ -61,8 +85,8 @@ Cargo pin. Внешние upstream репозитории этой достав�
 ## Evidence и границы
 
 Авторское и независимое source review, проверка preimages, strict apply/reverse
-и candidate byte comparisons выполнены. Отдельно проверены 61 fresh preimage и
-композицию всех 22 patches (17 прежних + 5 новых) с точным reverse. Regression sources добавлены, но
+и candidate byte comparisons выполнены. Отдельно проверены 72 fresh preimage и
+композицию всех 25 patches (17 прежних + 8 новых) с точным reverse. Regression sources добавлены, но
 **Успешное выполнение Rust tests/builds, UI, CI или benchmarks не подтверждено**.
 Static application не подтверждает компиляцию. Нет измеренных latency/CPU/RAM
 цифр. Требуемые executable gates остаются в существующих Core guides.
