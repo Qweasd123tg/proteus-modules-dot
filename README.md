@@ -15,6 +15,15 @@
 
 - **Экспериментальный process hook:** [наблюдатель повторяющихся tool results](research/2026-10-30/loop-observer/). Opt-in исходники и regression sources, без заявления о выполненных runtime-проверках.
 
+## Новые независимые предложения — 30 октября
+
+- [PR65](https://github.com/Qweasd123tg/proteus-modules-dot/pull/65): [владение worktree](https://github.com/Qweasd123tg/proteus-modules-dot/blob/04deb8b11ec3b57348d6755a4307a83d5dbc8bb0/foundation/2026-10-30/worktree-ownership/README.md) и [один Responses client](https://github.com/Qweasd123tg/proteus-modules-dot/blob/04deb8b11ec3b57348d6755a4307a83d5dbc8bb0/performance/2026-10-30/single-responses-client/README.md).
+- [PR66](https://github.com/Qweasd123tg/proteus-modules-dot/pull/66): [временный индекс строк tool](https://github.com/Qweasd123tg/proteus-modules-dot/blob/5de92063f4b86a8b606e906c709024aae4692163/performance/2026-10-30/render-local-tool-index/README.md) и [capture writer без polling](https://github.com/Qweasd123tg/proteus-modules-dot/blob/5de92063f4b86a8b606e906c709024aae4692163/performance/2026-10-30/capture-writer-notifications/README.md). Индекс добавляет временную память; снижение RAM не заявляется.
+- [PR67](https://github.com/Qweasd123tg/proteus-modules-dot/pull/67): [координированные API proposals](https://github.com/Qweasd123tg/proteus-modules-dot/blob/afcdd86618a434003d49cc96755ded482c1cf8f2/research/2026-10-30/coordinated-api-proposals/README.md), включая typed workflow и contracts runtime feature. Это не drop-in интеграция: нужны настоящий Core commit, consumer pins/locks и executable gates.
+- [PR68](https://github.com/Qweasd123tg/proteus-modules-dot/pull/68): [conformance CLI dependency boundary](https://github.com/Qweasd123tg/proteus-modules-dot/blob/29515aae1c214789a7402c4a82e989fa313610e7/build-speed/2026-10-30/protocol-conformance-cli/README.md). CLI tests остаются в полном runner; выбранный dependency graph требует проверки.
+
+Все перечисленные пакеты опубликованы как draft source proposals. Проверены исходники, применимость и описанные статические gates; успешные compile/tests/runtime/benchmarks не заявлены. Каждый пакет имеет свою базу и ограничения. Они не составляют одну обязательную цепочку применения.
+
 ## Как устроен репозиторий
 
 | Каталог | Назначение |
@@ -40,7 +49,7 @@
 
 ## Статус и история
 
-Сверка 30 октября 2026, 15:32 UTC: [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60)
+Сверка 30 октября 2026, 16:00 UTC: [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60)
 и [PR61](https://github.com/Qweasd123tg/proteus-modules-dot/pull/61) слиты в delivery;
 [PR62](https://github.com/Qweasd123tg/proteus-modules-dot/pull/62) остаётся open draft,
 хотя его изменения уже перенесены в upstream; [PR63](https://github.com/Qweasd123tg/proteus-modules-dot/pull/63)
@@ -48,9 +57,9 @@
 Это разные статусы, не повод повторять исторические patches.
 Mode08 исправлен по пользовательскому Core `b062bb3` и уже
 присутствует в `befd30516aefa6f0a0ad5db9924ad4957160b8dc`.
-Отдельный alpha API proposal packet ещё не опубликован; он не входит в PR62
-или историческую runtime-серию. Реальные pins и исполняемые gates для таких
-изменений проверяются отдельно.
+Отдельный alpha API proposal packet опубликован в PR67; он не входит в PR62
+или историческую runtime-серию. Новые PR65–68 остаются draft. Публикация артефакта
+не завершает upstream интеграцию: реальные pins и исполняемые gates проверяются отдельно.
 
 У этого репозитория нет одного глобального «все проверки прошли». Исторические результаты относятся к указанным в них commit, входам и сценариям. Новые исходники отдельно обозначают, что запускалось, а что ещё требует проверки.
 
