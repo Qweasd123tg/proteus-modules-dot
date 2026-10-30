@@ -1,0 +1,270 @@
+diff --git a/crates/proteus-module-protocol/src/v3/notification.rs b/crates/proteus-module-protocol/src/v3/notification.rs
+--- a/crates/proteus-module-protocol/src/v3/notification.rs
++++ b/crates/proteus-module-protocol/src/v3/notification.rs
+@@ -1,5 +1,6 @@
+ use std::{
+     fmt,
++    io::{self, Write},
+     sync::{
+         Arc, Mutex,
+         atomic::{AtomicU64, Ordering},
+@@ -11,6 +12,33 @@
+ use tokio::sync::mpsc;
+ 
+ pub type InvocationNotificationReceiver = mpsc::Receiver<InvocationNotification>;
++
++/// Count the same compact JSON bytes without retaining an encoded payload.
++/// Complete serialization before admission: errors never become partial sizes.
++pub(super) fn serialized_payload_len(value: &impl serde::Serialize) -> serde_json::Result<usize> {
++    let mut counter = JsonByteCounter(0);
++    serde_json::to_writer(&mut counter, value)?;
++    Ok(counter.0)
++}
++
++struct JsonByteCounter(usize);
++
++impl Write for JsonByteCounter {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        // Match the representable length of to_vec's Vec<u8>; do not turn
++        // capacity overflow into a wrapped, saturated or partial byte count.
++        self.0 = self
++            .0
++            .checked_add(bytes.len())
++            .filter(|length| *length <= isize::MAX as usize)
++            .expect("capacity overflow");
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
+ 
+ pub struct InvocationNotification {
+     pub method: String,
+@@ -142,3 +170,7 @@
+         Arc::clone(&self.dropped)
+     }
+ }
++
++#[cfg(test)]
++#[path = "notification_tests.rs"]
++mod tests;
+diff --git a/crates/proteus-module-protocol/src/v3/notification_tests.rs b/crates/proteus-module-protocol/src/v3/notification_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-module-protocol/src/v3/notification_tests.rs
+@@ -0,0 +1,103 @@
++use super::*;
++
++use serde::ser::{SerializeSeq, Serializer};
++use serde_json::json;
++
++#[test]
++fn payload_size_matches_compact_json_bytes_without_mutation() {
++    let controls = (0_u8..32).map(char::from).collect::<String>();
++    let mut nested = json!({"quote\"\\\n": ["😀", null, false, 1.5, {"nested": "é"}]});
++    for _ in 0..64 {
++        nested = json!([nested]);
++    }
++    let mut ordered = serde_json::Map::new();
++    ordered.insert("z-first".to_owned(), json!("line\n"));
++    ordered.insert("a-second".to_owned(), json!("中"));
++    for value in [
++        Value::Null,
++        json!(true),
++        json!(i64::MIN),
++        json!(u64::MAX),
++        json!(-0.0),
++        json!(1.25e-100),
++        json!(controls),
++        json!("Кириллица 中文 😀 \"\\\n\r\t"),
++        json!({"seq": 0, "value": "large\n中😀".repeat(16_384)}),
++        Value::Object(ordered),
++        nested,
++    ] {
++        let encoded = serde_json::to_vec(&value).unwrap();
++        assert_eq!(serialized_payload_len(&value).unwrap(), encoded.len());
++        assert_eq!(serde_json::to_vec(&value).unwrap(), encoded);
++    }
++}
++
++struct FailsAfterPrefix;
++
++impl serde::Serialize for FailsAfterPrefix {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        let mut sequence = serializer.serialize_seq(Some(2))?;
++        sequence.serialize_element("already written")?;
++        Err(serde::ser::Error::custom("intentional serialization failure"))
++    }
++}
++
++#[test]
++fn serialization_errors_do_not_return_partial_lengths() {
++    let expected = serde_json::to_vec(&FailsAfterPrefix).unwrap_err();
++    let actual = serialized_payload_len(&FailsAfterPrefix).unwrap_err();
++    assert_eq!(actual.classify(), expected.classify());
++    assert_eq!(actual.to_string(), expected.to_string());
++    assert_eq!(
++        serialized_payload_len(&FailsAfterPrefix).unwrap_or(usize::MAX),
++        usize::MAX,
++    );
++}
++
++#[test]
++fn byte_budget_is_held_after_receive_until_notification_drop() {
++    let payload = json!({"seq": 0, "value": "中😀\"\\\n"});
++    let bytes = serialized_payload_len(&payload).unwrap();
++    let (sink, mut receiver) = NotificationSink::channel(ReceiveLimits::new(8, bytes));
++    let send = || sink.try_send("module.progress".to_owned(), payload.clone(), bytes);
++    assert!(matches!(send(), NotificationDelivery::Delivered));
++    let held = receiver.try_recv().unwrap();
++    assert_eq!(held.params, payload);
++    assert!(matches!(send(), NotificationDelivery::Dropped));
++    assert_eq!(sink.dropped.load(Ordering::Acquire), 1);
++    drop(held);
++    assert!(matches!(send(), NotificationDelivery::Delivered));
++    drop(receiver.try_recv().unwrap());
++    drop(receiver);
++    assert!(matches!(send(), NotificationDelivery::Dropped));
++    assert_eq!(sink.dropped.load(Ordering::Acquire), 2);
++    let state = sink.budget.state.lock().unwrap();
++    assert_eq!(state.frames, 0);
++    assert_eq!(state.bytes, 0);
++}
++
++#[test]
++fn byte_counter_accepts_full_slices_and_preserves_capacity_overflow() {
++    let mut counter = JsonByteCounter(0);
++    assert_eq!(counter.write("中😀".as_bytes()).unwrap(), 7);
++    assert_eq!(counter.0, 7);
++    assert_eq!(counter.write(b"").unwrap(), 0);
++    assert!(counter.flush().is_ok());
++
++    let mut counter = JsonByteCounter(isize::MAX as usize - 1);
++    assert_eq!(counter.write(b"x").unwrap(), 1);
++    assert_eq!(counter.0, isize::MAX as usize);
++    assert_eq!(counter.write(b"").unwrap(), 0);
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        counter.write(b"x")
++    }));
++    assert!(result.is_err());
++    assert_eq!(counter.0, isize::MAX as usize);
++
++    let mut counter = JsonByteCounter(usize::MAX);
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        counter.write(b"x")
++    }));
++    assert!(result.is_err());
++    assert_eq!(counter.0, usize::MAX);
++}
+diff --git a/crates/proteus-module-protocol/src/v3/routing.rs b/crates/proteus-module-protocol/src/v3/routing.rs
+--- a/crates/proteus-module-protocol/src/v3/routing.rs
++++ b/crates/proteus-module-protocol/src/v3/routing.rs
+@@ -11,6 +11,7 @@
+     ComponentFrame, WireDirection,
+     broker::ControlCommand,
+     invocation::ComponentHostRequest,
++    notification::serialized_payload_len,
+     parse_component_frame, parse_wire_id,
+     pending::{LoopState, PendingCallback},
+     wire::{self, CallbackParams, NotificationParams},
+@@ -344,7 +345,7 @@
+             ));
+             return;
+         }
+-        let bytes = serde_json::to_vec(&params.payload).map_or(usize::MAX, |bytes| bytes.len());
++        let bytes = serialized_payload_len(&params.payload).unwrap_or(usize::MAX);
+         let _delivery = pending
+             .notifications
+             .try_send(method, params.payload, bytes);
+diff --git a/crates/proteus-module-protocol/tests/broker_v3.rs b/crates/proteus-module-protocol/tests/broker_v3.rs
+--- a/crates/proteus-module-protocol/tests/broker_v3.rs
++++ b/crates/proteus-module-protocol/tests/broker_v3.rs
+@@ -556,30 +556,45 @@
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn notification_overflow_does_not_block_terminal() -> Result<()> {
+-    let options = ComponentBrokerOptions {
+-        notification_limits: ReceiveLimits::new(2, 512),
+-        ..ComponentBrokerOptions::default()
+-    };
+-    let broker = broker(options)?;
+-    let mut invocation = broker
+-        .start_invocation(
+-            &export("workflow", "fixture.workflow"),
+-            PROCESS_WORKFLOW_METHOD,
+-            json!({"op":"flood", "count":100, "payload":"xxxxxxxxxxxxxxxx"}),
+-            INVOCATION_TIMEOUT,
+-        )
+-        .await?;
+-    ensure!(matches!(
+-        invocation.result().await?,
+-        InvocationTerminal::Success(_)
+-    ));
+-    ensure!(invocation.dropped_notifications() > 0);
+-    let mut notifications = invocation.notifications()?;
+-    let mut retained = 0;
+-    while notifications.try_recv().is_ok() {
+-        retained += 1;
++    let payload = "Кириллица 中文 😀 \"\\\n\t";
++    // Fixture progress wraps this value in {seq, value}. No consumer drains
++    // until terminal, so the exact encoded-payload quota decides retention.
++    let first_bytes = serde_json::to_vec(&json!({"seq": 0, "value": payload}))?.len();
++    for (limits, expected_retained) in [
++        (ReceiveLimits::new(2, 512), 2),
++        (ReceiveLimits::new(64, first_bytes), 1),
++        (ReceiveLimits::new(64, first_bytes - 1), 0),
++    ] {
++        let options = ComponentBrokerOptions {
++            notification_limits: limits,
++            ..ComponentBrokerOptions::default()
++        };
++        let broker = broker(options)?;
++        let mut invocation = broker
++            .start_invocation(
++                &export("workflow", "fixture.workflow"),
++                PROCESS_WORKFLOW_METHOD,
++                json!({"op":"flood", "count":100, "payload":payload}),
++                INVOCATION_TIMEOUT,
++            )
++            .await?;
++        let generation = invocation.generation();
++        ensure!(matches!(
++            invocation.result().await?,
++            InvocationTerminal::Success(_)
++        ));
++        ensure!(invocation.dropped_notifications() == 100 - expected_retained);
++        let mut notifications = invocation.notifications()?;
++        let mut retained = 0;
++        while let Ok(notification) = notifications.try_recv() {
++            ensure!(notification.method == "module.progress");
++            ensure!(notification.params["seq"] == json!(retained));
++            ensure!(notification.params["value"] == payload);
++            retained += 1;
++        }
++        ensure!(retained == expected_retained);
++        ensure!(broker.snapshot()?.generation == generation);
+     }
+-    ensure!(retained <= 2);
+     Ok(())
+ }
+ 
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -623,6 +623,14 @@
+ Child exit наблюдается отдельно от frame queue, а terminate прерывает blocked
+ read. Один reader маршрутизирует out-of-order terminal responses, callbacks и
+ live notifications по host-owned invocation records.
++
++Byte-бюджет live notifications считает полный compact JSON payload тем же
++serializer без промежуточного encoded buffer. Проверки envelope, метода,
++generation и видимости invocation остаются до подсчёта; reservation — после
++полного вызова serializer с прежней обработкой ошибок. Лимит учитывает UTF-8
++bytes и JSON escaping, а не число символов. Permit удерживается до drop
++notification, включая время после
++извлечения из очереди; переполнение notification budget не блокирует terminal.
+ 
+ Idle broker и writer блокируются на общем revision/Condvar уведомлении:
+ enqueue, frame, completion, child exit и закрытие terminal receiver будят

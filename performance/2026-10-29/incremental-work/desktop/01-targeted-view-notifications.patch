@@ -1,0 +1,26 @@
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -342,6 +342,9 @@
+                     });
+                 }
+                 self.content_finished(&view, source_revision, cx);
++                // The addressed view notified if it accepted the failure.
++                // Queue progress is not a change to every other surface.
++                return;
+             }
+             Signal::Message(Incoming::Focus {
+                 view: view_id,
+@@ -473,7 +476,11 @@
+                     }
+                 }
+                 self.content_finished(&view, source_revision, cx);
+-                self.error = None;
++                // show_with_revision already notifies the accepted target.
++                // Only clearing a shared runtime error affects other views.
++                if self.error.take().is_none() {
++                    return;
++                }
+             }
+             Signal::Message(Incoming::OpenDocument {
+                 mut context,

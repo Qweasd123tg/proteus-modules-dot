@@ -1,0 +1,221 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index fb2b107..6684474 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -50,6 +50,9 @@ seeder; не компилируйте Core ради получения тест
+ - Считайте стоимость по изменившемуся source/settings, не по числу читателей.
+   Передавайте immutable данные borrow/move, а копию оставляйте там, где
+   snapshot должен жить независимо от исходного владельца.
++  При разборе уже принадлежащего SDK сообщения переносите большие поля в
++  retained view без глубокого clone; сохраняйте порядок validation, прежний
++  payload при отказе и освобождение данных при close/смене поверхности.
+ - Cache имеет явный ключ, предел entries/bytes, eviction и освобождение
+   владельцев при closed/смене source. Ключ покрывает все влияющие на output
+   source, theme и settings; нормализация ключа не должна обходить прежнюю
+diff --git a/sdk/src/host.rs b/sdk/src/host.rs
+index ccfb6ca..540f756 100644
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -30,6 +30,29 @@ pub struct Content {
+     pub source_revision: Option<u64>,
+ }
+ 
++impl Content {
++    fn take_from(message: &mut Value) -> Result<Self> {
++        // The protocol loop already owns this message. Move its source and
++        // context into the retained view instead of cloning both payloads.
++        // Keep language-before-source validation and optional metadata rules.
++        let Some(Value::Object(mut content)) = message.get_mut("content").map(Value::take) else {
++            bail!("content.language is required");
++        };
++        let Some(Value::String(language)) = content.remove("language") else {
++            bail!("content.language is required");
++        };
++        let Some(Value::String(source)) = content.remove("source") else {
++            bail!("content.source is required");
++        };
++        Ok(Self {
++            language,
++            source,
++            context: content.remove("context").unwrap_or(Value::Null),
++            source_revision: content.get("source_revision").and_then(Value::as_u64),
++        })
++    }
++}
++
+ /// Состояние, которое клиент присылает процессу, и способы ему ответить.
+ pub struct Host {
+     pub server: Option<Server>,
+@@ -470,7 +493,7 @@ impl Host {
+         true
+     }
+ 
+-    fn handle(&mut self, extension: &mut dyn Extension, message: Value) -> Result {
++    fn handle(&mut self, extension: &mut dyn Extension, mut message: Value) -> Result {
+         self.route_message(&message)?;
+         match message.str("type") {
+             "context" => {
+@@ -569,25 +592,15 @@ impl Host {
+                 let surface = Surface::parse(message.str("surface"))
+                     .ok_or_else(|| anyhow!("unknown surface"))?;
+                 let argument = message.opt_str("argument").map(str::to_owned);
+-                let view = message.str("view");
+                 let changed_session = self.change_session(extension, session);
+-                if surface == Surface::Content {
+-                    let content = message.at("content");
+-                    let language = content
+-                        .opt_str("language")
+-                        .ok_or_else(|| anyhow!("content.language is required"))?;
+-                    let source = content
+-                        .opt_str("source")
+-                        .ok_or_else(|| anyhow!("content.source is required"))?;
+-                    self.content.insert(
+-                        view.to_owned(),
+-                        Content {
+-                            language: language.into(),
+-                            source: source.into(),
+-                            context: content.at("context").clone(),
+-                            source_revision: content.at("source_revision").as_u64(),
+-                        },
+-                    );
++                let content = if surface == Surface::Content {
++                    Some(Content::take_from(&mut message)?)
++                } else {
++                    None
++                };
++                let view = message.str("view");
++                if let Some(content) = content {
++                    self.content.insert(view.to_owned(), content);
+                 } else {
+                     self.content.remove(view);
+                 }
+diff --git a/sdk/src/host/tests.rs b/sdk/src/host/tests.rs
+index 4889af7..946ba67 100644
+--- a/sdk/src/host/tests.rs
++++ b/sdk/src/host/tests.rs
+@@ -332,6 +332,125 @@ impl Extension for ContentProbe {
+     }
+ }
+ 
++#[test]
++fn content_render_moves_owned_buffers_and_keeps_them_across_session_refresh() {
++    let (mut host, mut extension) = (Host::default(), ContentProbe::default());
++    for revision in [7, 8] {
++        let source = format!("revision {revision}: Привет 🦀\r\n\"quoted\"\\\0").repeat(128);
++        let message = json!({"type":"render", "context":"fixture", "surface":"content", "view":"content:moved",
++            "session_dir":"/fixture/chat-one", "content":{"language":"future-figure", "source":source,
++                "context":{"languages":["mermaid", "latex"], "theme":{"unknown":"owned context 🦀"}},
++                "source_revision":revision, "future_field":{"ignored":true}}});
++        let payload = &message["content"];
++        let language_ptr = payload["language"].as_str().unwrap().as_ptr();
++        let source_ptr = payload["source"].as_str().unwrap().as_ptr();
++        let languages_ptr = payload["context"]["languages"].as_array().unwrap().as_ptr();
++        let theme_ptr = payload["context"]["theme"]["unknown"].as_str().unwrap().as_ptr();
++        let expected_context = payload["context"].clone();
++        host.handle(&mut extension, message).unwrap();
++        let retained = host.content("content:moved").unwrap();
++        assert_eq!(retained.language, "future-figure");
++        assert_eq!(retained.source, source);
++        assert_eq!(retained.context, expected_context);
++        assert_eq!(retained.source_revision, Some(revision));
++        assert_eq!(retained.language.as_ptr(), language_ptr);
++        assert_eq!(retained.source.as_ptr(), source_ptr);
++        assert_eq!(retained.context["languages"].as_array().unwrap().as_ptr(), languages_ptr);
++        assert_eq!(retained.context["theme"]["unknown"].as_str().unwrap().as_ptr(), theme_ptr);
++        assert_eq!(last(&host)["source_revision"], revision);
++        host.handle(&mut extension, json!({"type":"session_update", "context":"fixture", "session_dir":"/fixture/chat-one",
++            "update":{"type":"state", "state":{"fixture":revision}}})).unwrap();
++        assert_eq!(host.content("content:moved").unwrap().source.as_ptr(), source_ptr);
++        assert_eq!(last(&host)["source_revision"], revision);
++    }
++    assert_eq!(extension.sources.len(), 4);
++}
++
++#[test]
++fn malformed_content_preserves_validation_order_and_previous_payload() {
++    let (mut host, mut extension) = (Host::default(), ContentProbe::default());
++    host.handle(&mut extension, json!({"type":"render", "context":"fixture", "surface":"content", "view":"content:valid",
++        "session_dir":"/fixture/chat-one", "content":{"language":"future-figure", "source":"kept", "source_revision":3}})).unwrap();
++    let source_ptr = host.content("content:valid").unwrap().source.as_ptr();
++    let previous = host.content("content:valid").unwrap().clone();
++    let sent = host.sent.borrow().len();
++    for (content, expected) in [
++        (Value::Null, "content.language is required"),
++        (json!([]), "content.language is required"),
++        (json!("not an object"), "content.language is required"),
++        (json!({}), "content.language is required"),
++        (json!({"language":0, "source":false}), "content.language is required"),
++        (json!({"language":"future-figure"}), "content.source is required"),
++        (json!({"language":"future-figure", "source":null}), "content.source is required"),
++        (json!({"language":"future-figure", "source":[]}), "content.source is required"),
++    ] {
++        let message = json!({"type":"render", "context":"fixture", "surface":"content", "view":"content:valid",
++            "session_dir":"/fixture/chat-one", "content":content});
++        assert_eq!(host.handle(&mut extension, message).unwrap_err().to_string(), expected);
++        assert_eq!(host.content("content:valid"), Some(&previous));
++        assert_eq!(host.content("content:valid").unwrap().source.as_ptr(), source_ptr);
++        assert_eq!(host.sent.borrow().len(), sent);
++        assert_eq!(extension.sources.len(), 1);
++    }
++    let missing = json!({"type":"render", "context":"fixture", "surface":"content", "view":"content:valid",
++        "session_dir":"/fixture/chat-one"});
++    assert_eq!(host.handle(&mut extension, missing).unwrap_err().to_string(), "content.language is required");
++    assert_eq!(host.content("content:valid"), Some(&previous));
++}
++
++#[test]
++fn malformed_content_still_switches_session_after_the_old_close_callback() {
++    let (mut host, mut extension) = (Host::default(), ScopedProbe::default());
++    host.handle(&mut extension, json!({"type":"render", "context":"fixture", "surface":"content", "view":"changing",
++        "session_dir":"/one", "content":{"language":"future-figure", "source":"kept", "source_revision":3}})).unwrap();
++    let previous = host.content("changing").unwrap().clone();
++    let source_ptr = host.content("changing").unwrap().source.as_ptr();
++    let error = host.handle(&mut extension, json!({"type":"render", "context":"fixture", "surface":"content", "view":"changing",
++        "session_dir":"/two", "content":{"language":"future-figure", "source":null}})).unwrap_err();
++    assert_eq!(error.to_string(), "content.source is required");
++    assert_eq!(host.session.as_deref(), Some("/two"));
++    assert_eq!(last(&host)["type"], "closed_probe");
++    assert_eq!(last(&host)["view"], "changing");
++    assert_eq!(last(&host)["session"], "/one");
++    assert_eq!(host.content("changing"), Some(&previous));
++    assert_eq!(host.content("changing").unwrap().source.as_ptr(), source_ptr);
++    assert!(!host.is_shown("changing"));
++    assert_eq!(host.sent.borrow().len(), 2);
++}
++
++#[test]
++fn moved_content_keeps_optional_metadata_and_empty_string_rules() {
++    for (content, context, revision) in [
++        (json!({"language":"", "source":""}), Value::Null, None),
++        (json!({"language":"", "source":"", "context":false, "source_revision":0}), json!(false), Some(0)),
++        (json!({"language":"", "source":"", "context":["future"], "source_revision":u64::MAX}), json!(["future"]), Some(u64::MAX)),
++        (json!({"language":"", "source":"", "context":{"future":1}, "source_revision":-1}), json!({"future":1}), None),
++        (json!({"language":"", "source":"", "source_revision":1.5}), Value::Null, None),
++        (json!({"language":"", "source":"", "source_revision":"7"}), Value::Null, None),
++    ] {
++        let mut message = json!({"content":content});
++        assert_eq!(Content::take_from(&mut message).unwrap(), Content {
++            language: String::new(),
++            source: String::new(),
++            context,
++            source_revision: revision,
++        });
++    }
++}
++
++#[test]
++fn non_content_render_ignores_payload_and_releases_retained_content() {
++    let (mut host, mut extension) = (Host::default(), Flaky::default());
++    host.handle(&mut extension, json!({"type":"render", "context":"fixture", "surface":"content", "view":"changing",
++        "session_dir":"/fixture/chat-one", "content":{"language":"future-figure", "source":"old"}})).unwrap();
++    assert!(host.content("changing").is_some());
++    host.handle(&mut extension, json!({"type":"render", "context":"fixture", "surface":"page", "view":"changing",
++        "session_dir":"/fixture/chat-one", "content":{"language":false, "source":null}})).unwrap();
++    assert!(host.content("changing").is_none());
++    assert_eq!(host.surface("changing"), Some(Surface::Page));
++    assert_eq!(last(&host)["source_revision"], Value::Null);
++}
++
+ #[test]
+ fn content_views_retain_independent_payloads_and_release_them_on_close() {
+     let (mut host, mut extension) = (Host::default(), ContentProbe::default());
