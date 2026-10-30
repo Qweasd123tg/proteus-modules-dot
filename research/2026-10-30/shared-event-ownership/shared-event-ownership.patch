@@ -1,0 +1,616 @@
+diff --git a/crates/proteus-core/src/app_server/acp/prompt.rs b/crates/proteus-core/src/app_server/acp/prompt.rs
+index 47a9ead..5e8c909 100644
+--- a/crates/proteus-core/src/app_server/acp/prompt.rs
++++ b/crates/proteus-core/src/app_server/acp/prompt.rs
+@@ -9,6 +9,7 @@ use crate::{
+     domain::AgentOutput,
+ };
+ use agent_client_protocol::{Client, ConnectionTo, Result, schema::v1::*};
++use std::sync::Arc;
+ use tokio::sync::{broadcast, oneshot};
+ 
+ pub(super) struct Prompt {
+@@ -17,7 +18,7 @@ pub(super) struct Prompt {
+     cancellation: CancellationToken,
+     finished: CancellationToken,
+     result: oneshot::Receiver<anyhow::Result<AgentOutput>>,
+-    events: broadcast::Receiver<AppServerEvent>,
++    events: broadcast::Receiver<Arc<AppServerEvent>>,
+     projection: Projection,
+     settled: bool,
+ }
+@@ -66,7 +67,7 @@ impl Prompt {
+             tokio::select! {
+                 biased;
+                 event = self.events.recv() => {
+-                    self.event(event.map_err(internal)?, cx).await?;
++                    self.event(event.map_err(internal)?.as_ref(), cx).await?;
+                 }
+                 result = &mut self.result => {
+                     self.settled = true;
+@@ -78,7 +79,7 @@ impl Prompt {
+         // Drain that same queue before sending the JSON-RPC prompt response.
+         loop {
+             match self.events.try_recv() {
+-                Ok(event) => self.event(event, cx).await?,
++                Ok(event) => self.event(event.as_ref(), cx).await?,
+                 Err(broadcast::error::TryRecvError::Empty) => break,
+                 Err(error) => return Err(internal(error)),
+             }
+@@ -113,15 +114,15 @@ impl Prompt {
+         cx.send_notification(SessionNotification::new(self.session.clone(), update))
+     }
+ 
+-    async fn event(&mut self, event: AppServerEvent, cx: &ConnectionTo<Client>) -> Result<()> {
++    async fn event(&mut self, event: &AppServerEvent, cx: &ConnectionTo<Client>) -> Result<()> {
+         match event {
+             AppServerEvent::Runtime { envelope } => {
+-                for update in self.projection.event(*envelope)? {
++                for update in self.projection.event((**envelope).clone())? {
+                     self.send(cx, update)?;
+                 }
+             }
+             AppServerEvent::ApprovalRequested { request } => {
+-                let request = *request;
++                let approval_id = request.approval_id.clone();
+                 let mut content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                     TextContent::new(request.reason.clone()),
+                 )))];
+@@ -167,7 +168,7 @@ impl Prompt {
+                     let approved = matches!(response.map(|r| r.outcome), Some(RequestPermissionOutcome::Selected(selected))
+                         if selected.option_id.0.as_ref() == "allow_once");
+                     // Expired/cancelled prompts may already have removed this responder.
+-                    let _ = server.respond_approval(&request.approval_id, approved,
++                    let _ = server.respond_approval(&approval_id, approved,
+                         (!approved).then(|| "Permission rejected or cancelled by ACP client".to_owned()),
+                         ApprovalCacheScope::None).await;
+                     Ok(())
+diff --git a/crates/proteus-core/src/app_server/events/session.rs b/crates/proteus-core/src/app_server/events/session.rs
+index 28cc5db..99ee492 100644
+--- a/crates/proteus-core/src/app_server/events/session.rs
++++ b/crates/proteus-core/src/app_server/events/session.rs
+@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock, Weak};
+ #[derive(Clone)]
+ pub(super) struct SequencedEvent {
+     pub seq: u64,
+-    pub event: AppServerEvent,
++    pub event: Arc<AppServerEvent>,
+ }
+ 
+ pub(super) struct SessionView {
+@@ -161,12 +161,11 @@ impl AppEventPublisher {
+             let previous_seq = parts.seq;
+             let mut snapshot = parts.into_snapshot();
+             snapshot.seq = previous_seq.checked_add(1).expect("session sequence");
+-            // Both transports own a DTO. Clone the completed transcript before
+-            // taking the event lock, then validate the sampled revision.
+-            let event = AppServerEvent::SessionSnapshot {
++            // Both rings share this frozen DTO. Build it before taking the
++            // event lock, then validate the sampled revision.
++            let event = Arc::new(AppServerEvent::SessionSnapshot {
+                 snapshot: Box::new(snapshot),
+-            };
+-            let copy = event.clone();
++            });
+             let mut view = self.0.view.lock().expect("session view lock");
+             if view.seq != previous_seq {
+                 continue;
+@@ -174,7 +173,7 @@ impl AppEventPublisher {
+             view.seq = previous_seq + 1;
+             let _ = self.0.sequenced.send(SequencedEvent {
+                 seq: view.seq,
+-                event: copy,
++                event: Arc::clone(&event),
+             });
+             let _ = self.0.events.send(event);
+             return Ok(());
+diff --git a/crates/proteus-core/src/app_server/events/shared_tests.rs b/crates/proteus-core/src/app_server/events/shared_tests.rs
+new file mode 100644
+index 0000000..0ab2eb1
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/events/shared_tests.rs
+@@ -0,0 +1,114 @@
++use super::*;
++
++#[test]
++fn raw_and_sequenced_rings_share_one_payload() {
++    let (publisher, mut raw) = test_event_channel(2);
++    let mut sequenced = publisher.0.sequenced.subscribe();
++    publisher
++        .send(AppServerEvent::Error {
++            message: "shared".into(),
++        })
++        .unwrap();
++    let raw = raw.try_recv().unwrap();
++    let sequenced = sequenced.try_recv().unwrap();
++    assert!(Arc::ptr_eq(&raw, &sequenced.event));
++}
++
++#[test]
++fn snapshot_publication_shares_one_payload() {
++    let (publisher, mut raw) = test_event_channel(2);
++    let mut sequenced = publisher.0.sequenced.subscribe();
++    publisher.publish_snapshot().unwrap();
++    let raw = raw.try_recv().unwrap();
++    let sequenced = sequenced.try_recv().unwrap();
++    assert!(matches!(
++        raw.as_ref(),
++        AppServerEvent::SessionSnapshot { .. }
++    ));
++    assert!(Arc::ptr_eq(&raw, &sequenced.event));
++}
++
++#[test]
++fn failed_raw_send_returns_the_payload_retained_by_sequenced_ring() {
++    let (publisher, raw) = test_event_channel(2);
++    drop(raw);
++    let mut sequenced = publisher.0.sequenced.subscribe();
++    let error = publisher.send(AppServerEvent::Shutdown).unwrap_err();
++    assert!(Arc::ptr_eq(&error.0, &sequenced.try_recv().unwrap().event));
++    drop(sequenced);
++    let error = publisher.send(AppServerEvent::Shutdown).unwrap_err();
++    assert_eq!(Arc::strong_count(&error.0), 1);
++    assert!(matches!(
++        Arc::try_unwrap(error.0).unwrap(),
++        AppServerEvent::Shutdown
++    ));
++}
++
++#[test]
++fn raw_only_delivery_preserves_lag_and_releases_evicted_payload() {
++    let (publisher, mut raw) = test_event_channel(1);
++    publisher.send(AppServerEvent::Shutdown).unwrap();
++    let first = raw.try_recv().unwrap();
++    let weak = Arc::downgrade(&first);
++    drop(first);
++    publisher.send(AppServerEvent::Shutdown).unwrap();
++    publisher.send(AppServerEvent::Shutdown).unwrap();
++    assert!(weak.upgrade().is_none());
++    assert!(matches!(
++        raw.try_recv(),
++        Err(broadcast::error::TryRecvError::Lagged(1))
++    ));
++    assert!(matches!(
++        raw.try_recv().unwrap().as_ref(),
++        AppServerEvent::Shutdown
++    ));
++}
++
++#[tokio::test]
++async fn owned_delivery_is_independent_and_covered_shutdown_is_not_filtered() {
++    let (publisher, mut raw) = test_event_channel(8);
++    let mut subscription = publisher.subscribe_session();
++    subscription.recv().await.unwrap(); // Initial pending projection.
++    subscription.recv().await.unwrap(); // Initial session baseline.
++    publisher
++        .send(AppServerEvent::Error {
++            message: "original".into(),
++        })
++        .unwrap();
++    let retained = raw.try_recv().unwrap();
++    let AppServerEvent::Error { mut message } = subscription.recv().await.unwrap() else {
++        panic!("owned error");
++    };
++    message.push_str(" changed");
++    assert!(
++        matches!(retained.as_ref(), AppServerEvent::Error { message } if message == "original")
++    );
++    // Explicitly put a covered event before Shutdown at the same sequence.
++    let seq = subscription.seq;
++    assert!(
++        publisher
++            .0
++            .sequenced
++            .send(SequencedEvent {
++                seq,
++                event: Arc::new(AppServerEvent::Error {
++                    message: "covered".into()
++                }),
++            })
++            .is_ok()
++    );
++    assert!(
++        publisher
++            .0
++            .sequenced
++            .send(SequencedEvent {
++                seq,
++                event: Arc::new(AppServerEvent::Shutdown),
++            })
++            .is_ok()
++    );
++    assert!(matches!(
++        subscription.recv().await.unwrap(),
++        AppServerEvent::Shutdown
++    ));
++}
+diff --git a/crates/proteus-core/src/app_server/events.rs b/crates/proteus-core/src/app_server/events.rs
+index 98c3205..8f10a49 100644
+--- a/crates/proteus-core/src/app_server/events.rs
++++ b/crates/proteus-core/src/app_server/events.rs
+@@ -17,7 +17,7 @@ use session::{SequencedEvent, SessionView};
+ pub(super) struct AppEventPublisher(Arc<Inner>);
+ 
+ struct Inner {
+-    events: broadcast::Sender<AppServerEvent>,
++    events: broadcast::Sender<Arc<AppServerEvent>>,
+     sequenced: broadcast::Sender<SequencedEvent>,
+     view: Mutex<SessionView>,
+     pending: Mutex<Pending>,
+@@ -68,9 +68,9 @@ impl AppSubscription {
+                     return Ok(self.pending_event());
+                 }
+                 event = self.events.recv() => match event {
+-                    Ok(event) if event.seq > self.seq || matches!(event.event, AppServerEvent::Shutdown) => {
++                    Ok(event) if event.seq > self.seq || matches!(event.event.as_ref(), AppServerEvent::Shutdown) => {
+                         self.seq = event.seq;
+-                        return Ok(event.event);
++                        return Ok(Arc::unwrap_or_clone(event.event));
+                     }
+                     Ok(_) => {}, // Already included in the snapshot.
+                     Err(broadcast::error::RecvError::Lagged(count)) => {
+@@ -121,7 +121,7 @@ impl AppEventPublisher {
+         publisher
+     }
+ 
+-    pub(super) fn subscribe(&self) -> broadcast::Receiver<AppServerEvent> {
++    pub(super) fn subscribe(&self) -> broadcast::Receiver<Arc<AppServerEvent>> {
+         self.0.events.subscribe()
+     }
+ 
+@@ -153,7 +153,7 @@ impl AppEventPublisher {
+     pub(super) fn send(
+         &self,
+         event: AppServerEvent,
+-    ) -> Result<usize, broadcast::error::SendError<AppServerEvent>> {
++    ) -> Result<usize, broadcast::error::SendError<Arc<AppServerEvent>>> {
+         self.send_with_history(event, None)
+     }
+ 
+@@ -161,7 +161,7 @@ impl AppEventPublisher {
+         &self,
+         event: AppServerEvent,
+         history: Option<Vec<super::AppTranscriptMessage>>,
+-    ) -> Result<usize, broadcast::error::SendError<AppServerEvent>> {
++    ) -> Result<usize, broadcast::error::SendError<Arc<AppServerEvent>>> {
+         let mut view = self.0.view.lock().expect("session view lock");
+         if let Some(history) = history {
+             view.history = Ok(Arc::new(history.into()));
+@@ -198,9 +198,10 @@ impl AppEventPublisher {
+             }
+             _ => false,
+         };
++        let event = Arc::new(event);
+         let _ = self.0.sequenced.send(SequencedEvent {
+             seq: view.seq,
+-            event: event.clone(),
++            event: Arc::clone(&event),
+         });
+         let result = self.0.events.send(event);
+         if changed || queue_changed {
+@@ -245,7 +246,7 @@ impl AppEventPublisher {
+ #[cfg(test)]
+ pub(super) fn test_event_channel(
+     capacity: usize,
+-) -> (AppEventPublisher, broadcast::Receiver<AppServerEvent>) {
++) -> (AppEventPublisher, broadcast::Receiver<Arc<AppServerEvent>>) {
+     let events = AppEventPublisher::new(capacity, crate::domain::new_session_id(), None);
+     let receiver = events.subscribe();
+     (events, receiver)
+@@ -253,3 +254,6 @@ pub(super) fn test_event_channel(
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++mod shared_tests;
+diff --git a/crates/proteus-core/src/app_server/http/state.rs b/crates/proteus-core/src/app_server/http/state.rs
+index 37ed864..e5f38fa 100644
+--- a/crates/proteus-core/src/app_server/http/state.rs
++++ b/crates/proteus-core/src/app_server/http/state.rs
+@@ -167,8 +167,8 @@ impl HttpAppState {
+             loop {
+                 match events.recv().await {
+                     Ok(event) => {
+-                        let should_stop = matches!(event, AppServerEvent::Shutdown);
+-                        if app_event_affects_session_activity(&event) {
++                        let should_stop = matches!(event.as_ref(), AppServerEvent::Shutdown);
++                        if app_event_affects_session_activity(event.as_ref()) {
+                             state.emit_session_activity_for_dir(&session_dir).await;
+                         }
+                         if should_stop {
+diff --git a/crates/proteus-core/src/app_server/http/tests/live.rs b/crates/proteus-core/src/app_server/http/tests/live.rs
+index 3ae46ce..592ebf8 100644
+--- a/crates/proteus-core/src/app_server/http/tests/live.rs
++++ b/crates/proteus-core/src/app_server/http/tests/live.rs
+@@ -58,8 +58,11 @@ async fn delete_waits_for_settlement_and_closes_admission_on_existing_handles()
+     ));
+     assert!(server.running_run_ids().await.is_empty());
+     let terminal = loop {
+-        if let AppServerEvent::ExecutionUpdated { execution } =
+-            events.try_recv().expect("terminal published before delete")
++        if let AppServerEvent::ExecutionUpdated { execution } = events
++            .try_recv()
++            .expect("terminal published before delete")
++            .as_ref()
++            .clone()
+         {
+             if let Some(last) = execution.last {
+                 break last;
+diff --git a/crates/proteus-core/src/app_server/http/tests/turns.rs b/crates/proteus-core/src/app_server/http/tests/turns.rs
+index 4c64066..499bf79 100644
+--- a/crates/proteus-core/src/app_server/http/tests/turns.rs
++++ b/crates/proteus-core/src/app_server/http/tests/turns.rs
+@@ -58,7 +58,7 @@ async fn route_send_async_returns_run_id_while_domain_turn_keeps_running() {
+     assert!(matches!(output, StdioOutput::Response { ok: true, .. }));
+     tokio::time::timeout(Duration::from_secs(5), async {
+         loop {
+-            if matches!(event_rx.recv().await.unwrap(), AppServerEvent::ExecutionUpdated { execution } if execution.active.is_none()) { break; }
++            if matches!(event_rx.recv().await.unwrap().as_ref(), AppServerEvent::ExecutionUpdated { execution } if execution.active.is_none()) { break; }
+         }
+     }).await.expect("confirmed settlement");
+     assert!(server.running_run_ids().await.is_empty());
+diff --git a/crates/proteus-core/src/app_server/http/tests.rs b/crates/proteus-core/src/app_server/http/tests.rs
+index 13d7af0..010fd8a 100644
+--- a/crates/proteus-core/src/app_server/http/tests.rs
++++ b/crates/proteus-core/src/app_server/http/tests.rs
+@@ -218,15 +218,15 @@ async fn shutdown_test_servers(state: &HttpAppState) {
+ }
+ 
+ async fn wait_for_approval_request(
+-    event_rx: &mut broadcast::Receiver<AppServerEvent>,
++    event_rx: &mut broadcast::Receiver<Arc<AppServerEvent>>,
+ ) -> crate::app_server::AppApprovalRequest {
+     loop {
+         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+             .await
+             .expect("approval request event should arrive")
+             .expect("event stream should stay open");
+-        match event {
+-            AppServerEvent::ApprovalRequested { request } => return *request,
++        match event.as_ref() {
++            AppServerEvent::ApprovalRequested { request } => return (**request).clone(),
+             AppServerEvent::Error { message } => {
+                 panic!("unexpected app-server error: {message}")
+             }
+@@ -236,15 +236,15 @@ async fn wait_for_approval_request(
+ }
+ 
+ async fn wait_for_user_input_request(
+-    event_rx: &mut broadcast::Receiver<AppServerEvent>,
++    event_rx: &mut broadcast::Receiver<Arc<AppServerEvent>>,
+ ) -> ContractUserInputRequest {
+     loop {
+         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+             .await
+             .expect("user-input request event should arrive")
+             .expect("event stream should stay open");
+-        match event {
+-            AppServerEvent::UserInputRequested { request } => return *request,
++        match event.as_ref() {
++            AppServerEvent::UserInputRequested { request } => return (**request).clone(),
+             AppServerEvent::Error { message } => {
+                 panic!("unexpected app-server error: {message}")
+             }
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+index 97209af..36ad602 100644
+--- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
++++ b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+@@ -6,11 +6,13 @@ use crate::{
+     domain::{PermissionMode, ToolCall, new_call_id},
+ };
+ 
+-async fn next_reload(events: &mut tokio::sync::broadcast::Receiver<AppServerEvent>) {
++async fn next_reload(
++    events: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<AppServerEvent>>,
++) {
+     tokio::time::timeout(Duration::from_secs(5), async {
+         loop {
+             if matches!(
+-                events.recv().await.unwrap(),
++                events.recv().await.unwrap().as_ref(),
+                 AppServerEvent::ModulesReloaded { .. }
+             ) {
+                 break;
+@@ -21,11 +23,11 @@ async fn next_reload(events: &mut tokio::sync::broadcast::Receiver<AppServerEven
+     .unwrap();
+ }
+ 
+-async fn next_error(events: &mut tokio::sync::broadcast::Receiver<AppServerEvent>) {
++async fn next_error(events: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<AppServerEvent>>) {
+     tokio::time::timeout(Duration::from_secs(5), async {
+         loop {
+             if matches!(
+-                events.recv().await.unwrap(),
++                events.recv().await.unwrap().as_ref(),
+                 AppServerEvent::ProfileReloadStatus { error: Some(_) }
+             ) {
+                 break;
+diff --git a/crates/proteus-core/src/app_server/tests.rs b/crates/proteus-core/src/app_server/tests.rs
+index bc14394..339ac2a 100644
+--- a/crates/proteus-core/src/app_server/tests.rs
++++ b/crates/proteus-core/src/app_server/tests.rs
+@@ -284,8 +284,8 @@ async fn approval_forwarder_denies_when_client_does_not_answer_before_timeout()
+         .await
+         .expect("approval request event should arrive")
+         .expect("event stream should stay open");
+-    let approval_id = match request_event {
+-        AppServerEvent::ApprovalRequested { request } => request.approval_id,
++    let approval_id = match request_event.as_ref() {
++        AppServerEvent::ApprovalRequested { request } => request.approval_id.clone(),
+         other => panic!("expected approval request, got {other:?}"),
+     };
+ 
+@@ -308,11 +308,11 @@ async fn approval_forwarder_denies_when_client_does_not_answer_before_timeout()
+         .expect("approval resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
++        resolved_event.as_ref(),
+         AppServerEvent::ApprovalResolved {
+             approval_id: id,
+             approved: false,
+-        } if id == approval_id
++        } if id == &approval_id
+     ));
+ }
+ 
+@@ -347,8 +347,8 @@ async fn approval_forwarder_waits_without_timeout_when_timeout_is_zero() {
+         .await
+         .expect("approval request event should arrive")
+         .expect("event stream should stay open");
+-    let approval_id = match request_event {
+-        AppServerEvent::ApprovalRequested { request } => request.approval_id,
++    let approval_id = match request_event.as_ref() {
++        AppServerEvent::ApprovalRequested { request } => request.approval_id.clone(),
+         other => panic!("expected approval request, got {other:?}"),
+     };
+ 
+@@ -395,7 +395,7 @@ async fn user_input_forwarder_waits_without_timeout_when_timeout_is_zero() {
+         .expect("user input request event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        request_event,
++        request_event.as_ref(),
+         AppServerEvent::UserInputRequested { request } if request.request_id == request_id
+     ));
+ 
+@@ -434,11 +434,11 @@ async fn shutdown_denies_pending_approvals() {
+         .expect("approval resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
++        resolved_event.as_ref(),
+         AppServerEvent::ApprovalResolved {
+             approval_id: id,
+             approved: false,
+-        } if id == approval_id
++        } if id == &approval_id
+     ));
+ }
+ 
+@@ -466,8 +466,8 @@ async fn shutdown_resolves_pending_user_inputs() {
+         .expect("user input resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
+-        AppServerEvent::UserInputResolved { request_id: id } if id == request_id
++        resolved_event.as_ref(),
++        AppServerEvent::UserInputResolved { request_id: id } if id == &request_id
+     ));
+ }
+ 
+@@ -506,7 +506,7 @@ async fn dropped_requester_removes_pending_approval_and_resolves_it() {
+         .expect("approval resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
++        resolved_event.as_ref(),
+         AppServerEvent::ApprovalResolved {
+             approval_id: id,
+             approved: false,
+@@ -552,11 +552,11 @@ async fn resolve_pending_approval_forwards_response_and_emits_event() {
+         .expect("approval resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
++        resolved_event.as_ref(),
+         AppServerEvent::ApprovalResolved {
+             approval_id: id,
+             approved: true,
+-        } if id == approval_id
++        } if id == &approval_id
+     ));
+ 
+     let unknown = approvals::resolve_pending_approval(
+@@ -605,7 +605,7 @@ async fn dropped_requester_removes_pending_user_input_and_resolves_it() {
+         .expect("user input resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
++        resolved_event.as_ref(),
+         AppServerEvent::UserInputResolved { request_id: id } if id == "input-cancelled"
+     ));
+ 
+@@ -649,8 +649,8 @@ async fn resolve_pending_user_input_forwards_response_and_emits_event() {
+         .expect("user input resolved event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        resolved_event,
+-        AppServerEvent::UserInputResolved { request_id: id } if id == request_id
++        resolved_event.as_ref(),
++        AppServerEvent::UserInputResolved { request_id: id } if id == &request_id
+     ));
+ 
+     let unknown = user_inputs::resolve_pending_user_input(
+@@ -700,7 +700,7 @@ async fn zero_timeout_pending_user_input_resolves_on_shutdown() {
+         .expect("user input request event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        request_event,
++        request_event.as_ref(),
+         AppServerEvent::UserInputRequested { request } if request.request_id == request_id
+     ));
+ 
+@@ -751,7 +751,7 @@ async fn app_server_forwards_streaming_text_deltas_before_turn_output() {
+             .await
+             .expect("event should arrive")
+             .expect("event stream should stay open");
+-        match event {
++        match event.as_ref() {
+             AppServerEvent::Runtime { envelope } => {
+                 if matches!(envelope.event, Event::AssistantTextDelta { .. }) {
+                     saw_delta = true;
+@@ -910,11 +910,11 @@ enabled = ["reload_probe"]
+         .expect("reload event should arrive")
+         .expect("event stream should stay open");
+     assert!(matches!(
+-        reload_event,
++        reload_event.as_ref(),
+         AppServerEvent::ModulesReloaded {
+             old_epoch: 0,
+             new_epoch: 1,
+-            ref tool_names,
++            tool_names,
+         } if tool_names.iter().any(|name| name == "reload_probe")
+     ));
+ 
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 70c4069..7ada760 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -75,7 +75,9 @@ pub use proteus_contracts::app_protocol::{
+ };
+ 
+ impl AppServerHandle {
+-    pub fn subscribe(&self) -> broadcast::Receiver<AppServerEvent> {
++    /// Raw events share immutable payloads; clone only fields a consumer must own.
++    /// This Rust API returns shared events; HTTP/stdio wire DTOs are unchanged.
++    pub fn subscribe(&self) -> broadcast::Receiver<Arc<AppServerEvent>> {
+         self.events.subscribe()
+     }
+ 
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 622a74e..1f142e1 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1186,6 +1186,19 @@ Shutdown закрывает admission и ждёт завершения runtime;
+ того же `session_id`; `seq` монотонен только внутри этого stream.
+ Это версия pending projection, а не history, config или состояния завершения turn.
+ 
++Прямая Rust-подписка `AppServerHandle::subscribe` возвращает
++`broadcast::Receiver<Arc<AppServerEvent>>`: raw и sequenced rings разделяют
++один immutable payload публикации. Это намеренное изменение Rust API, не
++drop-in совместимость с прежним `Receiver<AppServerEvent>`; caller сопоставляет
++варианты через `event.as_ref()` и получает owned данные только при необходимости.
++HTTP activity watcher читает событие по ссылке, ACP копирует только данные для
++owned projection/ответа. Активный `Arc` может пережить вытеснение из ring.
++`AppSubscription::recv` по-прежнему возвращает owned `AppServerEvent`: сначала
++отбрасывает покрытые snapshot события, затем перемещает уникальный payload или
++клонирует разделяемый. Это не обещание отсутствия копий на SSE/stdio delivery.
++DTO Contracts, `StdioOutput::Event { event: Box<_> }` и JSON wire не меняются;
++порядок публикации sequenced, raw, pending watch и правила lag сохраняются.
++
+ Общая для HTTP и stdio подписка `AppSubscription` сначала возвращает
+ `PendingRequestsUpdated { snapshot }`, затем обновления той же формы.
+ Подписка регистрируется до получения начального снимка. Для pending хранится
