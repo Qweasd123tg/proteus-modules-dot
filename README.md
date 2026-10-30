@@ -9,6 +9,10 @@
 - **Готовые примеры контрактов:** [планировщик шагов](examples/pi-ready-steps/), [блоки контекста](examples/letta-evidence-blocks/), [verification hook](examples/hermes-verify-evidence/), [portable skills](examples/portable-skill-catalog/).
 - **Сборка отдельных компонентов:** [Desktop](build-speed/desktop/), [Extensions](build-speed/extensions/). Применимость каждого patch определяется его собственной базовой ревизией.
 
+- **Новые source-only исправления runtime:** [согласованность настроек, replay после reset и outbound accounting](foundation/2026-10-30/runtime-consistency/). Ограничения и проверенные базы находятся рядом с каждым patch.
+
+- **Новый экспериментальный process hook:** [наблюдатель повторяющихся tool results](research/2026-10-30/loop-observer/). Opt-in исходники и regression sources, без заявления о выполненных runtime-проверках.
+
 ## Как устроен репозиторий
 
 | Каталог | Назначение |

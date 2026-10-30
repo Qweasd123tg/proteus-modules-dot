@@ -1,0 +1,388 @@
+diff --git a/crates/proteus-process-host/src/writer/size/tests.rs b/crates/proteus-process-host/src/writer/size/tests.rs
+new file mode 100644
+index 0000000..08cc361
+--- /dev/null
++++ b/crates/proteus-process-host/src/writer/size/tests.rs
+@@ -0,0 +1,175 @@
++use serde_json::{Number, json};
++
++use super::*;
++
++fn assert_size(value: &Value) {
++    assert_eq!(
++        compact_json_len(value).unwrap(),
++        serde_json::to_vec(value).unwrap().len(),
++        "compact size differs for {value:?}"
++    );
++}
++
++#[test]
++fn every_ascii_byte_matches_for_strings_and_object_keys() {
++    for byte in 0u8..=127 {
++        let text = char::from(byte).to_string();
++        assert_size(&Value::String(text.clone()));
++        let mut object = serde_json::Map::new();
++        object.insert(text.clone(), Value::String(text));
++        assert_size(&Value::Object(object));
++    }
++
++    let controls: String = (0u8..=31).map(char::from).collect();
++    assert_eq!(
++        compact_json_len(&Value::String(controls.clone())).unwrap(),
++        174
++    );
++    assert_size(&json!({"controls": controls, "short": "\"\\\x08\t\n\x0c\r"}));
++    assert_eq!(compact_json_len(&json!("/<> &")).unwrap(), 7);
++}
++
++#[test]
++fn utf8_widths_and_non_ascii_line_separators_are_not_escaped() {
++    let text = "\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}\u{2028}\u{2029}Привет🦀";
++    assert_eq!(compact_json_len(&json!(text)).unwrap(), text.len() + 2);
++    let mut object = serde_json::Map::new();
++    object.insert(text.to_owned(), json!([text, "\n", "\\"]));
++    assert_size(&Value::Object(object));
++}
++
++#[test]
++fn containers_include_exact_punctuation_and_preserve_map_iteration() {
++    for value in [
++        json!(null),
++        json!(true),
++        json!(false),
++        json!(""),
++        json!([]),
++        json!({}),
++        json!([[], {}, [true, false, null]]),
++        json!({"z": [1, "\n"], "a": {}, "": ["🦀", false]}),
++        json!({"$serde_json::private::Number": "1e9999"}),
++        json!({"$serde_json::private::RawValue": "[1,2]"}),
++    ] {
++        assert_size(&value);
++    }
++
++    let mut forward = serde_json::Map::new();
++    let mut reverse = serde_json::Map::new();
++    for (key, value) in [
++        ("z", json!(true)),
++        ("a\n", json!([1, 2])),
++        ("🦀", json!(null)),
++    ] {
++        forward.insert(key.to_owned(), value);
++    }
++    for (key, value) in forward.iter().rev() {
++        reverse.insert(key.clone(), value.clone());
++    }
++    let forward = Value::Object(forward);
++    let reverse = Value::Object(reverse);
++    assert_size(&forward);
++    assert_size(&reverse);
++    assert_eq!(
++        compact_json_len(&forward).unwrap(),
++        compact_json_len(&reverse).unwrap()
++    );
++}
++
++#[test]
++fn numeric_formatting_is_owned_by_serde_json() {
++    for value in [
++        json!(i64::MIN),
++        json!(i64::MAX),
++        json!(u64::MAX),
++        json!(0),
++        json!(-0.0),
++        json!(f64::MIN_POSITIVE),
++        json!(f64::MAX),
++        json!(f64::from_bits(1)),
++    ] {
++        assert_size(&value);
++    }
++    for source in [
++        "-0",
++        "1.00",
++        "1e+10",
++        "1e-100",
++        "1.2345678901234567",
++        "18446744073709551616",
++    ] {
++        let value: Value = serde_json::from_str(source).unwrap();
++        assert_size(&value);
++    }
++    // When arbitrary_precision is enabled by the workspace's feature graph,
++    // these retain long/exponent lexemes rather than passing through f64.
++    let long_integer = "1234567890".repeat(64);
++    for source in ["1e9999", "-1e-9999", long_integer.as_str()] {
++        if let Ok(number) = source.parse::<Number>() {
++            assert_size(&Value::Number(number));
++        }
++    }
++}
++
++#[test]
++fn mixed_trees_and_long_escape_runs_match_the_serializer() {
++    let leaves = [
++        json!(null),
++        json!(false),
++        json!(true),
++        json!(17),
++        json!(-12.5),
++        json!("abc"),
++        json!("\0\n\\\"🦀"),
++        json!([]),
++        json!({}),
++    ];
++    for index in 0..leaves.len() {
++        let mut value = leaves[index].clone();
++        for depth in 0..12 {
++            value = if depth % 2 == 0 {
++                json!([value, leaves[(index + depth) % leaves.len()]])
++            } else {
++                json!({"\n🦀": value, "": leaves[(index + depth) % leaves.len()]})
++            };
++            assert_size(&value);
++        }
++    }
++    assert_size(&json!([
++        "\0\n\"\\".repeat(4096),
++        "plain UTF-8 🦀".repeat(4096)
++    ]));
++}
++
++#[test]
++fn overflow_is_reported_without_wrapping_or_partial_success() {
++    let mut size = JsonSize { bytes: usize::MAX };
++    size.add(0).unwrap();
++    let error = size.add(1).unwrap_err();
++    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
++    assert_eq!(error.to_string(), "JSON frame length overflow");
++    assert_eq!(size.bytes, usize::MAX);
++
++    for value in [
++        json!(null),
++        json!(false),
++        json!(1),
++        json!(""),
++        json!([]),
++        json!({}),
++    ] {
++        let mut size = JsonSize { bytes: usize::MAX };
++        assert_eq!(
++            size.value(&value).unwrap_err().to_string(),
++            "JSON frame length overflow"
++        );
++    }
++    let mut size = JsonSize {
++        bytes: usize::MAX - 3,
++    };
++    assert!(
++        size.string("\0").is_err(),
++        "escape expansion must also be checked"
++    );
++}
+diff --git a/crates/proteus-process-host/src/writer/size.rs b/crates/proteus-process-host/src/writer/size.rs
+new file mode 100644
+index 0000000..386a461
+--- /dev/null
++++ b/crates/proteus-process-host/src/writer/size.rs
+@@ -0,0 +1,83 @@
++use std::io::{self, Write};
++
++use anyhow::Result;
++use serde_json::Value;
++
++/// Exact compact JSON size for the already-owned transport Value.
++///
++/// This is not a generic Serialize size hint: it mirrors the six Value variants
++/// and serde_json's default compact string escaping. Number formatting remains
++/// delegated to serde_json, including feature-dependent number representations.
++/// The entire Value is measured before the writer reserves any queue bytes.
++pub(super) fn compact_json_len(value: &Value) -> Result<usize> {
++    let mut size = JsonSize::default();
++    size.value(value)?;
++    Ok(size.bytes)
++}
++
++#[derive(Default)]
++struct JsonSize {
++    bytes: usize,
++}
++
++impl JsonSize {
++    fn add(&mut self, bytes: usize) -> io::Result<()> {
++        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::FileTooLarge, "JSON frame length overflow")
++        })?;
++        Ok(())
++    }
++
++    fn string(&mut self, value: &str) -> io::Result<()> {
++        self.add(2)?; // Quotes.
++        self.add(value.len())?; // UTF-8, not Unicode scalar count.
++        for byte in value.bytes() {
++            match byte {
++                b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => self.add(1)?,
++                0x00..=0x1f => self.add(5)?, // Six-byte \u00XX replaces one byte.
++                _ => {}
++            }
++        }
++        Ok(())
++    }
++
++    fn value(&mut self, value: &Value) -> Result<()> {
++        match value {
++            Value::Null => self.add(4)?,
++            Value::Bool(value) => self.add(if *value { 4 } else { 5 })?,
++            Value::Number(number) => serde_json::to_writer(&mut *self, number)?,
++            Value::String(value) => self.string(value)?,
++            Value::Array(values) => {
++                self.add(2)?; // Brackets.
++                self.add(values.len().saturating_sub(1))?; // Commas.
++                for value in values {
++                    self.value(value)?;
++                }
++            }
++            Value::Object(values) => {
++                self.add(2)?; // Braces.
++                self.add(values.len().saturating_sub(1))?; // Commas.
++                for (key, value) in values {
++                    self.string(key)?;
++                    self.add(1)?; // Colon.
++                    self.value(value)?;
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
++impl Write for JsonSize {
++    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
++        self.add(buffer.len())?;
++        Ok(buffer.len())
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-process-host/src/writer.rs b/crates/proteus-process-host/src/writer.rs
+index 2fc6b84..4320a9a 100644
+--- a/crates/proteus-process-host/src/writer.rs
++++ b/crates/proteus-process-host/src/writer.rs
+@@ -12,7 +12,11 @@ use std::{
+ 
+ use serde_json::Value;
+ 
+-use crate::{Framing, ProcessLifecycle, ProcessWake, receive::compact_json_len};
++use crate::{Framing, ProcessLifecycle, ProcessWake};
++
++mod size;
++
++use size::compact_json_len;
+ 
+ /// Default number of data frames that may wait for the dedicated stdin writer.
+ pub const DEFAULT_MAX_QUEUED_WRITES: usize = 256;
+diff --git a/crates/proteus-process-host/tests/session.rs b/crates/proteus-process-host/tests/session.rs
+index 2ce8a2c..d1772e8 100644
+--- a/crates/proteus-process-host/tests/session.rs
++++ b/crates/proteus-process-host/tests/session.rs
+@@ -65,6 +65,10 @@ fn run_tests() -> Result<()> {
+             "writer_frame_and_byte_limits_are_enforced",
+             writer_frame_and_byte_limits_are_enforced,
+         ),
++        (
++            "writer_exact_lengths_cover_escaping_and_error_precedence",
++            writer_exact_lengths_cover_escaping_and_error_precedence,
++        ),
+         (
+             "slow_transport_consumer_remains_receive_bounded",
+             slow_transport_consumer_remains_receive_bounded,
+@@ -393,6 +397,63 @@ fn writer_frame_and_byte_limits_are_enforced() -> Result<()> {
+     Ok(())
+ }
+ 
++fn writer_exact_lengths_cover_escaping_and_error_precedence() -> Result<()> {
++    let frame = request(
++        "exact-size",
++        "echo",
++        json!({
++            "\0\n\"\\🦀": [null, true, false, -0.0, u64::MAX, "\u{2028}\u{2029}"],
++            "controls": (0u8..=31).map(char::from).collect::<String>(),
++        }),
++    );
++    let bytes = serde_json::to_vec(&frame)?.len();
++    let spec = mock_spec("newline")?;
++    let limits = ProcessTransportLimits::new(ReceiveLimits::default(), 4)
++        .with_control_queue(2)
++        .with_write_byte_limits(bytes, bytes, bytes);
++    let mut exact =
++        ProcessTransport::spawn_with_limits(&spec, NewlineJsonFraming::default(), limits)?;
++    let writer = exact.frame_writer();
++    writer.send_frame(frame.clone())?;
++    assert_eq!(exact.recv_frame(SHORT_TIMEOUT)?["result"], frame["params"]);
++    writer.send_control_frame(frame.clone())?;
++    assert_eq!(exact.recv_frame(SHORT_TIMEOUT)?["result"], frame["params"]);
++    exact.terminate()?;
++
++    // FrameTooLarge still wins even when the whole frame also exceeds the
++    // lane byte budget. Admission must not stop at the first escape fragment.
++    for (max_frame, max_queue, frame_error) in [(bytes - 1, 1, true), (bytes, bytes - 1, false)] {
++        let limits = ProcessTransportLimits::new(ReceiveLimits::default(), 4)
++            .with_control_queue(2)
++            .with_write_byte_limits(max_frame, max_queue, max_queue);
++        let mut transport =
++            ProcessTransport::spawn_with_limits(&spec, NewlineJsonFraming::default(), limits)?;
++        let writer = transport.frame_writer();
++        for error in [
++            writer.queue_frame(frame.clone()).unwrap_err(),
++            writer.queue_control_frame(frame.clone()).unwrap_err(),
++        ] {
++            if frame_error {
++                assert_eq!(
++                    error,
++                    SendFrameError::FrameTooLarge {
++                        bytes,
++                        max_frame_bytes: max_frame
++                    }
++                );
++            } else {
++                assert!(matches!(error, SendFrameError::QueueBytesFull {
++                    attempted_bytes,
++                    max_queued_bytes,
++                    ..
++                } if attempted_bytes == bytes && max_queued_bytes == max_queue));
++            }
++        }
++        transport.terminate()?;
++    }
++    Ok(())
++}
++
+ fn request(id: &str, method: &str, params: Value) -> Value {
+     json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
+ }
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 2f61675..56f83ac 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -632,6 +632,17 @@ enqueue, frame, completion, child exit и закрытие terminal receiver б
+ ядро или платформа не поддерживает pidfd. Per-component потоки и failure
+ domains сохраняются; это не общий process/I/O pool.
+ 
++Outbound byte admission целиком измеряет принадлежащий вызову `serde_json::Value`
++до атомарного резервирования lane budget. Для compact JSON строк и контейнеров
++считаются UTF-8 bytes, escape expansion и punctuation без генерации промежуточных
++JSON fragments; числа форматируются самим `serde_json`. Это по-прежнему полный
++обход, а не size hint и не ранняя остановка по quota. Receive accounting сохраняет
++свой serializer counter. Data/control queues, framing callbacks и момент
++освобождения permits не меняются: нет staging lane, partial reservations или
++ожидания чужой сериализации. Sole writer затем сериализует принятый `Value`;
++его активный JSON buffer сохраняется. Byte budgets ограничивают compact JSON,
++а не полный RSS/allocator overhead процесса.
++
+ Initialize использует один `handshake_timeout_ms` для подготовки, записи
+ кадра и получения ответа; зависшая запись завершает конкретное поколение.
+ Лимит Content-Length headers действует во время накопления байтов, включая
