@@ -1,0 +1,203 @@
+diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
+index b7e46d8..2678e8e 100644
+--- a/.github/workflows/check.yml
++++ b/.github/workflows/check.yml
+@@ -57,11 +57,13 @@ jobs:
+           restore-keys: deps-${{ runner.os }}-${{ runner.arch }}-rust1.95-node22-
+       - name: Formatting
+         run: cargo fmt --all -- --check
++      - name: Test runner feature selection
++        run: python3 -m unittest discover -s scripts -p 'test_conformance_selection.py'
+       - name: Workspace gate with real process fixtures
+         run: python3 scripts/test.py full
+       - name: Standalone Rust SDK starter and process conformance
+         run: |
+           export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+           cargo build --locked --manifest-path examples/modules/rust-tool/Cargo.toml
+-          cargo build --locked -p proteus-module-protocol --bin proteus-component-conformance
++          cargo build --locked -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance
+           python3 examples/modules/rust-tool/smoke.py --module "$CARGO_TARGET_DIR/debug/proteus-rust-tool-example" --conformance "$CARGO_TARGET_DIR/debug/proteus-component-conformance"
+diff --git a/crates/proteus-module-protocol/Cargo.toml b/crates/proteus-module-protocol/Cargo.toml
+index d0c747f..a4e77a9 100644
+--- a/crates/proteus-module-protocol/Cargo.toml
++++ b/crates/proteus-module-protocol/Cargo.toml
+@@ -3,11 +3,20 @@ name = "proteus-module-protocol"
+ version = "0.1.0-alpha.2"
+ edition = "2024"
+ 
++[features]
++default = []
++conformance-cli = ["dep:clap"]
++
++[[bin]]
++name = "proteus-component-conformance"
++path = "src/bin/proteus-component-conformance.rs"
++required-features = ["conformance-cli"]
++
+ [dependencies]
+ proteus-contracts = { path = "../proteus-contracts" }
+ proteus-process-host = { path = "../proteus-process-host" }
+ anyhow = "1"
+-clap = { version = "4", features = ["derive"] }
++clap = { version = "4", features = ["derive"], optional = true }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ tokio = { version = "1", features = ["rt", "sync", "time"] }
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 958c94b..6db1254 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -855,7 +855,7 @@ JS/TS [`hook-process`](../../examples/modules/hook-process/README.md) испол
+ Новый component проверяется CLI:
+ 
+ ```bash
+-cargo run -p proteus-module-protocol --bin proteus-component-conformance -- \
++cargo run -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance -- \
+   --component-id python-search \
+   --export '{"slot":"tool","module_id":"python_rg","contract_version":"v6","module_config":{}}' \
+   --probe-export tool/python_rg \
+diff --git a/docs/development/testing.md b/docs/development/testing.md
+index 0d625df..ec51cbf 100644
+--- a/docs/development/testing.md
++++ b/docs/development/testing.md
+@@ -98,6 +98,14 @@ Runner готовит reference-модуль из отдельного Proteus-m
+ и в полном gate; его свежесть обеспечивает вызывающий сценарий. Отсутствующий
+ файл — ошибка. Отложенный DCP не подготавливается общим runner.
+ 
++Conformance CLI включается feature `proteus-module-protocol/conformance-cli`.
++`full` включает её явно, сохраняя unit tests бинарника. Для отдельной проверки:
++`./scripts/test.py -p proteus-module-protocol --features conformance-cli`.
++Обычная зависимость от protocol не включает CLI parser; wire, authority,
++cancellation и schema validation не меняются. Cargo features объединяются:
++отдельно проверьте normal dependency tree выбранного worker, а не только
++workspace tests. `Cargo.lock` может сохранять clap для других targets.
++
+ `full` выбирает пять crates harness, включая worker SDK. Реализации проверяются
+ своим `python3 scripts/test.py full` в Proteus-modules. В приложении обычный
+ `python3 scripts/test.py` из Proteus-desktop проверяет только GPUI workspace
+diff --git a/examples/modules/agent-worker/README.md b/examples/modules/agent-worker/README.md
+index c121f9a..bc618d4 100644
+--- a/examples/modules/agent-worker/README.md
++++ b/examples/modules/agent-worker/README.md
+@@ -31,7 +31,7 @@ executable + config-ом без Rust adapter под конкретный `module
+ Из корня репозитория:
+ 
+ ```bash
+-cargo run -p proteus-module-protocol --bin proteus-component-conformance -- \
++cargo run -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance -- \
+   --component-id python-agent \
+   --export '{"slot":"workflow","module_id":"python_agent_loop","contract_version":"v20","module_config":{}}' \
+   -- python3 -B examples/modules/agent-worker/agent.py
+diff --git a/examples/modules/context-preparation-process/README.md b/examples/modules/context-preparation-process/README.md
+index c03883f..29be84b 100644
+--- a/examples/modules/context-preparation-process/README.md
++++ b/examples/modules/context-preparation-process/README.md
+@@ -62,7 +62,7 @@ Model request nullable: алгоритм работает и без модели
+ можно проверить отдельно от core:
+ 
+ ```bash
+-cargo run -p proteus-module-protocol --bin proteus-component-conformance -- \
++cargo run -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance -- \
+   --component-id python-compactor \
+   --export '{"slot":"hook","module_id":"python_suffix","contract_version":"v6","module_config":{"trigger_messages":12,"retain_user_turns":2}}' \
+   -- python3 examples/modules/context-preparation-process/prepare.py
+diff --git a/examples/modules/hook-process/README.md b/examples/modules/hook-process/README.md
+index 1dbec6a..846f30f 100644
+--- a/examples/modules/hook-process/README.md
++++ b/examples/modules/hook-process/README.md
+@@ -228,7 +228,7 @@ contract. Они не считаются успешно перенесённым
+ ```bash
+ node --test examples/modules/hook-process/tests/*.test.mjs
+ ./scripts/test.py -p proteus-core --test hook_runtime --test module_swap
+-cargo run -p proteus-module-protocol --bin proteus-component-conformance -- \
++cargo run -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance -- \
+   --component-id js-hooks \
+   --export '{"slot":"hook","module_id":"ported-pi","contract_version":"v6","module_config":{"entry":"examples/modules/hook-process/entries/pi.ts"}}' \
+   --probe-export hook/ported-pi --probe-method hook.invoke \
+diff --git a/examples/modules/rust-tool/README.md b/examples/modules/rust-tool/README.md
+index fd3ad05..6474004 100644
+--- a/examples/modules/rust-tool/README.md
++++ b/examples/modules/rust-tool/README.md
+@@ -48,7 +48,7 @@ workflow и context. Если `[tools]` уже существует, добав
+ Из корня Core соберите публичный conformance CLI один раз:
+ 
+ ```bash
+-cargo build --locked -p proteus-module-protocol --bin proteus-component-conformance
++cargo build --locked -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance
+ python3 examples/modules/rust-tool/smoke.py \
+   --conformance target/debug/proteus-component-conformance \
+   --module examples/modules/rust-tool/target/debug/proteus-rust-tool-example
+diff --git a/examples/modules/search-process/README.md b/examples/modules/search-process/README.md
+index cfacd66..3abd7a7 100644
+--- a/examples/modules/search-process/README.md
++++ b/examples/modules/search-process/README.md
+@@ -48,7 +48,7 @@ Tool получает canonical `ToolCall`, cwd и обязательную exec
+ protocol smoke без запуска всего `proteus-core`:
+ 
+ ```bash
+-cargo run -p proteus-module-protocol --bin proteus-component-conformance -- \
++cargo run -p proteus-module-protocol --features conformance-cli --bin proteus-component-conformance -- \
+   --component-id python-search \
+   --export '{"slot":"tool","module_id":"python_rg","contract_version":"v6","module_config":{}}' \
+   --probe-export tool/python_rg \
+diff --git a/scripts/test.py b/scripts/test.py
+index cfb44c0..f10729a 100644
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -43,7 +43,8 @@ def main(args):
+         return 0 if args else 2
+     full = args[0] == "full"
+     if full:
+-        args = ["--workspace", "--no-fail-fast", *args[1:]]
++        args = ["--workspace", "--no-fail-fast",
++                "--features", "proteus-module-protocol/conformance-cli", *args[1:]]
+     elif not selected_packages(args):
+         raise SystemExit("Select -p PACKAGE, or full for the harness workspace gate")
+     env = test_env()
+diff --git a/scripts/test_conformance_selection.py b/scripts/test_conformance_selection.py
+new file mode 100644
+index 0000000..f515be5
+--- /dev/null
++++ b/scripts/test_conformance_selection.py
+@@ -0,0 +1,41 @@
++"""Runner-selection regression source; no Cargo or fixture process is started."""
++import unittest
++from unittest.mock import patch
++
++import test as runner
++
++
++class ConformanceSelection(unittest.TestCase):
++    def invoke(self, arguments):
++        with (patch.object(runner, "test_env", return_value={}),
++              patch.object(runner, "build_packages", return_value={}) as packages,
++              patch.object(runner, "build", return_value="/fixture/reference") as reference,
++              patch.object(runner.subprocess, "call", return_value=0) as cargo):
++            self.assertEqual(runner.main(arguments), 0)
++        return cargo.call_args.args[0], packages.call_count, reference.call_count
++
++    def test_full_preserves_conformance_binary_coverage(self):
++        command, packages, reference = self.invoke(["full", "--", "--nocapture"])
++        self.assertEqual(command, [
++            "cargo", "test", "--locked", "--workspace", "--no-fail-fast",
++            "--features", "proteus-module-protocol/conformance-cli",
++            "--", "--nocapture",
++        ])
++        self.assertEqual((packages, reference), (1, 1))
++
++    def test_selected_protocol_stays_library_only_by_default(self):
++        command, packages, reference = self.invoke(["-p", "proteus-module-protocol"])
++        self.assertEqual(command, [
++            "cargo", "test", "--locked", "-p", "proteus-module-protocol",
++        ])
++        self.assertEqual((packages, reference), (0, 0))
++
++    def test_explicit_cli_feature_is_forwarded_without_core_fixtures(self):
++        arguments = ["-p", "proteus-module-protocol", "--features", "conformance-cli"]
++        command, packages, reference = self.invoke(arguments)
++        self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++        self.assertEqual((packages, reference), (0, 0))
++
++
++if __name__ == "__main__":
++    unittest.main()
