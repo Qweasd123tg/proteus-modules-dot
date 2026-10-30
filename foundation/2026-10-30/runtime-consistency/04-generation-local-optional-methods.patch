@@ -1,0 +1,626 @@
+diff --git a/crates/proteus-core/src/process_adapters/client.rs b/crates/proteus-core/src/process_adapters/client.rs
+--- a/crates/proteus-core/src/process_adapters/client.rs
++++ b/crates/proteus-core/src/process_adapters/client.rs
+@@ -169,15 +169,6 @@
+ 
+     pub fn module_id(&self) -> &str {
+         &self.module_id
+-    }
+-
+-    /// Read the acknowledgement of this export in the current process generation.
+-    pub fn supports_feature(&self, feature: &str) -> Result<bool> {
+-        Ok(self.broker.manifest()?.exports.iter().any(|export| {
+-            export.slot == self.target.slot
+-                && export.module_id == self.target.module_id
+-                && export.module_features.iter().any(|value| value == feature)
+-        }))
+     }
+ 
+     pub(super) async fn start(
+@@ -223,7 +214,7 @@
+         })
+     }
+ 
+-    fn invocation_context(&self, method: &str) -> String {
++    pub(super) fn invocation_context(&self, method: &str) -> String {
+         format!(
+             "process component {:?} export {:?}: {method} invocation failed",
+             self.component_id, self.module_id
+diff --git a/crates/proteus-core/src/process_adapters/model.rs b/crates/proteus-core/src/process_adapters/model.rs
+--- a/crates/proteus-core/src/process_adapters/model.rs
++++ b/crates/proteus-core/src/process_adapters/model.rs
+@@ -6,14 +6,14 @@
+     sync::{Arc, Mutex as StdMutex},
+ };
+ 
+-use anyhow::{Result, bail};
++use anyhow::{Context, Result, bail};
+ use async_trait::async_trait;
+ use futures_util::Stream;
+ use proteus_module_protocol::{
+     ProcessModuleRpcError,
+     v3::{
+-        AsyncHostRequestDispatcher, CancelCause, ComponentHostRequest, HostRequestFuture,
+-        InvocationCancelHandle,
++        AsyncHostRequestDispatcher, CancelCause, ComponentBrokerErrorKind, ComponentHostRequest,
++        HostRequestFuture, InvocationCancelHandle, InvocationHandle,
+     },
+ };
+ use serde_json::Value;
+@@ -38,6 +38,22 @@
+ }
+ 
+ impl ProcessModel {
++    async fn start_metadata(&self, method: &str) -> Result<Option<InvocationHandle>> {
++        match self
++            .client
++            .start(
++                method,
++                Value::Null,
++                Arc::new(proteus_module_protocol::v3::NoAsyncHostRequests),
++            )
++            .await
++        {
++            Ok(handle) => Ok(Some(handle)),
++            Err(error) if error.kind == ComponentBrokerErrorKind::UnsupportedFeature => Ok(None),
++            Err(error) => Err(error.into()),
++        }
++    }
++
+     pub fn new(
+         config: ProcessExportConfig,
+         cwd: &Path,
+@@ -189,16 +205,20 @@
+     }
+ 
+     async fn catalog(&self) -> Result<Option<crate::contracts::ModelCatalog>> {
+-        if !self
+-            .client
+-            .supports_feature(crate::contracts::MODEL_CATALOG_FEATURE)?
+-        {
++        let method = crate::contracts::PROCESS_MODEL_CATALOG_METHOD;
++        let Some(mut handle) = self
++            .start_metadata(method)
++            .await
++            .with_context(|| self.client.invocation_context(method))?
++        else {
+             return Ok(None);
+-        }
+-        let result: Option<crate::contracts::ModelCatalog> = self
+-            .client
+-            .invoke(crate::contracts::PROCESS_MODEL_CATALOG_METHOD, &Value::Null)
+-            .await?;
++        };
++        let terminal = handle
++            .result()
++            .await
++            .with_context(|| self.client.invocation_context(method))?;
++        let result: Option<crate::contracts::ModelCatalog> =
++            self.client.decode(method, terminal)?;
+         if let Some(catalog) = &result {
+             if let Err(error) = catalog.validate() {
+                 self.client.reset();
+@@ -209,21 +229,10 @@
+     }
+ 
+     async fn quota(&self) -> Result<Option<crate::contracts::ModelQuotaSnapshot>> {
+-        if !self
+-            .client
+-            .supports_feature(crate::contracts::MODEL_QUOTA_FEATURE)?
+-        {
++        let method = crate::contracts::PROCESS_MODEL_QUOTA_METHOD;
++        let Some(mut handle) = self.start_metadata(method).await? else {
+             return Ok(None);
+-        }
+-        let method = crate::contracts::PROCESS_MODEL_QUOTA_METHOD;
+-        let mut handle = self
+-            .client
+-            .start(
+-                method,
+-                Value::Null,
+-                Arc::new(proteus_module_protocol::v3::NoAsyncHostRequests),
+-            )
+-            .await?;
++        };
+         let mut guard = CancelOnDrop(Some(handle.cancel_handle()));
+         let terminal = handle.result().await?;
+         guard.disarm();
+diff --git a/crates/proteus-core/tests/fixtures/process_model.py b/crates/proteus-core/tests/fixtures/process_model.py
+--- a/crates/proteus-core/tests/fixtures/process_model.py
++++ b/crates/proteus-core/tests/fixtures/process_model.py
+@@ -34,6 +34,8 @@
+ 
+ def invoke(context, method, params):
+     config = settings[context.export["module_id"]]
++    if method in config.get("metadata_errors", {}):
++        raise ProtocolError(config["metadata_errors"][method])
+     if method == "describe":
+         if not isinstance(params, dict) or set(params) != {"model"} or set(params["model"]) != {"provider", "model"}:
+             raise ProtocolError("describe expects a ModelRef")
+diff --git a/crates/proteus-core/tests/model_process/features.rs b/crates/proteus-core/tests/model_process/features.rs
+--- a/crates/proteus-core/tests/model_process/features.rs
++++ b/crates/proteus-core/tests/model_process/features.rs
+@@ -33,3 +33,22 @@
+         );
+     }
+ }
++
++#[tokio::test]
++async fn acknowledged_metadata_errors_cannot_masquerade_as_missing_features() {
++    let cwd = tempfile::tempdir().unwrap();
++    let mut settings = settings();
++    settings["metadata_errors"] = json!({
++        "catalog": "UnsupportedFeature: model.catalog.v1 was not acknowledged",
++        "quota": "UnsupportedFeature: model.quota.v1 was not acknowledged"
++    });
++    let adapter = model(&config("claimed", settings), cwd.path()).unwrap();
++    let catalog_error = adapter.catalog().await.unwrap_err();
++    let quota_error = adapter.quota().await.unwrap_err();
++    assert!(format!("{catalog_error:#}").contains("UnsupportedFeature"));
++    assert!(format!("{quota_error:#}").contains("UnsupportedFeature"));
++    assert_eq!(
++        adapter.complete(request("claimed")).await.unwrap(),
++        response()
++    );
++}
+diff --git a/crates/proteus-module-protocol/src/authority.rs b/crates/proteus-module-protocol/src/authority.rs
+--- a/crates/proteus-module-protocol/src/authority.rs
++++ b/crates/proteus-module-protocol/src/authority.rs
+@@ -57,6 +57,8 @@
+     pub contract_version: &'static str,
+     pub composition: ProcessModuleComposition,
+     pub module_methods: &'static [&'static str],
++    /// Optional method -> per-export acknowledgement required at admission.
++    pub module_method_features: &'static [(&'static str, &'static str)],
+     pub host_methods: &'static [&'static str],
+     pub host_features: &'static [&'static str],
+     pub required_features: &'static [&'static str],
+@@ -69,6 +71,12 @@
+ 
+     pub fn allows_module_method(self, method: &str) -> bool {
+         self.module_methods.contains(&method)
++    }
++
++    pub(crate) fn feature_for_module_method(self, method: &str) -> Option<&'static str> {
++        self.module_method_features
++            .iter()
++            .find_map(|(candidate, feature)| (*candidate == method).then_some(*feature))
+     }
+ }
+ 
+@@ -86,6 +94,16 @@
+             PROCESS_MODEL_QUOTA_METHOD,
+             PROCESS_MODEL_STREAM_METHOD,
+         ],
++        module_method_features: &[
++            (
++                PROCESS_MODEL_CATALOG_METHOD,
++                proteus_contracts::contracts::MODEL_CATALOG_FEATURE,
++            ),
++            (
++                PROCESS_MODEL_QUOTA_METHOD,
++                proteus_contracts::contracts::MODEL_QUOTA_FEATURE,
++            ),
++        ],
+         host_methods: &[MODEL_HOST_EMIT_METHOD],
+         host_features: &[
+             proteus_contracts::contracts::MODEL_CATALOG_FEATURE,
+@@ -98,6 +116,7 @@
+         contract_version: PROCESS_HOOK_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::OrderedMany,
+         module_methods: &[PROCESS_HOOK_INVOKE_METHOD],
++        module_method_features: &[],
+         host_methods: OPERATION_HOST_METHODS,
+         host_features: NO_PROTOCOL_FEATURES,
+         required_features: NO_PROTOCOL_FEATURES,
+@@ -107,6 +126,7 @@
+         contract_version: PROCESS_POLICY_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::SelectOne,
+         module_methods: POLICY_METHODS,
++        module_method_features: &[],
+         host_methods: NO_HOST_METHODS,
+         host_features: NO_PROTOCOL_FEATURES,
+         required_features: NO_PROTOCOL_FEATURES,
+@@ -116,6 +136,7 @@
+         contract_version: PROCESS_CONTEXT_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::SelectOne,
+         module_methods: CONTEXT_METHODS,
++        module_method_features: &[],
+         host_methods: CONTEXT_HOST_METHODS,
+         host_features: NO_PROTOCOL_FEATURES,
+         required_features: NO_PROTOCOL_FEATURES,
+@@ -125,6 +146,7 @@
+         contract_version: PROCESS_CONTEXT_PROVIDER_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::OrderedMany,
+         module_methods: CONTEXT_PROVIDER_METHODS,
++        module_method_features: &[],
+         host_methods: NO_HOST_METHODS,
+         host_features: NO_PROTOCOL_FEATURES,
+         required_features: NO_PROTOCOL_FEATURES,
+@@ -134,6 +156,7 @@
+         contract_version: PROCESS_TOOL_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::OrderedMany,
+         module_methods: TOOL_METHODS,
++        module_method_features: &[],
+         host_methods: &[
+             OPERATION_HOST_COMPLETE_MODEL_METHOD,
+             OPERATION_HOST_EXECUTE_TOOL_METHOD,
+@@ -148,6 +171,7 @@
+         contract_version: PROCESS_WORKFLOW_CONTRACT_VERSION,
+         composition: ProcessModuleComposition::SelectOne,
+         module_methods: WORKFLOW_METHODS,
++        module_method_features: &[],
+         host_methods: WORKFLOW_HOST_METHODS,
+         host_features: NO_PROTOCOL_FEATURES,
+         required_features: NO_PROTOCOL_FEATURES,
+@@ -196,6 +220,15 @@
+             "component config requires exactly one current contract per slot"
+         );
+         for authority in PROCESS_CONTRACT_AUTHORITIES {
++            let mut feature_methods = BTreeSet::new();
++            for (method, feature) in authority.module_method_features {
++                assert!(authority.module_methods.contains(method));
++                assert!(authority.host_features.contains(feature));
++                assert!(
++                    feature_methods.insert(method),
++                    "ambiguous method acknowledgement"
++                );
++            }
+             assert!(
+                 authority
+                     .required_features
+diff --git a/crates/proteus-module-protocol/src/v3/invocation.rs b/crates/proteus-module-protocol/src/v3/invocation.rs
+--- a/crates/proteus-module-protocol/src/v3/invocation.rs
++++ b/crates/proteus-module-protocol/src/v3/invocation.rs
+@@ -140,6 +140,8 @@
+     ParentInactive,
+     RuntimeUnavailable,
+     BootstrapClosed,
++    /// The current generation did not acknowledge this optional export method.
++    UnsupportedFeature,
+     Stopped,
+ }
+ 
+diff --git a/crates/proteus-module-protocol/src/v3/runtime.rs b/crates/proteus-module-protocol/src/v3/runtime.rs
+--- a/crates/proteus-module-protocol/src/v3/runtime.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime.rs
+@@ -328,6 +328,32 @@
+         if request.terminal.receiver_dropped() {
+             return;
+         }
++        if let Some(feature) = authority.feature_for_module_method(&request.method) {
++            let acknowledged = self
++                .worker
++                .as_ref()
++                .expect("initialized worker")
++                .manifest
++                .exports
++                .iter()
++                .any(|export| {
++                    export.slot == request.target.slot
++                        && export.module_id == request.target.module_id
++                        && export.module_features.iter().any(|value| value == feature)
++                });
++            if !acknowledged {
++                // This is an admission disposition, never a worker-supplied
++                // RPC error. Reject before allocating an id or touching siblings.
++                request.ack.send(Err(ComponentBrokerError::new(
++                    ComponentBrokerErrorKind::UnsupportedFeature,
++                    format!(
++                        "component generation {} export {}/{} did not acknowledge {feature:?}",
++                        self.generation, request.target.slot, request.target.module_id
++                    ),
++                )));
++                return;
++            }
++        }
+         let id = wire::host_id(self.generation, self.next_host_sequence);
+         self.next_host_sequence = self.next_host_sequence.saturating_add(1);
+         let root_id = if root_id.is_empty() {
+diff --git a/crates/proteus-module-protocol/src/v3/runtime_tests.rs b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+--- a/crates/proteus-module-protocol/src/v3/runtime_tests.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+@@ -8,7 +8,11 @@
+ };
+ 
+ use anyhow::{Context, Result, ensure};
+-use proteus_contracts::contracts::{PROCESS_WORKFLOW_CONTRACT_VERSION, PROCESS_WORKFLOW_METHOD};
++use proteus_contracts::contracts::{
++    MODEL_CATALOG_FEATURE, MODEL_QUOTA_FEATURE, PROCESS_MODEL_CATALOG_METHOD,
++    PROCESS_MODEL_CONTRACT_VERSION, PROCESS_MODEL_DESCRIBE_METHOD, PROCESS_MODEL_QUOTA_METHOD,
++    PROCESS_WORKFLOW_CONTRACT_VERSION, PROCESS_WORKFLOW_METHOD,
++};
+ use proteus_process_host::ProcessSpec;
+ use serde_json::{Value, json};
+ use tokio::sync::oneshot;
+@@ -17,8 +21,8 @@
+     broker::{StartAck, StartRequest},
+     config::ComponentBrokerOptions,
+     invocation::{
+-        CancelCause, ComponentBrokerError, ComponentFailure, InvocationRef, InvocationTerminal,
+-        NoAsyncHostRequests, StartMeta,
++        CancelCause, ComponentBrokerError, ComponentBrokerErrorKind, ComponentFailure,
++        InvocationRef, InvocationTerminal, NoAsyncHostRequests, StartMeta,
+     },
+     notification::NotificationSink,
+     pending::{LoopState, TerminalSender},
+@@ -126,17 +130,33 @@
+ 
+ #[test]
+ fn abandoned_start_during_restart_is_not_dispatched() -> Result<()> {
++    check_abandoned_restart(false)
++}
++
++#[test]
++fn abandoned_optional_start_during_restart_is_not_dispatched() -> Result<()> {
++    check_abandoned_restart(true)
++}
++
++fn check_abandoned_restart(optional_method: bool) -> Result<()> {
+     let listener = TcpListener::bind(("127.0.0.1", 0))?;
+     listener.set_nonblocking(true)?;
+     let spec = fixture().env(
+         "PROTEUS_TEST_RESTART_HANDSHAKE_PORT",
+         listener.local_addr()?.port().to_string(),
+     );
+-    let mut state = state(spec)?;
++    let mut state = if optional_method {
++        feature_state(spec)?
++    } else {
++        state(spec)?
++    };
+     state.ensure_worker()?;
+     state.reset_generation(ComponentFailure::Shutdown);
+     ensure!(state.generation == 2);
+     let (mut request, _, _) = request(&state, json!({"op": "wait_cancel"}), None);
++    if optional_method {
++        request.method = PROCESS_MODEL_QUOTA_METHOD.to_owned();
++    }
+     let (terminal_tx, terminal_rx) = oneshot::channel();
+     let (ack_tx, ack_rx) = oneshot::channel();
+     request.terminal = TerminalSender::Async(terminal_tx);
+@@ -350,3 +370,208 @@
+         }
+     }
+ }
++
++fn feature_state(spec: ProcessSpec) -> Result<LoopState> {
++    let mut state = state(spec)?;
++    state.binding = ProcessComponentBinding::new(
++        "feature-admission",
++        [
++            ProcessExportBinding::new(
++                "model",
++                "changing",
++                PROCESS_MODEL_CONTRACT_VERSION,
++                json!({"features_by_generation": {
++                    "1": [MODEL_QUOTA_FEATURE], "2": [], "3": [MODEL_CATALOG_FEATURE]
++                }}),
++            )?,
++            ProcessExportBinding::new(
++                "model",
++                "sibling",
++                PROCESS_MODEL_CONTRACT_VERSION,
++                json!({"features": [MODEL_CATALOG_FEATURE]}),
++            )?,
++            ProcessExportBinding::new(
++                "workflow",
++                "parent",
++                PROCESS_WORKFLOW_CONTRACT_VERSION,
++                json!({}),
++            )?,
++        ],
++    )?;
++    Ok(state)
++}
++
++fn feature_request(
++    state: &LoopState,
++    export: usize,
++    method: &str,
++    parent: Option<InvocationRef>,
++) -> (
++    StartRequest,
++    mpsc::Receiver<Result<StartMeta, ComponentBrokerError>>,
++    mpsc::Receiver<InvocationTerminal>,
++) {
++    let (mut request, ack, terminal) =
++        request(state, json!({"op": "echo", "value": method}), parent);
++    request.target = state.binding.exports[export].export_ref();
++    request.method = method.to_owned();
++    (request, ack, terminal)
++}
++
++fn finish_feature_call(
++    state: &mut LoopState,
++    export: usize,
++    method: &str,
++    parent: Option<InvocationRef>,
++) -> Result<StartMeta> {
++    let (request, ack, terminal) = feature_request(state, export, method, parent);
++    state.accept_start(request);
++    let meta = ack.recv_timeout(WAIT)??;
++    let frame = receive(state)?;
++    state.handle_frame(frame);
++    ensure!(matches!(
++        terminal.recv_timeout(WAIT)?,
++        InvocationTerminal::Success(value) if value["value"] == method
++    ));
++    Ok(meta)
++}
++
++#[test]
++fn optional_admission_uses_current_generation_and_exact_export_not_a_previous_manifest() -> Result<()> {
++    let mut state = feature_state(fixture())?;
++    state.ensure_worker()?;
++    let old_manifest = state.worker.as_ref().unwrap().manifest.clone();
++    ensure!(old_manifest.exports[0].module_features == vec![MODEL_QUOTA_FEATURE.to_owned()]);
++    state.reset_generation(ComponentFailure::Shutdown);
++
++    // Mirrors a stale successful feature probe followed by lazy restart. G2
++    // acknowledges no optional method for this export, but its sibling does.
++    for method in [PROCESS_MODEL_QUOTA_METHOD, PROCESS_MODEL_CATALOG_METHOD] {
++        let next_id = state.next_host_sequence;
++        let (request, ack, terminal) = feature_request(&state, 0, method, None);
++        state.accept_start(request);
++        let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++        ensure!(error.kind == ComponentBrokerErrorKind::UnsupportedFeature);
++        ensure!(matches!(terminal.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
++        ensure!(state.generation == 2 && state.next_host_sequence == next_id);
++        ensure!(!state.runtime_started);
++        assert_clean(&state)?;
++    }
++    let sibling = finish_feature_call(&mut state, 1, PROCESS_MODEL_CATALOG_METHOD, None)?;
++    let mandatory = finish_feature_call(&mut state, 0, PROCESS_MODEL_DESCRIBE_METHOD, None)?;
++    ensure!(sibling.pid == mandatory.pid && state.generation == 2);
++    assert_clean(&state)?;
++
++    // G3 adds catalog and removes quota; neither positive nor negative
++    // knowledge from an earlier generation may determine admission.
++    state.reset_generation(ComponentFailure::Shutdown);
++    let added = finish_feature_call(&mut state, 0, PROCESS_MODEL_CATALOG_METHOD, None)?;
++    ensure!(added.invocation.generation == 3);
++    let (request, ack, _) = feature_request(&state, 0, PROCESS_MODEL_QUOTA_METHOD, None);
++    state.accept_start(request);
++    let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++    ensure!(error.kind == ComponentBrokerErrorKind::UnsupportedFeature);
++    ensure!(state.worker.as_ref().unwrap().pid == added.pid && state.generation == 3);
++    assert_clean(&state)?;
++    state.reset_generation(ComponentFailure::Shutdown);
++    Ok(())
++}
++
++#[test]
++fn missing_nested_feature_preserves_parent_and_cancel_then_rejects_stale_parent() -> Result<()> {
++    let mut state = feature_state(fixture())?;
++    let (mut request, ack, parent_terminal) =
++        feature_request(&state, 2, PROCESS_WORKFLOW_METHOD, None);
++    request.params = json!({"op": "wait_cancel", "notify_started": true});
++    state.accept_start(request);
++    let parent = ack.recv_timeout(WAIT)??;
++    let started = receive(&mut state)?;
++    ensure!(started["method"] == "module.progress");
++    state.handle_frame(started);
++    ensure!(state.pending[parent.invocation.id()].is_visible_to_worker());
++
++    let (request, ack, _) = feature_request(
++        &state,
++        0,
++        PROCESS_MODEL_CATALOG_METHOD,
++        Some(parent.invocation.clone()),
++    );
++    state.accept_start(request);
++    let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++    ensure!(error.kind == ComponentBrokerErrorKind::UnsupportedFeature);
++    ensure!(state.pending.len() == 1 && state.active_roots == 1 && state.active_nested == 0);
++    ensure!(state.pending[parent.invocation.id()].cancel.is_none());
++    let child = finish_feature_call(
++        &mut state,
++        0,
++        PROCESS_MODEL_QUOTA_METHOD,
++        Some(parent.invocation.clone()),
++    )?;
++    ensure!(child.pid == parent.pid);
++    ensure!(child.invocation.parent_id.as_deref() == Some(parent.invocation.id()));
++
++    state.cancel(
++        parent.invocation.id(),
++        parent.invocation.generation,
++        CancelCause::User,
++    )?;
++    let (request, ack, _) = feature_request(
++        &state,
++        0,
++        PROCESS_MODEL_CATALOG_METHOD,
++        Some(parent.invocation.clone()),
++    );
++    state.accept_start(request);
++    let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++    ensure!(error.kind == ComponentBrokerErrorKind::ParentInactive);
++    let response = receive(&mut state)?;
++    state.handle_frame(response);
++    terminal(&parent_terminal, InvocationTerminal::Canceled)?;
++    assert_clean(&state)?;
++    ensure!(state.generation == 1 && state.worker.as_ref().unwrap().pid == parent.pid);
++    let (request, ack, _) = feature_request(
++        &state,
++        0,
++        PROCESS_MODEL_CATALOG_METHOD,
++        Some(parent.invocation),
++    );
++    state.accept_start(request);
++    let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++    ensure!(error.kind == ComponentBrokerErrorKind::ParentInactive);
++    assert_clean(&state)?;
++    state.reset_generation(ComponentFailure::Shutdown);
++    Ok(())
++}
++
++#[test]
++fn invalid_restart_handshake_is_not_optional_feature_absence() -> Result<()> {
++    let mut state = feature_state(fixture())?;
++    state.binding.exports[0].module_config["features_by_generation"]["2"] =
++        json!(["unoffered.feature"]);
++    state.ensure_worker()?;
++    state.reset_generation(ComponentFailure::Shutdown);
++    let (request, ack, _) = feature_request(&state, 0, PROCESS_MODEL_QUOTA_METHOD, None);
++    state.accept_start(request);
++    let error = ack.recv_timeout(WAIT)?.err().context("expected rejection")?;
++    ensure!(error.kind == ComponentBrokerErrorKind::RuntimeUnavailable);
++    ensure!(state.worker.is_none());
++    ensure!(state.last_failure == Some(ComponentFailure::Protocol));
++    assert_clean(&state)?;
++    Ok(())
++}
++
++#[test]
++fn expired_acknowledged_optional_start_settles_without_dispatch() -> Result<()> {
++    let mut state = feature_state(fixture())?;
++    let (mut request, ack, result) =
++        feature_request(&state, 0, PROCESS_MODEL_QUOTA_METHOD, None);
++    request.deadline = Instant::now();
++    state.accept_start(request);
++    let admitted = ack.recv_timeout(WAIT)??;
++    ensure!(admitted.invocation.generation == 1);
++    terminal(&result, InvocationTerminal::TimedOut)?;
++    assert_clean(&state)?;
++    ensure!(state.worker.is_some() && state.runtime_started);
++    state.reset_generation(ComponentFailure::Shutdown);
++    Ok(())
++}
+diff --git a/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py b/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
+--- a/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
++++ b/crates/proteus-module-protocol/tests/fixtures/multiplex_worker.py
+@@ -132,12 +132,15 @@
+                 if not isinstance(export, dict):
+                     self.send_error(request_id, -32602, "invalid component-v3 export")
+                     return
++                config = export.get("module_config", {})
++                features = config.get("features_by_generation", {}).get(
++                    request_id.split(":")[1], config.get("features", []))
+                 manifest_exports.append({
+                     "slot": export.get("slot"),
+                     "module_id": export.get("module_id"),
+                     "contract_version": export.get("contract_version"),
+                     "composition": export.get("composition"),
+-                    "module_features": [], "config_schema": export.get("module_config", {}).get("schema_fixture"),
++                    "module_features": features, "config_schema": config.get("schema_fixture"),
+                 })
+             self.send({
+                 "jsonrpc": "2.0",
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -835,6 +835,12 @@
+ В `model/v12` `describe` и `stream` составляют обязательное ядро;
+ `model.catalog.v1` и `model.quota.v1` разрешают соответствующие optional вызовы.
+ Без подтверждения host не вызывает метод и возвращает отсутствие данных.
++Связь method→feature задаётся общей таблицей slot contracts. Broker проверяет
++acknowledgement именно текущего generation/export при admission, после lazy
++restart и до создания invocation; отдельный предварительный manifest read не
++разрешает вызов в другом поколении. Отсутствие подтверждения — typed admission
++result без dispatch/reset: оно не ломает sibling exports или активный parent.
++Только этот результат адаптер превращает в отсутствие optional metadata.
+ Подтверждённый метод может вернуть `null`, если сейчас данных нет; его ошибка
+ или неверный DTO остаются ошибкой и не превращаются в отсутствие поддержки.
+ Reference module подтверждает только предложенные ему возможности.

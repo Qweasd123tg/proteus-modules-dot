@@ -1,0 +1,240 @@
+diff --git a/crates/proteus-core/src/core/runtime.rs b/crates/proteus-core/src/core/runtime.rs
+--- a/crates/proteus-core/src/core/runtime.rs
++++ b/crates/proteus-core/src/core/runtime.rs
+@@ -135,7 +135,6 @@
+     events: Arc<EventEmitter>,
+     approval: Arc<dyn ApprovalTransport>,
+     user_input: Arc<dyn UserInputTransport>,
+-    default_reasoning: ReasoningConfig,
+ }
+ 
+ struct SessionState {
+diff --git a/crates/proteus-core/src/core/runtime/builder.rs b/crates/proteus-core/src/core/runtime/builder.rs
+--- a/crates/proteus-core/src/core/runtime/builder.rs
++++ b/crates/proteus-core/src/core/runtime/builder.rs
+@@ -258,7 +258,6 @@
+             .as_ref()
+             .map(|cfg| cfg.reasoning.clone())
+             .unwrap_or_default();
+-        let default_reasoning = reasoning.clone();
+         let images = super::images::ImageStore::new(
+             session_store
+                 .as_ref()
+@@ -318,7 +317,6 @@
+                 events,
+                 approval,
+                 user_input,
+-                default_reasoning,
+             },
+             session: Arc::new(session),
+         })
+diff --git a/crates/proteus-core/src/core/runtime/settings.rs b/crates/proteus-core/src/core/runtime/settings.rs
+--- a/crates/proteus-core/src/core/runtime/settings.rs
++++ b/crates/proteus-core/src/core/runtime/settings.rs
+@@ -105,13 +105,14 @@
+     pub async fn set_reasoning_enabled(&self, enabled: bool) {
+         let _guard = self.services.reload_lock.lock().await;
+         let mut state = self.services.execution_state.write().await;
++        let default_reasoning = state.configured_reasoning();
+         let reasoning = &mut state.reasoning;
+         if enabled {
+             if reasoning.effort.is_none() || reasoning.effort.as_deref() == Some("none") {
+-                reasoning.effort = self.services.default_reasoning.effort.clone();
++                reasoning.effort = default_reasoning.effort;
+             }
+-            reasoning.summary = self.services.default_reasoning.summary;
+-            reasoning.budget_tokens = self.services.default_reasoning.budget_tokens;
++            reasoning.summary = default_reasoning.summary;
++            reasoning.budget_tokens = default_reasoning.budget_tokens;
+         } else {
+             reasoning.effort = None;
+             reasoning.summary = false;
+@@ -144,6 +145,7 @@
+                 model.id
+             );
+         }
++        let default_reasoning = state.configured_reasoning();
+         let reasoning = &mut state.reasoning;
+         match effort.as_deref() {
+             // «none» — первоклассное значение effort: выключает рассуждения
+@@ -157,8 +159,8 @@
+             // выключены: summary/budget возвращаются к дефолтам конфига.
+             Some(value) => {
+                 if !reasoning.is_enabled() {
+-                    reasoning.summary = self.services.default_reasoning.summary;
+-                    reasoning.budget_tokens = self.services.default_reasoning.budget_tokens;
++                    reasoning.summary = default_reasoning.summary;
++                    reasoning.budget_tokens = default_reasoning.budget_tokens;
+                 }
+                 reasoning.effort = Some(value.to_owned());
+             }
+@@ -172,3 +174,16 @@
+         self.services.execution_state.read().await.reasoning.clone()
+     }
+ }
++
++impl RuntimeExecutionState {
++    fn configured_reasoning(&self) -> ReasoningConfig {
++        // Defaults belong to the published assembly, not the runtime's first
++        // provider. Reading them under execution_state preserves reload rollback.
++        self.runtime
++            .registry
++            .model_config
++            .as_ref()
++            .map(|config| config.reasoning.clone())
++            .unwrap_or_default()
++    }
++}
+diff --git a/crates/proteus-core/src/core/runtime/tests.rs b/crates/proteus-core/src/core/runtime/tests.rs
+--- a/crates/proteus-core/src/core/runtime/tests.rs
++++ b/crates/proteus-core/src/core/runtime/tests.rs
+@@ -19,6 +19,7 @@
+ mod clear_history;
+ mod execution;
+ mod interruption;
++mod reasoning_reload;
+ mod resume_cache;
+ mod snapshot_atomicity;
+ mod steering_integration;
+diff --git a/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs b/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs
+@@ -0,0 +1,122 @@
++use super::*;
++
++fn profile_with_reasoning(reasoning: ReasoningConfig) -> AppConfig {
++    let mut config = crate::test_model::config();
++    config.providers.get_mut("fake").unwrap().reasoning = reasoning;
++    config
++}
++
++fn prepare(config: AppConfig, cwd: &std::path::Path) -> PreparedAssembly {
++    let catalog = crate::test_support::module_catalog_for(&config);
++    PreparedAssembly::from_catalog(config, cwd.to_path_buf(), None, catalog)
++        .expect("prepared assembly")
++}
++
++#[tokio::test]
++async fn reasoning_reenable_uses_published_defaults_without_changing_admitted_settings() {
++    let cwd = tempfile::tempdir().expect("workspace");
++    let first = ReasoningConfig::new(Some("low".into()), true).with_budget_tokens(Some(1024));
++    let next = ReasoningConfig::new(Some("high".into()), false).with_budget_tokens(Some(8192));
++    let config = profile_with_reasoning(first.clone());
++    let catalog = crate::test_support::module_catalog_for(&config);
++    let runtime = AgentRuntime::builder(config, cwd.path().to_path_buf())
++        .with_module_catalog(catalog)
++        .build()
++        .expect("runtime");
++    let admitted = runtime.capture_execution_snapshot().await;
++
++    runtime
++        .reload_assembly_with_commit(
++            prepare(profile_with_reasoning(next.clone()), cwd.path()),
++            None,
++            None,
++            None,
++            Some(next.clone()),
++            || async { Ok(()) },
++        )
++        .await
++        .expect("publish next profile");
++    assert_eq!(runtime.reasoning().await, next);
++    runtime.set_reasoning_enabled(false).await;
++    assert_eq!(runtime.reasoning().await, ReasoningConfig::default());
++    runtime.set_reasoning_enabled(true).await;
++    assert_eq!(runtime.reasoning().await, next);
++
++    runtime
++        .set_reasoning_effort(Some("none".into()))
++        .await
++        .expect("disable by effort");
++    runtime
++        .set_reasoning_effort(Some("medium".into()))
++        .await
++        .expect("select explicit effort");
++    let overridden =
++        ReasoningConfig::new(Some("medium".into()), false).with_budget_tokens(Some(8192));
++    assert_eq!(runtime.reasoning().await, overridden);
++
++    // Reloading another field must not erase the session override; defaults
++    // nevertheless remain those of the bound profile for a later re-enable.
++    let mut unrelated = profile_with_reasoning(next.clone());
++    unrelated.profile.name = "renamed".into();
++    runtime
++        .reload_assembly(prepare(unrelated, cwd.path()), None)
++        .await
++        .expect("reload unrelated setting");
++    assert_eq!(runtime.reasoning().await, overridden);
++    runtime.set_reasoning_enabled(false).await;
++    runtime.set_reasoning_enabled(true).await;
++    assert_eq!(runtime.reasoning().await, next);
++
++    assert_eq!(admitted.reasoning, first);
++    assert_eq!(admitted.runtime.epoch.as_u64(), 0);
++    assert_eq!(runtime.module_epoch().await.as_u64(), 2);
++    assert_eq!(
++        admitted.runtime.registry.model_config.as_ref().unwrap().reasoning,
++        first
++    );
++}
++
++#[tokio::test]
++async fn failed_profile_commit_keeps_reasoning_defaults_until_successful_publication() {
++    let cwd = tempfile::tempdir().expect("workspace");
++    let first = ReasoningConfig::new(Some("low".into()), true).with_budget_tokens(Some(1024));
++    let next = ReasoningConfig::new(Some("high".into()), false).with_budget_tokens(Some(8192));
++    let config = profile_with_reasoning(first.clone());
++    let catalog = crate::test_support::module_catalog_for(&config);
++    let runtime = AgentRuntime::builder(config, cwd.path().to_path_buf())
++        .with_module_catalog(catalog)
++        .build()
++        .expect("runtime");
++
++    let error = runtime
++        .reload_assembly_with_commit(
++            prepare(profile_with_reasoning(next.clone()), cwd.path()),
++            None,
++            None,
++            None,
++            Some(next),
++            || async { anyhow::bail!("persistence refused") },
++        )
++        .await
++        .expect_err("failed commit must not publish");
++    assert!(error.to_string().contains("persistence refused"));
++    assert_eq!(runtime.module_epoch().await.as_u64(), 0);
++    assert_eq!(runtime.reasoning().await, first);
++    runtime.set_reasoning_enabled(false).await;
++    runtime.set_reasoning_enabled(true).await;
++    assert_eq!(runtime.reasoning().await, first);
++
++    // Removing the configured model must not retain the first provider's
++    // defaults through a second, constructor-owned source of truth.
++    let mut model_free = AppConfig::default();
++    model_free.active_provider = None;
++    model_free.providers.clear();
++    runtime
++        .reload_assembly(prepare(model_free, cwd.path()), None)
++        .await
++        .expect("publish model-free assembly");
++    runtime.set_reasoning_enabled(false).await;
++    runtime.set_reasoning_enabled(true).await;
++    assert_eq!(runtime.reasoning().await, ReasoningConfig::default());
++    assert!(runtime.model_ref().await.is_none());
++}
+diff --git a/docs/guides/configuration.md b/docs/guides/configuration.md
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -1401,7 +1401,10 @@
+ 
+ Временные model/reasoning/mode overrides сессии сохраняются при правке других
+ частей профиля; изменение соответствующего default применяется ко всем открытым
+-сессиям. Приложение обновляет селекторы и shared settings draft по server events,
++сессиям. Повторное включение reasoning и выбор effort после отключения берут
++defaults из текущей опубликованной сборки, а не из профиля на момент запуска.
++Неудачный reload не меняет эти defaults; уже принятый ход сохраняет свои
++effective settings. Приложение обновляет селекторы и shared settings draft по server events,
+ сохраняя несохранённые изменения в отредактированных областях.
+ 
+ Блок «Подключения» в настройках приложения показывает, откуда берутся части

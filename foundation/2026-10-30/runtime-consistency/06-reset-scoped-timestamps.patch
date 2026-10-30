@@ -1,0 +1,341 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs
+@@ -0,0 +1,149 @@
++use super::*;
++use crate::{
++    core::{HistoryMutated, HistoryMutationKind, JOURNAL_SCHEMA_VERSION, JournalRecord},
++    domain::{
++        HostedToolActivity, HostedToolStatus, ToolCall, WebSearchAction, new_record_id,
++        new_session_id, new_thread_id,
++    },
++    model_standard::MessageRole,
++};
++
++fn projection(
++    entries: Vec<(HistoryMutationKind, Vec<CanonicalMessage>, i64)>,
++) -> JournalProjection {
++    let session = new_session_id();
++    let thread = new_thread_id();
++    let records = entries
++        .into_iter()
++        .enumerate()
++        .map(|(index, (mutation, messages, timestamp_ms))| JournalRecord {
++            schema_version: JOURNAL_SCHEMA_VERSION,
++            record_id: new_record_id(),
++            session_seq: index as u64 + 1,
++            timestamp_ms,
++            session_id: session,
++            execution_id: None,
++            thread_id: Some(thread),
++            turn_id: None,
++            entry: JournalEntry::HistoryMutated(HistoryMutated {
++                previous_revision: index as u64,
++                new_revision: index as u64 + 1,
++                mutation,
++                messages,
++                compaction: None,
++                tool_results: vec![],
++            }),
++        })
++        .collect();
++    JournalProjection::build(session, records).unwrap()
++}
++
++#[test]
++fn scoped_dates_keep_only_requested_message_and_original_part_keys() {
++    let erased = (0..64)
++        .map(|index| CanonicalMessage::text(MessageRole::User, format!("old {index}")))
++        .collect::<Vec<_>>();
++    let mut retained = CanonicalMessage::text(MessageRole::Assistant, "new text");
++    retained.parts.insert(0, erased[0].parts[0].clone());
++    let projection = projection(vec![
++        (HistoryMutationKind::Append, erased, 100),
++        (HistoryMutationKind::Replace, vec![retained.clone()], 50),
++    ]);
++    let full = TranscriptTimestamps::from_projection(&projection);
++    let scoped = TranscriptTimestamps::for_replay(&projection, 1);
++    assert_eq!(full.messages.len(), 65);
++    assert_eq!(full.parts.len(), 65);
++    assert_eq!(scoped.messages.len(), 1);
++    assert_eq!(scoped.parts.len(), 2);
++    assert_eq!(scoped.message(&retained), Some(100));
++    assert_eq!(scoped.message(&retained), full.message(&retained));
++    assert_eq!(
++        std::mem::size_of::<RecordedAt>(),
++        std::mem::size_of::<(u64, i64)>(),
++        "vacant slots must not grow the per-date value",
++    );
++}
++
++#[test]
++fn no_reset_and_small_prefix_large_suffix_do_not_create_a_second_index() {
++    let current = (0..64)
++        .map(|index| CanonicalMessage::text(MessageRole::Assistant, format!("new {index}")))
++        .collect::<Vec<_>>();
++    let projection = projection(vec![
++        (
++            HistoryMutationKind::Append,
++            vec![CanonicalMessage::text(MessageRole::User, "old")],
++            100,
++        ),
++        (HistoryMutationKind::Replace, current.clone(), 50),
++    ]);
++    let full = TranscriptTimestamps::from_projection(&projection);
++    let no_reset = TranscriptTimestamps::for_replay(&projection, 0);
++    let scoped = TranscriptTimestamps::for_replay(&projection, 1);
++    assert_eq!(no_reset.messages.len(), full.messages.len());
++    assert_eq!(no_reset.parts.len(), full.parts.len());
++    assert_eq!(scoped.messages.len(), 64);
++    assert_eq!(scoped.parts.len(), 64);
++    for message in &current {
++        assert_eq!(scoped.message(message), full.message(message));
++        assert_eq!(no_reset.message(message), full.message(message));
++    }
++
++    let empty = projection_with_empty_reset();
++    let empty_index = TranscriptTimestamps::for_replay(&empty, 1);
++    assert!(empty_index.messages.is_empty());
++    assert!(empty_index.parts.is_empty());
++}
++
++fn projection_with_empty_reset() -> JournalProjection {
++    projection(vec![
++        (
++            HistoryMutationKind::Append,
++            vec![CanonicalMessage::text(MessageRole::User, "discarded")],
++            100,
++        ),
++        (HistoryMutationKind::Replace, vec![], 50),
++    ])
++}
++
++#[test]
++fn call_dates_stay_global_without_preseeding_absent_hosted_ids() {
++    let old = CanonicalMessage::new(
++        MessageRole::Assistant,
++        vec![ContentPart::ToolCall {
++            call: ToolCall::new("shared-id", "probe", serde_json::json!({})),
++        }],
++    );
++    let current = (0..32)
++        .map(|index| {
++            let id = if index == 0 { "shared-id".into() } else { format!("hosted-{index}") };
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::HostedToolActivity {
++                    activity: HostedToolActivity::WebSearch {
++                        id,
++                        status: HostedToolStatus::Completed,
++                        action: WebSearchAction::Search { queries: vec![], sources: vec![] },
++                    },
++                }],
++            )
++        })
++        .collect::<Vec<_>>();
++    let projection = projection(vec![
++        (HistoryMutationKind::Append, vec![old], 100),
++        (HistoryMutationKind::Replace, current, 50),
++    ]);
++    let full = TranscriptTimestamps::from_projection(&projection);
++    let scoped = TranscriptTimestamps::for_replay(&projection, 1);
++    assert_eq!(scoped.calls.len(), 1);
++    assert_eq!(scoped.calls.len(), full.calls.len());
++    assert_eq!(scoped.call("shared-id"), Some(100));
++    assert_eq!(scoped.call("hosted-1"), None);
++    let rows = super::super::journal_transcript_messages(&projection, None);
++    assert_eq!(rows[0].timestamp_ms, Some(100));
++    assert_eq!(rows[1].timestamp_ms, Some(50));
++    assert_eq!(
++        serde_json::to_value(&rows).unwrap(),
++        serde_json::to_value(super::super::replay_transcript(&projection, None, 0)).unwrap(),
++    );
++}
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -1,6 +1,6 @@
+ //! Temporary identity index: dates come from the first durable occurrence,
+ //! including retained parts rehosted by a later replacement or compaction.
+-use std::collections::HashMap;
++use std::{collections::HashMap, hash::Hash, num::NonZeroU64};
+ 
+ use crate::{
+     core::{JournalEntry, JournalProjection, ModelResponseOutcome},
+@@ -8,9 +8,11 @@
+     model_standard::{CanonicalMessage, ContentPart},
+ };
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone, Copy, Default)]
+ struct RecordedAt {
+-    sequence: u64,
++    // None is an explicitly vacant requested slot, not a guessed date. Validated
++    // journal sequences start at one; Option<NonZeroU64> keeps a one-word key.
++    sequence: Option<NonZeroU64>,
+     timestamp_ms: i64,
+ }
+ 
+@@ -23,48 +25,94 @@
+ 
+ impl TranscriptTimestamps {
+     pub(super) fn from_projection(projection: &JournalProjection) -> Self {
++        Self::default().collect::<false>(projection)
++    }
++
++    /// Restrict message/part keys to the replay suffix, but find their dates in
++    /// the entire journal. Seed the same maps that will hold dates: no separate
++    /// full-size wanted set or retained record payloads.
++    pub(super) fn for_replay(projection: &JournalProjection, start: usize) -> Self {
++        if start == 0 {
++            return Self::from_projection(projection);
++        }
+         let mut index = Self::default();
++        for record in &projection.records[start..] {
++            match &record.entry {
++                JournalEntry::HistoryMutated(mutation) => {
++                    for message in &mutation.messages {
++                        index.require_message(message);
++                    }
++                }
++                JournalEntry::ModelResponseRecorded(item) => {
++                    if let ModelResponseOutcome::Response { response } = &item.outcome {
++                        for message in &response.messages {
++                            index.require_message(message);
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++        index.collect::<true>(projection)
++    }
++
++    fn require_message(&mut self, message: &CanonicalMessage) {
++        self.messages.entry(message.id).or_default();
++        // Dates use all original parts, including hidden and duplicate parts.
++        for part in &message.parts {
++            self.parts.entry(part.part_id).or_default();
++        }
++    }
++
++    fn collect<const SCOPED: bool>(mut self, projection: &JournalProjection) -> Self {
+         for record in &projection.records {
+             let at = RecordedAt {
+-                sequence: record.session_seq,
++                sequence: Some(
++                    NonZeroU64::new(record.session_seq)
++                        .expect("validated journal sequences start at one"),
++                ),
+                 timestamp_ms: record.timestamp_ms,
+             };
+             match &record.entry {
+                 JournalEntry::HistoryMutated(mutation) => {
+                     for message in &mutation.messages {
+-                        index.record_message(message, at);
++                        self.record_message::<SCOPED>(message, at);
+                     }
+                 }
+-                JournalEntry::ModelMessageRecorded(item) => index.record_message(&item.message, at),
++                JournalEntry::ModelMessageRecorded(item) => {
++                    self.record_message::<SCOPED>(&item.message, at);
++                }
+                 JournalEntry::ModelResponseRecorded(item) => {
+                     if let ModelResponseOutcome::Response { response } = &item.outcome {
+                         for message in &response.messages {
+-                            index.record_message(message, at);
++                            self.record_message::<SCOPED>(message, at);
+                         }
+                     }
+                 }
+                 JournalEntry::ToolCallRecorded(item) => {
+-                    index.calls.entry(item.call.id.clone()).or_insert(at);
++                    self.calls.entry(item.call.id.clone()).or_insert(at);
+                 }
+                 JournalEntry::ToolResultRecorded(item) | JournalEntry::ToolEffectRecorded(item) => {
+-                    index.calls.entry(item.result.call_id.clone()).or_insert(at);
++                    self.calls.entry(item.result.call_id.clone()).or_insert(at);
+                 }
+                 _ => {}
+             }
+         }
+-        index
++        self
+     }
+ 
+-    fn record_message(&mut self, message: &CanonicalMessage, at: RecordedAt) {
+-        self.messages.entry(message.id).or_insert(at);
++    fn record_message<const SCOPED: bool>(&mut self, message: &CanonicalMessage, at: RecordedAt) {
++        record_date::<SCOPED, _>(&mut self.messages, message.id, at);
+         for part in &message.parts {
+-            self.parts.entry(part.part_id).or_insert(at);
++            record_date::<SCOPED, _>(&mut self.parts, part.part_id, at);
+             let call_id = match &part.payload {
+                 ContentPart::ToolCall { call } => Some(&call.id),
+                 ContentPart::ToolResult { result } => Some(&result.call_id),
+                 _ => None,
+             };
+             if let Some(id) = call_id {
++                // Hosted cards can reuse an old call ID. Keep call dates global
++                // instead of adding an unbounded set of absent hosted-call IDs.
+                 self.calls.entry(id.clone()).or_insert(at);
+             }
+         }
+@@ -80,6 +128,7 @@
+                     .iter()
+                     .filter_map(|part| self.parts.get(&part.part_id)),
+             )
++            .filter(|at| at.sequence.is_some())
+             // Journal order, not wall-clock ordering: a clock adjustment must
+             // not move an existing message's creation time to a later record.
+             .min_by_key(|at| at.sequence)
+@@ -90,3 +139,22 @@
+         self.calls.get(id).map(|at| at.timestamp_ms)
+     }
+ }
++
++fn record_date<const SCOPED: bool, K: Eq + Hash>(
++    dates: &mut HashMap<K, RecordedAt>,
++    key: K,
++    at: RecordedAt,
++) {
++    if SCOPED {
++        if let Some(slot) = dates.get_mut(&key)
++            && slot.sequence.is_none()
++        {
++            *slot = at;
++        }
++    } else {
++        dates.entry(key).or_insert(at);
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -58,7 +58,7 @@
+ ) -> Vec<AppTranscriptMessage> {
+     let visibility = TranscriptVisibility::from_projection(projection, start);
+     let mut state = TranscriptProjectionState {
+-        timestamps: TranscriptTimestamps::from_projection(projection),
++        timestamps: TranscriptTimestamps::for_replay(projection, start),
+         ..Default::default()
+     };
+     let final_results = projection
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1340,6 +1340,10 @@
+ первые даты message/part/call по-прежнему охватывают все records, включая пропущенный
+ render-префикс. Это сокращение replay после очистки/замены, не incremental disk
+ recovery и не новый источник истины; при отсутствии границы replay начинается с нуля.
++После такой границы индекс дат удерживает только message/part identities исходных
++сообщений replay-суффикса; первые даты по-прежнему ищутся во всём журнале. Call dates
++остаются глобальными, в том числе при совпадении id с hosted card. Отдельной полной
++копии wanted identities нет; при replay с нуля дополнительного прохода отбора нет.
+ 
+ Холодные HTTP `/history`, `/conversation`, `/context` и `/usage` используют
+ одну свежую read-проекцию, не создавая runtime сессии и не получая writer lease.

@@ -1,0 +1,1089 @@
+diff --git a/crates/proteus-core/src/app_server/http/tests/session_reads.rs b/crates/proteus-core/src/app_server/http/tests/session_reads.rs
+--- a/crates/proteus-core/src/app_server/http/tests/session_reads.rs
++++ b/crates/proteus-core/src/app_server/http/tests/session_reads.rs
+@@ -337,9 +337,7 @@
+         std::fs::remove_file(&path).unwrap();
+     }
+     store
+-        .project_read_model(|projection| {
+-            crate::app_server::journal_transcript_messages(projection, None)
+-        })
++        .project_read_model(|records| crate::app_server::journal_transcript_messages(records, None))
+         .unwrap();
+     match damage {
+         "missing" => std::fs::remove_file(&path).unwrap(),
+diff --git a/crates/proteus-core/src/app_server/read_model/tests.rs b/crates/proteus-core/src/app_server/read_model/tests.rs
+--- a/crates/proteus-core/src/app_server/read_model/tests.rs
++++ b/crates/proteus-core/src/app_server/read_model/tests.rs
+@@ -25,7 +25,7 @@
+         store.clear_history(thread).await.unwrap();
+     }
+     store
+-        .project_read_model(|projection| journal_transcript_messages(projection, None))
++        .project_read_model(|records| journal_transcript_messages(records, None))
+         .unwrap();
+     let page = store.saved_transcript_page(None, None).unwrap();
+     (root, workspace, store, page)
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -104,8 +104,7 @@
+     );
+     // Strict journal validation is mandatory; cached conversation state is not
+     // an authority. project_read_model saves the index only on a stable source.
+-    let model =
+-        store.project_read_model(|projection| journal_transcript_messages(projection, None))?;
++    let model = store.project_read_model(|records| journal_transcript_messages(records, None))?;
+     anyhow::ensure!(
+         SourceFingerprint::read(store.session_dir(), 8192).as_ref() == Some(&source),
+         "history source changed during recovery; refresh the session snapshot"
+@@ -119,9 +118,7 @@
+ pub(super) fn current_read_model(store: &SessionStore) -> anyhow::Result<SessionReadModel> {
+     match store.fresh_read_model() {
+         Some(model) => Ok(model),
+-        None => {
+-            store.project_read_model(|projection| journal_transcript_messages(projection, None))
+-        }
++        None => store.project_read_model(|records| journal_transcript_messages(records, None)),
+     }
+ }
+ 
+@@ -132,7 +129,7 @@
+     // returning free pages. The completed page and writer's live state survive.
+     let result = (|| {
+         let model =
+-            store.project_read_model(|projection| journal_transcript_messages(projection, None))?;
++            store.project_read_model(|records| journal_transcript_messages(records, None))?;
+         Ok(CompletedTranscript::from_model(
+             store,
+             model.transcript,
+@@ -179,8 +176,9 @@
+             };
+             let transcript = tokio::task::spawn_blocking(move || {
+                 let store = SessionStore::open(dir)?;
+-                let transcript = journal_transcript_messages(&projection, None);
+-                let model = SessionReadModel::from_projection(&store, projection, transcript)?;
++                let model = SessionReadModel::from_projection(&store, projection, |records| {
++                    journal_transcript_messages(records, None)
++                })?;
+                 #[cfg(unix)]
+                 if let Some(source) = source {
+                     store.save_read_model(&source, &model);
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+@@ -86,10 +86,14 @@
+                 JournalProjection::build(self.session, self.records[..end].to_vec()).unwrap();
+             for &live in live_turns {
+                 assert_eq!(
+-                    serde_json::to_value(journal_transcript_messages(&projection, live)).unwrap(),
++                    serde_json::to_value(journal_transcript_messages(
++                        projection.records.clone(),
++                        live
++                    ))
++                    .unwrap(),
+                     serde_json::to_value(replay_transcript(&projection, live, 0)).unwrap(),
+                     "prefix {end}, live {live:?}, frontier {}",
+-                    replay_start(&projection, live),
++                    replay_start(&projection.records, live),
+                 );
+             }
+         }
+@@ -114,7 +118,10 @@
+     for index in 0..32 {
+         fixture.history(
+             HistoryMutationKind::Append,
+-            vec![CanonicalMessage::text(MessageRole::Assistant, format!("discard {index}"))],
++            vec![CanonicalMessage::text(
++                MessageRole::Assistant,
++                format!("discard {index}"),
++            )],
+             false,
+             false,
+         );
+@@ -127,9 +134,9 @@
+     fixture.assert_prefixes(&[None, Some(fixture.turn)]);
+ 
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, None), reset);
++    assert_eq!(replay_start(&projection.records, None), reset);
+     assert_eq!(projection.records[reset..].len(), 1);
+-    let rows = journal_transcript_messages(&projection, None);
++    let rows = journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows.len(), 1);
+     assert_eq!(rows[0].text, "retained part\nnew part");
+     assert_eq!(rows[0].timestamp_ms, Some(100));
+@@ -155,15 +162,24 @@
+     let live_reset = fixture.records.len();
+     fixture.history(
+         HistoryMutationKind::Replace,
+-        vec![CanonicalMessage::text(MessageRole::User, "live replacement")],
++        vec![CanonicalMessage::text(
++            MessageRole::User,
++            "live replacement",
++        )],
+         false,
+         true,
+     );
+     fixture.assert_prefixes(&[None, Some(fixture.turn), Some(new_turn_id())]);
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, Some(fixture.turn)), settled_reset);
+-    assert_eq!(replay_start(&projection, None), live_reset);
+-    assert_eq!(journal_transcript_messages(&projection, Some(fixture.turn))[0].text, "settled");
++    assert_eq!(
++        replay_start(&projection.records, Some(fixture.turn)),
++        settled_reset
++    );
++    assert_eq!(replay_start(&projection.records, None), live_reset);
++    assert_eq!(
++        journal_transcript_messages(projection.records.clone(), Some(fixture.turn))[0].text,
++        "settled"
++    );
+ }
+ 
+ #[test]
+@@ -181,13 +197,23 @@
+             activity: HostedToolActivity::WebSearch {
+                 id: "hosted".into(),
+                 status: HostedToolStatus::Completed,
+-                action: WebSearchAction::Search { queries: vec!["docs".into()], sources: vec![] },
++                action: WebSearchAction::Search {
++                    queries: vec!["docs".into()],
++                    sources: vec![],
++                },
+             },
+         }],
+     );
+     let mut illustrated = CanonicalMessage::new(
+         MessageRole::Assistant,
+-        vec![ContentPart::Text { text: "illustrated".into() }, ContentPart::Image { image: image("old") }],
++        vec![
++            ContentPart::Text {
++                text: "illustrated".into(),
++            },
++            ContentPart::Image {
++                image: image("old"),
++            },
++        ],
+     );
+     let reset = fixture.records.len();
+     fixture.history(
+@@ -199,7 +225,9 @@
+     illustrated.parts.push(CanonicalPart::new(
+         PartProvenance::Model,
+         PartScope::Conversation,
+-        ContentPart::Image { image: image("new") },
++        ContentPart::Image {
++            image: image("new"),
++        },
+     ));
+     let mut summary = CanonicalMessage::text(MessageRole::Assistant, "hidden compacted summary");
+     summary.parts[0].provenance = PartProvenance::Compactor;
+@@ -227,10 +255,16 @@
+     );
+     fixture.assert_prefixes(&[None]);
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, None), reset);
+-    let rows = journal_transcript_messages(&projection, None);
++    assert_eq!(replay_start(&projection.records, None), reset);
++    let rows = journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows.len(), 2);
+-    assert_eq!(rows[0].tool.as_ref().unwrap().metadata["citations"].as_array().unwrap().len(), 1);
++    assert_eq!(
++        rows[0].tool.as_ref().unwrap().metadata["citations"]
++            .as_array()
++            .unwrap()
++            .len(),
++        1
++    );
+     // Only the newly admitted image part is rendered; the existing helper
+     // replaces the last matching row's image list rather than adding a row.
+     assert_eq!(rows[1].images, vec![image("new")]);
+@@ -245,7 +279,9 @@
+     fixture.push(
+         JournalEntry::ToolCallRecorded(ToolCallRecorded {
+             call: call.clone(),
+-            phase: ToolCallRecordPhase::Requested { owner: crate::contracts::OperationOwner::Workflow },
++            phase: ToolCallRecordPhase::Requested {
++                owner: crate::contracts::OperationOwner::Workflow,
++            },
+         }),
+         true,
+         true,
+@@ -254,16 +290,21 @@
+     fixture.push(
+         JournalEntry::ToolCallRecorded(ToolCallRecorded {
+             call: call.clone(),
+-            phase: ToolCallRecordPhase::Resolved { resolution: ToolCallResolution::Allowed },
++            phase: ToolCallRecordPhase::Resolved {
++                resolution: ToolCallResolution::Allowed,
++            },
+         }),
+         true,
+         true,
+     );
+     let reset = fixture.records.len();
+     fixture.history(HistoryMutationKind::Replace, vec![], false, false);
+-    let effect = ToolResult::ok(call.id.clone(), "effect").with_metadata(json!({"stage": "effect"}));
+-    fixture.push(
+-        JournalEntry::ToolEffectRecorded(ToolResultRecorded { result: effect.clone() }),
++    let effect =
++        ToolResult::ok(call.id.clone(), "effect").with_metadata(json!({"stage": "effect"}));
++    fixture.push(
++        JournalEntry::ToolEffectRecorded(ToolResultRecorded {
++            result: effect.clone(),
++        }),
+         true,
+         true,
+     );
+@@ -271,19 +312,25 @@
+     final_result.output = "final".into();
+     final_result.metadata = json!({"stage": "final"});
+     fixture.push(
+-        JournalEntry::ToolResultRecorded(ToolResultRecorded { result: final_result }),
+-        true,
+-        true,
+-    );
+-    fixture.push(
+-        JournalEntry::TurnSettled(TurnSettled { status: TurnSettlementStatus::Timeout, output: None, error: None }),
++        JournalEntry::ToolResultRecorded(ToolResultRecorded {
++            result: final_result,
++        }),
++        true,
++        true,
++    );
++    fixture.push(
++        JournalEntry::TurnSettled(TurnSettled {
++            status: TurnSettlementStatus::Timeout,
++            output: None,
++            error: None,
++        }),
+         false,
+         true,
+     );
+     fixture.assert_prefixes(&[None, Some(fixture.turn)]);
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, None), reset);
+-    let rows = journal_transcript_messages(&projection, None);
++    assert_eq!(replay_start(&projection.records, None), reset);
++    let rows = journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows.len(), 2);
+     let tool = rows[0].tool.as_ref().unwrap();
+     assert_eq!(tool.call_id, call.id);
+@@ -297,7 +344,12 @@
+     let mut fixture = Fixture::new();
+     fixture.open();
+     let message = CanonicalMessage::text(MessageRole::Assistant, "old committed identity");
+-    fixture.history(HistoryMutationKind::Append, vec![message.clone()], false, false);
++    fixture.history(
++        HistoryMutationKind::Append,
++        vec![message.clone()],
++        false,
++        false,
++    );
+     let first_date = fixture.records.last().unwrap().timestamp_ms;
+     let reset = fixture.records.len();
+     fixture.history(HistoryMutationKind::Replace, vec![], false, false);
+@@ -324,8 +376,8 @@
+     );
+     fixture.assert_prefixes(&[None, Some(fixture.turn)]);
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, None), reset);
+-    let rows = journal_transcript_messages(&projection, None);
++    assert_eq!(replay_start(&projection.records, None), reset);
++    let rows = journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows.len(), 1);
+     assert_eq!(rows[0].text, "old committed identity");
+     assert_eq!(rows[0].timestamp_ms, Some(first_date));
+@@ -377,8 +429,8 @@
+     fixture.history(HistoryMutationKind::Append, vec![message], false, false);
+     fixture.assert_prefixes(&[None, Some(fixture.turn)]);
+     let projection = fixture.projection();
+-    assert_eq!(replay_start(&projection, None), reset);
+-    let rows = journal_transcript_messages(&projection, None);
++    assert_eq!(replay_start(&projection.records, None), reset);
++    let rows = journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows.len(), 1);
+     assert_eq!(rows[0].text, "late committed text");
+     assert_eq!(rows[0].timestamp_ms, Some(first_date));
+@@ -415,5 +467,9 @@
+     fixture.push(response, true, true);
+     let error = JournalProjection::build(fixture.session, fixture.records)
+         .expect_err("a display reset does not reset exchange validation");
+-    assert!(error.to_string().contains("duplicate model exchange response"));
+-}
++    assert!(
++        error
++            .to_string()
++            .contains("duplicate model exchange response")
++    );
++}
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/tests.rs b/crates/proteus-core/src/app_server/transcript/journal/tests.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/tests.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/tests.rs
+@@ -193,7 +193,8 @@
+     }
+     let live_projection =
+         JournalProjection::build(session_id, records[..7].to_vec()).expect("live projection");
+-    let live_transcript = journal_transcript_messages(&live_projection, Some(turn_id));
++    let live_transcript =
++        journal_transcript_messages(live_projection.records.clone(), Some(turn_id));
+     assert!(
+         live_transcript.is_empty(),
+         "live turn belongs entirely to the event projection until settlement"
+@@ -201,7 +202,7 @@
+ 
+     let projection = JournalProjection::build(session_id, records).expect("projection");
+ 
+-    let transcript = journal_transcript_messages(&projection, None);
++    let transcript = journal_transcript_messages(projection.records.clone(), None);
+ 
+     assert!(
+         transcript
+@@ -278,7 +279,7 @@
+     ];
+ 
+     let projection = JournalProjection::build(session_id, records).expect("projection");
+-    let transcript = journal_transcript_messages(&projection, None);
++    let transcript = journal_transcript_messages(projection.records.clone(), None);
+ 
+     assert_eq!(transcript.len(), 1);
+     assert_eq!(transcript[0].role, "system");
+@@ -339,7 +340,7 @@
+             item.timestamp_ms = 100 - index as i64;
+             records.push(item);
+             let projection = JournalProjection::build(session_id, records.clone()).unwrap();
+-            let rows = journal_transcript_messages(&projection, None);
++            let rows = journal_transcript_messages(projection.records.clone(), None);
+             assert_eq!(rows.len(), 1);
+             assert_eq!(rows[0].timestamp_ms, Some(100));
+         }
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps/tests.rs
+@@ -16,24 +16,26 @@
+     let records = entries
+         .into_iter()
+         .enumerate()
+-        .map(|(index, (mutation, messages, timestamp_ms))| JournalRecord {
+-            schema_version: JOURNAL_SCHEMA_VERSION,
+-            record_id: new_record_id(),
+-            session_seq: index as u64 + 1,
+-            timestamp_ms,
+-            session_id: session,
+-            execution_id: None,
+-            thread_id: Some(thread),
+-            turn_id: None,
+-            entry: JournalEntry::HistoryMutated(HistoryMutated {
+-                previous_revision: index as u64,
+-                new_revision: index as u64 + 1,
+-                mutation,
+-                messages,
+-                compaction: None,
+-                tool_results: vec![],
+-            }),
+-        })
++        .map(
++            |(index, (mutation, messages, timestamp_ms))| JournalRecord {
++                schema_version: JOURNAL_SCHEMA_VERSION,
++                record_id: new_record_id(),
++                session_seq: index as u64 + 1,
++                timestamp_ms,
++                session_id: session,
++                execution_id: None,
++                thread_id: Some(thread),
++                turn_id: None,
++                entry: JournalEntry::HistoryMutated(HistoryMutated {
++                    previous_revision: index as u64,
++                    new_revision: index as u64 + 1,
++                    mutation,
++                    messages,
++                    compaction: None,
++                    tool_results: vec![],
++                }),
++            },
++        )
+         .collect();
+     JournalProjection::build(session, records).unwrap()
+ }
+@@ -116,14 +118,21 @@
+     );
+     let current = (0..32)
+         .map(|index| {
+-            let id = if index == 0 { "shared-id".into() } else { format!("hosted-{index}") };
++            let id = if index == 0 {
++                "shared-id".into()
++            } else {
++                format!("hosted-{index}")
++            };
+             CanonicalMessage::new(
+                 MessageRole::Assistant,
+                 vec![ContentPart::HostedToolActivity {
+                     activity: HostedToolActivity::WebSearch {
+                         id,
+                         status: HostedToolStatus::Completed,
+-                        action: WebSearchAction::Search { queries: vec![], sources: vec![] },
++                        action: WebSearchAction::Search {
++                            queries: vec![],
++                            sources: vec![],
++                        },
+                     },
+                 }],
+             )
+@@ -139,7 +148,7 @@
+     assert_eq!(scoped.calls.len(), full.calls.len());
+     assert_eq!(scoped.call("shared-id"), Some(100));
+     assert_eq!(scoped.call("hosted-1"), None);
+-    let rows = super::super::journal_transcript_messages(&projection, None);
++    let rows = super::super::journal_transcript_messages(projection.records.clone(), None);
+     assert_eq!(rows[0].timestamp_ms, Some(100));
+     assert_eq!(rows[1].timestamp_ms, Some(50));
+     assert_eq!(
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -3,10 +3,13 @@
+ use std::{collections::HashMap, hash::Hash, num::NonZeroU64};
+ 
+ use crate::{
+-    core::{JournalEntry, JournalProjection, ModelResponseOutcome},
++    core::{JournalEntry, JournalRecord, ModelResponseOutcome},
+     domain::{CallId, MessageId, PartId},
+     model_standard::{CanonicalMessage, ContentPart},
+ };
++
++#[cfg(test)]
++use crate::core::JournalProjection;
+ 
+ #[derive(Clone, Copy, Default)]
+ struct RecordedAt {
+@@ -24,19 +27,25 @@
+ }
+ 
+ impl TranscriptTimestamps {
++    #[cfg(test)]
+     pub(super) fn from_projection(projection: &JournalProjection) -> Self {
+-        Self::default().collect::<false>(projection)
++        Self::for_records(&projection.records, 0)
++    }
++
++    #[cfg(test)]
++    pub(super) fn for_replay(projection: &JournalProjection, start: usize) -> Self {
++        Self::for_records(&projection.records, start)
+     }
+ 
+     /// Restrict message/part keys to the replay suffix, but find their dates in
+     /// the entire journal. Seed the same maps that will hold dates: no separate
+     /// full-size wanted set or retained record payloads.
+-    pub(super) fn for_replay(projection: &JournalProjection, start: usize) -> Self {
++    pub(super) fn for_records(records: &[JournalRecord], start: usize) -> Self {
+         if start == 0 {
+-            return Self::from_projection(projection);
++            return Self::default().collect::<false>(records);
+         }
+         let mut index = Self::default();
+-        for record in &projection.records[start..] {
++        for record in &records[start..] {
+             match &record.entry {
+                 JournalEntry::HistoryMutated(mutation) => {
+                     for message in &mutation.messages {
+@@ -53,7 +62,7 @@
+                 _ => {}
+             }
+         }
+-        index.collect::<true>(projection)
++        index.collect::<true>(records)
+     }
+ 
+     fn require_message(&mut self, message: &CanonicalMessage) {
+@@ -64,8 +73,8 @@
+         }
+     }
+ 
+-    fn collect<const SCOPED: bool>(mut self, projection: &JournalProjection) -> Self {
+-        for record in &projection.records {
++    fn collect<const SCOPED: bool>(mut self, records: &[JournalRecord]) -> Self {
++        for record in records {
+             let at = RecordedAt {
+                 sequence: Some(
+                     NonZeroU64::new(record.session_seq)
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -1,11 +1,17 @@
+-use std::collections::{HashMap, HashSet};
++use std::{
++    borrow::Borrow,
++    collections::{HashMap, HashSet},
++};
++
++#[cfg(test)]
++use crate::core::JournalProjection;
+ 
+ mod timestamps;
+ use timestamps::TranscriptTimestamps;
+ 
+ use crate::{
+     core::{
+-        HistoryMutationKind, JournalEntry, JournalProjection, ModelResponseOutcome,
++        HistoryMutationKind, JournalEntry, JournalRecord, ModelResponseOutcome,
+         ToolCallRecordPhase, TurnSettled, TurnSettlementStatus,
+     },
+     domain::{CallId, PartId, ThreadId, ToolCallResolution, TurnId},
+@@ -21,23 +27,22 @@
+ /// turn проецируется отдельно через in-memory `turn_progress`: здесь records
+ /// уже являются единственным durable источником фактов.
+ pub(crate) fn journal_transcript_messages(
+-    projection: &JournalProjection,
++    records: Vec<JournalRecord>,
+     live_turn_id: Option<TurnId>,
+ ) -> Vec<AppTranscriptMessage> {
+-    replay_transcript(
+-        projection,
+-        live_turn_id,
+-        replay_start(projection, live_turn_id),
+-    )
++    let start = replay_start(&records, live_turn_id);
++    let replay = TranscriptReplay::new(&records, start);
++    // Facts own their identities/dates. Drop skipped record payloads before the
++    // first rendered item, then each consumed record after its rows are built.
++    replay.render(records.into_iter().skip(start), live_turn_id)
+ }
+ 
+ /// A visible, non-compaction Replace resets every mutable render/dedup field.
+ /// Earlier rows cannot survive it, even when later facts reveal old responses.
+ /// This is only a render frontier: validation, visibility, final results and
+ /// first-occurrence dates must still cover the entire committed projection.
+-fn replay_start(projection: &JournalProjection, live_turn_id: Option<TurnId>) -> usize {
+-    projection
+-        .records
++fn replay_start(records: &[JournalRecord], live_turn_id: Option<TurnId>) -> usize {
++    records
+         .iter()
+         .rposition(|record| {
+             !(live_turn_id.is_some() && record.turn_id == live_turn_id)
+@@ -51,100 +56,130 @@
+         .unwrap_or(0)
+ }
+ 
++#[cfg(test)]
+ fn replay_transcript(
+     projection: &JournalProjection,
+     live_turn_id: Option<TurnId>,
+     start: usize,
+ ) -> Vec<AppTranscriptMessage> {
+-    let visibility = TranscriptVisibility::from_projection(projection, start);
+-    let mut state = TranscriptProjectionState {
+-        timestamps: TranscriptTimestamps::for_replay(projection, start),
+-        ..Default::default()
+-    };
+-    let final_results = projection
+-        .records
+-        .iter()
+-        .filter_map(|record| match &record.entry {
+-            JournalEntry::ToolResultRecorded(tool) => Some(tool.result.call_id.clone()),
+-            _ => None,
+-        })
+-        .collect::<HashSet<_>>();
+-
+-    for record in &projection.records[start..] {
+-        // The live turn is owned by the inline event projection until settlement.
+-        if live_turn_id.is_some() && record.turn_id == live_turn_id {
+-            continue;
+-        }
+-        match &record.entry {
+-            JournalEntry::HistoryMutated(mutation) => {
+-                if mutation.mutation == HistoryMutationKind::Replace
+-                    && mutation.compaction.is_none()
+-                {
+-                    state.reset();
+-                }
+-                let hide_compactor_parts = mutation.mutation != HistoryMutationKind::Append
+-                    && mutation.compaction.is_some();
+-                for message in &mutation.messages {
+-                    state.append_message(message, hide_compactor_parts);
+-                }
+-            }
+-            JournalEntry::ModelResponseRecorded(response)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id)
+-                    && visibility
+-                        .visible_model_responses
+-                        .contains(&response.exchange_id) =>
+-            {
+-                if let ModelResponseOutcome::Response { response } = &response.outcome {
+-                    for message in &response.messages {
+-                        state.append_message(message, false);
+-                    }
+-                }
+-            }
+-            JournalEntry::ToolCallRecorded(tool)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id)
+-                    && visibility.visible_tool_calls.contains(&tool.call.id) =>
+-            {
+-                match &tool.phase {
+-                    ToolCallRecordPhase::Requested { .. } => state.append_tool_call(&tool.call),
+-                    ToolCallRecordPhase::Resolved { resolution } => {
+-                        state.apply_resolution(&tool.call, resolution)
+-                    }
+-                    ToolCallRecordPhase::ApprovalRequested { .. } => {}
+-                }
+-            }
+-            JournalEntry::ToolResultRecorded(tool)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id)
+-                    && visibility.visible_tool_calls.contains(&tool.result.call_id) =>
+-            {
+-                if state.seen_results.insert(tool.result.call_id.clone()) {
+-                    state.append_tool_result(&tool.result);
+-                }
+-            }
+-            JournalEntry::ToolEffectRecorded(tool)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id)
+-                    && !final_results.contains(&tool.result.call_id)
+-                    && visibility.visible_tool_calls.contains(&tool.result.call_id) =>
+-            {
+-                if state.seen_results.insert(tool.result.call_id.clone()) {
+-                    state.append_tool_result(&tool.result);
+-                }
+-            }
+-            JournalEntry::TurnSettled(settled)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id) =>
+-            {
+-                state.append_turn_failure(settled, record.timestamp_ms);
+-            }
+-            _ => {}
+-        }
+-    }
+-
+-    finalize_interrupted_tools(&mut state.transcript);
+-    state.transcript
++    TranscriptReplay::new(&projection.records, start)
++        .render(projection.records[start..].iter(), live_turn_id)
++}
++
++struct TranscriptReplay {
++    state: TranscriptProjectionState,
++    visibility: TranscriptVisibility,
++    final_results: HashSet<CallId>,
++}
++
++impl TranscriptReplay {
++    fn new(records: &[JournalRecord], start: usize) -> Self {
++        let visibility = TranscriptVisibility::from_records(records, start);
++        let state = TranscriptProjectionState {
++            timestamps: TranscriptTimestamps::for_records(records, start),
++            ..Default::default()
++        };
++        let final_results = records
++            .iter()
++            .filter_map(|record| match &record.entry {
++                JournalEntry::ToolResultRecorded(tool) => Some(tool.result.call_id.clone()),
++                _ => None,
++            })
++            .collect::<HashSet<_>>();
++        Self {
++            state,
++            visibility,
++            final_results,
++        }
++    }
++
++    fn render<R: Borrow<JournalRecord>>(
++        self,
++        records: impl IntoIterator<Item = R>,
++        live_turn_id: Option<TurnId>,
++    ) -> Vec<AppTranscriptMessage> {
++        let Self {
++            mut state,
++            visibility,
++            final_results,
++        } = self;
++        for record in records {
++            let record: &JournalRecord = record.borrow();
++            // The live turn is owned by the inline event projection until settlement.
++            if live_turn_id.is_some() && record.turn_id == live_turn_id {
++                continue;
++            }
++            match &record.entry {
++                JournalEntry::HistoryMutated(mutation) => {
++                    if mutation.mutation == HistoryMutationKind::Replace
++                        && mutation.compaction.is_none()
++                    {
++                        state.reset();
++                    }
++                    let hide_compactor_parts = mutation.mutation != HistoryMutationKind::Append
++                        && mutation.compaction.is_some();
++                    for message in &mutation.messages {
++                        state.append_message(message, hide_compactor_parts);
++                    }
++                }
++                JournalEntry::ModelResponseRecorded(response)
++                    if record.turn_id != live_turn_id
++                        && visibility.is_root_record(record.thread_id, record.turn_id)
++                        && visibility
++                            .visible_model_responses
++                            .contains(&response.exchange_id) =>
++                {
++                    if let ModelResponseOutcome::Response { response } = &response.outcome {
++                        for message in &response.messages {
++                            state.append_message(message, false);
++                        }
++                    }
++                }
++                JournalEntry::ToolCallRecorded(tool)
++                    if record.turn_id != live_turn_id
++                        && visibility.is_root_record(record.thread_id, record.turn_id)
++                        && visibility.visible_tool_calls.contains(&tool.call.id) =>
++                {
++                    match &tool.phase {
++                        ToolCallRecordPhase::Requested { .. } => state.append_tool_call(&tool.call),
++                        ToolCallRecordPhase::Resolved { resolution } => {
++                            state.apply_resolution(&tool.call, resolution)
++                        }
++                        ToolCallRecordPhase::ApprovalRequested { .. } => {}
++                    }
++                }
++                JournalEntry::ToolResultRecorded(tool)
++                    if record.turn_id != live_turn_id
++                        && visibility.is_root_record(record.thread_id, record.turn_id)
++                        && visibility.visible_tool_calls.contains(&tool.result.call_id) =>
++                {
++                    if state.seen_results.insert(tool.result.call_id.clone()) {
++                        state.append_tool_result(&tool.result);
++                    }
++                }
++                JournalEntry::ToolEffectRecorded(tool)
++                    if record.turn_id != live_turn_id
++                        && visibility.is_root_record(record.thread_id, record.turn_id)
++                        && !final_results.contains(&tool.result.call_id)
++                        && visibility.visible_tool_calls.contains(&tool.result.call_id) =>
++                {
++                    if state.seen_results.insert(tool.result.call_id.clone()) {
++                        state.append_tool_result(&tool.result);
++                    }
++                }
++                JournalEntry::TurnSettled(settled)
++                    if record.turn_id != live_turn_id
++                        && visibility.is_root_record(record.thread_id, record.turn_id) =>
++                {
++                    state.append_turn_failure(settled, record.timestamp_ms);
++                }
++                _ => {}
++            }
++        }
++
++        finalize_interrupted_tools(&mut state.transcript);
++        state.transcript
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -155,12 +190,12 @@
+ }
+ 
+ impl TranscriptVisibility {
+-    fn from_projection(projection: &JournalProjection, replay_start: usize) -> Self {
++    fn from_records(records: &[JournalRecord], replay_start: usize) -> Self {
+         let mut root_threads = HashMap::new();
+         let mut committed_parts = HashSet::new();
+         let mut root_lifecycle_calls = HashSet::new();
+ 
+-        for record in &projection.records {
++        for record in records {
+             if matches!(record.entry, JournalEntry::TurnOpened(_))
+                 && let Some(turn_id) = record.turn_id
+                 && let Some(thread_id) = record.thread_id
+@@ -174,7 +209,7 @@
+             }
+         }
+ 
+-        for record in &projection.records {
++        for record in records {
+             if let JournalEntry::ToolCallRecorded(tool) = &record.entry
+                 && matches!(
+                     &tool.phase,
+@@ -191,7 +226,7 @@
+         let mut visible_model_responses = HashSet::new();
+         // Only replayed responses need an eligibility decision. Their part and
+         // lifecycle dependencies above still include facts before the frontier.
+-        for record in &projection.records[replay_start..] {
++        for record in &records[replay_start..] {
+             let JournalEntry::ModelResponseRecorded(response) = &record.entry else {
+                 continue;
+             };
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -485,7 +485,7 @@
+         let initial_transcript = if let Some(prepared) = resumed_session {
+             let (session_store, model, _, stale) = tokio::task::spawn_blocking(move || {
+                 let result = prepared
+-                    .into_display_view(|projection| journal_transcript_messages(projection, None));
++                    .into_display_view(|records| journal_transcript_messages(records, None));
+                 read_model::release_projection_memory();
+                 result
+             })
+diff --git a/crates/proteus-core/src/core/session_store/catalog/prepared.rs b/crates/proteus-core/src/core/session_store/catalog/prepared.rs
+--- a/crates/proteus-core/src/core/session_store/catalog/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/catalog/prepared.rs
+@@ -94,13 +94,12 @@
+     pub(crate) fn into_display_view(
+         self,
+         render: impl FnOnce(
+-            &JournalProjection,
++            Vec<crate::core::JournalRecord>,
+         ) -> Vec<proteus_contracts::app_protocol::AppTranscriptMessage>,
+     ) -> Result<(SessionStore, SessionReadView, bool, bool)> {
+         let (model, deferred) = match self.history {
+             PreparedHistory::Validated(projection) => {
+-                let transcript = render(&projection);
+-                let model = SessionReadModel::from_projection(&self.store, projection, transcript)?;
++                let model = SessionReadModel::from_projection(&self.store, projection, render)?;
+                 #[cfg(unix)]
+                 if let Some(source) = &self.source {
+                     self.store.save_read_model(source, &model);
+diff --git a/crates/proteus-core/src/core/session_store/catalog.rs b/crates/proteus-core/src/core/session_store/catalog.rs
+--- a/crates/proteus-core/src/core/session_store/catalog.rs
++++ b/crates/proteus-core/src/core/session_store/catalog.rs
+@@ -172,8 +172,16 @@
+     session_id: crate::domain::SessionId,
+     projection: &JournalProjection,
+ ) -> Result<AppSessionSummary> {
++    session_summary_from_history(session_dir, session_id, &projection.history)
++}
++
++pub(super) fn session_summary_from_history(
++    session_dir: PathBuf,
++    session_id: crate::domain::SessionId,
++    history: &[CanonicalMessage],
++) -> Result<AppSessionSummary> {
+     let workspace_path = workspace_path_from_session_dir(&session_dir)?;
+-    let (message_count, preview) = messages_summary(&projection.history);
++    let (message_count, preview) = messages_summary(history);
+     let updated_at_ms = session_updated_at_ms(&journal_path(&session_dir));
+ 
+     Ok(AppSessionSummary::new(
+diff --git a/crates/proteus-core/src/core/session_store/read_model/tests/consuming.rs b/crates/proteus-core/src/core/session_store/read_model/tests/consuming.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/read_model/tests/consuming.rs
+@@ -0,0 +1,109 @@
++use super::*;
++
++#[tokio::test]
++async fn consuming_render_keeps_non_transcript_sections_and_accepts_local_closures() {
++    let root = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let store = saved(root.path(), workspace.path(), "owned projection").await;
++    add_exchange(&store, workspace.path()).await;
++    let projection = store.load_projection().unwrap();
++    let expected_conversation = ConversationSnapshot {
++        revision: projection.history_revision,
++        messages: projection.history.clone(),
++        model_context: ModelContextState::from_records(&projection.records, None).snapshot(),
++    };
++    let mut usage = UsageProjection::default();
++    for record in &projection.records {
++        usage.apply(record);
++    }
++    let expected_summary = crate::core::session_store::catalog::session_summary_from_projection(
++        store.session_dir().to_owned(),
++        store.session_id(),
++        &projection,
++    )
++    .unwrap();
++    let expected_rows = render(projection.records.clone());
++    let expected_ids = projection
++        .records
++        .iter()
++        .map(|record| record.record_id)
++        .collect::<Vec<_>>();
++    let calls = Cell::new(0);
++    let model = store
++        .project_read_model(|records| {
++            calls.set(calls.get() + 1);
++            assert_eq!(
++                records
++                    .iter()
++                    .map(|record| record.record_id)
++                    .collect::<Vec<_>>(),
++                expected_ids,
++            );
++            render(records)
++        })
++        .unwrap();
++    assert_eq!(calls.get(), 1);
++    assert_eq!(model.conversation, expected_conversation);
++    assert_eq!(model.usage, usage.snapshot(store.session_id()));
++    assert_eq!(model.summary, expected_summary);
++    assert_eq!(
++        serde_json::to_value(model.transcript).unwrap(),
++        serde_json::to_value(expected_rows).unwrap(),
++    );
++}
++
++#[tokio::test]
++async fn consuming_render_still_precedes_summary_metadata_observation() {
++    let root = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let store = saved(root.path(), workspace.path(), "metadata order").await;
++    let bytes = fs::read(store.journal_path()).unwrap();
++    let modified_ms = 1_700_000_000_000_u64;
++    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(modified_ms);
++    let calls = Cell::new(0);
++    let model = store
++        .project_read_model(|records| {
++            calls.set(calls.get() + 1);
++            fs::File::open(store.journal_path())
++                .unwrap()
++                .set_times(fs::FileTimes::new().set_modified(modified))
++                .unwrap();
++            render(records)
++        })
++        .unwrap();
++    assert_eq!(calls.get(), 1);
++    let observed_ms = fs::metadata(store.journal_path())
++        .unwrap()
++        .modified()
++        .unwrap()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_millis() as u64;
++    assert_eq!(observed_ms, modified_ms);
++    assert_eq!(model.summary.updated_at_ms, Some(observed_ms));
++    assert_eq!(fs::read(store.journal_path()).unwrap(), bytes);
++    // The callback changed source metadata, so the existing fingerprint gate
++    // must not mark this in-memory result as a newly persisted fresh view.
++    assert!(store.fresh_read_model().is_none());
++}
++
++#[tokio::test]
++async fn consuming_render_still_precedes_fallible_workspace_resolution() {
++    let root = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let store = saved(root.path(), workspace.path(), "workspace order").await;
++    let rendered = Cell::new(false);
++    let result = store.project_read_model(|records| {
++        rendered.set(true);
++        fs::remove_dir(workspace.path()).unwrap();
++        render(records)
++    });
++    assert!(
++        rendered.get(),
++        "summary filesystem checks must remain after render"
++    );
++    assert!(
++        result.is_err(),
++        "the vanished workspace must still fail summary resolution"
++    );
++}
+diff --git a/crates/proteus-core/src/core/session_store/read_model/tests.rs b/crates/proteus-core/src/core/session_store/read_model/tests.rs
+--- a/crates/proteus-core/src/core/session_store/read_model/tests.rs
++++ b/crates/proteus-core/src/core/session_store/read_model/tests.rs
+@@ -7,8 +7,8 @@
+     app_server::journal_transcript_messages,
+     contracts::{ExecutionAttribution, ModelCallOrigin, OperationOwner},
+     core::{
+-        JournalEntry, ModelRequestRecorded, ModelResponseOutcome, ModelResponseRecorded,
+-        PreparedSession, TurnOpened, TurnSettled, TurnSettlementStatus,
++        JournalEntry, JournalRecord, ModelRequestRecorded, ModelResponseOutcome,
++        ModelResponseRecorded, PreparedSession, TurnOpened, TurnSettled, TurnSettlementStatus,
+         session_journal::JournalWriterState,
+     },
+     domain::{
+@@ -21,8 +21,8 @@
+     },
+ };
+ 
+-fn render(projection: &JournalProjection) -> Vec<AppTranscriptMessage> {
+-    journal_transcript_messages(projection, None)
++fn render(records: Vec<JournalRecord>) -> Vec<AppTranscriptMessage> {
++    journal_transcript_messages(records, None)
+ }
+ 
+ async fn saved(root: &Path, workspace: &Path, text: &str) -> SessionStore {
+@@ -510,3 +510,5 @@
+     assert_eq!(store.conversation_snapshot().unwrap().messages, messages);
+     assert_eq!(fs::read(store.journal_path()).unwrap(), journal);
+ }
++
++mod consuming;
+diff --git a/crates/proteus-core/src/core/session_store/read_model.rs b/crates/proteus-core/src/core/session_store/read_model.rs
+--- a/crates/proteus-core/src/core/session_store/read_model.rs
++++ b/crates/proteus-core/src/core/session_store/read_model.rs
+@@ -3,7 +3,10 @@
+ 
+ use crate::{
+     contracts::ConversationSnapshot,
+-    core::{JournalProjection, model_context::ModelContextState, session_journal::UsageProjection},
++    core::{
++        JournalProjection, JournalRecord, model_context::ModelContextState,
++        session_journal::UsageProjection,
++    },
+     domain::SessionUsageSnapshot,
+ };
+ use proteus_contracts::app_protocol::{AppSessionSummary, AppTranscriptMessage};
+@@ -72,18 +75,21 @@
+     pub(crate) fn from_projection(
+         store: &SessionStore,
+         projection: JournalProjection,
+-        transcript: Vec<AppTranscriptMessage>,
++        render: impl FnOnce(Vec<JournalRecord>) -> Vec<AppTranscriptMessage>,
+     ) -> anyhow::Result<Self> {
+-        let summary = super::catalog::session_summary_from_projection(
+-            store.session_dir().to_owned(),
+-            store.session_id(),
+-            &projection,
+-        )?;
+         let mut usage = UsageProjection::default();
+         for record in &projection.records {
+             usage.apply(record);
+         }
+         let model_context = ModelContextState::from_records(&projection.records, None).snapshot();
++        let transcript = render(projection.records);
++        // Preserve the post-render metadata observation without retaining raw
++        // records merely so the summary helper can borrow the projection.
++        let summary = super::catalog::session_summary_from_history(
++            store.session_dir().to_owned(),
++            store.session_id(),
++            &projection.history,
++        )?;
+         Ok(Self {
+             summary,
+             conversation: ConversationSnapshot {
+@@ -121,13 +127,12 @@
+ 
+     pub(crate) fn project_read_model(
+         &self,
+-        render: impl FnOnce(&JournalProjection) -> Vec<AppTranscriptMessage>,
++        render: impl FnOnce(Vec<JournalRecord>) -> Vec<AppTranscriptMessage>,
+     ) -> anyhow::Result<SessionReadModel> {
+         #[cfg(unix)]
+         let source = super::read_cache::SourceFingerprint::read(self.session_dir(), 8192);
+         let projection = self.load_projection()?;
+-        let transcript = render(&projection);
+-        let model = SessionReadModel::from_projection(self, projection, transcript)?;
++        let model = SessionReadModel::from_projection(self, projection, render)?;
+         #[cfg(unix)]
+         if let Some(source) = source {
+             self.save_read_model(&source, &model);
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1344,6 +1344,12 @@
+ сообщений replay-суффикса; первые даты по-прежнему ищутся во всём журнале. Call dates
+ остаются глобальными, в том числе при совпадении id с hosted card. Отдельной полной
+ копии wanted identities нет; при replay с нуля дополнительного прохода отбора нет.
++Usage и model context вычисляются по полным проверенным records до передачи их
++в renderer по владению. После подготовки global display facts renderer освобождает
++payload пропущенных records, затем каждого обработанного record; canonical history
++перемещается в read model без второй копии. Summary по-прежнему читает workspace
++identity и timestamp файла после rendering. Начальный full-parse/fact-building пик
++и allocation заголовков Vec этим не устраняются; это не замер RSS.
+ 
+ Холодные HTTP `/history`, `/conversation`, `/context` и `/usage` используют
+ одну свежую read-проекцию, не создавая runtime сессии и не получая writer lease.
