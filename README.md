@@ -29,6 +29,8 @@
 
 - [PR72](https://github.com/Qweasd123tg/proteus-modules-dot/pull/72): [потеря пробуждения process writer при остановке](https://github.com/Qweasd123tg/proteus-modules-dot/blob/6a5d2e5b63e50d7cc035095a4ee791c4f5f0df01/foundation/2026-10-30/writer-stop-wake/README.md). Независимое узкое исправление, композиция с PR71 в обоих порядках проверена. Actual transport fixture только исходником; точная гонка не форсируется, executable gates остаются.
 
+- [PR73](https://github.com/Qweasd123tg/proteus-modules-dot/pull/73): [общий payload событий app-server](https://github.com/Qweasd123tg/proteus-modules-dot/blob/6a57de168a3a4b2f8baaec929b0cf50d8da62941/research/2026-10-30/shared-event-ownership/README.md). Public Rust subscribe меняет return type на Arc; JSON/Contracts и owned AppSubscription остаются прежними. [Дополнение о композиции](docs/source-composition-2026-10-30/pr73/README.md).
+
 Все перечисленные пакеты опубликованы как draft source proposals. Проверены исходники, применимость и описанные статические gates; успешные compile/tests/runtime/benchmarks не заявлены. Каждый пакет имеет свою базу и ограничения. Они не составляют одну обязательную цепочку применения.
 
 [Совместное применение source-пакетов](docs/source-composition-2026-10-30/README.md): точные базы, независимые и optional API orders, проверенная композиция и незакрытые интеграционные gates. Статическая применимость не заменяет runtime-проверки.
@@ -58,7 +60,7 @@
 
 ## Статус и история
 
-Сверка 30 октября 2026, 18:06 UTC: [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60)
+Сверка 30 октября 2026: [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60)
 и [PR61](https://github.com/Qweasd123tg/proteus-modules-dot/pull/61) слиты в delivery;
 [PR62](https://github.com/Qweasd123tg/proteus-modules-dot/pull/62) остаётся open draft,
 хотя его изменения уже перенесены в upstream; [PR63](https://github.com/Qweasd123tg/proteus-modules-dot/pull/63)
@@ -67,7 +69,7 @@
 Mode08 исправлен по пользовательскому Core `b062bb3` и уже
 присутствует в `befd30516aefa6f0a0ad5db9924ad4957160b8dc`.
 Отдельный alpha API proposal packet опубликован в PR67; он не входит в PR62
-или историческую runtime-серию. Новые PR65–72 остаются draft. Публикация артефакта
+или историческую runtime-серию. Новые PR65–73 остаются draft. Публикация артефакта
 не завершает upstream интеграцию: реальные pins и исполняемые gates проверяются отдельно.
 
 У этого репозитория нет одного глобального «все проверки прошли». Исторические результаты относятся к указанным в них commit, входам и сценариям. Новые исходники отдельно обозначают, что запускалось, а что ещё требует проверки.
