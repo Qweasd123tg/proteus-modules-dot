@@ -28,7 +28,7 @@ diff --git a/crates/proteus-core/src/core/session_journal/mod.rs b/crates/proteu
 diff --git a/crates/proteus-core/src/core/session_journal/projection.rs b/crates/proteus-core/src/core/session_journal/projection.rs
 --- a/crates/proteus-core/src/core/session_journal/projection.rs
 +++ b/crates/proteus-core/src/core/session_journal/projection.rs
-@@ -488,6 +488,10 @@
+@@ -499,6 +499,10 @@
          &self.history
      }
  
@@ -728,3 +728,24 @@ diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core
      }
  
      pub fn load_projection(&self) -> Result<JournalProjection> {
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1410,6 +1410,17 @@
+ Проверка известных `part_id` сравнивает содержимое, но сохраняет копию только новой части;
+ неизменившиеся части не копируются заново на каждом model request.
+ 
++Чтения только производных данных — `load_messages`, холодные fallback-и
++`conversation_snapshot`, `usage_snapshot`, `history_revision` и сводки каталога —
++применяют тот же строгий валидатор построчно, без отдельного накопления всех
++`JournalRecord`. Usage и model context сворачиваются только там, где нужны
++результату; canonical history и необходимые validation indices остаются в памяти.
++После первой semantic error чтение всё равно проверяет оставшиеся полные записи
++и blobs: более поздняя ошибка parse/hydration сохраняет прежний приоритет.
++Это не обход validation, writer lease или source rechecks. Raw inspection/replay
++и read-model renderer с произвольным callback по-прежнему получают полные records.
++Удаление промежуточного Vec не задаёт общий предел памяти и не является замером RSS.
++
+ Кандидат следующего append использует структурно разделяемые индексы и
+ copy-on-write history/payloads. Изменения кандидата изолированы до успешного
+ `sync_data`; ошибка validation или записи не изменяет committed state.

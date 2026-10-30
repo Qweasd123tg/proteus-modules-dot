@@ -1,10 +1,12 @@
-# Проверенные исходные дополнения к фундаменту
+# Проверенные исходные дополнения к свежему upstream
 
-Шесть неизменённых после review патчей поверх 25 исходных патчей из уже
-объединённых [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60) и
-[PR61](https://github.com/Qweasd123tg/proteus-modules-dot/pull/61).
-Delivery baseline — `73d438d49be6ef15307abb179d1beaa6cbeb7312`, tree
-`14339a1b851f5a31bb4ff21aac1f00de685902d5`.
+Шесть reviewed source patches поверх актуальных upstream commits. Прежние
+25 патчей из [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60) и
+[PR61](https://github.com/Qweasd123tg/proteus-modules-dot/pull/61) уже перенесены
+в upstream: **повторно применять их не нужно и нельзя считать prerequisite**.
+Delivery repo остаётся отдельным хранилищем патчей; его baseline —
+`73d438d49be6ef15307abb179d1beaa6cbeb7312`.
+
 **`success-evidence: false`**: source review и статическая композиция не
 подтверждают успешную компиляцию, тесты, runtime, CI или измеренный выигрыш.
 
@@ -27,53 +29,59 @@ host/model pipeline через обычный RPC. Anonymous files/handles от�
 Queue/file failure после spawn не повторяет команду и не подменяет её exit
 code. Sealed prefix, range EOF и complete stream — отдельные состояния.
 
-## Порядок и зависимости
+## Базы, порядок и зависимости
 
 Патчи применяются к соответствующим upstream checkout, **не** к delivery repo:
 
-- Core: `925de0fc5ee5995409b11e42b216a15ca12f76d0`;
-- Modules: `8ec681b861d290d1bcf0d9d9b3087bb463dfd9b2`;
-- реальная Core dependency Modules остаётся
-  `1f533a13f20a93bf164f7c8a169553b0b219bb51`, без фиктивного нового pin.
+- [Core `b062bb34634bb7de346d898fb326a9e154c6ed69`](https://github.com/Proteus-harness/Proteus-core/tree/b062bb34634bb7de346d898fb326a9e154c6ed69);
+- [Modules `3936728a123fa7019fcf90011804314f609ff7d8`](https://github.com/Proteus-harness/Proteus-modules/tree/3936728a123fa7019fcf90011804314f609ff7d8).
 
-Воспроизводимая полная цепочка — `COMPOSITION.json`, steps 1–25 (merged
-baseline), затем 26–31 (эти шесть патчей). Порядок внутри каждого repository
-сохраняется. Перед каждым применением выполнена обычная проверка
-`git apply --check --whitespace=error-all`; ослабление context/whitespace,
-zero-context, forced/three-way/reject application не использовались.
+Реальная Core dependency Modules остаётся
+`1f533a13f20a93bf164f7c8a169553b0b219bb51`; новый pin не выдуман и не требуется
+этими патчами. Journal reset/timestamps/owned-renderer теперь входят в базовый
+Core, поэтому прежняя четырёхпатчевая цепочка больше не нужна.
+Единственная зависимость между новыми патчами: `modules/04` требует
+`modules/03`. Остальные пять применяются непосредственно к своим свежим базам.
 
-Для отдельного применения `core/01` необходима прежняя journal-цепочка:
-PR60 borrowed transcript parts → PR61 reset frontier → reset-scoped timestamps
-→ consuming read-model renderer. Для `modules/04` обязателен `modules/03`.
-Остальные четыре новых патча применяются непосредственно к своему pinned
-upstream. Точные пути, SHA-256 и URLs — в `DEPENDENCIES.json` и `SOURCES.json`.
-Патч retry имеет SHA-256 `e80b2e9d08c93eec65cb760977a0d5f1a07f0a0a9c6eb3a7b2582afde2745a57`.
+Проверенный полный порядок — `COMPOSITION.json`: два Core patches, затем
+четыре Modules patches в числовом порядке. Перед каждым применением — обычный
+`git apply --check --whitespace=error-all`. Zero-context, ослабление whitespace,
+forced/three-way/reject application не являются способом разрешать конфликт:
+при смене upstream требуется новое source review, а не принудительный перенос.
 
-## Проверка и документы
+## Сохранённые изменения владельца
 
-- Все 25 baseline patch blobs сверены с указанным merged Git tree.
-- 96 original files сверены с pinned upstream blobs; вся цепочка из 31 патча
-  применена и обращена до точного восстановления исходных bytes.
-- Каждый новый патч отдельно с его prerequisites воспроизводит frozen
-  candidate byte-for-byte. Полная композиция содержит 127 файлов выбранного
-  среза; это не полный checkout или full-workspace gate.
-- Пересекающийся `docs/reference.md` сохраняет baseline и обе новые темы;
-  frozen patches не переписывались. Source behavior и правила остаются у
-  существующих owners: Core `docs/architecture/subagents.md`, Modules
-  `docs/reference.md` и `model/model-pack/UPSTREAM.md`. Этот README — инструкция
-  доставки, не новый нормативный guide или параллельная конфигурация.
+Fresh rebase сохраняет уже перенесённые journal validation, Core refactors,
+явное наследование `source.permission_mode()` в `execute_new_session`,
+Modules ACK documentation и новые upstream regression sources. Наследование
+mode — содержательное upstream исправление прежнего патча, не форматирование;
+старая mode patch не должна заменять свежую реализацию. Совместная
+композиция сохраняет все темы `docs/reference.md`, без параллельной копии guide.
 
-`SOURCES.json` содержит исходные identities и отдельные preimage/candidate
-hashes; `COMPOSITION.json` — порядок, pre/post hashes и восстановление;
-`VALIDATION.json` — статические результаты и границы; `SHA256SUMS` — весь пакет
-кроме самого checksum-файла. Regression sources присутствуют, но успешного
-executable evidence для этих изменений нет. Нет измеренных CPU/RAM/latency
-цифр. Публикация исходников не означает deployment, готовую portable-сборку
-или выполненную проверку продукта.
+[Desktop `a316ec34443db3c5469f3868d3d6bdef984dcb75`](https://github.com/Proteus-harness/Proteus-desktop/tree/a316ec34443db3c5469f3868d3d6bdef984dcb75)
+и [Extensions `a5a76246f40219161bdc2a7d7821929ef607d031`](https://github.com/Proteus-harness/Proteus-desktop-extensions/tree/a5a76246f40219161bdc2a7d7821929ef607d031)
+также уже содержат прежние scoped optimizations. Новые inline-math/typography
+features и связанные tests/docs не заменяются старыми патчами. Дополнительных
+Desktop/Extensions patches здесь нет; Desktop `repositories.json` уже закрепляет
+все три свежие upstream revisions. Это source compatibility review, не UI gate.
+
+## Evidence и следующие gates
+
+`SOURCES.json` содержит source identities, frozen patch hashes и отдельные
+preimage/candidate hashes. `COMPOSITION.json` фиксирует строгую цепочку только
+этих шести патчей, pre/post hashes и обратное восстановление. `DEPENDENCIES.json`
+содержит оставшиеся реальные зависимости, `VALIDATION.json` — статические
+результаты и границы, `SHA256SUMS` — весь пакет кроме самого checksum-файла.
+
+Regression sources присутствуют, но успешного executable evidence для этих
+изменений нет. Нет измеренных CPU/RAM/latency цифр. Публикация исходников не
+означает deployment, готовую portable-сборку или выполненную проверку продукта. Formatter не является compiler/test gate.
 
 Для исполняемой проверки нужны существующие scoped gates: Core journal /
 session-store / read-model и process-agent admission/reuse; Modules model-pack,
 shell-tool и affected independent/aggregate process fixtures. Для затронутых
 wiring/contracts — применимый full/module-swap gate из действующих
-[Core testing rules](https://github.com/Proteus-harness/Proteus-core/blob/925de0fc5ee5995409b11e42b216a15ca12f76d0/docs/development/testing.md)
-и [Modules rules](https://github.com/Proteus-harness/Proteus-modules/blob/8ec681b861d290d1bcf0d9d9b3087bb463dfd9b2/AGENTS.md).
+[Core testing rules](https://github.com/Proteus-harness/Proteus-core/blob/b062bb34634bb7de346d898fb326a9e154c6ed69/docs/development/testing.md)
+и [Modules rules](https://github.com/Proteus-harness/Proteus-modules/blob/3936728a123fa7019fcf90011804314f609ff7d8/AGENTS.md).
+Правила остаются у существующих owners; этот README — инструкция доставки,
+не новый нормативный guide, framework или параллельная конфигурация.
