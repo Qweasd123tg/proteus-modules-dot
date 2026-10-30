@@ -31,6 +31,8 @@
 
 - [PR73](https://github.com/Qweasd123tg/proteus-modules-dot/pull/73): [общий payload событий app-server](https://github.com/Qweasd123tg/proteus-modules-dot/blob/6a57de168a3a4b2f8baaec929b0cf50d8da62941/research/2026-10-30/shared-event-ownership/README.md). Public Rust subscribe меняет return type на Arc; JSON/Contracts и owned AppSubscription остаются прежними. [Дополнение о композиции](docs/source-composition-2026-10-30/pr73/README.md).
 
+- [PR74](https://github.com/Qweasd123tg/proteus-modules-dot/pull/74): [одна сериализация для отсутствующей строки SQLite cache](https://github.com/Qweasd123tg/proteus-modules-dot/blob/291ee253750985da1835d9229e06a49e08ff90f2/performance/2026-10-30/read-cache-missing-rows/README.md). Без дополнительного SELECT/cache; oversized missing row может потребовать больше временной памяти до отказа. Это не универсальная RAM-оптимизация.
+
 Все перечисленные пакеты опубликованы как draft source proposals. Проверены исходники, применимость и описанные статические gates; успешные compile/tests/runtime/benchmarks не заявлены. Каждый пакет имеет свою базу и ограничения. Они не составляют одну обязательную цепочку применения.
 
 [Совместное применение source-пакетов](docs/source-composition-2026-10-30/README.md): точные базы, независимые и optional API orders, проверенная композиция и незакрытые интеграционные gates. Статическая применимость не заменяет runtime-проверки.
@@ -69,7 +71,7 @@
 Mode08 исправлен по пользовательскому Core `b062bb3` и уже
 присутствует в `befd30516aefa6f0a0ad5db9924ad4957160b8dc`.
 Отдельный alpha API proposal packet опубликован в PR67; он не входит в PR62
-или историческую runtime-серию. Новые PR65–73 остаются draft. Публикация артефакта
+или историческую runtime-серию. Новые PR65–74 остаются draft. Публикация артефакта
 не завершает upstream интеграцию: реальные pins и исполняемые gates проверяются отдельно.
 
 У этого репозитория нет одного глобального «все проверки прошли». Исторические результаты относятся к указанным в них commit, входам и сценариям. Новые исходники отдельно обозначают, что запускалось, а что ещё требует проверки.
