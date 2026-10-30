@@ -1,0 +1,95 @@
+{
+  "repository": "Proteus-harness/Proteus-core",
+  "commit": "befd30516aefa6f0a0ad5db9924ad4957160b8dc",
+  "source_url": "https://github.com/Proteus-harness/Proteus-core/tree/befd30516aefa6f0a0ad5db9924ad4957160b8dc",
+  "patch": "terminal-outcome-claim.patch",
+  "patch_sha256": "cb8f5fd57d9ff4f63074bcb0186c9088f98e57f71332716c4c6a819255f6f036",
+  "patch_git_blob_sha": "a944f416a534cb11fa2c4ae6edf8937691265067",
+  "prerequisite_patches": [],
+  "already_upstream": false,
+  "prelease_cancellation_already_upstream": true,
+  "independent_of_worktree_followup": true,
+  "files": [
+    {
+      "path": "crates/proteus-core/src/core/agent_control/pending.rs",
+      "upstream_git_blob_sha": "3d659ec26cd42afe45bdd4b52965537903a7e4fe",
+      "upstream_sha256": "8faf2fd111a7f189b2ca196386eb04452bd7c1714b24fef20bbd1522f4754eef",
+      "candidate_git_blob_sha": "2df9845f5cbfa9b44f12843777b23aa720df4c38",
+      "candidate_sha256": "a9b40d6a35df19faa52b4923f7dac0d96c6b6c8881fb1e9a8ff0a30d12dea8f6",
+      "source_url": "https://github.com/Proteus-harness/Proteus-core/blob/befd30516aefa6f0a0ad5db9924ad4957160b8dc/crates/proteus-core/src/core/agent_control/pending.rs"
+    },
+    {
+      "path": "crates/proteus-core/src/core/agent_control/process/mod.rs",
+      "upstream_git_blob_sha": "ab4c7e8f8cbff7a33f3d300d96f39932954508b0",
+      "upstream_sha256": "58ffbebe43650a8acac41fab1b707e65d4d03a2fc9211610b213ff772712fc6a",
+      "candidate_git_blob_sha": "9baddbf6605f060855816810e690e62fe03f377e",
+      "candidate_sha256": "218a6ccf1f256802b4a5b2caa10f8bc6b8229126057b881454655aa62bc4d320",
+      "source_url": "https://github.com/Proteus-harness/Proteus-core/blob/befd30516aefa6f0a0ad5db9924ad4957160b8dc/crates/proteus-core/src/core/agent_control/process/mod.rs"
+    },
+    {
+      "path": "docs/architecture/subagents.md",
+      "upstream_git_blob_sha": "62d25983030b553f9fb3f2bda726e723a4c08318",
+      "upstream_sha256": "d5050a6510c05d5e65a2cb4b39bbf59d059acf39a4ec6db3a374ec60436faaa9",
+      "candidate_git_blob_sha": "09dc241d1f8ac1859f4d87a57a8ed3f6d05b02db",
+      "candidate_sha256": "bc75abe9c0d3006cd7553124ee06acadb3c217a17ad347252adcaa0543826261",
+      "source_url": "https://github.com/Proteus-harness/Proteus-core/blob/befd30516aefa6f0a0ad5db9924ad4957160b8dc/docs/architecture/subagents.md"
+    }
+  ],
+  "source_review": {
+    "patch_sha256": "cb8f5fd57d9ff4f63074bcb0186c9088f98e57f71332716c4c6a819255f6f036",
+    "upstream_commit": "befd30516aefa6f0a0ad5db9924ad4957160b8dc",
+    "verdict": "No source-level blocker found for the scoped terminal receipt claim fix.",
+    "successful_executable_validation_evidence": false,
+    "invariants": [
+      "One mutex protects readiness and the consumed bit; a premature claim does not set consumed.",
+      "An acquired Arc remains claimable at most once after eviction of its discovery-index entry.",
+      "The production wait consumer returns the child result only after a successful claim, including the child-error path; the losing consumer receives the already-consumed error.",
+      "Pointer-equal index removal cannot delete a replacement entry with the same textual spawn_id.",
+      "Dropping a pending wait future never calls consume; the existing detached monitor still owns the JoinHandle.",
+      "Notify registration is enabled before reading result; no new lost-wakeup window is introduced.",
+      "Registry-to-outcome mutex order is consistent with reserve; complete and outcome wait do not acquire the registry mutex.",
+      "After outcome.wait resolves, no additional await occurs before registry claim and the production wait return; this does not imply durable/exactly-once downstream delivery.",
+      "Active caps, oldest-ready eviction and non-evictable control-plane entries are unchanged.",
+      "Receipt ownership is not descendant effect quiescence or worktree cleanup authority."
+    ],
+    "regression_sources": [
+      "active_waiter_claims_terminal_result_after_ready_entry_is_evicted",
+      "concurrent_waiters_claim_a_terminal_error_only_once",
+      "old_outcome_claim_does_not_remove_a_replacement_entry",
+      "dropped_wait_future_does_not_consume_later_terminal_result"
+    ],
+    "regression_limits": "Deterministic source scenarios, not an executed scheduler/concurrency stress proof.",
+    "checks": {
+      "fresh_source_blob_matches": 3,
+      "forward_check_and_apply_exit": 0,
+      "candidate_byte_matches": 3,
+      "reverse_check_and_apply_exit": 0,
+      "original_byte_restoration": true,
+      "direct_installed_rustfmt_file_count": 2,
+      "rustfmt_exit": 0
+    }
+  },
+  "formatter": {
+    "version": "rustfmt 1.9.0-stable (59807616e1 2026-04-14)",
+    "binary_sha256": "56b31ad3ec8fe0277a2884a189e243b8f04e9b48e5fd22e547c1516c5f8fd34c",
+    "args": [
+      "--check",
+      "--edition",
+      "2024",
+      "--config",
+      "skip_children=true"
+    ],
+    "wrapper_used": false
+  },
+  "successful_executable_validation_evidence": false,
+  "success-evidence": false,
+  "remaining_gates": [
+    "Focused Core pending tests",
+    "Applicable real process_agent_pool/process_agent_control boundaries using the existing runner and current fixtures"
+  ],
+  "limits": [
+    "Selected source slice, not full checkout compilation",
+    "At-most-once receipt claim, not a durable or unlimited result store",
+    "No runtime, CI or benchmark success claim"
+  ]
+}
