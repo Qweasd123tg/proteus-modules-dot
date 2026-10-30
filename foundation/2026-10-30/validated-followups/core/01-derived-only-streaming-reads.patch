@@ -1,0 +1,730 @@
+diff --git a/crates/proteus-core/src/core/model_context/projection.rs b/crates/proteus-core/src/core/model_context/projection.rs
+--- a/crates/proteus-core/src/core/model_context/projection.rs
++++ b/crates/proteus-core/src/core/model_context/projection.rs
+@@ -16,6 +16,10 @@
+ }
+ 
+ impl ModelContextProjection {
++    pub(crate) fn snapshot(&self) -> Vec<ModelContextObservation> {
++        self.context.snapshot()
++    }
++
+     pub(crate) fn before_turn(&self, turn: TurnId) -> Option<Vec<ModelContextObservation>> {
+         self.before_latest_turn
+             .as_ref()
+diff --git a/crates/proteus-core/src/core/session_journal/mod.rs b/crates/proteus-core/src/core/session_journal/mod.rs
+--- a/crates/proteus-core/src/core/session_journal/mod.rs
++++ b/crates/proteus-core/src/core/session_journal/mod.rs
+@@ -20,7 +20,8 @@
+ pub(crate) use storage::{
+     JournalRecordAttribution, JournalWriterState, SessionWriteOwnership, WriterRetirement,
+     append_record, initialize_writer_projection, initialize_writer_state, journal_path,
+-    load_records,
++    load_records, load_validated_conversation, load_validated_history,
++    load_validated_history_revision, load_validated_usage,
+ };
+ 
+ #[cfg(test)]
+diff --git a/crates/proteus-core/src/core/session_journal/projection.rs b/crates/proteus-core/src/core/session_journal/projection.rs
+--- a/crates/proteus-core/src/core/session_journal/projection.rs
++++ b/crates/proteus-core/src/core/session_journal/projection.rs
+@@ -488,6 +488,10 @@
+         &self.history
+     }
+ 
++    pub(crate) fn into_history(self) -> Vec<CanonicalMessage> {
++        Arc::unwrap_or_clone(self.history)
++    }
++
+     pub(crate) fn committed_history(
+         &self,
+         thread_id: ThreadId,
+diff --git a/crates/proteus-core/src/core/session_journal/storage/derived/tests.rs b/crates/proteus-core/src/core/session_journal/storage/derived/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_journal/storage/derived/tests.rs
+@@ -0,0 +1,494 @@
++use super::super::{StoredJournalRecord, StoredPayload, write_blob};
++use super::*;
++use crate::{
++    contracts::{ModelCallOrigin, OperationOwner, WorkflowToolResultBinding},
++    core::{
++        HistoryMutated, HistoryMutationKind, ModelRequestRecorded, ModelResponseOutcome,
++        ModelResponseRecorded, ToolCallRecordPhase, ToolCallRecorded, ToolResultRecorded,
++        TurnOpened, TurnSettled, TurnSettlementStatus, model_context::ModelContextState,
++    },
++    domain::{
++        AgentTask, HistoryCompactionReport, ModelRef, ToolCall, ToolCallResolution, ToolResult,
++        new_exchange_id, new_execution_id, new_record_id, new_session_id, new_thread_id,
++        new_turn_id,
++    },
++    model_standard::{
++        CanonicalModelRequest, CanonicalModelResponse, ContentPart, FinishReason, MessageRole,
++        ModelFailure, ModelFailureKind, TokenUsage,
++    },
++};
++
++struct Fixture {
++    session: SessionId,
++    thread: ThreadId,
++    turn: TurnId,
++    execution: ExecutionId,
++    records: Vec<JournalRecord>,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        Self {
++            session: new_session_id(),
++            thread: new_thread_id(),
++            turn: new_turn_id(),
++            execution: new_execution_id(),
++            records: Vec::new(),
++        }
++    }
++
++    fn push(&mut self, entry: JournalEntry, execution: bool, turn: bool) {
++        self.records.push(JournalRecord {
++            schema_version: JOURNAL_SCHEMA_VERSION,
++            record_id: new_record_id(),
++            session_seq: self.records.len() as u64 + 1,
++            timestamp_ms: 1000 - self.records.len() as i64,
++            session_id: self.session,
++            execution_id: execution.then_some(self.execution),
++            thread_id: Some(self.thread),
++            turn_id: turn.then_some(self.turn),
++            entry,
++        });
++    }
++
++    fn revision(&self) -> u64 {
++        JournalProjection::build(self.session, self.records.clone())
++            .unwrap()
++            .history_revision
++    }
++
++    fn history(
++        &mut self,
++        mutation: HistoryMutationKind,
++        messages: Vec<CanonicalMessage>,
++        compacted: bool,
++        turn: bool,
++    ) {
++        let revision = self.revision();
++        let mut compaction = HistoryCompactionReport::unchanged(0, None);
++        compaction.changed = true;
++        self.push(
++            JournalEntry::HistoryMutated(HistoryMutated {
++                previous_revision: revision,
++                new_revision: revision + 1,
++                mutation,
++                messages,
++                compaction: compacted.then_some(compaction),
++                tool_results: Vec::new(),
++            }),
++            false,
++            turn,
++        );
++    }
++
++    fn request(&mut self, origin: ModelCallOrigin) -> crate::domain::ExchangeId {
++        let exchange_id = new_exchange_id();
++        let mut request = CanonicalModelRequest::new(
++            ModelRef::new("fixture", "model"),
++            vec![CanonicalMessage::text(
++                MessageRole::User,
++                "request payload not retained by the derived fold ".repeat(4096),
++            )],
++        );
++        request.limits.max_input_tokens = Some(100_000);
++        self.push(
++            JournalEntry::ModelRequestRecorded(ModelRequestRecorded {
++                exchange_id,
++                origin,
++                owner: OperationOwner::Workflow,
++                request,
++            }),
++            true,
++            true,
++        );
++        exchange_id
++    }
++}
++
++fn stored(record: &JournalRecord) -> StoredJournalRecord {
++    StoredJournalRecord {
++        schema_version: record.schema_version,
++        record_id: record.record_id,
++        session_seq: record.session_seq,
++        timestamp_ms: record.timestamp_ms,
++        session_id: record.session_id,
++        execution_id: record.execution_id,
++        thread_id: record.thread_id,
++        turn_id: record.turn_id,
++        kind: record.entry.kind(),
++        payload: StoredPayload::Inline {
++            value: record.entry.payload_value().unwrap(),
++        },
++    }
++}
++
++fn write_stored(dir: &Path, records: &[StoredJournalRecord], tail: &[u8]) {
++    let mut bytes = Vec::new();
++    for record in records {
++        serde_json::to_writer(&mut bytes, record).unwrap();
++        bytes.push(b'\n');
++    }
++    bytes.extend_from_slice(tail);
++    std::fs::write(journal_path(dir), bytes).unwrap();
++}
++
++fn reference(dir: &Path, session: SessionId) -> Result<JournalProjection> {
++    JournalProjection::build(session, read::load_records(dir, session)?)
++}
++
++fn assert_derived(dir: &Path, session: SessionId) {
++    let projection = reference(dir, session).unwrap();
++    let mut usage = UsageProjection::default();
++    for record in &projection.records {
++        usage.apply(record);
++    }
++    let conversation = ConversationSnapshot {
++        revision: projection.history_revision,
++        messages: projection.history.clone(),
++        model_context: ModelContextState::from_records(&projection.records, None).snapshot(),
++    };
++    assert_eq!(
++        load_validated_history(dir, session).unwrap(),
++        projection.history
++    );
++    assert_eq!(
++        load_validated_history_revision(dir, session).unwrap(),
++        projection.history_revision,
++    );
++    assert_eq!(
++        load_validated_conversation(dir, session).unwrap(),
++        conversation
++    );
++    assert_eq!(
++        load_validated_usage(dir, session).unwrap(),
++        usage.snapshot(session)
++    );
++}
++
++fn assert_same_error(dir: &Path, session: SessionId, expected: &str) {
++    let reference = format!("{:#}", reference(dir, session).unwrap_err());
++    assert!(reference.contains(expected), "{reference}");
++    let errors = [
++        format!("{:#}", load_validated_history(dir, session).unwrap_err()),
++        format!(
++            "{:#}",
++            load_validated_history_revision(dir, session).unwrap_err()
++        ),
++        format!(
++            "{:#}",
++            load_validated_conversation(dir, session).unwrap_err()
++        ),
++        format!("{:#}", load_validated_usage(dir, session).unwrap_err()),
++    ];
++    for error in errors {
++        assert_eq!(error, reference);
++    }
++}
++
++#[test]
++fn derived_reads_match_full_projection_at_every_prefix_and_both_encodings() {
++    let mut fixture = Fixture::new();
++    let user = CanonicalMessage::text(MessageRole::User, "retained user");
++    fixture.history(
++        HistoryMutationKind::Append,
++        vec![user.clone()],
++        false,
++        false,
++    );
++    fixture.push(
++        JournalEntry::TurnOpened(TurnOpened {
++            task: AgentTask::new("derived reads", "/tmp/workspace".into()),
++            intent: None,
++            base_history_revision: fixture.revision(),
++            module_epoch: 0,
++            config_snapshot: serde_json::json!({}),
++        }),
++        true,
++        true,
++    );
++    let completed = fixture.request(ModelCallOrigin::Direct);
++    let answer = CanonicalMessage::text(MessageRole::Assistant, "answer");
++    fixture.push(
++        JournalEntry::ModelResponseRecorded(ModelResponseRecorded {
++            exchange_id: completed,
++            outcome: ModelResponseOutcome::Response {
++                response: CanonicalModelResponse::new(
++                    answer.clone(),
++                    Vec::new(),
++                    FinishReason::Stop,
++                )
++                .with_usage(TokenUsage::new(10, 2)),
++            },
++        }),
++        true,
++        true,
++    );
++    fixture.history(
++        HistoryMutationKind::Checkpoint,
++        vec![user.clone(), answer.clone()],
++        false,
++        true,
++    );
++    let failed = fixture.request(ModelCallOrigin::Direct);
++    fixture.push(
++        JournalEntry::ModelResponseRecorded(ModelResponseRecorded {
++            exchange_id: failed,
++            outcome: ModelResponseOutcome::Error {
++                failure: ModelFailure::new(ModelFailureKind::ContextWindowExceeded, "overflow"),
++            },
++        }),
++        true,
++        true,
++    );
++    fixture.history(HistoryMutationKind::Replace, vec![user, answer], true, true);
++    fixture.request(ModelCallOrigin::Auxiliary);
++    fixture.push(
++        JournalEntry::TurnSettled(TurnSettled {
++            status: TurnSettlementStatus::Canceled,
++            output: None,
++            error: Some("cancelled".into()),
++        }),
++        false,
++        true,
++    );
++    fixture.history(
++        HistoryMutationKind::Replace,
++        vec![CanonicalMessage::text(
++            MessageRole::User,
++            "new conversation",
++        )],
++        false,
++        false,
++    );
++    for blobs in [false, true] {
++        let root = tempfile::tempdir().unwrap();
++        let mut records = fixture.records.iter().map(stored).collect::<Vec<_>>();
++        if blobs {
++            for record in &mut records {
++                let StoredPayload::Inline { value } = &record.payload else {
++                    unreachable!()
++                };
++                record.payload =
++                    write_blob(root.path(), &serde_json::to_vec(value).unwrap()).unwrap();
++            }
++        }
++        for end in 0..=records.len() {
++            write_stored(root.path(), &records[..end], b"{torn tail");
++            let before = std::fs::read(journal_path(root.path())).unwrap();
++            assert_derived(root.path(), fixture.session);
++            assert_eq!(std::fs::read(journal_path(root.path())).unwrap(), before);
++        }
++    }
++}
++
++#[test]
++fn captured_results_and_settled_effects_match_full_history_at_each_prefix() {
++    for settle_effect in [false, true] {
++        let root = tempfile::tempdir().unwrap();
++        let mut fixture = Fixture::new();
++        fixture.push(
++            JournalEntry::TurnOpened(TurnOpened {
++                task: AgentTask::new("capture", "/tmp/workspace".into()),
++                intent: None,
++                base_history_revision: 0,
++                module_epoch: 0,
++                config_snapshot: serde_json::json!({}),
++            }),
++            true,
++            true,
++        );
++        let binding = WorkflowToolResultBinding::new(ToolCall::new(
++            "captured",
++            "probe",
++            serde_json::json!({}),
++        ));
++        fixture.push(
++            JournalEntry::HistoryMutated(HistoryMutated {
++                previous_revision: 0,
++                new_revision: 1,
++                mutation: HistoryMutationKind::Checkpoint,
++                messages: vec![CanonicalMessage::new(
++                    MessageRole::Assistant,
++                    vec![ContentPart::ToolCall {
++                        call: binding.execution_call.clone(),
++                    }],
++                )],
++                compaction: None,
++                tool_results: vec![binding.clone()],
++            }),
++            false,
++            true,
++        );
++        for phase in [
++            ToolCallRecordPhase::Requested {
++                owner: OperationOwner::Workflow,
++            },
++            ToolCallRecordPhase::Resolved {
++                resolution: ToolCallResolution::Allowed,
++            },
++        ] {
++            fixture.push(
++                JournalEntry::ToolCallRecorded(ToolCallRecorded {
++                    call: binding.execution_call.clone(),
++                    phase,
++                }),
++                true,
++                true,
++            );
++        }
++        let mut result = ToolResult::ok(binding.call_id.clone(), "effect payload ".repeat(4096));
++        fixture.push(
++            JournalEntry::ToolEffectRecorded(ToolResultRecorded {
++                result: result.clone(),
++            }),
++            true,
++            true,
++        );
++        if !settle_effect {
++            result.output = "formatted final result".into();
++            fixture.push(
++                JournalEntry::ToolResultRecorded(ToolResultRecorded {
++                    result: result.clone(),
++                }),
++                true,
++                true,
++            );
++        }
++        fixture.push(
++            JournalEntry::TurnSettled(TurnSettled {
++                status: TurnSettlementStatus::Canceled,
++                output: None,
++                error: Some("stopped after effect".into()),
++            }),
++            false,
++            true,
++        );
++        let records = fixture.records.iter().map(stored).collect::<Vec<_>>();
++        for end in 0..=records.len() {
++            write_stored(root.path(), &records[..end], b"");
++            assert_derived(root.path(), fixture.session);
++        }
++        assert_eq!(
++            load_validated_history(root.path(), fixture.session)
++                .unwrap()
++                .last(),
++            Some(&binding.message(result)),
++        );
++        assert_eq!(
++            load_validated_history_revision(root.path(), fixture.session).unwrap(),
++            2
++        );
++    }
++}
++
++#[test]
++fn later_decode_failures_precede_the_first_semantic_error() {
++    let root = tempfile::tempdir().unwrap();
++    let mut fixture = Fixture::new();
++    fixture.history(
++        HistoryMutationKind::Append,
++        vec![CanonicalMessage::text(MessageRole::User, "first")],
++        false,
++        false,
++    );
++    let mut first = stored(&fixture.records[0]);
++    first.session_seq = 2;
++    // The first semantic error must not prevent scanning a later stored record.
++    write_stored(root.path(), &[first.clone()], b"{malformed}\n");
++    assert_same_error(root.path(), fixture.session, "failed to parse journal");
++    write_stored(root.path(), &[first.clone()], b"\n");
++    assert_same_error(root.path(), fixture.session, "contains an empty line");
++    write_stored(root.path(), &[first.clone()], b"{ignored torn tail");
++    assert_same_error(root.path(), fixture.session, "sequence mismatch");
++
++    let mut later = stored(&fixture.records[0]);
++    later.record_id = new_record_id();
++    later.session_seq = 3;
++    later.schema_version += 1;
++    write_stored(root.path(), &[first.clone(), later.clone()], b"");
++    assert_same_error(
++        root.path(),
++        fixture.session,
++        "unsupported journal schema_version",
++    );
++    later.schema_version = JOURNAL_SCHEMA_VERSION;
++    later.session_id = new_session_id();
++    write_stored(root.path(), &[first.clone(), later.clone()], b"");
++    assert_same_error(root.path(), fixture.session, "belongs to session");
++    later.session_id = fixture.session;
++    later.payload = StoredPayload::Inline {
++        value: serde_json::json!({}),
++    };
++    write_stored(root.path(), &[first.clone(), later.clone()], b"");
++    assert_same_error(root.path(), fixture.session, "invalid journal payload");
++
++    let payload = serde_json::to_vec(&fixture.records[0].entry.payload_value().unwrap()).unwrap();
++    later.payload = write_blob(root.path(), &payload).unwrap();
++    let StoredPayload::Blob { relative_path, .. } = &later.payload else {
++        unreachable!()
++    };
++    let path = root.path().join(relative_path);
++    let mut corrupt = payload;
++    corrupt[0] ^= 1;
++    std::fs::write(&path, &corrupt).unwrap();
++    write_stored(root.path(), &[first.clone(), later.clone()], b"");
++    assert_same_error(root.path(), fixture.session, "hash mismatch");
++    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
++    std::fs::remove_file(&path).unwrap();
++    assert_same_error(
++        root.path(),
++        fixture.session,
++        "failed to inspect journal blob",
++    );
++
++    // With hydration successful, preserve the first semantic error, not a later one.
++    later = stored(&fixture.records[0]);
++    write_stored(root.path(), &[first, later], b"");
++    assert_same_error(root.path(), fixture.session, "sequence mismatch");
++}
++
++#[test]
++fn a_semantically_invalid_record_never_reaches_the_usage_fold() {
++    let root = tempfile::tempdir().unwrap();
++    let mut fixture = Fixture::new();
++    fixture.push(
++        JournalEntry::ModelResponseRecorded(ModelResponseRecorded {
++            exchange_id: new_exchange_id(),
++            outcome: ModelResponseOutcome::Error {
++                failure: ModelFailure::other("no request"),
++            },
++        }),
++        true,
++        false,
++    );
++    // A detached response is well-formed storage, but invalid without a request.
++    // UsageProjection::apply assumes validation and would panic on this input.
++    fixture.records[0].thread_id = None;
++    write_stored(root.path(), &[stored(&fixture.records[0])], b"");
++    assert_same_error(root.path(), fixture.session, "has no preceding request");
++
++    fixture.records.clear();
++    fixture.history(
++        HistoryMutationKind::Append,
++        vec![CanonicalMessage::text(MessageRole::User, "first")],
++        false,
++        false,
++    );
++    let first = stored(&fixture.records[0]);
++    let mut duplicate = first.clone();
++    duplicate.session_seq = 2;
++    write_stored(root.path(), &[first, duplicate], b"");
++    assert_same_error(root.path(), fixture.session, "duplicate journal record_id");
++}
++
++#[test]
++fn empty_and_invalid_file_reads_do_not_materialize_or_repair_storage() {
++    let root = tempfile::tempdir().unwrap();
++    let missing = root.path().join("missing");
++    let session = new_session_id();
++    assert_derived(&missing, session);
++    assert!(!missing.exists());
++    std::fs::create_dir(journal_path(root.path())).unwrap();
++    assert_same_error(root.path(), session, "not a regular file");
++    assert!(journal_path(root.path()).is_dir());
++}
+diff --git a/crates/proteus-core/src/core/session_journal/storage/derived.rs b/crates/proteus-core/src/core/session_journal/storage/derived.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_journal/storage/derived.rs
+@@ -0,0 +1,75 @@
++//! Strict derived-only reads without retaining a second copy of all raw records.
++use super::*;
++use crate::{
++    contracts::ConversationSnapshot,
++    core::{model_context::projection::ModelContextProjection, session_journal::UsageProjection},
++    domain::SessionUsageSnapshot,
++    model_standard::CanonicalMessage,
++};
++
++pub(crate) fn load_validated_history(
++    session_dir: &Path,
++    session_id: SessionId,
++) -> Result<Vec<CanonicalMessage>> {
++    Ok(scan_validated(session_dir, session_id, |_| {})?.into_history())
++}
++
++pub(crate) fn load_validated_history_revision(
++    session_dir: &Path,
++    session_id: SessionId,
++) -> Result<u64> {
++    Ok(scan_validated(session_dir, session_id, |_| {})?.history_revision())
++}
++
++pub(crate) fn load_validated_conversation(
++    session_dir: &Path,
++    session_id: SessionId,
++) -> Result<ConversationSnapshot> {
++    let mut context = ModelContextProjection::default();
++    let state = scan_validated(session_dir, session_id, |record| context.apply(record))?;
++    Ok(ConversationSnapshot {
++        revision: state.history_revision(),
++        messages: state.into_history(),
++        model_context: context.snapshot(),
++    })
++}
++
++pub(crate) fn load_validated_usage(
++    session_dir: &Path,
++    session_id: SessionId,
++) -> Result<SessionUsageSnapshot> {
++    let mut usage = UsageProjection::default();
++    scan_validated(session_dir, session_id, |record| usage.apply(record))?;
++    Ok(usage.snapshot(session_id))
++}
++
++// This private fold is used only by the fixed, local metadata projections above.
++// It is not an early-render hook and never receives a caller's callback.
++fn scan_validated(
++    session_dir: &Path,
++    session_id: SessionId,
++    mut fold: impl FnMut(&JournalRecord),
++) -> Result<JournalValidationState> {
++    let mut state = JournalValidationState::default();
++    let mut next_seq = 1;
++    let mut semantic_error = None;
++    read::scan_records(session_dir, session_id, |record| {
++        if semantic_error.is_none() {
++            match state.apply_sequenced(session_id, &record, &mut next_seq) {
++                Ok(()) => fold(&record),
++                Err(error) => semantic_error = Some(error),
++            }
++        }
++        // load_records + JournalProjection::build decodes the entire complete
++        // prefix before semantic validation. Keep later parse/blob failures
++        // ahead of an earlier semantic error, without retaining the records.
++        Ok(())
++    })?;
++    if let Some(error) = semantic_error {
++        return Err(error);
++    }
++    Ok(state)
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/core/session_journal/storage.rs b/crates/proteus-core/src/core/session_journal/storage.rs
+--- a/crates/proteus-core/src/core/session_journal/storage.rs
++++ b/crates/proteus-core/src/core/session_journal/storage.rs
+@@ -19,8 +19,13 @@
+ mod initialize;
+ mod ownership;
+ pub(crate) use initialize::{initialize_writer_projection, initialize_writer_state};
++mod derived;
+ mod read;
+ pub(crate) use append::append_record;
++pub(crate) use derived::{
++    load_validated_conversation, load_validated_history, load_validated_history_revision,
++    load_validated_usage,
++};
+ pub(crate) use read::load_records;
+ mod recovery;
+ mod redaction;
+diff --git a/crates/proteus-core/src/core/session_store/catalog.rs b/crates/proteus-core/src/core/session_store/catalog.rs
+--- a/crates/proteus-core/src/core/session_store/catalog.rs
++++ b/crates/proteus-core/src/core/session_store/catalog.rs
+@@ -7,7 +7,7 @@
+ use proteus_contracts::app_protocol::AppSessionSummary;
+ 
+ use crate::{
+-    core::session_journal::{JournalProjection, journal_path, load_records},
++    core::session_journal::{JournalProjection, journal_path, load_validated_history},
+     model_standard::{CanonicalMessage, ContentPart, MessageRole},
+ };
+ 
+@@ -163,8 +163,8 @@
+ 
+ fn session_summary_from_dir(session_dir: PathBuf) -> Result<AppSessionSummary> {
+     let session_id = resolve_session_identity(&session_dir)?.session_id;
+-    let projection = JournalProjection::build(session_id, load_records(&session_dir, session_id)?)?;
+-    session_summary_from_projection(session_dir, session_id, &projection)
++    let history = load_validated_history(&session_dir, session_id)?;
++    session_summary_from_history(session_dir, session_id, &history)
+ }
+ 
+ pub(super) fn session_summary_from_projection(
+diff --git a/crates/proteus-core/src/core/session_store/usage.rs b/crates/proteus-core/src/core/session_store/usage.rs
+--- a/crates/proteus-core/src/core/session_store/usage.rs
++++ b/crates/proteus-core/src/core/session_store/usage.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::{core::session_journal::UsageProjection, domain::SessionUsageSnapshot};
++use crate::{core::session_journal::load_validated_usage, domain::SessionUsageSnapshot};
+ 
+ impl SessionStore {
+     /// Живой writer отдаёт готовую проекцию; cold read валидирует журнал без
+@@ -19,12 +19,7 @@
+             if let Some(usage) = store.fresh_read_usage() {
+                 return Ok(usage);
+             }
+-            let projection = store.load_projection()?;
+-            let mut usage = UsageProjection::default();
+-            for record in &projection.records {
+-                usage.apply(record);
+-            }
+-            Ok(usage.snapshot(store.session_id))
++            load_validated_usage(&store.session_dir, store.session_id)
+         })
+         .await?;
+         drop(writer);
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -13,6 +13,7 @@
+         DEFAULT_BLOB_THRESHOLD_BYTES, HistoryMutated, HistoryMutationKind, JournalEntry,
+         JournalProjection, JournalRecord, JournalRecordAttribution, JournalWriterState,
+         WriterRetirement, append_record, initialize_writer_state, journal_path, load_records,
++        load_validated_conversation, load_validated_history, load_validated_history_revision,
+     },
+     domain::{ExecutionId, HistoryCompactionReport, SessionId, ThreadId, TurnId},
+     model_standard::CanonicalMessage,
+@@ -121,7 +122,7 @@
+     }
+ 
+     pub fn load_messages(&self) -> Result<Vec<CanonicalMessage>> {
+-        Ok(self.load_projection()?.history)
++        load_validated_history(&self.session_dir, self.session_id)
+     }
+ 
+     /// Read the current canonical conversation, without replay or a writer lease.
+@@ -130,15 +131,7 @@
+         if let Some(conversation) = read_model::sqlite_conversation(self) {
+             return Ok(conversation);
+         }
+-        let projection = self.load_projection()?;
+-        let model_context =
+-            super::model_context::ModelContextState::from_records(&projection.records, None)
+-                .snapshot();
+-        Ok(crate::contracts::ConversationSnapshot {
+-            revision: projection.history_revision,
+-            messages: projection.history,
+-            model_context,
+-        })
++        load_validated_conversation(&self.session_dir, self.session_id)
+     }
+ 
+     pub fn load_records(&self) -> Result<Vec<JournalRecord>> {
+@@ -155,7 +148,7 @@
+         if let Some(cached) = self.cached_read_metadata() {
+             return Ok(cached.revision);
+         }
+-        Ok(self.load_projection()?.history_revision)
++        load_validated_history_revision(&self.session_dir, self.session_id)
+     }
+ 
+     pub fn load_projection(&self) -> Result<JournalProjection> {
