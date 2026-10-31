@@ -1,0 +1,32 @@
+diff --git a/src/ui/chat/pump.rs b/src/ui/chat/pump.rs
+index d467da1..ae50695 100644
+--- a/src/ui/chat/pump.rs
++++ b/src/ui/chat/pump.rs
+@@ -68,11 +68,17 @@ impl Chat {
+         let session = &mut self.session;
+         match item {
+             PumpItem::Connected => {
++                // A reconnect baseline does not carry profile/config state.
++                // Initial setup already starts its own config request.
++                let reconnecting = session.link_error.is_some();
+                 self.context_requests.invalidate();
+                 session.cursor.begin_connection();
+                 session.pending_cursor.begin_connection();
+                 session.connected = true;
+                 session.link_error = None;
++                if reconnecting {
++                    self.load_config(cx);
++                }
+                 cx.emit(ChatEvent::SessionStateChanged);
+                 true
+             }
+@@ -188,7 +194,8 @@ impl Chat {
+                 }
+                 Change::None
+             }
+-            AppServerEvent::ModulesReloaded { .. }
++            AppServerEvent::EventStreamLagged { .. }
++            | AppServerEvent::ModulesReloaded { .. }
+             | AppServerEvent::ProfileReloadStatus { error: None } => {
+                 self.load_config(cx);
+                 Change::None
