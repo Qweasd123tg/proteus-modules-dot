@@ -1,8 +1,23 @@
 # Согласованность runtime и работа после reset
 
-Source-only изменения Core на
-`925de0fc5ee5995409b11e42b216a15ca12f76d0`. Это продолжение работы над
-фундаментом, не заявление о завершённой оптимизации проекта.
+Исторический source-only пакет для Core
+`925de0fc5ee5995409b11e42b216a15ca12f76d0`, а не набор для повторного применения
+к текущему upstream. Delivery PR60/61 слиты, их изменения перенесены владельцем.
+Слияние delivery и перенос upstream не являются доказательством выполнения tests.
+
+**Историческая поправка 08:** исходный artifact `37cc15d3…` был неполным:
+отделив session mode от AppConfig, он пропустил наследование effective mode
+через `/new-session` с явным `source_session_dir`. Исправленный 08 заменяет
+его целиком и включает точную правку владельца из Core
+[`b062bb34634bb7de346d898fb326a9e154c6ed69`](https://github.com/Proteus-harness/Proteus-core/commit/b062bb34634bb7de346d898fb326a9e154c6ed69):
+отдельное чтение/применение runtime mode, addressing assertions и текст guide.
+Это всё ещё patch для исходной базы `925de0f`; исправление уже есть в `b062bb3`
+и сохранено в текущем Core
+[`befd30516aefa6f0a0ad5db9924ad4957160b8dc`](https://github.com/Proteus-harness/Proteus-core/commit/befd30516aefa6f0a0ad5db9924ad4957160b8dc).
+Повторно применять 08 к ним нельзя. Успешный запуск tests не заявлен.
+Старый 08 с SHA-256 `37cc15d331fad55cf66bec5824fe1f6b9bdbed80aacf40da0769f40ccb209cca`
+заменён полным `3f9a9ae5b8b58248b5e80fb362069ff5140e3372105ef19cc5bb7b879ba926c2`,
+а не дополнен ещё одним runtime patch. Старый вариант остаётся только в Git history.
 
 ## Изменения
 
@@ -62,10 +77,18 @@ Source-only изменения Core на
   не переписывает опубликованный AppConfig. Несвязанное изменение профиля
   не сбрасывает session override; первый Config Builder save не записывает
   временный Plan как profile default. Runtime остаётся единственным владельцем
-  effective mode, UI продолжает читать его. Propagation между сессиями остаётся
+  effective mode, UI продолжает читать его. Явный source-session переносит
+  effective mode отдельным override до `start_session`, в том числе при выборе
+  другого workspace, не меняя default новой сессии; source-less путь остаётся
+  прежним. Старые addressing tests уже требовали inherited Auto, новые assertions
+  дополнительно закрепляют published Normal. Propagation между сессиями остаётся
   предусмотренным per-session eventual reload, не общей транзакцией.
 
-## Применение
+## Применение только к исторической базе
+
+Ниже — воспроизведение состава на `925de0f`, не инструкция установки на свежий
+Core. Для текущего checkout сначала сравните уже портированные изменения;
+само наличие patch в delivery не означает, что его нужно применять снова.
 
 `SOURCES.json` фиксирует исходные Git blobs, candidate hashes и порядок
 проверенной композиции. Патчи относятся к Core checkout, а не к delivery repo.
@@ -82,11 +105,26 @@ Cargo pin. Внешние upstream репозитории этой достав�
 Изменения PR58/59 уже перенесены в закреплённые upstreams, повторять их не нужно.
 Не переносите утверждение о совместимости на произвольные будущие commits.
 
+## Навигация и статус доставки
+
+Сверка 30 октября 2026, 15:32 UTC; состояния PR и факт наличия кода — разные вещи.
+
+| Набор | Delivery-статус | Что делать на текущем upstream |
+|---|---|---|
+| [PR60](https://github.com/Qweasd123tg/proteus-modules-dot/pull/60) и [PR61](https://github.com/Qweasd123tg/proteus-modules-dot/pull/61) | merged; main `73d438d49…` | Исторические 25 patches уже портированы; не применять повторно. Этот 08 исправляет только неполный delivery artifact. |
+| [PR62](https://github.com/Qweasd123tg/proteus-modules-dot/pull/62) | open draft, head `a8f53154…` с отчётом PORTED; не слит в delivery main | Все 6 изменений перенесены upstream; пользовательские fixture/docs refinements сохраняются. Draft-статус не означает отсутствие кода upstream. |
+| [PR63](https://github.com/Qweasd123tg/proteus-modules-dot/pull/63) | open draft, head `6ca100ed…`; не слит в delivery main | Два новых отдельных source-патча: terminal receipt и streaming Extensions ZIP. Их свежие базы и gates не относятся к этой исторической серии. |
+| Отдельные alpha API proposals | Не опубликованы отдельным delivery packet/PR | Не являются частью этого пакета или PR62; требуют собственной согласованной интеграции и настоящих consumer pins. |
+
+[SHA256SUMS](SHA256SUMS) фиксирует все 8 patches, этот README и SOURCES.json;
+сам checksum-файл не хеширует себя. Проверка суммы не заменяет review или tests.
+
 ## Evidence и границы
 
 Авторское и независимое source review, проверка preimages, strict apply/reverse
-и candidate byte comparisons выполнены. Отдельно проверены 72 fresh preimage и
-композицию всех 25 patches (17 прежних + 8 новых) с точным reverse. Regression sources добавлены, но
+и candidate byte comparisons выполнены. После поправки 08 проверены 74 точных
+preimages; композиция всех 25 patches (17 прежних + 8 новых) проверена с точным
+reverse. Regression sources добавлены, но
 **Успешное выполнение Rust tests/builds, UI, CI или benchmarks не подтверждено**.
 Static application не подтверждает компиляцию. Нет измеренных latency/CPU/RAM
 цифр. Требуемые executable gates остаются в существующих Core guides.
@@ -95,3 +133,7 @@ Static application не подтверждает компиляцию. Нет и
 observer — отдельные направления, а не скрытые зависимости этих patches.
 После выпуска этого пакета исследование продолжается; подтверждённые новые
 изменения доставляются отдельными понятными дополнениями.
+
+При отделении defaults от effective state проверяйте не только setters и
+save/reload, но и все clone/inherit/session-create consumers вместе с уже
+существующими assertions: AppConfig не должен неявно переносить session override.

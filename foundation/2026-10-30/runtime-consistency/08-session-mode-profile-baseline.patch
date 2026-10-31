@@ -43,6 +43,72 @@ index 84b6433..5f9923b 100644
 +    assert_eq!(server.permission_mode().await, PermissionMode::Plan);
 +    server.shutdown().await;
 +}
+diff --git a/crates/proteus-core/src/app_server/http/lifecycle.rs b/crates/proteus-core/src/app_server/http/lifecycle.rs
+index 36876f4..207de02 100644
+--- a/crates/proteus-core/src/app_server/http/lifecycle.rs
++++ b/crates/proteus-core/src/app_server/http/lifecycle.rs
+@@ -52,20 +52,31 @@ pub(super) async fn execute_new_session(
+                 Ok(path)
+             })
+             .transpose()?;
+-        let (config, cwd, config_path) = match source_session_dir {
++        let (config, cwd, config_path, permission_mode) = match source_session_dir {
+             Some(path) => {
+                 let source = super::sessions::server_for_session(state, path).await?;
+                 let config = source.config.read().await.clone();
+-                (config, source.cwd.clone(), source.config_path.clone())
++                (
++                    config,
++                    source.cwd.clone(),
++                    source.config_path.clone(),
++                    Some(source.permission_mode().await),
++                )
+             }
+             None => (
+                 state.launch.config.clone(),
+                 state.launch.cwd.clone(),
+                 state.launch.config_path.clone(),
++                None,
+             ),
+         };
+         let cwd = workspace.unwrap_or(cwd);
+         let next = AgentAppServer::launch(config, cwd, config_path.as_deref()).await?;
++        // Inherit the source session override without changing the published
++        // profile that config saves and unrelated reloads use as their baseline.
++        if let Some(mode) = permission_mode {
++            next.set_permission_mode(mode).await;
++        }
+         next.start_session().await?;
+         state.remember_server(next.clone()).await;
+         session_opened(state, &next).await
+diff --git a/crates/proteus-core/src/app_server/http/tests/addressing.rs b/crates/proteus-core/src/app_server/http/tests/addressing.rs
+index 9f15e36..d7ed82e 100644
+--- a/crates/proteus-core/src/app_server/http/tests/addressing.rs
++++ b/crates/proteus-core/src/app_server/http/tests/addressing.rs
+@@ -400,6 +400,11 @@ async fn lifecycle_uses_the_explicit_source_workspace_and_keeps_deletion_in_the_
+     let config = read_json_at(&state, &scoped_path("/config", &created_server)).await;
+     assert_eq!(config["cwd"], workspace_b.path().to_str().unwrap());
+     assert_eq!(config["permission_mode"], "Auto");
++    assert_eq!(
++        created_server.config.read().await.permissions.mode,
++        PermissionMode::Normal,
++        "inherited session overrides must not rewrite the published profile"
++    );
+     assert!(created_dir.starts_with(config_dir.path()));
+     let elsewhere = tempfile::tempdir().unwrap();
+     let opened = command_value(
+@@ -421,6 +426,11 @@ async fn lifecycle_uses_the_explicit_source_workspace_and_keeps_deletion_in_the_
+             .unwrap()
+     );
+     assert_eq!(config["permission_mode"], "Auto");
++    assert_eq!(
++        opened_server.config.read().await.permissions.mode,
++        PermissionMode::Normal,
++        "workspace selection must preserve the published profile baseline"
++    );
+     assert!(
+         command_value(
+             post_at(
 diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
 index 5d3e583..97209af 100644
 --- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
@@ -161,3 +227,18 @@ index 84d5fa3..410acee 100644
  `allow_all` полезен только для контролируемых profiles; это ordinary
  reference implementation с той же authority.
  
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 7b0b868..48e7ac0 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1048,7 +1048,9 @@ store; stdio остаётся привязанным к одной session пр
+ - `POST /new-session` - регистрирует новый пустой runtime и возвращает его
+   `SessionOpened {session_dir, activity}`. Optional `source_session_dir` в body
+   явно выбирает live session, от которой берутся workspace и конфигурация;
+-  приложение передаёт свой выбранный чат.
++  приложение передаёт свой выбранный чат. Действующий permission mode
++  наследуется как session override и не меняет опубликованный профиль
++  новой сессии.
+   Без этого поля используется стартовая конфигурация и workspace сервера.
+   Optional `workspace` (существующая папка) задаёт workspace новой сессии,
+   так клиент открывает чат в другой папке без перезапуска сервера.
