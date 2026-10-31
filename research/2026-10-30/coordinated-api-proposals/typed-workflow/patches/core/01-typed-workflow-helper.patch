@@ -1,0 +1,144 @@
+diff --git a/crates/proteus-contracts/src/process_module/workflow_tests.rs b/crates/proteus-contracts/src/process_module/workflow_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..aad78a8ee05c97c0cb8fe0cdab488937b392e1fb
+--- /dev/null
++++ b/crates/proteus-contracts/src/process_module/workflow_tests.rs
+@@ -0,0 +1,76 @@
++use super::*;
++use crate::{
++    domain::ContextChunk,
++    model_standard::{ContentPart, MessageRole},
++};
++use serde_json::{Value, json};
++
++fn output() -> WorkflowModuleOutput {
++    WorkflowModuleOutput {
++        output: AgentOutput::new("done", Value::Null),
++        new_messages: Vec::new(),
++        history_replacement: None,
++        compactions: Vec::new(),
++    }
++}
++
++#[test]
++fn typed_output_does_not_normalize_nonfinite_optional_scores() {
++    for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
++        let mut typed = output();
++        typed.new_messages.push(CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![ContentPart::Context {
++                chunk: ContextChunk::new("probe", "context").with_score(score),
++            }],
++        ));
++        let old_text = serde_json::to_string(&typed).unwrap();
++        let old_normalized: WorkflowModuleOutput = serde_json::from_str(&old_text).unwrap();
++        let ContentPart::Context { chunk } = &typed.new_messages[0].parts[0].payload else {
++            panic!("context")
++        };
++        assert!(!chunk.score.unwrap().is_finite());
++        let ContentPart::Context { chunk } = &old_normalized.new_messages[0].parts[0].payload
++        else {
++            panic!("context")
++        };
++        assert_eq!(chunk.score, None);
++        // Actual JSON encoding still normalizes the score to null. Typed helper
++        // values are not automatically valid root history; domain validation
++        // remains the host's responsibility and is not exercised by this fixture.
++        assert_eq!(
++            serde_json::to_value(typed).unwrap(),
++            serde_json::to_value(old_normalized).unwrap(),
++        );
++    }
++}
++
++#[test]
++fn serde_defaults_and_explicit_empty_replacement_remain_distinct() {
++    let minimal = json!({"output": {"text": "done", "metadata": null}});
++    let decoded: WorkflowModuleOutput = serde_json::from_value(minimal).unwrap();
++    assert!(decoded.new_messages.is_empty());
++    assert!(decoded.compactions.is_empty());
++    assert_eq!(decoded.history_replacement, None);
++    let mut value = serde_json::to_value(decoded).unwrap();
++    assert!(value.get("history_replacement").is_none());
++    value["history_replacement"] = json!([]);
++    let explicit: WorkflowModuleOutput = serde_json::from_value(value).unwrap();
++    assert_eq!(explicit.history_replacement, Some(Vec::new()));
++}
++
++#[test]
++fn explicit_serde_readers_stay_strict_but_are_not_a_helper_stage() {
++    let mut value = serde_json::to_value(output()).unwrap();
++    value["unknown"] = json!(true);
++    assert!(serde_json::from_value::<WorkflowModuleOutput>(value).is_err());
++
++    let malformed = json!({"output": {"text": [], "metadata": null}});
++    let old_text_error =
++        serde_json::from_str::<WorkflowModuleOutput>(&serde_json::to_string(&malformed).unwrap())
++            .unwrap_err();
++    let value_error = serde_json::from_value::<WorkflowModuleOutput>(malformed).unwrap_err();
++    assert!(old_text_error.line() > 0);
++    assert_eq!(value_error.line(), 0);
++    assert_eq!(value_error.column(), 0);
++}
+diff --git a/crates/proteus-contracts/src/process_module.rs b/crates/proteus-contracts/src/process_module.rs
+index 430d38c1719d72f181a749edc0460a067135e339..3166414a4e4a1ccdd86704ad73ff4e855fe58dfc 100644
+--- a/crates/proteus-contracts/src/process_module.rs
++++ b/crates/proteus-contracts/src/process_module.rs
+@@ -261,12 +261,18 @@ pub trait WorkflowModuleHost: Send + Sync {
+ 
+ pub type WorkflowModuleHostMut<'a> = dyn WorkflowModuleHost + 'a;
+ 
++/// Owned, link-time workflow helper; JSON validation belongs to the process adapter.
++///
++/// This alpha API moves typed values without an internal serde normalization pass.
++/// Algorithm failures preserve their explicit history and model failure. Invalid
++/// process input and response encoding errors remain transport failures, not
++/// synthesized algorithm failures. Host authority still belongs to the invocation.
+ pub trait WorkflowModule: Send + Sync + 'static {
+-    fn run_json(
++    fn run(
+         &self,
+-        input_json: String,
++        input: WorkflowModuleInput,
+         host: &mut dyn WorkflowModuleHost,
+-    ) -> Result<String, crate::contracts::WorkflowFailure>;
++    ) -> Result<WorkflowModuleOutput, crate::contracts::WorkflowFailure>;
+ }
+ 
+ pub type WorkflowModuleObject = Box<dyn WorkflowModule>;
+@@ -338,3 +344,6 @@ pub trait ModuleRegistry {
+         workflow: WorkflowModuleObject,
+     ) -> ProcessModuleResult<()>;
+ }
++
++#[cfg(test)]
++mod workflow_tests;
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 958c94bdb8758163859e84773a11fad386ef50a6..da048a2b247c0b910bed809d7ba18e08f88ac70e 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -516,6 +516,24 @@ Core восстанавливает их из journal либо памяти; в
+ сохраняет типизированную модельную причину, если она известна. Это обычный result
+ invocation, а protocol/transport failure остаётся ошибкой broker-а.
+ 
++Rust helper `WorkflowModule::run` внутри одного worker executable принимает
++owned `WorkflowModuleInput` и возвращает `WorkflowModuleOutput` без промежуточных
++JSON строк. Это alpha API, не второй extension path и не изменение `workflow/v20`.
++Process adapter по-прежнему строго декодирует `ProcessWorkflowInput`, выбирает
++bound export/config и кодирует terminal envelope. Host callbacks остаются
++invocation-bound; typed helper не предоставляет дополнительную authority.
++
++Helper больше не нормализует Rust значения через serde: нет отдельного depth
++limit, line/column diagnostics или преобразования non-finite optional float
++в `None` между соседними Rust вызовами. На реальной JSON границе по-прежнему
++действуют parser limits и serde encoding (в том числе non-finite float → null).
++Не-UTF-8 `PathBuf` из результата теперь даёт encoding/transport error в adapter,
++а не синтетический `WorkflowFailure` из helper serializer. Ошибка алгоритма
++передаётся без изменения вместе с явными `history` и `model_failure`; никаких
++новых rollback/default/fallback правил нет. `None` и `Some([])` replacement
++не объединяются. DTO сохраняют serde defaults/strictness для явного чтения,
++но внутренний typed вызов сам по себе больше не является serde reader.
++
+ Core сохраняет явно возвращённую историю до `TurnSettled(Error)` через тот же
+ validator, что и успешный output: новые сообщения имеют роли assistant/tool
+ либо принадлежат доставленному Core steering; replacement требует changed

@@ -1,0 +1,499 @@
+diff --git a/crates/proteus-contracts/Cargo.toml b/crates/proteus-contracts/Cargo.toml
+index e3528dcbdb4d9f9f8e2ca643e357f4a40d9dabf9..5152c42d0aba86bbd9b42c6ba0e46f66a61eac06 100644
+--- a/crates/proteus-contracts/Cargo.toml
++++ b/crates/proteus-contracts/Cargo.toml
+@@ -3,6 +3,11 @@ name = "proteus-contracts"
+ version = "0.1.0-alpha.2"
+ edition = "2024"
+ 
++[features]
++default = ["runtime"]
++# Host execution services and mandatory tool-schema validation.
++runtime = ["dep:jsonschema"]
++
+ [dependencies]
+ anyhow = "1"
+ base64 = "0.22"
+@@ -10,7 +15,7 @@ async-trait = "0.1"
+ chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ futures-core = "0.3"
+ futures-util = "0.3"
+-jsonschema = { version = "0.58.3", default-features = false }
++jsonschema = { version = "0.58.3", default-features = false, optional = true }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ tokio = { version = "1", default-features = false, features = ["sync"] }
+diff --git a/crates/proteus-contracts/src/contracts/agent_control.rs b/crates/proteus-contracts/src/contracts/agent_control.rs
+index a270d128c785f3d1dd3daa3b49374b953ac6a65b..4c18e0fea0ea2d7a0a7f6a57238b4939d89cc31e 100644
+--- a/crates/proteus-contracts/src/contracts/agent_control.rs
++++ b/crates/proteus-contracts/src/contracts/agent_control.rs
+@@ -12,10 +12,9 @@ use anyhow::{Result, bail};
+ use async_trait::async_trait;
+ use serde::{Deserialize, Deserializer, Serialize, de};
+ 
+-use crate::{
+-    contracts::workflow::AgentWorkflowContext,
+-    domain::{AgentTask, SessionId, ThreadId},
+-};
++#[cfg(feature = "runtime")]
++use crate::contracts::workflow::AgentWorkflowContext;
++use crate::domain::{AgentTask, SessionId, ThreadId};
+ 
+ pub const AGENT_CONTROL_SCHEMA_VERSION: u32 = 1;
+ pub const MAX_AGENT_MESSAGE_BYTES: usize = 16_000;
+@@ -426,6 +425,7 @@ impl WorkspaceInfo {
+ ///
+ /// This is an application service, not a replaceable behavior slot. Child
+ /// agent model loops stay behind their own named configs.
++#[cfg(feature = "runtime")]
+ #[async_trait]
+ pub trait AgentControl: Send + Sync {
+     fn profiles(&self) -> Vec<AgentProfile>;
+diff --git a/crates/proteus-contracts/src/contracts/context_preparation.rs b/crates/proteus-contracts/src/contracts/context_preparation.rs
+index 701ffbfa0f1206e6a112bbc2e0c48984d5f5d1e5..a38101814816833a8021c5153943ca0bb9c0f0bf 100644
+--- a/crates/proteus-contracts/src/contracts/context_preparation.rs
++++ b/crates/proteus-contracts/src/contracts/context_preparation.rs
+@@ -147,6 +147,7 @@ pub trait ContextPreparation: Send + Sync {
+     async fn prepare(&self, input: ContextPreparationInput) -> Result<ContextPreparationResult>;
+ }
+ 
++#[cfg(feature = "runtime")]
+ pub(crate) fn compose_outputs(
+     input: &ContextPreparationInput,
+     previous: &ContextPreparationOutput,
+@@ -233,10 +234,11 @@ pub(crate) fn compose_outputs(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::{contracts::HookResponse, domain::ModelRef, model_standard::MessageRole};
++    #[cfg(feature = "runtime")]
+     use crate::{
+-        contracts::{HookEvent, HookResponse, apply_hook_response},
+-        domain::{ModelRef, new_execution_id},
+-        model_standard::MessageRole,
++        contracts::{HookEvent, apply_hook_response},
++        domain::new_execution_id,
+     };
+     use serde_json::json;
+ 
+@@ -280,6 +282,7 @@ mod tests {
+         assert!(decoded.request.unwrap().messages.is_empty());
+     }
+ 
++    #[cfg(feature = "runtime")]
+     #[test]
+     fn hook_preparation_cannot_replace_its_bound_target_or_source_identity() {
+         let input = input();
+@@ -330,6 +333,7 @@ mod tests {
+         assert!(serde_json::from_value::<HookResponse>(value).is_err());
+     }
+ 
++    #[cfg(feature = "runtime")]
+     #[test]
+     fn ordered_preparation_composes_user_derivations_back_to_root() {
+         use crate::model_standard::{CanonicalPart, ContentPart, PartProvenance, PartScope};
+@@ -427,6 +431,6 @@ mod tests {
+     }
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "runtime"))]
+ #[path = "context_preparation/allocation_tests.rs"]
+ mod allocation_tests;
+diff --git a/crates/proteus-contracts/src/contracts/execution.rs b/crates/proteus-contracts/src/contracts/execution.rs
+index 0d69c54b8f82fdbd0b9b3778d02e8d42f7992d36..afd0567fb58cef6e0b7b0ffa80d0ddfe74f2d4f0 100644
+--- a/crates/proteus-contracts/src/contracts/execution.rs
++++ b/crates/proteus-contracts/src/contracts/execution.rs
+@@ -1,13 +1,16 @@
++#[cfg(feature = "runtime")]
+ use std::sync::Arc;
+ 
+ use crate::{
+-    contracts::{
+-        ApprovalPolicy, ApprovalTransport, CancellationToken, ExecutionPermissionGrants, Model,
+-        ToolRegistry,
+-    },
++    contracts::CancellationToken,
+     domain::{ExecutionId, new_execution_id},
+ };
+ 
++#[cfg(feature = "runtime")]
++use crate::contracts::{
++    ApprovalPolicy, ApprovalTransport, ExecutionPermissionGrants, Model, ToolRegistry,
++};
++
+ /// Generic identity and cancellation boundary for one logical workload.
+ ///
+ /// The scope deliberately owns no runtime services, chat identity, history or
+@@ -42,6 +45,7 @@ impl ExecutionScope {
+ /// This is a migration boundary, not a promise that a broad context object is
+ /// the final capability API. It deliberately contains no conversational
+ /// identity, history, agent task or presentation state.
++#[cfg(feature = "runtime")]
+ #[derive(Clone)]
+ #[non_exhaustive]
+ pub struct ExecutionContext {
+@@ -58,6 +62,7 @@ pub struct ExecutionContext {
+     pub permission_grants: Arc<ExecutionPermissionGrants>,
+ }
+ 
++#[cfg(feature = "runtime")]
+ impl ExecutionContext {
+     pub fn require_model(&self) -> anyhow::Result<&Arc<dyn Model>> {
+         self.model
+diff --git a/crates/proteus-contracts/src/contracts/hook/tests.rs b/crates/proteus-contracts/src/contracts/hook/tests.rs
+index 6f3c2efa3c5a766e0a1e01bc55d2f2f65faac56d..b61e2f133ab6aa4a4263fb1e24f4a9907b7d3ea6 100644
+--- a/crates/proteus-contracts/src/contracts/hook/tests.rs
++++ b/crates/proteus-contracts/src/contracts/hook/tests.rs
+@@ -1,5 +1,7 @@
+ use super::*;
++#[cfg(feature = "runtime")]
+ use crate::domain::{ModelRef, ToolCall, ToolResult, new_call_id};
++#[cfg(feature = "runtime")]
+ #[test]
+ fn tool_selection_chain_only_narrows_and_preserves_full_specs() {
+     use super::super::{ToolSelectionInput, ToolSelectionOutput, ToolSelectionRequest};
+@@ -172,6 +174,7 @@ fn tool_selection_wire_is_strict_at_all_levels() {
+     assert!(serde_json::from_value::<HookResponse>(value).is_err());
+ }
+ 
++#[cfg(feature = "runtime")]
+ #[test]
+ fn responses_cannot_change_identity_or_status() {
+     let id = new_call_id();
+@@ -206,6 +209,7 @@ fn responses_cannot_change_identity_or_status() {
+     };
+     assert!(apply_hook_response(&model, &HookResponse::ToolOutput { output: "x".into() }).is_err());
+ }
++#[cfg(feature = "runtime")]
+ #[test]
+ fn notification_and_blank_blocks_are_rejected_strictly() {
+     let notification = HookEvent::TurnSettled {
+@@ -237,8 +241,13 @@ fn notification_and_blank_blocks_are_rejected_strictly() {
+         )
+         .is_err()
+     );
++}
++
++#[test]
++fn continue_response_rejects_unknown_fields() {
+     assert!(serde_json::from_str::<HookResponse>(r#"{"action":"continue","extra":true}"#).is_err());
+ }
++#[cfg(feature = "runtime")]
+ #[test]
+ fn model_context_cannot_rewrite_existing_canonical_part() {
+     let original = CanonicalMessage::text(crate::model_standard::MessageRole::User, "original");
+diff --git a/crates/proteus-contracts/src/contracts/hook.rs b/crates/proteus-contracts/src/contracts/hook.rs
+index edd73acbdfa8a601197dc7675d560be1d23525f4..71f80cce63d1b2b4fc842bf19f4f61a26b21740e 100644
+--- a/crates/proteus-contracts/src/contracts/hook.rs
++++ b/crates/proteus-contracts/src/contracts/hook.rs
+@@ -1,10 +1,14 @@
+ //! Ordered, execution-bound contributions at typed runtime boundaries.
+ use super::{ExecutionAttribution, ModelCallOrigin};
++#[cfg(feature = "runtime")]
++use crate::domain::validate_tool_call_args;
+ use crate::{
+-    domain::{AgentOutput, AgentTask, ToolCall, ToolResult, ToolSpec, validate_tool_call_args},
++    domain::{AgentOutput, AgentTask, ToolCall, ToolResult, ToolSpec},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, InstructionBlock},
+ };
+-use anyhow::{Result, bail};
++use anyhow::Result;
++#[cfg(feature = "runtime")]
++use anyhow::bail;
+ use async_trait::async_trait;
+ use serde::{Deserialize, Serialize};
+ use std::{path::PathBuf, sync::Arc};
+@@ -156,6 +160,7 @@ pub struct ProcessHookResponse {
+     pub result: HookResponse,
+ }
+ 
++#[cfg(feature = "runtime")]
+ pub fn apply_hook_response(event: &HookEvent, response: &HookResponse) -> Result<HookEvent> {
+     let mut event = event.clone();
+     match (&mut event, response) {
+@@ -211,6 +216,7 @@ pub fn apply_hook_response(event: &HookEvent, response: &HookResponse) -> Result
+     }
+     Ok(event)
+ }
++#[cfg(feature = "runtime")]
+ fn validate_model_context(
+     original: &[CanonicalMessage],
+     messages: &[CanonicalMessage],
+diff --git a/crates/proteus-contracts/src/contracts/tool.rs b/crates/proteus-contracts/src/contracts/tool.rs
+index 9b5bd8c2f8b39dcffb6450084156e9babba23bd4..83239a0af310af855bcb025b9390e6f5282f318d 100644
+--- a/crates/proteus-contracts/src/contracts/tool.rs
++++ b/crates/proteus-contracts/src/contracts/tool.rs
+@@ -1,5 +1,4 @@
+ use std::{
+-    collections::HashMap,
+     fmt,
+     path::PathBuf,
+     sync::{
+@@ -8,7 +7,12 @@ use std::{
+     },
+ };
+ 
+-use anyhow::{Result, anyhow};
++#[cfg(feature = "runtime")]
++use std::collections::HashMap;
++
++use anyhow::Result;
++#[cfg(feature = "runtime")]
++use anyhow::anyhow;
+ use async_trait::async_trait;
+ use tokio::sync::Notify;
+ 
+@@ -26,8 +30,8 @@ pub struct ToolContext {
+     /// Текущий canonical task. Обычным tools достаточно `cwd`; facade-tools,
+     /// создающие дочернюю работу, сохраняют исходный task как parent context.
+     pub task: Option<AgentTask>,
+-    /// Runtime-bound capability для facade-tool `task`. Dylib tools её не
+-    /// получают через свой ABI и не могут вызывать subagent slot напрямую.
++    /// Runtime-bound capability для host facade-tools. Process tools не
++    /// получают прямую ссылку на runtime service; доступ задаёт host protocol.
+     pub agent_control: Option<Arc<dyn AgentControlToolHost>>,
+     /// Read-only canonical history; absent for detached/non-conversation work.
+     pub conversation: Option<Arc<dyn super::ConversationReader>>,
+@@ -271,12 +275,14 @@ pub struct ToolEntry {
+     pub tool: Arc<dyn Tool>,
+ }
+ 
++#[cfg(feature = "runtime")]
+ #[derive(Clone, Default)]
+ pub struct ToolRegistry {
+     tools: HashMap<String, ToolEntry>,
+     schema_caches: HashMap<String, Arc<crate::domain::tool_validation::ToolSchemaCache>>,
+ }
+ 
++#[cfg(feature = "runtime")]
+ impl ToolRegistry {
+     pub fn new() -> Self {
+         Self::default()
+@@ -435,6 +441,6 @@ impl ToolRegistry {
+     }
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "runtime"))]
+ #[path = "tool/schema_cache_tests.rs"]
+ mod schema_cache_tests;
+diff --git a/crates/proteus-contracts/src/contracts/tool_provider.rs b/crates/proteus-contracts/src/contracts/tool_provider.rs
+index 2f9c4992096457bbfd42cb80fa39f02e7a22da7c..bd0673c974f70734570440f36d0282b23ad1ad43 100644
+--- a/crates/proteus-contracts/src/contracts/tool_provider.rs
++++ b/crates/proteus-contracts/src/contracts/tool_provider.rs
+@@ -2,7 +2,9 @@ use std::sync::Arc;
+ 
+ use anyhow::Result;
+ 
+-use crate::contracts::{Tool, ToolRegistry, ToolSource};
++#[cfg(feature = "runtime")]
++use crate::contracts::ToolRegistry;
++use crate::contracts::{Tool, ToolSource};
+ 
+ #[derive(Clone)]
+ pub struct ProvidedTool {
+@@ -21,6 +23,7 @@ pub trait ToolProvider: Send + Sync {
+     fn tools(&self) -> Result<Vec<ProvidedTool>>;
+ }
+ 
++#[cfg(feature = "runtime")]
+ pub fn register_provider_tools(
+     registry: &mut ToolRegistry,
+     provider: &dyn ToolProvider,
+diff --git a/crates/proteus-contracts/src/contracts/workflow.rs b/crates/proteus-contracts/src/contracts/workflow.rs
+index 9c48f82d901c3202e4c5dd4f4cc1aded07be192c..f3a5789ed13bd3b686da413f1b61a6316600a4dc 100644
+--- a/crates/proteus-contracts/src/contracts/workflow.rs
++++ b/crates/proteus-contracts/src/contracts/workflow.rs
+@@ -1,27 +1,38 @@
++#[cfg(feature = "runtime")]
+ use std::sync::{
+     Arc,
+     atomic::{AtomicUsize, Ordering},
+ };
+ 
++#[cfg(feature = "runtime")]
+ use anyhow::Result;
++#[cfg(feature = "runtime")]
+ use async_trait::async_trait;
+ use serde::{Deserialize, Serialize};
+ 
++#[cfg(feature = "runtime")]
+ mod invocation;
++#[cfg(feature = "runtime")]
+ pub use invocation::*;
+ 
++use crate::{
++    contracts::WorkflowFailure,
++    domain::{
++        AgentOutput, AgentTask, Event, HistoryCompactionReport, MessageId, ModelRef,
++        ReasoningConfig, SessionId, ThreadId, ToolCall, TurnId,
++    },
++    model_standard::{CanonicalMessage, CanonicalModelRequest, InstructionBlock},
++};
++
++#[cfg(feature = "runtime")]
+ use crate::{
+     contracts::{
+         AgentControl, CancellationToken, ContextBuilder, ContextPreparation, EventEmitter,
+         ExecutionContext, ModelContextObservation, NoopToolExecutionRecorder,
+-        NoopWorkflowHistoryRecorder, ToolExecutionRecorder, UserInputTransport, WorkflowFailure,
++        NoopWorkflowHistoryRecorder, ToolExecutionRecorder, UserInputTransport,
+         WorkflowHistoryRecorder,
+     },
+-    domain::{
+-        AgentOutput, AgentTask, Event, EventContext, HistoryCompactionReport, MessageId, ModelRef,
+-        ReasoningConfig, SessionId, ThreadId, ToolCall, TurnId,
+-    },
+-    model_standard::{CanonicalMessage, CanonicalModelRequest, InstructionBlock},
++    domain::EventContext,
+ };
+ 
+ pub const PROCESS_WORKFLOW_CONTRACT_VERSION: &str = "v20";
+@@ -185,6 +196,7 @@ pub struct WorkflowEmitEventRequest {
+ #[serde(deny_unknown_fields)]
+ pub struct WorkflowHostAck {}
+ 
++#[cfg(feature = "runtime")]
+ #[derive(Clone)]
+ #[non_exhaustive]
+ pub struct AgentWorkflowContext {
+@@ -220,6 +232,7 @@ pub struct AgentWorkflowContext {
+     pub thread_label: Option<String>,
+ }
+ 
++#[cfg(feature = "runtime")]
+ impl AgentWorkflowContext {
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+@@ -304,6 +317,7 @@ impl AgentWorkflowContext {
+     }
+ }
+ 
++#[cfg(feature = "runtime")]
+ #[async_trait]
+ pub trait Workflow: Send + Sync {
+     /// A terminal algorithm error may return [`WorkflowFailure`] through anyhow
+diff --git a/crates/proteus-contracts/src/domain/mod.rs b/crates/proteus-contracts/src/domain/mod.rs
+index 1e591c5253897a09a530f8aa222a93e8af2ff48d..9188314c54334a8205d30fad0b4f45670cc2a81b 100644
+--- a/crates/proteus-contracts/src/domain/mod.rs
++++ b/crates/proteus-contracts/src/domain/mod.rs
+@@ -26,6 +26,7 @@ pub use run_options::RunOptions;
+ pub mod search;
+ pub mod task;
+ pub mod tool;
++#[cfg(feature = "runtime")]
+ pub mod tool_validation;
+ pub mod usage;
+ 
+@@ -46,5 +47,6 @@ pub use process_sandbox::*;
+ pub use search::*;
+ pub use task::*;
+ pub use tool::*;
++#[cfg(feature = "runtime")]
+ pub use tool_validation::validate_tool_call_args;
+ pub use usage::*;
+diff --git a/crates/proteus-contracts/src/lib.rs b/crates/proteus-contracts/src/lib.rs
+index d71581aa0c006f07fddb36951bf5233e55a2277c..b23227ab6a3f1f73ef62adce6f6816192401ac97 100644
+--- a/crates/proteus-contracts/src/lib.rs
++++ b/crates/proteus-contracts/src/lib.rs
+@@ -2,6 +2,38 @@
+ //!
+ //! Этот crate содержит canonical contracts, общие для host и process workers.
+ //! Внешние workers не зависят от `proteus-core`.
++//!
++//! # Feature boundary
++//!
++//! `runtime` (enabled by default) provides schema-backed tool registration and
++//! validation, hook-response application and host workflow execution contexts.
++//! Disable default features for clients that consume DTOs and wire helpers only.
++//! Canonical DTOs, strict deserialization and their validation do not change.
++//! No validation-disabled form of the runtime APIs is provided. Core and the
++//! worker SDK explicitly enable `runtime`; Cargo features are additive.
++
++#![cfg_attr(
++    not(feature = "runtime"),
++    doc = r#"
++DTO-only builds do not expose runtime APIs that require tool-schema validation:
++
++```compile_fail
++use proteus_contracts::contracts::ToolRegistry;
++```
++
++```compile_fail
++use proteus_contracts::domain::validate_tool_call_args;
++```
++
++```compile_fail
++use proteus_contracts::contracts::apply_hook_response;
++```
++
++```compile_fail
++use proteus_contracts::contracts::ExecutionContext;
++```
++"#
++)]
+ 
+ pub mod app_protocol;
+ pub mod contracts;
+diff --git a/crates/proteus-core/Cargo.toml b/crates/proteus-core/Cargo.toml
+index 439602fb164bc64a0bc3aba11a715f5f460970e4..457642401fe6ffa59763a7e6b949de33f116c5d7 100644
+--- a/crates/proteus-core/Cargo.toml
++++ b/crates/proteus-core/Cargo.toml
+@@ -10,7 +10,7 @@ path = "src/main.rs"
+ [dependencies]
+ agent-client-protocol = "=2.1.0"
+ rmcp = { version = "=3.3.0", default-features = false, features = ["client"] }
+-proteus-contracts = { path = "../proteus-contracts" }
++proteus-contracts = { path = "../proteus-contracts", features = ["runtime"] }
+ proteus-module-protocol = { path = "../proteus-module-protocol" }
+ proteus-process-host = { path = "../proteus-process-host" }
+ anyhow = "1"
+diff --git a/crates/proteus-module-sdk/Cargo.toml b/crates/proteus-module-sdk/Cargo.toml
+index 03049779bb6eefaca5f3dba2158ff629ae0a6aca..fda7a0838b58c3bbed7225568361667879a3e76c 100644
+--- a/crates/proteus-module-sdk/Cargo.toml
++++ b/crates/proteus-module-sdk/Cargo.toml
+@@ -7,7 +7,7 @@ license = "MIT"
+ 
+ [dependencies]
+ anyhow = "1"
+-proteus-contracts = { path = "../proteus-contracts" }
++proteus-contracts = { path = "../proteus-contracts", features = ["runtime"] }
+ proteus-module-protocol = { path = "../proteus-module-protocol" }
+ serde = "1"
+ serde_json = "1"
+diff --git a/docs/development/testing.md b/docs/development/testing.md
+index 0d625dfec4e6609c2d9304d923828f5edbaaca8c..cb78ba9283aff736323e08ad865cc5fe901cd501 100644
+--- a/docs/development/testing.md
++++ b/docs/development/testing.md
+@@ -85,6 +85,30 @@ git diff --check
+ `./scripts/test.py -p proteus-core --test <target> <filter>`.
+ `cargo check` не заменяет поведенческие tests.
+ 
++### DTO-only contracts
++
++`proteus-contracts` имеет default-enabled feature `runtime`: schema validation,
++registry и связанные host execution helpers включаются вместе. Core и worker
++SDK явно требуют эту feature; это не переключатель отключения validation
++в исполняющем host/worker. Desktop и другие DTO-only consumers могут задать
++`default-features = false` после обновления на revision с этой границей.
++Canonical DTOs и strict serde validation остаются единственными общими типами.
++
++После изменения этой границы дополните полный Rust gate отдельным target:
++
++```bash
++./scripts/test.py -p proteus-contracts --no-default-features
++cargo tree -p proteus-contracts --no-default-features -e normal
++```
++
++Второй запуск tests проверяет DTOs и compile-fail doctests без runtime APIs;
++обычный workspace gate объединяет features с Core/SDK и этот режим не покрывает.
++В normal dependency tree этого target не должно быть `jsonschema`. Для клиента
++отдельно проверьте его tree и gates: Cargo объединяет features всех consumers,
++поэтому `default-features = false` в одной dependency записи недостаточно,
++если другая включает runtime. Изменение pin/lock требует реального проверенного
++Core revision; время сборки измеряйте, а не выводите из числа зависимостей.
++
+ ## Быстрая Локальная Проверка
+ 
+ `scripts/test.py` принимает обычные Cargo arguments с явным `-p`, а `full`
