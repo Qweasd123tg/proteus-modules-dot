@@ -1,0 +1,700 @@
+--- a/crates/proteus-contracts/src/app_protocol/transcript.rs
++++ b/crates/proteus-contracts/src/app_protocol/transcript.rs
+@@ -72,7 +72,9 @@
+     pub tools: Vec<AppTranscriptTool>,
+ }
+ 
+-/// Latest accepted tool row in one source-validated display revision.
++/// Latest accepted tool row in one coherent server-view revision.
++/// Active sessions combine completed state with live progress; inactive sessions
++/// use a source-validated saved display. `revision` is opaque to consumers.
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct AppLatestToolState {
+--- a/crates/proteus-core/src/app_server/events/session.rs
++++ b/crates/proteus-core/src/app_server/events/session.rs
+@@ -1,7 +1,7 @@
+ //! The view is updated inline with event delivery, before a producer can move
+ //! on. A subscription snapshot and its sequence are sampled under that same lock.
+ use super::{AppEventPublisher, AppServerEvent};
+-use crate::app_server::read_model::CompletedTranscript;
++use crate::app_server::read_model::{CompletedTranscript, ToolStateNotReady, ToolStates};
+ use crate::app_server::{AppTranscriptMessage, TurnProgress};
+ use crate::{
+     contracts::EventSink,
+@@ -9,7 +9,9 @@
+     domain::{EventEnvelope, SessionId},
+ };
+ use anyhow::{Result, anyhow};
+-use proteus_contracts::app_protocol::{AppExecutionState, AppSessionSnapshot};
++use proteus_contracts::app_protocol::{
++    AppExecutionState, AppLatestToolState, AppSessionSnapshot, AppToolState,
++};
+ use std::sync::{Arc, OnceLock, Weak};
+ 
+ #[derive(Clone)]
+@@ -24,6 +26,9 @@
+     pub seq: u64,
+     runtime: Weak<AgentRuntime>,
+     progress: TurnProgress,
++    // Queued turns already reset TurnProgress, but are not in completed history yet.
++    // Kept separate so a delayed pre-run history refresh cannot erase them.
++    settled_live_tools: ToolStates,
+     execution: AppExecutionState,
+     // Completed turns are projected from the validated journal at attachment
+     // and settlement. Reconnect snapshots must not reread it under this lock.
+@@ -64,6 +69,7 @@
+             seq: 0,
+             runtime: Weak::new(),
+             progress: TurnProgress::default(),
++            settled_live_tools: ToolStates::new(),
+             execution: AppExecutionState::default(),
+             history: Ok(Arc::new(CompletedTranscript::default())),
+         }
+@@ -72,7 +78,19 @@
+     pub fn apply(&mut self, event: &AppServerEvent) {
+         self.seq = self.seq.checked_add(1).expect("session sequence");
+         match event {
+-            AppServerEvent::Runtime { envelope } => self.progress.apply(envelope),
++            AppServerEvent::Runtime { envelope } => {
++                if matches!(envelope.event, crate::domain::Event::TurnStarted { .. }) {
++                    for tool in self
++                        .progress
++                        .tools()
++                        .filter(|tool| !matches!(tool.status.as_str(), "failed" | "denied"))
++                    {
++                        self.settled_live_tools
++                            .insert(tool.name.clone(), AppToolState::from(tool));
++                    }
++                }
++                self.progress.apply(envelope);
++            }
+             AppServerEvent::UserMessageSubmitted { text, images } => {
+                 self.progress.submit_input(text.clone(), images.clone())
+             }
+@@ -100,6 +118,34 @@
+ }
+ 
+ impl AppEventPublisher {
++    pub(in crate::app_server) fn latest_tool_state(
++        &self,
++        name: &str,
++    ) -> Result<AppLatestToolState> {
++        let view = self.0.view.lock().expect("session view lock");
++        let live =
++            view.progress.tools().rev().find(|tool| {
++                tool.name == name && !matches!(tool.status.as_str(), "failed" | "denied")
++            });
++        let tool = if let Some(tool) = live {
++            Some(AppToolState::from(tool))
++        } else if let Some(tool) = view.settled_live_tools.get(name) {
++            Some(tool.clone())
++        } else {
++            let history = view.history.as_ref().map_err(|_| ToolStateNotReady)?;
++            history
++                .tools
++                .as_ref()
++                .ok_or(ToolStateNotReady)?
++                .get(name)
++                .cloned()
++        };
++        Ok(AppLatestToolState {
++            revision: format!("{}:{}", view.stream_id, view.seq),
++            tool,
++        })
++    }
++
+     pub(in crate::app_server) fn completed_history(&self) -> Option<Arc<CompletedTranscript>> {
+         self.0
+             .view
+@@ -125,6 +171,7 @@
+             {
+                 return Ok(());
+             }
++            view.seq = view.seq.checked_add(1).expect("session sequence");
+             view.history = Ok(Arc::new(history));
+         }
+         self.publish_snapshot()
+@@ -185,6 +232,7 @@
+         let mut view = self.0.view.lock().expect("session view lock");
+         view.seq = view.seq.checked_add(1).expect("session sequence");
+         view.progress.finish_parent_turn();
++        view.settled_live_tools.clear();
+         view.history = history
+             .map(Arc::new)
+             .map_err(|error| Arc::new(format!("{error:#}")));
+--- a/crates/proteus-core/src/app_server/events/tests.rs
++++ b/crates/proteus-core/src/app_server/events/tests.rs
+@@ -152,3 +152,116 @@
+             .is_err()
+     );
+ }
++
++#[test]
++fn compact_tool_state_tracks_live_outcomes_queued_turns_refresh_and_clear() {
++    use crate::domain::{ToolCall, ToolResult};
++    use serde_json::json;
++    let (events, _) = test_event_channel(32);
++    let context = EventContext::new(
++        events.pending_snapshot().session_id,
++        new_thread_id(),
++        Some(new_turn_id()),
++    );
++    let send = |event| {
++        let _ = events.send(AppServerEvent::Runtime {
++            envelope: Box::new(EventEnvelope::new(context.clone(), 1, event)),
++        });
++    };
++    let start = || {
++        send(Event::TurnStarted {
++            session_id: context.session_id,
++            thread_id: context.thread_id,
++            turn_id: new_turn_id(),
++        })
++    };
++    let call = |id, args| {
++        send(Event::ToolCallRequested {
++            call: ToolCall::new(id, "update_plan", args),
++        })
++    };
++    let mut unvalidated = crate::app_server::read_model::CompletedTranscript::default();
++    unvalidated.tools = None;
++    events.finish_progress(Ok(unvalidated));
++    assert!(
++        events.latest_tool_state("missing").is_err(),
++        "stale startup is not authoritative absence"
++    );
++    start();
++    call("old", json!({"plan":["old"]}));
++    send(Event::ToolFinished {
++        result: ToolResult::ok("old".into(), "not retained"),
++    });
++    let completed = events.session_snapshot().unwrap().transcript;
++    events.finish_progress(Ok(completed.into()));
++    let refresh = events.completed_history().unwrap();
++    start();
++    call("new", json!({"plan":["new"]}));
++    assert_eq!(
++        events
++            .latest_tool_state("update_plan")
++            .unwrap()
++            .tool
++            .unwrap()
++            .call_id,
++        "new"
++    );
++    let mut failed = ToolResult::ok("new".into(), "failure");
++    failed.ok = false;
++    send(Event::ToolFinished { result: failed });
++    assert_eq!(
++        events
++            .latest_tool_state("update_plan")
++            .unwrap()
++            .tool
++            .unwrap()
++            .call_id,
++        "old"
++    );
++    call("denied", json!({"plan":["denied"]}));
++    send(Event::ApprovalResolved {
++        call_id: "denied".into(),
++        approved: false,
++    });
++    assert_eq!(
++        events
++            .latest_tool_state("update_plan")
++            .unwrap()
++            .tool
++            .unwrap()
++            .call_id,
++        "old"
++    );
++    call("clear", json!({"plan":["request"]}));
++    send(Event::ToolCallResolved {
++        call: ToolCall::new("clear", "update_plan", json!({"plan":[]})),
++    });
++    send(Event::ToolFinished {
++        result: ToolResult::ok("clear".into(), "not retained"),
++    });
++    start(); // A queued follow-up clears current TurnProgress before settlement.
++    let canonical =
++        crate::app_server::read_model::CompletedTranscript::from(refresh.messages.clone());
++    events.refresh_history(&refresh, canonical).unwrap(); // Delayed pre-run refresh.
++    let state = events.latest_tool_state("update_plan").unwrap();
++    let tool = state.tool.unwrap();
++    assert_eq!(tool.call_id, "clear");
++    assert_eq!(tool.effective_args, Some(json!({"plan":[]})));
++    assert!(!state.revision.is_empty());
++    assert!(events.latest_tool_state("missing").unwrap().tool.is_none());
++    events.finish_progress(Ok(Vec::new().into())); // Authoritative clear replaces both prefixes.
++    assert!(
++        events
++            .latest_tool_state("update_plan")
++            .unwrap()
++            .tool
++            .is_none()
++    );
++    events.finish_progress(Err(anyhow::anyhow!("projection unavailable")));
++    assert!(
++        events
++            .latest_tool_state("missing")
++            .unwrap_err()
++            .is::<crate::app_server::read_model::ToolStateNotReady>()
++    );
++}
+--- a/crates/proteus-core/src/app_server/http/reads.rs
++++ b/crates/proteus-core/src/app_server/http/reads.rs
+@@ -60,7 +60,7 @@
+         ),
+         "/history/tool-state" => json_response(
+             StatusCode::OK,
+-            &super::sessions::tool_state_json(query).await?,
++            &super::sessions::tool_state_json(state, query).await?,
+         ),
+         "/conversation" => json_response(StatusCode::OK, &conversation_json(state, query).await?),
+         "/context" => json_response(StatusCode::OK, &context_map_json(state, query).await?),
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -335,8 +335,9 @@
+     }
+ }
+ 
+-/// Compact read never activates a runtime or rebuilds the canonical projection.
++/// Use an existing live view or the compact saved index; never activate or replay a runtime.
+ pub(super) async fn tool_state_json(
++    state: &HttpAppState,
+     query: Option<&str>,
+ ) -> Result<proteus_contracts::app_protocol::AppLatestToolState> {
+     let dir = canonicalize_session_dir_path(required_session_query(query)?)?;
+@@ -346,6 +347,9 @@
+         !name.is_empty() && !name.chars().any(char::is_control),
+         "name must be nonempty and contain no control characters"
+     );
++    if let Some(server) = state.server_for_session_dir(&dir).await {
++        return server.events.latest_tool_state(&name);
++    }
+     tokio::task::spawn_blocking(move || {
+         let store = SessionStore::open(dir)?;
+         #[cfg(unix)]
+--- a/crates/proteus-core/src/app_server/http/tests/tool_state.rs
++++ b/crates/proteus-core/src/app_server/http/tests/tool_state.rs
+@@ -113,3 +113,56 @@
+     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn active_tool_state_uses_live_view_without_rebuilding_stale_saved_index() {
++    use crate::domain::{Event, EventContext, EventEnvelope, new_thread_id, new_turn_id};
++    let (state, server, _root) = test_state().await;
++    let store = crate::core::SessionStore::open(server.session_dir_path().unwrap()).unwrap();
++    store
++        .append_history(
++            new_thread_id(),
++            None,
++            &[CanonicalMessage::text(
++                MessageRole::User,
++                "new journal input",
++            )],
++        )
++        .await
++        .unwrap();
++    assert!(store.saved_tool_state("update_plan").is_none());
++    let context = EventContext::new(server.session_id(), new_thread_id(), Some(new_turn_id()));
++    for event in [
++        Event::TurnStarted {
++            session_id: context.session_id,
++            thread_id: context.thread_id,
++            turn_id: context.turn_id.unwrap(),
++        },
++        Event::ToolCallRequested {
++            call: ToolCall::new("live-plan", "update_plan", json!({"plan":["live"]})),
++        },
++    ] {
++        let _ = server.events.send(AppServerEvent::Runtime {
++            envelope: Box::new(EventEnvelope::new(context.clone(), 1, event)),
++        });
++    }
++    let journal = std::fs::read(store.journal_path()).unwrap();
++    let response = route_request(
++        state,
++        authed_get_request(&session_uri(
++            "/history/tool-state?name=update_plan",
++            &server,
++        )),
++    )
++    .await
++    .unwrap();
++    assert_eq!(response.status(), StatusCode::OK);
++    let value: Value = serde_json::from_slice(&response_bytes(response).await).unwrap();
++    assert_eq!(value["tool"]["call_id"], "live-plan");
++    assert!(
++        store.saved_tool_state("update_plan").is_none(),
++        "live read must not rebuild the stale index"
++    );
++    assert_eq!(std::fs::read(store.journal_path()).unwrap(), journal);
++    server.shutdown().await;
++}
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -5,37 +5,77 @@
+ };
+ use crate::core::{SessionReadModel, SessionStore};
+ 
+-use proteus_contracts::app_protocol::{AppTranscriptCursor, AppTranscriptMessage};
+-
+-#[derive(Default)]
++use proteus_contracts::app_protocol::{AppToolState, AppTranscriptCursor, AppTranscriptMessage};
++use std::collections::HashMap;
++
++pub(super) type ToolStates = HashMap<String, AppToolState>;
++
++pub(super) fn collect_tool_states(messages: &[AppTranscriptMessage]) -> ToolStates {
++    messages
++        .iter()
++        .filter_map(|message| message.tool.as_ref())
++        .filter(|tool| !matches!(tool.status.as_str(), "failed" | "denied"))
++        .map(|tool| (tool.name.clone(), AppToolState::from(tool)))
++        .collect()
++}
++
+ pub(super) struct CompletedTranscript {
+     pub messages: Vec<AppTranscriptMessage>,
+     pub cursor: Option<AppTranscriptCursor>,
++    // The exact completed prefix, independent of the resident 50-row page.
++    // None means unavailable, not an authoritative absence.
++    pub tools: Option<ToolStates>,
++}
++
++impl Default for CompletedTranscript {
++    fn default() -> Self {
++        Vec::new().into()
++    }
+ }
+ 
+ impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
+     fn from(messages: Vec<AppTranscriptMessage>) -> Self {
++        let tools = Some(collect_tool_states(&messages));
+         Self {
+             messages,
++            tools,
+             cursor: None,
+         }
+     }
+ }
+ 
+ impl CompletedTranscript {
++    pub fn from_view(
++        store: &SessionStore,
++        messages: Vec<AppTranscriptMessage>,
++        cursor: Option<AppTranscriptCursor>,
++    ) -> Self {
++        let tools = match &cursor {
++            #[cfg(unix)]
++            Some(cursor) => store.saved_tool_states(&cursor.revision),
++            _ => Some(collect_tool_states(&messages)),
++        };
++        let _ = store;
++        Self {
++            messages,
++            cursor,
++            tools,
++        }
++    }
++
+     pub fn from_model(
+         store: &SessionStore,
+         transcript: Vec<AppTranscriptMessage>,
+-        stale: bool,
++        expected_revision: Option<&str>,
+     ) -> Self {
++        let tools = Some(collect_tool_states(&transcript));
+         #[cfg(unix)]
+-        if let Some(page) = if stale {
+-            store.saved_display_page()
+-        } else {
+-            store.saved_transcript_page(None, None)
+-        } {
++        if let Some(page) =
++            expected_revision.and_then(|revision| store.saved_transcript_page(None, Some(revision)))
++        {
+             return Self {
+                 messages: page.messages,
++                tools,
+                 cursor: Some(AppTranscriptCursor {
+                     revision: page.revision,
+                     before: page.start,
+@@ -43,8 +83,12 @@
+                 }),
+             };
+         }
+-        let _ = (store, stale);
+-        transcript.into()
++        let _ = (store, expected_revision);
++        Self {
++            messages: transcript,
++            cursor: None,
++            tools,
++        }
+     }
+ }
+ 
+@@ -135,10 +179,11 @@
+             |source| journal_transcript_from_source(source, None),
+             journal_transcript_append_from_source,
+         )?;
+-        Ok(CompletedTranscript {
+-            messages: view.transcript,
+-            cursor: view.cursor,
+-        })
++        Ok(CompletedTranscript::from_view(
++            store,
++            view.transcript,
++            view.cursor,
++        ))
+     })();
+     #[cfg(feature = "memory-diagnostics")]
+     crate::memory_diagnostics::point("completed.full_model_dropped", &[]);
+@@ -188,13 +233,26 @@
+                     journal_transcript_from_source(source, None)
+                 })?;
+                 #[cfg(unix)]
+-                if let Some(source) = source {
+-                    store.save_read_model(&source, &model);
++                if let Some(source) = &source {
++                    store.save_read_model(source, &model);
+                 }
++                #[cfg(unix)]
++                let revision = source
++                    .filter(|source| {
++                        crate::core::session_read_cache::SourceFingerprint::read(
++                            store.session_dir(),
++                            8192,
++                        )
++                        .as_ref()
++                            == Some(source)
++                    })
++                    .and_then(|source| source.revision());
++                #[cfg(not(unix))]
++                let revision: Option<String> = None;
+                 Ok::<_, anyhow::Error>(CompletedTranscript::from_model(
+                     &store,
+                     model.transcript,
+-                    false,
++                    revision.as_deref(),
+                 ))
+             })
+             .await??;
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -185,6 +185,12 @@
+         }
+     }
+ 
++    pub(super) fn tools(&self) -> impl DoubleEndedIterator<Item = &AppTranscriptTool> {
++        self.messages
++            .iter()
++            .filter_map(|message| message.tool.as_ref())
++    }
++
+     pub(super) fn finish_parent_turn(&mut self) {
+         self.messages.clear();
+         self.turn_id = None;
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -504,16 +504,27 @@
+             .await
+             .map_err(|error| anyhow!("session transcript task failed: {error}"))??;
+             refresh_stale_view = stale;
++            let transcript = if stale {
++                // Startup's stale display is not a certified prefix of this run.
++                read_model::CompletedTranscript {
++                    messages: model.transcript,
++                    cursor: model.cursor,
++                    tools: None,
++                }
++            } else {
++                read_model::CompletedTranscript::from_view(
++                    &session_store,
++                    model.transcript,
++                    model.cursor,
++                )
++            };
+             builder = builder.resume_from_session_view(
+                 session_store,
+                 model.revision,
+                 model.summary.message_count,
+                 new_thread_id(),
+             );
+-            Some(read_model::CompletedTranscript {
+-                messages: model.transcript,
+-                cursor: model.cursor,
+-            })
++            Some(transcript)
+         } else {
+             None
+         };
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+@@ -87,6 +87,29 @@
+         key: &str,
+     ) -> Option<Option<T>> {
+         read_keyed(&self.conn, section, key)
++    }
++
++    pub(in crate::core::session_store) fn keyed_rows<T: DeserializeOwned>(
++        &self,
++        section: &str,
++    ) -> Option<Vec<(String, T)>> {
++        let mut statement = self
++            .conn
++            .prepare_cached(
++                "SELECT key,payload,checksum FROM keyed_records WHERE section=?1 ORDER BY key",
++            )
++            .ok()?;
++        let mut rows = statement.query(params![section]).ok()?;
++        let mut out = Vec::new();
++        while let Some(row) = rows.next().ok()? {
++            let bytes = row.get_ref(1).ok()?.as_blob().ok()?;
++            let checksum = row.get_ref(2).ok()?.as_blob().ok()?;
++            if bytes.len() > MAX_BYTES || digest(&SHA256, bytes).as_ref() != checksum {
++                return None;
++            }
++            out.push((row.get(0).ok()?, serde_json::from_slice(bytes).ok()?));
++        }
++        Some(out)
+     }
+ 
+     pub(in crate::core::session_store) fn keyed_fingerprint(
+--- a/crates/proteus-core/src/core/session_store/read_model/sqlite/tool_state.rs
++++ b/crates/proteus-core/src/core/session_store/read_model/sqlite/tool_state.rs
+@@ -15,6 +15,56 @@
+     name: &str,
+ ) -> Option<AppLatestToolState> {
+     load(store, name).or_else(|| rebuild(store, name))
++}
++
++/// Read exactly the completed display's index, even while the journal advances.
++/// Its owning SessionView combines this prefix with authoritative live progress.
++pub(in crate::core::session_store::read_model) fn tool_states(
++    store: &SessionStore,
++    revision: &str,
++) -> Option<std::collections::HashMap<String, AppToolState>> {
++    let reader = Reader::open(store.session_dir(), VIEW_CACHE)?;
++    let header: Header = reader.one("header")?;
++    if !matches(store, &header) || reader.revision()?.as_str() != revision {
++        return None;
++    }
++    let indexed = (|| {
++        let fingerprint: (usize, [u8; 32]) = reader.one(INDEX)?;
++        if reader.keyed_fingerprint(TOOL_STATE)? != fingerprint {
++            return None;
++        }
++        let mut tools = std::collections::HashMap::new();
++        for (name, tool) in reader.keyed_rows::<AppToolState>(TOOL_STATE)? {
++            if tool.name != name || !accepted(&tool.status) {
++                return None;
++            }
++            tools.insert(name, tool);
++        }
++        Some(tools)
++    })();
++    let tools = match indexed {
++        Some(tools) => tools,
++        None => {
++            // Older or damaged auxiliary indexes do not make a verified display
++            // unreadable. Decode compact fields one checksummed row at a time,
++            // once at attachment, never replay the canonical journal here.
++            let mut tools = std::collections::HashMap::new();
++            for position in 0..header.transcript_len {
++                let row: CompactRow = reader
++                    .page("transcript", position, position.checked_add(1)?)?
++                    .pop()?;
++                if let Some(tool) = row.tool
++                    && accepted(&tool.status)
++                {
++                    let tool = tool.into_state();
++                    tools.insert(tool.name.clone(), tool);
++                }
++            }
++            tools
++        }
++    };
++    reader.finish()?;
++    Some(tools)
+ }
+ 
+ fn load(store: &SessionStore, name: &str) -> Option<AppLatestToolState> {
+--- a/crates/proteus-core/src/core/session_store/read_model/sqlite.rs
++++ b/crates/proteus-core/src/core/session_store/read_model/sqlite.rs
+@@ -183,5 +183,5 @@
+ }
+ 
+ mod tool_state;
+-pub(super) use tool_state::tool_state;
+ use tool_state::{TOOL_STATE, accepted};
++pub(super) use tool_state::{tool_state, tool_states};
+--- a/crates/proteus-core/src/core/session_store/read_model/tool_state_tests.rs
++++ b/crates/proteus-core/src/core/session_store/read_model/tool_state_tests.rs
+@@ -60,6 +60,10 @@
+             .len(),
+         50
+     );
++    let revision = store.saved_transcript_page(None, None).unwrap().revision;
++    let tools = store.saved_tool_states(&revision).unwrap();
++    assert_eq!(tools["opaque / exact"].call_id, "accepted");
++    assert!(store.saved_tool_states("wrong revision").is_none());
+     let state = store.saved_tool_state("opaque / exact").unwrap();
+     let tool = state.tool.unwrap();
+     assert_eq!(tool.call_id, "accepted");
+@@ -85,6 +89,7 @@
+ #[tokio::test]
+ async fn latest_tool_state_append_and_authoritative_empty_input_then_clear() {
+     let (_root, _workspace, store) = fixture().await;
++    let prior_revision = store.saved_transcript_page(None, None).unwrap().revision;
+     // Establish a certified append checkpoint, then forbid a full renderer.
+     store
+         .project_read_view(render, journal_transcript_append_from_source)
+@@ -103,6 +108,11 @@
+     assert!(
+         store.saved_tool_state("opaque / exact").is_none(),
+         "stale state is not returned"
++    );
++    assert_eq!(
++        store.saved_tool_states(&prior_revision).unwrap()["opaque / exact"].call_id,
++        "accepted",
++        "live ownership can retain exactly its completed prefix"
+     );
+     store
+         .project_read_view(
+@@ -187,6 +197,12 @@
+     .unwrap();
+     drop(db);
+     assert!(store.fresh_read_model().is_none());
++    let revision = store.saved_display_page().unwrap().revision;
++    assert_eq!(
++        store.saved_tool_states(&revision).unwrap()["opaque / exact"].call_id,
++        "accepted",
++        "attachment recovers a missing auxiliary index from the exact display"
++    );
+     let latest = store.saved_tool_state("opaque / exact").unwrap();
+     assert_eq!(latest.tool.unwrap().call_id, "accepted");
+     assert!(
+--- a/crates/proteus-core/src/core/session_store/read_model.rs
++++ b/crates/proteus-core/src/core/session_store/read_model.rs
+@@ -225,6 +225,15 @@
+     }
+ 
+     #[cfg(unix)]
++    pub(crate) fn saved_tool_states(
++        &self,
++        revision: &str,
++    ) -> Option<std::collections::HashMap<String, proteus_contracts::app_protocol::AppToolState>>
++    {
++        sqlite::tool_states(self, revision)
++    }
++
++    #[cfg(unix)]
+     pub(crate) fn saved_tool_state(
+         &self,
+         name: &str,
