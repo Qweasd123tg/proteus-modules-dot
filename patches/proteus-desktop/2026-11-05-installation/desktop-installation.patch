@@ -1,0 +1,499 @@
+From da17ec856688626e607143c51d487dae9a77e590 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 5 Nov 2026 17:14:08 +0800
+Subject: [PATCH] Integrate catalog state preservation and extension
+ installation preflight
+
+Preserve Agent Plugin enablement during catalog updates, validate staged
+extension files before publication, and align setup documentation.
+
+Base-Commit: 6e66189b50c112cf13448fc1feaa1eee5a3c85d6
+Source-Commit: 5390011f54fe3c0cb22ebb736a430550c210e4dc
+Source-Commit: 54b00b81f120f1b364c71f1ec3ab40985b7a4de6
+Source-Commit: 9274508913aaa10e77f8f0ce3643c148497e4243
+---
+ README.md                   |   8 +-
+ examples/catalog/README.md  |   2 +-
+ src/catalog/install.rs      |  18 +++-
+ src/catalog/tests.rs        | 164 ++++++++++++++++++++++++++++++++++++
+ src/declarative/manifest.rs |   2 +-
+ src/declarative/package.rs  | 128 +++++++++++++++++++++++++++-
+ src/packages.rs             |  24 ++++--
+ 7 files changed, 334 insertions(+), 12 deletions(-)
+
+diff --git a/README.md b/README.md
+index 403593f..da5f7fc 100644
+--- a/README.md
++++ b/README.md
+@@ -121,7 +121,13 @@ tree-sitter) оптимизируются (`opt-level = 2`), сам клиент
+ окно не тормозило, а пересборка оставалась быстрой. Dev/test сохраняют line
+ tables для backtraces без тяжёлой debug-информации переменных, как Core и
+ Modules; для её получения задайте `CARGO_PROFILE_DEV_DEBUG=2` и
+-`CARGO_PROFILE_TEST_DEBUG=2`:
++`CARGO_PROFILE_TEST_DEBUG=2`.
++
++Перед прямым вызовом Cargo с default feature `ghostty-vt` подготовьте
++закреплённый Zig и его зависимости через `python3 scripts/terminal_toolchain.py`
++и передайте напечатанный путь как `ZIG=/absolute/path/to/zig`; подробности —
++в [BUILDING.md](BUILDING.md#запуск-и-проверки). Скрипты `run.py`, `test.py`
++и `portable.py` готовят этот toolchain сами, когда он нужен.
+ 
+ ```bash
+ cargo build --release
+diff --git a/examples/catalog/README.md b/examples/catalog/README.md
+index bbca139..83add0c 100644
+--- a/examples/catalog/README.md
++++ b/examples/catalog/README.md
+@@ -73,7 +73,7 @@ discovery агента: `name` из строчных латинских букв
+ | `kind` | Содержимое `path` | Установка |
+ |---|---|---|
+ | `client_extension` | `extension.json` и программа; id манифеста совпадает с id записи | В папку расширений клиента, применяется сразу |
+-| `agent_plugin` | Agent Plugins 1.0: `plugin.json`, при необходимости `skills/` и `.mcp.json` | Отдельная папка пакета, её путь сразу записывается в профиль |
++| `agent_plugin` | Agent Plugins 1.0: `plugin.json`, при необходимости `skills/` и `mcp.json` | Отдельная папка пакета, её путь сразу записывается в профиль |
+ | `skill` | `SKILL.md` с frontmatter `name` и `description`; имя skill совпадает с id записи | Пользовательская папка skills, применяется при следующем чтении skills |
+ | `mcp_server` | `server.json` — объект `ConfiguredMcpServerConfig`, например `{"name":"fetch","command":"uvx","args":["mcp-server-fetch"]}` | Запись сервера сразу записывается в профиль |
+ 
+diff --git a/src/catalog/install.rs b/src/catalog/install.rs
+index 2c0fb12..134397a 100644
+--- a/src/catalog/install.rs
++++ b/src/catalog/install.rs
+@@ -123,7 +123,13 @@ pub fn prepare(
+             );
+             // An existing immutable plugin version may only be reused by its receipt.
+             if !(entry.kind == Kind::AgentPlugin && managed && path.exists()) {
+-                files.install(root, &id, managed)?;
++                if entry.kind == Kind::ClientExtension {
++                    files.install_checked(root, &id, managed, |dir| {
++                        crate::declarative::manifest::load(dir).map(|_| ())
++                    })?;
++                } else {
++                    files.install(root, &id, managed)?;
++                }
+             }
+             Target::Folder { path }
+         }
+@@ -148,14 +154,24 @@ pub fn connect(
+ ) -> Result<()> {
+     match &installed.target {
+         Target::Folder { path } if installed.kind == Kind::AgentPlugin => {
++            let mut enabled = true;
+             if let Some(Installed {
+                 target: Target::Folder { path: old },
+                 ..
+             }) = previous
+             {
++                // Updating a package must preserve the profile's switch.
++                enabled = draft
++                    .addons
++                    .addons
++                    .plugins
++                    .iter()
++                    .find(|plugin| plugin.path == *old)
++                    .is_none_or(|plugin| plugin.enabled);
+                 draft.remove_package(old);
+             }
+             draft.add_package(path.clone());
++            draft.set_package(path, enabled);
+         }
+         Target::Mcp { server } => {
+             let old = previous.and_then(|old| match &old.target {
+diff --git a/src/catalog/tests.rs b/src/catalog/tests.rs
+index 1d81fd8..cc91cc8 100644
+--- a/src/catalog/tests.rs
++++ b/src/catalog/tests.rs
+@@ -207,6 +207,79 @@ fn installation_binding_update_and_removal_use_the_existing_formats() {
+     );
+ }
+ 
++fn plugin_receipt(path: &str) -> Installed {
++    Installed {
++        source: source(Path::new("catalog")),
++        entry: "plugin".into(),
++        version: "1.0.0".into(),
++        kind: Kind::AgentPlugin,
++        profile: Some("profile.toml".into()),
++        target: Target::Folder { path: path.into() },
++    }
++}
++
++#[test]
++fn plugin_catalog_updates_preserve_the_profile_switch() {
++    let installed = plugin_receipt("plugin-v1");
++    for enabled in [false, true] {
++        for path in ["plugin-v1", "plugin-v2"] {
++            let mut draft = Draft::default();
++            install::connect(&mut draft, &installed, None).unwrap();
++            draft.set_package(Path::new("plugin-v1"), enabled);
++            draft.add_package("unrelated".into());
++            draft.set_package(Path::new("unrelated"), false);
++            let baseline = draft.clone();
++            let updated = plugin_receipt(path);
++
++            install::connect(&mut draft, &updated, Some(&installed)).unwrap();
++
++            let plugins = &draft.addons.addons.plugins;
++            assert_eq!(plugins.len(), 2);
++            let unrelated = plugins
++                .iter()
++                .find(|plugin| plugin.path == Path::new("unrelated"))
++                .unwrap();
++            assert!(!unrelated.enabled);
++            let current = plugins
++                .iter()
++                .find(|plugin| plugin.path == Path::new(path))
++                .unwrap();
++            assert_eq!(current.enabled, enabled);
++            assert!(install::connected(&updated, &draft));
++
++            if path != "plugin-v1" {
++                assert!(!install::connected(&installed, &draft));
++                let saved = draft.changes(&baseline).addon_settings.unwrap();
++                assert_eq!(saved.addons.plugins, draft.addons.addons.plugins);
++            }
++
++            let connected = draft.clone();
++            install::connect(&mut draft, &updated, Some(&updated)).unwrap();
++            assert_eq!(draft, connected, "retrying an update keeps the switch");
++        }
++    }
++}
++
++#[test]
++fn plugin_catalog_installs_without_a_current_binding_start_enabled() {
++    let installed = plugin_receipt("plugin-v1");
++    let updated = plugin_receipt("plugin-v2");
++    for previous in [None, Some(&installed)] {
++        let mut draft = Draft::default();
++        draft.add_package("unrelated".into());
++        draft.set_package(Path::new("unrelated"), false);
++
++        install::connect(&mut draft, &updated, previous).unwrap();
++
++        let plugins = &draft.addons.addons.plugins;
++        assert_eq!(plugins.len(), 2);
++        assert_eq!(plugins[0].path, Path::new("unrelated"));
++        assert!(!plugins[0].enabled);
++        assert_eq!(plugins[1].path, Path::new("plugin-v2"));
++        assert!(plugins[1].enabled);
++    }
++}
++
+ #[test]
+ fn mcp_conflicts_dont_overwrite_manual_edits_and_receipts_are_profile_scoped() {
+     let fixture = Fixture::new();
+@@ -374,3 +447,94 @@ fn repository_without_index_lists_agent_skills_as_installable_entries() {
+         assert_eq!(source.name(), "owner/skills");
+     }
+ }
++
++#[test]
++fn extension_preflight_checks_staged_files_before_installing_or_replacing() {
++    use crate::declarative::manifest;
++
++    let fixture = Fixture::new();
++    let repo = Contents::folder(&example())
++        .unwrap()
++        .install(&fixture.0, "repo", false)
++        .unwrap();
++    let catalog = schema::read(&repo, "example", &Default::default()).unwrap();
++    let entry = catalog
++        .entries
++        .iter()
++        .find(|entry| entry.kind == Kind::ClientExtension)
++        .unwrap();
++    let package = repo.join(&entry.path);
++    let manifest_path = package.join(manifest::MANIFEST);
++    let mut value: serde_json::Value =
++        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
++    value["command"] = serde_json::json!(["proteus-preflight-must-not-run"]);
++    value["required_features"] = serde_json::json!(["manifest.agent_instructions.v1"]);
++    value["agent_instructions"] = serde_json::json!([{"skill": "guide", "path": "skills/guide"}]);
++    let original = value.to_string();
++    fs::write(&manifest_path, &original).unwrap();
++
++    let source = source(&repo);
++    let locations = fixture.locations();
++    let profile = fixture.0.join("profile.toml");
++    assert!(install::prepare(&locations, &source, &catalog, entry, None, &profile, &[]).is_err());
++    assert_eq!(fs::read_dir(&locations.extensions).unwrap().count(), 0);
++
++    let skill = package.join("skills/guide/SKILL.md");
++    fs::create_dir_all(skill.parent().unwrap()).unwrap();
++    fs::write(&skill, "# Original").unwrap();
++    let previous =
++        install::prepare(&locations, &source, &catalog, entry, None, &profile, &[]).unwrap();
++    let destination = locations.extensions.join(&entry.id);
++    assert_eq!(manifest::load(&destination).unwrap().id, entry.id);
++    // The catalog folder is named demo, not catalog-demo. Validation must use
++    // the staged final id, rather than the source or hidden staging folder name.
++    assert_ne!(package.file_name(), destination.file_name());
++
++    let mut newer = entry.clone();
++    newer.version = "2.0.0".into();
++    value["title"] = serde_json::json!("Updated");
++    fs::write(&manifest_path, value.to_string()).unwrap();
++    fs::remove_file(&skill).unwrap();
++    assert!(
++        install::prepare(
++            &locations,
++            &source,
++            &catalog,
++            &newer,
++            Some(&previous),
++            &profile,
++            &[entry.id.clone()],
++        )
++        .is_err()
++    );
++    assert_eq!(
++        fs::read_to_string(destination.join(manifest::MANIFEST)).unwrap(),
++        original
++    );
++    assert_eq!(
++        fs::read_to_string(destination.join("skills/guide/SKILL.md")).unwrap(),
++        "# Original"
++    );
++    assert!(manifest::load(&destination).is_ok());
++    assert_eq!(fs::read_dir(&locations.extensions).unwrap().count(), 1);
++
++    fs::write(&skill, "# Updated").unwrap();
++    let updated = install::prepare(
++        &locations,
++        &source,
++        &catalog,
++        &newer,
++        Some(&previous),
++        &profile,
++        &[entry.id.clone()],
++    )
++    .unwrap();
++    assert_eq!(updated.target, previous.target);
++    assert_eq!(updated.version, "2.0.0");
++    assert_eq!(manifest::load(&destination).unwrap().title, "Updated");
++    assert_eq!(
++        fs::read_to_string(destination.join("skills/guide/SKILL.md")).unwrap(),
++        "# Updated"
++    );
++    assert_eq!(fs::read_dir(&locations.extensions).unwrap().count(), 1);
++}
+diff --git a/src/declarative/manifest.rs b/src/declarative/manifest.rs
+index 9c02cfa..a409637 100644
+--- a/src/declarative/manifest.rs
++++ b/src/declarative/manifest.rs
+@@ -326,7 +326,7 @@ fn is_hidden(path: &Path) -> bool {
+         .is_some_and(|name| name.starts_with('.'))
+ }
+ 
+-fn load(dir: &Path) -> Result<Manifest> {
++pub(crate) fn load(dir: &Path) -> Result<Manifest> {
+     let path = dir.join(MANIFEST);
+     let text = std::fs::read_to_string(&path)
+         .with_context(|| format!("cannot read {}", path.display()))?;
+diff --git a/src/declarative/package.rs b/src/declarative/package.rs
+index eebebcc..cce4c3f 100644
+--- a/src/declarative/package.rs
++++ b/src/declarative/package.rs
+@@ -2,8 +2,8 @@
+ //!
+ //! The archive holds the extension folder contents with `extension.json` at
+ //! its root. It is unpacked into a hidden folder first and renamed into
+-//! `<root>/<id>` only when complete, so a broken archive leaves nothing
+-//! behind.
++//! `<root>/<id>` only after the normal on-disk manifest checks pass.
++//! An incomplete update never replaces the previous installation.
+ 
+ use std::path::Path;
+ 
+@@ -40,7 +40,9 @@ fn install_contents(root: &Path, files: Contents, taken: &[&str]) -> Result<Mani
+             "Существующая папка не принадлежит этому расширению"
+         );
+     }
+-    files.install(root, &manifest.id, replace)?;
++    files.install_checked(root, &manifest.id, replace, |dir| {
++        super::manifest::load(dir).map(|_| ())
++    })?;
+     Ok(manifest)
+ }
+ 
+@@ -82,6 +84,126 @@ mod tests {
+         std::env::temp_dir().join(format!("proteus-zip-{}", uuid::Uuid::new_v4()))
+     }
+ 
++    fn skill_manifest(title: &str) -> String {
++        let mut manifest: serde_json::Value = serde_json::from_str(MANIFEST_TEXT).unwrap();
++        manifest["title"] = serde_json::json!(title);
++        // A preflight must not try to spawn or resolve the extension's command.
++        manifest["command"] = serde_json::json!(["proteus-preflight-must-not-run"]);
++        manifest["required_features"] = serde_json::json!(["manifest.agent_instructions.v1"]);
++        manifest["agent_instructions"] =
++            serde_json::json!([{"skill": "guide", "path": "skills/guide"}]);
++        manifest.to_string()
++    }
++
++    #[test]
++    fn incomplete_skill_links_leave_no_new_installation() {
++        let root = temp_root();
++        let text = skill_manifest("New");
++        assert!(parse(&text).is_ok());
++        for extra in [
++            vec![],
++            vec![("skills/guide/README.md", "No skill file", 0o644)],
++            vec![("skills/guide", "Not a directory", 0o644)],
++            vec![(
++                "skills/guide/SKILL.md/child",
++                "Not a regular skill file",
++                0o644,
++            )],
++        ] {
++            let mut files = vec![("extension.json", text.as_str(), 0o644)];
++            files.extend(extra);
++            assert!(install_bytes(&root, &archive(&files), &[]).is_err());
++            assert!(!root.join("todo").exists());
++            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
++        }
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn incomplete_skill_update_keeps_the_previous_package_and_cleans_staging() {
++        let root = temp_root();
++        let original = skill_manifest("Original");
++        let good = archive(&[
++            ("extension.json", original.as_str(), 0o644),
++            ("skills/guide/SKILL.md", "# Original instructions", 0o644),
++            ("old-asset.txt", "Keep this until a valid update", 0o644),
++        ]);
++        install_bytes(&root, &good, &[]).unwrap();
++        let changed = skill_manifest("Incomplete");
++        for extra in [
++            vec![],
++            vec![("skills/guide/README.md", "No skill file", 0o644)],
++            vec![("skills/guide", "Not a directory", 0o644)],
++            vec![(
++                "skills/guide/SKILL.md/child",
++                "Not a regular skill file",
++                0o644,
++            )],
++        ] {
++            let mut files = vec![("extension.json", changed.as_str(), 0o644)];
++            files.extend(extra);
++            assert!(install_bytes(&root, &archive(&files), &[]).is_err());
++            assert_eq!(
++                std::fs::read_to_string(root.join("todo/extension.json")).unwrap(),
++                original
++            );
++            assert_eq!(
++                std::fs::read_to_string(root.join("todo/skills/guide/SKILL.md")).unwrap(),
++                "# Original instructions"
++            );
++            assert_eq!(
++                std::fs::read_to_string(root.join("todo/old-asset.txt")).unwrap(),
++                "Keep this until a valid update"
++            );
++            assert_eq!(
++                super::super::manifest::load(&root.join("todo"))
++                    .unwrap()
++                    .title,
++                "Original"
++            );
++            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
++        }
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn complete_skill_update_passes_discovery_without_running_the_command() {
++        let root = temp_root();
++        let original = skill_manifest("Original");
++        install_bytes(
++            &root,
++            &archive(&[
++                ("extension.json", original.as_str(), 0o644),
++                ("skills/guide/SKILL.md", "# Original", 0o644),
++                ("old-asset.txt", "Obsolete", 0o644),
++            ]),
++            &[],
++        )
++        .unwrap();
++        let changed = skill_manifest("Updated");
++        let installed = install_bytes(
++            &root,
++            &archive(&[
++                ("extension.json", changed.as_str(), 0o644),
++                ("skills/guide/SKILL.md", "# Updated", 0o644),
++            ]),
++            &[],
++        )
++        .unwrap();
++        let (found, problems) = super::super::manifest::discover(&root);
++        assert!(problems.is_empty(), "{problems:?}");
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0].manifest, installed);
++        assert_eq!(installed.title, "Updated");
++        assert_eq!(
++            std::fs::read_to_string(root.join("todo/skills/guide/SKILL.md")).unwrap(),
++            "# Updated"
++        );
++        assert!(!root.join("todo/old-asset.txt").exists());
++        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
+     #[test]
+     fn installs_and_updates_keeping_executables_and_removes() {
+         use std::os::unix::fs::PermissionsExt;
+diff --git a/src/packages.rs b/src/packages.rs
+index 02cdc68..767131a 100644
+--- a/src/packages.rs
++++ b/src/packages.rs
+@@ -113,6 +113,18 @@ impl Contents {
+ 
+     /// Validated contents are written to a hidden sibling before publication.
+     pub fn install(&self, root: &Path, id: &str, replace: bool) -> Result<PathBuf> {
++        self.install_checked(root, id, replace, |_| Ok(()))
++    }
++
++    /// Check the complete staged package before touching an existing installation.
++    /// Its directory has the final id so normal on-disk validators can be reused.
++    pub fn install_checked(
++        &self,
++        root: &Path,
++        id: &str,
++        replace: bool,
++        validate: impl FnOnce(&Path) -> Result<()>,
++    ) -> Result<PathBuf> {
+         ensure!(
+             !id.is_empty()
+                 && id.len() <= 128
+@@ -131,8 +143,10 @@ impl Contents {
+         let temporary = root.join(format!(".install-{}", uuid::Uuid::new_v4()));
+         let result = (|| {
+             std::fs::create_dir(&temporary)?;
++            let staged = temporary.join(id);
++            std::fs::create_dir(&staged)?;
+             for (path, file) in &self.0 {
+-                let target = temporary.join(path);
++                let target = staged.join(path);
+                 if let Some(parent) = target.parent() {
+                     std::fs::create_dir_all(parent)?;
+                 }
+@@ -145,12 +159,12 @@ impl Contents {
+                     )?;
+                 }
+             }
+-            publish(&temporary, &destination, replace)?;
++            validate(&staged)?;
++            publish(&staged, &destination, replace)?;
+             Ok(destination)
+         })();
+-        if result.is_err() {
+-            let _ = std::fs::remove_dir_all(temporary);
+-        }
++        // On success publication moved the child; on failure discard only staging.
++        let _ = std::fs::remove_dir_all(temporary);
+         result
+     }
+ }
+-- 
+2.52.0
+
