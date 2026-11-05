@@ -1,0 +1,189 @@
+diff --git a/docs/reference.md b/docs/reference.md
+index 41e9c64..ec61d70 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -55,6 +55,12 @@ policy/approval и authority остаётся на прежних граница
+   а JSON кодируйте один раз у process/HTTP/storage writer. API, требующий строку,
+   и подпись точных bytes — конкретные исключения, не повод для roundtrip
+   между соседними helpers. Strict validation и wire format сохраняются.
++  В OpenAI HTTP retry одна фаза повторяет уже подготовленный request: JSON
++  body сериализуется один раз, попытки разделяют immutable bytes reqwest.
++  Encoded body живёт до конца фазы, включая backoff; drop future освобождает
++  его. После OAuth refresh начинается отдельная фаза со свежими headers.
++  Non-cloneable streaming body по-прежнему строится для каждой попытки;
++  число повторов, ошибки, backoff и принятый response/SSE не меняются.
+ - Token estimates, context projections и другие derived данные обновляйте
+   по изменившемуся срезу. Переиспользование prefix требует доказанного
+   append-only состояния; edit/truncate/reset или смена config/revision
+diff --git a/model/model-pack/src/adapters/openai/http_retry.rs b/model/model-pack/src/adapters/openai/http_retry.rs
+index c84321a..dd60ef7 100644
+--- a/model/model-pack/src/adapters/openai/http_retry.rs
++++ b/model/model-pack/src/adapters/openai/http_retry.rs
+@@ -29,11 +29,21 @@ impl RequestRetry {
+     where
+         F: FnMut() -> reqwest::RequestBuilder,
+     {
++        // Each phase retries one immutable request. JSON bodies are reusable
++        // reqwest bytes: keep the encoding, not another copy of the payload.
++        // Auth refresh remains outside this phase. Streaming bodies cannot be
++        // cloned and keep the existing per-attempt builder path.
++        let mut next = build();
++        let template = if self.max_retries > 0 {
++            next.try_clone()
++        } else {
++            None
++        };
+         let mut attempt = 0;
+         loop {
+             // Building is not a transport operation. Invalid URL/headers/body
+             // must fail immediately, before entering the network retry path.
+-            let (client, request) = build().build_split();
++            let (client, request) = next.build_split();
+             let response = client.execute(request?).await;
+             let retryable = match &response {
+                 Ok(response) => response.status().is_server_error(),
+@@ -49,6 +59,10 @@ impl RequestRetry {
+             // The caller owns the model deadline and cancellation. Dropping
+             // this future cancels both the request and this backoff sleep.
+             tokio::time::sleep(backoff(attempt)).await;
++            next = template
++                .as_ref()
++                .and_then(reqwest::RequestBuilder::try_clone)
++                .unwrap_or_else(&mut build);
+         }
+     }
+ }
+diff --git a/model/model-pack/src/adapters/openai/http_retry_tests.rs b/model/model-pack/src/adapters/openai/http_retry_tests.rs
+index 5f1a337..c6fbce9 100644
+--- a/model/model-pack/src/adapters/openai/http_retry_tests.rs
++++ b/model/model-pack/src/adapters/openai/http_retry_tests.rs
+@@ -82,7 +82,7 @@ async fn retryable_statuses_reuse_the_request_and_preserve_the_final_response()
+ }
+ 
+ #[tokio::test]
+-async fn transport_retries_are_bounded_and_invalid_requests_fail_before_retry() {
++async fn noncloneable_transport_retries_are_bounded_and_invalid_requests_fail_before_retry() {
+     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+     let url = format!("http://{}", listener.local_addr().unwrap());
+     drop(listener);
+@@ -92,7 +92,12 @@ async fn transport_retries_are_bounded_and_invalid_requests_fail_before_retry()
+         let error = RequestRetry { max_retries: 2 }
+             .send(|| {
+                 attempts += 1;
+-                client.get(url)
++                // Streaming bodies must retain the per-attempt builder path.
++                client
++                    .get(url)
++                    .body(reqwest::Body::wrap_stream(futures_util::stream::once(
++                        async { Ok::<_, std::io::Error>("fixture") },
++                    )))
+             })
+             .await
+             .unwrap_err();
+@@ -100,3 +105,106 @@ async fn transport_retries_are_bounded_and_invalid_requests_fail_before_retry()
+         assert!(error.is_connect() || error.is_builder());
+     }
+ }
++
++#[tokio::test]
++async fn retryable_json_is_serialized_once_and_every_attempt_keeps_identical_bytes() {
++    struct CountedJson<'a> {
++        serializations: &'a AtomicUsize,
++        value: &'a Value,
++    }
++    impl serde::Serialize for CountedJson<'_> {
++        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++        where
++            S: serde::Serializer,
++        {
++            self.serializations.fetch_add(1, Ordering::SeqCst);
++            serde::Serialize::serialize(self.value, serializer)
++        }
++    }
++
++    tokio::time::timeout(Duration::from_secs(10), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        // Both halves belong to this timeout, rather than a detached task:
++        // timeout or panic drops the fixture listener/socket with the client.
++        let server = async move {
++            let mut received = Vec::new();
++            for status in [503, 502, 200] {
++                let (mut socket, _) = listener.accept().await.unwrap();
++                let mut headers = Vec::new();
++                while !headers.ends_with(b"\r\n\r\n") {
++                    headers.push(socket.read_u8().await.unwrap());
++                }
++                let headers = String::from_utf8(headers).unwrap();
++                assert!(headers.starts_with("POST / HTTP/1.1\r\n"));
++                let length = headers
++                    .lines()
++                    .find_map(|line| {
++                        let (name, value) = line.split_once(':')?;
++                        name.eq_ignore_ascii_case("content-length")
++                            .then(|| value.trim().parse::<usize>().unwrap())
++                    })
++                    .unwrap();
++                let mut body = vec![0; length];
++                socket.read_exact(&mut body).await.unwrap();
++                received.push(body);
++                socket
++                    .write_all(
++                        format!(
++                            "HTTP/1.1 {status} Fixture\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal"
++                        )
++                        .as_bytes(),
++                    )
++                    .await
++                    .unwrap();
++            }
++            received
++        };
++        let client = reqwest::Client::builder().no_proxy().build().unwrap();
++        let value = json!({"input": "Текст\n\"quoted\"", "tools": [{"name": "fixture"}]});
++        let serializations = AtomicUsize::new(0);
++        let payload = CountedJson {
++            serializations: &serializations,
++            value: &value,
++        };
++        let send = async {
++            let response = RequestRetry { max_retries: 2 }
++                .send(|| client.post(&url).json(&payload))
++                .await
++                .unwrap();
++            assert_eq!(response.status(), reqwest::StatusCode::OK);
++            response.text().await.unwrap()
++        };
++        let (response, received) = tokio::join!(send, server);
++        assert_eq!(response, "final");
++        assert_eq!(serializations.load(Ordering::SeqCst), 1);
++        let expected = serde_json::to_vec(&value).unwrap();
++        assert_eq!(received, vec![expected; 3]);
++    })
++    .await
++    .expect("retry JSON loopback exchange must finish within 10 seconds");
++}
++
++#[tokio::test]
++async fn serialization_errors_are_not_rebuilt_or_retried() {
++    struct FailingJson<'a>(&'a AtomicUsize);
++    impl serde::Serialize for FailingJson<'_> {
++        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
++        where
++            S: serde::Serializer,
++        {
++            self.0.fetch_add(1, Ordering::SeqCst);
++            Err(serde::ser::Error::custom("fixture serialization failure"))
++        }
++    }
++
++    let serializations = AtomicUsize::new(0);
++    let payload = FailingJson(&serializations);
++    let client = reqwest::Client::builder().no_proxy().build().unwrap();
++    let error = RequestRetry { max_retries: 2 }
++        .send(|| client.post("http://127.0.0.1:1").json(&payload))
++        .await
++        .unwrap_err();
++    assert!(error.is_builder());
++    assert_eq!(serializations.load(Ordering::SeqCst), 1);
++}

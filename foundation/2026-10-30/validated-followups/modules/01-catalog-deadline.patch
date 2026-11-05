@@ -1,0 +1,132 @@
+diff --git a/model/model-pack/UPSTREAM.md b/model/model-pack/UPSTREAM.md
+index de2fb1c..c682785 100644
+--- a/model/model-pack/UPSTREAM.md
++++ b/model/model-pack/UPSTREAM.md
+@@ -64,7 +64,8 @@ Client id соответствует OAuth-приложению Codex, как в
+   сохраняются, `visibility` становится `hidden`, порядок задаёт `priority`.
+   Из catalog не импортируются base instructions, tools или capabilities.
+   В отличие от полного Codex ModelsManager здесь только memory cache на
+-  5 минут и общий deadline 30 секунд: нет disk cache, embedded model list,
++  5 минут и общий deadline 30 секунд, включая ожидание cache lock другого
++  читателя: нет disk cache, embedded model list,
+   ETag merge или stale fallback при ошибке.
+ - Квота читается из `/backend-api/wham/usage`. Основная группа `codex` и все
+   `additional_rate_limits` сохраняют свои окна, `used_percent`, длительности в
+diff --git a/model/model-pack/src/adapters/openai/codex_catalog.rs b/model/model-pack/src/adapters/openai/codex_catalog.rs
+index 5bda81d..c7d8468 100644
+--- a/model/model-pack/src/adapters/openai/codex_catalog.rs
++++ b/model/model-pack/src/adapters/openai/codex_catalog.rs
+@@ -59,13 +59,15 @@ impl OpenAiResponsesClient {
+         let Some(auth) = &self.codex_auth else {
+             return Ok(None);
+         };
+-        let mut cache = self.catalog_cache.lock().await;
+-        if let Some((fetched, catalog)) = &*cache {
+-            if fetched.elapsed() < CACHE_TTL {
+-                return Ok(Some(catalog.clone()));
++        tokio::time::timeout(Duration::from_secs(30), async {
++            // The caller's total budget includes coalescing behind another
++            // reader, not only the HTTP request after acquiring the cache.
++            let mut cache = self.catalog_cache.lock().await;
++            if let Some((fetched, catalog)) = &*cache {
++                if fetched.elapsed() < CACHE_TTL {
++                    return Ok(Some(catalog.clone()));
++                }
+             }
+-        }
+-        let catalog = tokio::time::timeout(Duration::from_secs(30), async {
+             let mut access = auth.access(None).await?;
+             let version = self.catalog_client_version();
+             for attempt in 0..2 {
+@@ -110,13 +112,12 @@ impl OpenAiResponsesClient {
+                         .collect(),
+                 };
+                 catalog.validate().map_err(anyhow::Error::msg)?;
+-                return Ok(catalog);
++                *cache = Some((Instant::now(), catalog.clone()));
++                return Ok(Some(catalog));
+             }
+             unreachable!()
+         })
+         .await
+-        .context("ChatGPT model catalog timed out")??;
+-        *cache = Some((Instant::now(), catalog.clone()));
+-        Ok(Some(catalog))
++        .context("ChatGPT model catalog timed out")?
+     }
+ }
+diff --git a/model/model-pack/src/adapters/openai/codex_catalog_tests.rs b/model/model-pack/src/adapters/openai/codex_catalog_tests.rs
+index c8bfac1..2dd07b3 100644
+--- a/model/model-pack/src/adapters/openai/codex_catalog_tests.rs
++++ b/model/model-pack/src/adapters/openai/codex_catalog_tests.rs
+@@ -10,6 +10,70 @@ fn remote_model(id: &str, priority: i64, hidden: bool, efforts: &[&str]) -> Valu
+         "base_instructions": "must not enter the canonical catalog"})
+ }
+ 
++#[tokio::test(start_paused = true)]
++async fn catalog_deadline_includes_waiting_for_another_reader() {
++    use std::time::Duration;
++
++    let root = tempfile::tempdir().unwrap();
++    // No credentials are created or read: the held cache prevents auth/HTTP.
++    let client = OpenAiResponsesClient::from_codex_config(json!({
++        "auth_file": root.path().join("unused.json"),
++        "base_url": "http://127.0.0.1:1"
++    }))
++    .unwrap();
++    let guard = client.catalog_cache.lock().await;
++    let started = tokio::time::Instant::now();
++    let error = tokio::time::timeout(Duration::from_secs(31), client.catalog())
++        .await
++        .expect("catalog must enforce its own deadline while waiting for the lock")
++        .unwrap_err();
++    assert_eq!(error.to_string(), "ChatGPT model catalog timed out");
++    assert_eq!(started.elapsed(), Duration::from_secs(30));
++    assert!(guard.is_none());
++}
++
++#[tokio::test(start_paused = true)]
++async fn catalog_waiter_uses_the_leaders_cache_within_its_budget() {
++    use proteus_contracts::contracts::ModelCatalog;
++    use std::time::{Duration, Instant};
++
++    let root = tempfile::tempdir().unwrap();
++    let client = OpenAiResponsesClient::from_codex_config(json!({
++        "auth_file": root.path().join("unused.json"),
++        "base_url": "http://127.0.0.1:1"
++    }))
++    .unwrap();
++    let mut guard = client.catalog_cache.lock().await;
++    let mut lookup = Box::pin(client.catalog());
++    assert!(futures_util::poll!(&mut lookup).is_pending());
++    tokio::time::advance(Duration::from_secs(29)).await;
++    let catalog = ModelCatalog { models: vec![] };
++    *guard = Some((Instant::now(), catalog.clone()));
++    drop(guard);
++    assert_eq!(lookup.await.unwrap(), Some(catalog));
++}
++
++#[tokio::test(start_paused = true)]
++async fn dropping_a_catalog_waiter_leaves_the_cache_usable() {
++    use proteus_contracts::contracts::ModelCatalog;
++    use std::time::Instant;
++
++    let root = tempfile::tempdir().unwrap();
++    let client = OpenAiResponsesClient::from_codex_config(json!({
++        "auth_file": root.path().join("unused.json"),
++        "base_url": "http://127.0.0.1:1"
++    }))
++    .unwrap();
++    let mut guard = client.catalog_cache.lock().await;
++    let mut lookup = Box::pin(client.catalog());
++    assert!(futures_util::poll!(&mut lookup).is_pending());
++    drop(lookup);
++    let catalog = ModelCatalog { models: vec![] };
++    *guard = Some((Instant::now(), catalog.clone()));
++    drop(guard);
++    assert_eq!(client.catalog().await.unwrap(), Some(catalog));
++}
++
+ #[tokio::test]
+ async fn catalog_fetches_all_models_and_per_model_efforts_with_oauth_and_shared_cache() {
+     let root = tempfile::tempdir().unwrap();
