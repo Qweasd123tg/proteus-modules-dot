@@ -4,6 +4,7 @@
 
 ## С чего начать
 
+- **Аудит 6 ноября:** [каталог, состояние плагинов и терминалы](research/proteus-audit-2026-11-06/README.md). Точные source links, оставшиеся ограничения и план проверок; новые runtime-сценарии не запускались.
 - **Новые механизмы и оптимизации:** [исследование архитектур агентов](research/agent-architectures-20261028/README.md). Здесь разделены подключаемые process modules, host-facing прототипы и patches для upstream.
 - **Выбрать место для изменения:** [карта разработки](docs/DEVELOPMENT-MAP.md).
 - **Готовые примеры контрактов:** [планировщик шагов](examples/pi-ready-steps/), [блоки контекста](examples/letta-evidence-blocks/), [verification hook](examples/hermes-verify-evidence/), [portable skills](examples/portable-skill-catalog/).
