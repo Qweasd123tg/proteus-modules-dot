@@ -4,6 +4,7 @@
 
 ## С чего начать
 
+- **Полный аудит 7 ноября:** [Core, Modules, Desktop и Extensions](research/proteus-full-audit-2026-11-07/README.md). PDF на 91 странице и DOCX; 2921 текстовый файл, 805803 строки. Только статическое чтение на закреплённых SHA, без runtime-проверок.
 - **Аудит 6 ноября:** [каталог, состояние плагинов и терминалы](research/proteus-audit-2026-11-06/README.md). Точные source links, оставшиеся ограничения и план проверок; новые runtime-сценарии не запускались.
 - **Новые механизмы и оптимизации:** [исследование архитектур агентов](research/agent-architectures-20261028/README.md). Здесь разделены подключаемые process modules, host-facing прототипы и patches для upstream.
 - **Выбрать место для изменения:** [карта разработки](docs/DEVELOPMENT-MAP.md).
