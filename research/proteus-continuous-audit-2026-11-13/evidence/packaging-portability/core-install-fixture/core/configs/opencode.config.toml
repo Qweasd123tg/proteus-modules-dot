@@ -1,0 +1,72 @@
+# Native OpenCode 2.0.22 slot adapters; source pin 527f0b931d1f9b3ebd34e106c51b31ce5db5b075.
+# Install: Proteus-modules/workflow/opencode-runtime/install.py --prefix /ready/Proteus
+include = "proteus.provider.example.toml"
+
+[profile]
+name = "opencode"
+
+[modules]
+workflow = "opencode_loop"
+context = "opencode_context"
+policy = "opencode_policy"
+hooks = ["opencode_prompt", "opencode_compact"]
+
+[agent_control]
+surface = "none"
+roles = []
+
+[addons]
+plugins = []
+
+[components.opencode-runtime]
+command = "proteus-opencode-module"
+env_allowlist = ["HOME", "PATH", "SHELL", "LANG", "LC_ALL", "XDG_STATE_HOME", "PROTEUS_OPENCODE_RUNTIME_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+[components.opencode-runtime.exports.workflow.opencode_loop]
+[components.opencode-runtime.exports.context.opencode_context]
+[components.opencode-runtime.exports.hook.opencode_prompt]
+[components.opencode-runtime.exports.hook.opencode_compact]
+[components.opencode-runtime.exports.tool.opencode_tools]
+
+[components.policy-pack]
+command = "proteus-policy-pack-module"
+[components.policy-pack.exports.policy.opencode_policy]
+
+[tools]
+enabled = ["read", "write", "edit", "patch", "shell", "glob", "grep"]
+mcp_servers = []
+
+[permissions]
+mode = "normal"
+
+# Core remains the effect admission boundary. The upstream file/shell plugin's
+# additional external_directory requests fail closed inside the adapter.
+[module_config.policy.opencode_policy]
+rules = [
+  { permission = "*", action = "allow" },
+  { permission = "read", pattern = "*.env", action = "ask" },
+  { permission = "read", pattern = "*.env.*", action = "ask" },
+  { permission = "read", pattern = "*.env.example", action = "allow" },
+  { permission = "shell", pattern = "git push*", action = "ask" },
+  { permission = "shell", pattern = "git reset --hard*", action = "ask" },
+  { permission = "shell", pattern = "git checkout -- *", action = "ask" },
+  { permission = "shell", pattern = "rm -rf*", action = "ask" },
+]
+[module_config.policy.opencode_policy.groups.edit]
+tools = ["edit", "write", "patch"]
+pattern_args = ["path"]
+[module_config.policy.opencode_policy.groups.shell]
+tools = ["shell"]
+pattern_args = ["command"]
+split_commands = true
+[module_config.policy.opencode_policy.groups.read]
+tools = ["read"]
+pattern_args = ["path"]
+
+[app_server]
+approval_timeout_ms = 0
+[runtime]
+model_timeout_ms = 10800000
+context_timeout_ms = 30000
+workflow_timeout_ms = 14400000
+[event_log]
+path = ".proteus/events.jsonl"

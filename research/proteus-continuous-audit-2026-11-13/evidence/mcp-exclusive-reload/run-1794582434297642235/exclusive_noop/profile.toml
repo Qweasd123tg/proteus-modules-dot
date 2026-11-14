@@ -1,0 +1,45 @@
+[modules]
+workflow = "audit_tool_driver"
+policy = "fixture_allow_all"
+hooks = []
+[module_config]
+[addons]
+disabled_skills = []
+disabled_mcp_servers = []
+plugins = []
+
+[[tools.mcp_servers]]
+name = "fixture"
+command = "python3"
+enabled = true
+args = [
+    "-B",
+    "/workspace/shared/trace-mcp-exclusive-reload-evidence/mcp.py",
+    "exclusive",
+    "/workspace/shared/trace-mcp-exclusive-reload-evidence/run-1794582434297642235/exclusive_noop",
+]
+env_allowlist = []
+protocol_version = "2025-11-25"
+safety = "RunsCommands"
+supports_parallel_tool_calls = false
+timeout_ms = 2000
+
+[tools.mcp_servers.env]
+[providers]
+
+[permissions]
+mode = "normal"
+
+[agent_control]
+surface = "task"
+
+[tools]
+enabled = []
+[components.workflow]
+command="python3"
+args=["-B","/workspace/shared/trace-mcp-exclusive-reload-evidence/workflow.py","/workspace/shared/proteus-review-20261112/core/examples/modules"]
+[components.workflow.exports.workflow.audit_tool_driver]
+[components.policy]
+command="python3"
+args=["-B","/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]

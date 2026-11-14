@@ -1,0 +1,94 @@
+   Compiling desktop-feedback-repro v0.0.0 (/workspace/scratch/3ba0fff8d310/desktop-behaviour/audit-repros)
+warning: fields `run` and `phase` are never read
+  --> src/../../src/ui/chat/feedback/mod.rs:14:5
+   |
+12 | pub(super) struct Feedback {
+   |                   -------- fields in this struct
+13 |     sends: Vec<PendingSend>,
+14 |     run: Option<String>,
+   |     ^^^
+15 |     phase: Phase,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `queue_baseline` is never read
+  --> src/../../src/ui/chat/feedback/mod.rs:25:5
+   |
+18 | pub(super) struct PendingSend {
+   |                   ----------- field in this struct
+...
+25 |     queue_baseline: HashSet<MessageId>,
+   |     ^^^^^^^^^^^^^^
+
+warning: variants `Thinking`, `Writing`, and `Tools` are never constructed
+  --> src/../../src/ui/chat/feedback/mod.rs:32:5
+   |
+29 | enum Phase {
+   |      ----- variants in this enum
+...
+32 |     Thinking,
+   |     ^^^^^^^^
+33 |     Writing,
+   |     ^^^^^^^
+34 |     Tools,
+   |     ^^^^^
+   |
+   = note: `Phase` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: multiple methods are never used
+   --> src/../../src/ui/chat/feedback/mod.rs:62:12
+    |
+ 37 | impl Feedback {
+    | ------------- methods in this implementation
+...
+ 62 |     pub fn latest_receipt(&self) -> Option<(&PendingSend, usize)> {
+    |            ^^^^^^^^^^^^^^
+...
+101 |     pub fn queued(&mut self, messages: &[AppQueuedUserMessage]) {
+    |            ^^^^^^
+...
+123 |     pub fn snapshot(
+    |            ^^^^^^^^
+...
+147 |     pub fn execution(&mut self, execution: &AppExecutionState) {
+    |            ^^^^^^^^^
+...
+165 |     pub fn runtime(&mut self, event: &Event) -> bool {
+    |            ^^^^^^^
+...
+189 |     pub fn active(&self, execution: &AppExecutionState) -> bool {
+    |            ^^^^^^
+...
+197 |     pub fn preparing_tools(&self) -> bool {
+    |            ^^^^^^^^^^^^^^^
+...
+201 |     pub fn clear_activity(&mut self) {
+    |            ^^^^^^^^^^^^^^
+...
+206 |     pub fn fail_activity(&mut self) {
+    |            ^^^^^^^^^^^^^
+
+warning: methods `preview` and `status` are never used
+   --> src/../../src/ui/chat/feedback/mod.rs:218:12
+    |
+217 | impl PendingSend {
+    | ---------------- methods in this implementation
+218 |     pub fn preview(&self) -> String {
+    |            ^^^^^^^
+...
+222 |     pub fn status(&self) -> &'static str {
+    |            ^^^^^^
+
+warning: function `preview` is never used
+   --> src/../../src/ui/chat/feedback/mod.rs:233:4
+    |
+233 | fn preview(text: &str) -> String {
+    |    ^^^^^^^
+
+warning: `desktop-feedback-repro` (bin "desktop-feedback-repro") generated 6 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running `audit-repros/target/debug/desktop-feedback-repro`
+B echoed, but pending receipt left = ["request-B"]
+A failed; restore its draft = false
+REPRODUCED: B's echo suppresses A's failed-send recovery and notice

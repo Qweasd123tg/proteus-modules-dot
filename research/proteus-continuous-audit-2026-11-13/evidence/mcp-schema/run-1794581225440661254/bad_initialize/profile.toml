@@ -1,0 +1,25 @@
+[modules]
+workflow = "audit_tool_driver"
+policy = "fixture_allow_all"
+[components.workflow]
+command = "python3"
+args = ["-B", "/workspace/shared/trace-mcp-schema-isolation-evidence/workflow.py", "/workspace/shared/proteus-review-20261112/core/examples/modules"]
+[components.workflow.exports.workflow.audit_tool_driver]
+[components.policy]
+command = "python3"
+args = ["-B", "/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+
+[[tools.mcp_servers]]
+name="good"
+enabled=true
+command="python3"
+args=["-B","/workspace/shared/trace-mcp-schema-isolation-evidence/mcp.py","ok"]
+timeout_ms=2000
+
+[[tools.mcp_servers]]
+name="bad"
+enabled=true
+command="python3"
+args=["-B","/workspace/shared/trace-mcp-schema-isolation-evidence/mcp.py","bad_initialize"]
+timeout_ms=2000

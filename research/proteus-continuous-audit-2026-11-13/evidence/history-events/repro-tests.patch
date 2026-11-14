@@ -1,0 +1,110 @@
+diff --git a/crates/proteus-core/src/app_server/events/tests/active_followup.rs b/crates/proteus-core/src/app_server/events/tests/active_followup.rs
+index 9c02c51..cfcddd9 100644
+--- a/crates/proteus-core/src/app_server/events/tests/active_followup.rs
++++ b/crates/proteus-core/src/app_server/events/tests/active_followup.rs
+@@ -278,3 +278,105 @@ async fn active_followup_reopen_preserves_completed_prefix_cursor_and_partial_on
+         server.shutdown().await;
+     }
+ }
++
++/// Audit regression: a healthy already-connected reader is not told that its
++/// immutable page revision was replaced between queued root turns.
++#[tokio::test]
++async fn audit_connected_followup_reader_keeps_retired_history_revision() {
++    let root = tempfile::tempdir().unwrap();
++    let workflow = Arc::new(FollowupWorkflow::default());
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    crate::test_support::select_test_modules(&mut config, "coding.single_loop");
++    let mut catalog = crate::test_support::module_catalog_for(&config);
++    catalog.register_test_workflow("coding.single_loop", workflow.clone());
++    let store = SessionStore::new(root.path(), root.path(), uuid::Uuid::new_v4()).unwrap();
++    let messages: Vec<_> = (0..120).map(|i| CanonicalMessage::text(
++        if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant },
++        format!("saved row {i}"),
++    )).collect();
++    store.append_history(uuid::Uuid::new_v4(), None, &messages).await.unwrap();
++    store.project_read_model(|source| crate::app_server::journal_transcript_from_source(source, None)).unwrap();
++    let prepared = crate::core::PreparedSession::from_dir(store.session_dir().to_owned()).unwrap();
++    let config_path = root.path().join("configs/config.toml");
++    let server = AgentAppServer::launch_inner(config, root.path().to_owned(), Some(&config_path), Some(catalog), Some(prepared), None).await.unwrap();
++    let mut stream = server.subscribe_session();
++    assert!(matches!(bounded(stream.recv()).await.unwrap(), AppServerEvent::PendingRequestsUpdated { .. }));
++    let AppServerEvent::SessionSnapshot { snapshot } = bounded(stream.recv()).await.unwrap() else { panic!("initial snapshot") };
++    let old = snapshot.history.unwrap();
++    assert_eq!(old.before, 70);
++    let SendDispatch::Started(result) = server.dispatch_user_message(Some("audit-chain".into()), "Первый запрос".to_owned(), Default::default(), CancellationToken::new()).await.unwrap() else { panic!("started") };
++    bounded(workflow.first_started.notified()).await;
++    let page = crate::app_server::read_model::transcript_page(&store, Some(old.before), Some(&old.revision)).unwrap();
++    assert_eq!(page.total, 120, "old cursor works during the first active turn");
++    assert!(matches!(server.dispatch_user_message(Some("audit-queued".into()), "ау".to_owned(), Default::default(), CancellationToken::new()).await.unwrap(), SendDispatch::Queued(_)));
++    workflow.release_first.notify_one();
++    bounded(workflow.second_started.notified()).await;
++    let mut updated_snapshots = 0;
++    let mut saw_second = false;
++    for _ in 0..100 {
++        let event = bounded(stream.recv()).await.unwrap();
++        if matches!(&event, AppServerEvent::SessionSnapshot { .. }) { updated_snapshots += 1; }
++        if matches!(&event, AppServerEvent::Runtime { envelope } if matches!(&envelope.event, Event::AssistantTextDelta { text, .. } if text == "Частичный ответ")) { saw_second = true; break; }
++    }
++    assert!(saw_second);
++    assert_eq!(updated_snapshots, 0, "connected reader never receives a new history cursor");
++    let error = crate::app_server::read_model::transcript_page(&store, Some(old.before), Some(&old.revision)).unwrap_err();
++    assert!(error.to_string().contains("history revision changed"));
++    let reopened = reopen_snapshot(&server).await;
++    let fresh = reopened.history.unwrap();
++    assert_ne!(fresh.revision, old.revision);
++    assert_eq!(fresh.before, 72);
++    let page = crate::app_server::read_model::transcript_page(&store, Some(fresh.before), Some(&fresh.revision)).unwrap();
++    assert_eq!(page.total, 122);
++    eprintln!("AUDIT: old_before={} fresh_before={} connected_snapshots={} old_page_error={error}", old.before, fresh.before, updated_snapshots);
++    workflow.release_second.notify_one();
++    assert_eq!(bounded(result).await.unwrap().unwrap().text, "Частичный ответ завершён");
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn audit_latest_history_read_retires_active_snapshot_without_notification() {
++    let root = tempfile::tempdir().unwrap();
++    let workflow = Arc::new(FollowupWorkflow::default());
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    crate::test_support::select_test_modules(&mut config, "coding.single_loop");
++    let mut catalog = crate::test_support::module_catalog_for(&config);
++    catalog.register_test_workflow("coding.single_loop", workflow.clone());
++    let store = SessionStore::new(root.path(), root.path(), uuid::Uuid::new_v4()).unwrap();
++    let messages: Vec<_> = (0..120).map(|i| CanonicalMessage::text(
++        if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant },
++        format!("saved row {i}"),
++    )).collect();
++    store.append_history(uuid::Uuid::new_v4(), None, &messages).await.unwrap();
++    store.project_read_model(|source| crate::app_server::journal_transcript_from_source(source, None)).unwrap();
++    let prepared = crate::core::PreparedSession::from_dir(store.session_dir().to_owned()).unwrap();
++    let config_path = root.path().join("configs/config.toml");
++    let server = AgentAppServer::launch_inner(config, root.path().to_owned(), Some(&config_path), Some(catalog), Some(prepared), None).await.unwrap();
++    let mut stream = server.subscribe_session();
++    assert!(matches!(bounded(stream.recv()).await.unwrap(), AppServerEvent::PendingRequestsUpdated { .. }));
++    let AppServerEvent::SessionSnapshot { snapshot } = bounded(stream.recv()).await.unwrap() else { panic!("initial snapshot") };
++    let old = snapshot.history.unwrap();
++    assert_eq!(old.before, 70);
++    let SendDispatch::Started(result) = server.dispatch_user_message(Some("audit-chain".into()), "Первый запрос".to_owned(), Default::default(), CancellationToken::new()).await.unwrap() else { panic!("started") };
++    bounded(workflow.first_started.notified()).await;
++    let page = crate::app_server::read_model::transcript_page(&store, Some(old.before), Some(&old.revision)).unwrap();
++    assert_eq!(page.total, 120, "old cursor works during the first active turn");
++    // The public latest history-page endpoint does not consult the active
++    // AppServer state. This is its exact SessionStore/read_model path.
++    let latest = crate::app_server::read_model::transcript_page(&store, None, None).unwrap();
++    assert_ne!(latest.revision, old.revision);
++    let error = crate::app_server::read_model::transcript_page(&store, Some(old.before), Some(&old.revision)).unwrap_err();
++    assert!(error.to_string().contains("history revision changed"));
++    let active = reopen_snapshot(&server).await;
++    assert_eq!(active.history.unwrap().revision, old.revision, "even reconnect retains the retired revision because publisher history was not refreshed");
++    let history_error = server.transcript().await.unwrap_err();
++    assert!(history_error.to_string().contains("history revision changed"));
++    eprintln!("AUDIT: latest_read_total={} live_snapshot_before={} old_page_error={error}; full_history_error={history_error}", latest.total, old.before);
++    workflow.release_first.notify_one();
++    assert_eq!(bounded(result).await.unwrap().unwrap().text, "Первый ответ");
++    server.shutdown().await;
++}

@@ -1,0 +1,116 @@
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use schema::Kind;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    pub url: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+impl Source {
+    /// Stable across client builds; no dependence on Rust's hash algorithm.
+    pub fn key(&self) -> String {
+        key(&format!(
+            "{}\n{}",
+            self.url,
+            self.branch.as_deref().unwrap_or_default()
+        ))
+    }
+
+    /// `owner/repo` of the URL; titles a repository without an index.
+    pub fn name(&self) -> String {
+        let url = self.url.trim_end_matches('/');
+        let url = url.strip_suffix(".git").unwrap_or(url);
+        let mut parts = url
+            .rsplit(['/', ':'])
+            .filter(|part| !part.is_empty())
+            .take(2)
+            .collect::<Vec<_>>();
+        parts.reverse();
+        parts.join("/")
+    }
+}
+
+pub fn key(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{hash:016x}")
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Preferences {
+    pub sources: Vec<Source>,
+    pub installed: Vec<Installed>,
+    pub official_sources_initialized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Installed {
+    pub source: Source,
+    pub entry: String,
+    pub version: String,
+    pub kind: Kind,
+    /// Agent Plugins and MCP receipts are scoped to the profile, not a conversation.
+    pub profile: Option<PathBuf>,
+    pub target: Target,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Target {
+    Component {
+        path: PathBuf,
+        command: Vec<String>,
+        exports: std::collections::BTreeMap<String, Vec<String>>,
+    },
+    Folder {
+        path: PathBuf,
+    },
+    Mcp {
+        server: proteus_contracts::domain::ConfiguredMcpServerConfig,
+    },
+}
+
+impl Preferences {
+    pub fn ensure_official_sources(&mut self) {
+        if self.official_sources_initialized {
+            return;
+        }
+        for official in &open::OFFICIAL {
+            let source = official.source();
+            if !self.sources.iter().any(|old| official.matches(old)) {
+                self.sources.push(source);
+            }
+        }
+        self.official_sources_initialized = true;
+    }
+
+    pub fn remember(&mut self, installed: Installed) {
+        self.installed.retain(|old| {
+            old.source != installed.source
+                || old.entry != installed.entry
+                || old.profile != installed.profile
+        });
+        self.installed.push(installed);
+    }
+}
+
+/// All filesystem locations are explicit in the installer, including tests.
+#[derive(Clone)]
+pub struct Locations {
+    pub cache: PathBuf,
+    pub extensions: PathBuf,
+    pub plugins: PathBuf,
+    pub skills: PathBuf,
+    pub modules: PathBuf,
+}
+

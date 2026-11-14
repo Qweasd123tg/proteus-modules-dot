@@ -1,0 +1,110 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+index f69bdab..38987d1 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -201,3 +201,105 @@ async fn json_profile_save_does_not_apply_toml_value_restrictions() {
+     );
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn audit_included_config_clear_does_not_survive_reload() {
++    let dir = tempfile::Builder::new().prefix("audit-included-config-")
++        .tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
++    let base = dir.path().join("base.toml");
++    let profile = dir.path().join("profile.toml");
++    tokio::fs::write(&base, "[module_config.tool.example]\nkept=1\nremoved=2\n").await.unwrap();
++    tokio::fs::write(&profile, "include=['base.toml']\n").await.unwrap();
++    let mut config = AppConfig::load(Some(&profile)).await.unwrap();
++    config.module_config.get_mut("tool").unwrap().get_mut("example").unwrap()
++        .as_object_mut().unwrap().remove("removed");
++    persist_config_builder(&profile, &config).await.unwrap();
++    let reloaded = AppConfig::load(Some(&profile)).await.unwrap();
++    eprintln!("intended module_config={}, reloaded module_config={}",
++        serde_json::to_string(&config.module_config).unwrap(),
++        serde_json::to_string(&reloaded.module_config).unwrap());
++    assert_eq!(reloaded.module_config["tool"]["example"]["removed"], serde_json::json!(2),
++        "current bug: removed key from include should reappear");
++    assert_ne!(config.module_config, reloaded.module_config);
++}
++
++#[tokio::test]
++async fn audit_include_save_ack_and_next_save_disagree() {
++    let dir = tempfile::Builder::new().prefix("audit-include-roundtrip-")
++        .tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
++    let base = dir.path().join("base.toml");
++    let profile = dir.path().join("profile.toml");
++    let initial = crate::test_model::config();
++    tokio::fs::write(&base, toml::to_string_pretty(&initial).unwrap()).await.unwrap();
++    tokio::fs::write(&profile, "include=['base.toml']\n").await.unwrap();
++    let loaded = AppConfig::load(Some(&profile)).await.unwrap();
++    let server = AgentAppServer::launch(loaded, dir.path().into(), Some(&profile))
++        .await.unwrap();
++    let mut values = initial.module_config["model"].clone();
++    values.get_mut("fake").unwrap().as_object_mut().unwrap().remove("stream_delay_ms");
++    let request = proteus_contracts::app_protocol::http::SetConfigBuilderRequest {
++        module_config: BTreeMap::from([("model".into(), values)]),
++        ..Default::default()
++    };
++    let accepted = server.set_profile_config(request).await.unwrap();
++    assert_eq!(accepted.module_config["model"]["fake"].get("stream_delay_ms"), None);
++    let disk = AppConfig::load(Some(&profile)).await.unwrap();
++    assert_eq!(disk.module_config["model"]["fake"]["stream_delay_ms"], serde_json::json!(1));
++    let after_next_save = server.set_profile_config(
++        proteus_contracts::app_protocol::http::SetConfigBuilderRequest {
++            permission_mode: Some(PermissionMode::Plan),
++            ..Default::default()
++        }
++    ).await.unwrap();
++    assert_eq!(after_next_save.module_config["model"]["fake"]["stream_delay_ms"], serde_json::json!(1));
++    eprintln!("accepted={}; on_disk={}; after_unrelated_save={}",
++        accepted.module_config["model"]["fake"], disk.module_config["model"]["fake"],
++        after_next_save.module_config["model"]["fake"]);
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn audit_real_history_can_contain_none_provider() {
++    let dir = tempfile::Builder::new().prefix("audit-history-provider-")
++        .tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
++    let profile = dir.path().join("profile.toml");
++    let mut initial = crate::test_model::config();
++    initial.active_provider = None;
++    tokio::fs::write(&profile, toml::to_string_pretty(&initial).unwrap()).await.unwrap();
++    let server = AgentAppServer::launch(initial, dir.path().into(), Some(&profile)).await.unwrap();
++    let accepted = server.set_profile_config(
++        proteus_contracts::app_protocol::http::SetConfigBuilderRequest {
++            active_provider: Some("fake".into()),
++            ..Default::default()
++        }
++    ).await.unwrap();
++    let history = server.config_history().await.unwrap();
++    assert_eq!(accepted.active_provider.as_deref(), Some("fake"));
++    assert_eq!(history.revisions.len(), 1);
++    assert_eq!(history.revisions[0].state.active_provider, None);
++    eprintln!("current provider={:?}; replaced history provider={:?}",
++        accepted.active_provider, history.revisions[0].state.active_provider);
++    server.shutdown().await;
++}
++
++#[tokio::test]
++async fn audit_catalog_after_history_payload_is_rejected() {
++    let path = std::env::var("AUDIT_PLUGIN_ADDONS_JSON").expect("bind actual Desktop probe output");
++    let addons: proteus_contracts::app_protocol::addons::AppAddonsUpdate =
++        serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
++    assert_eq!(addons.addons.plugins.len(), 2);
++    let dir = tempfile::Builder::new().prefix("audit-catalog-history-")
++        .tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
++    let profile = dir.path().join("profile.toml");
++    let server = AgentAppServer::launch(crate::test_model::config(), dir.path().into(), Some(&profile))
++        .await.unwrap();
++    let result = server.set_profile_config(
++        proteus_contracts::app_protocol::http::SetConfigBuilderRequest {
++            addon_settings: Some(addons), ..Default::default()
++        }
++    ).await;
++    let message = format!("{:#}", result.unwrap_err());
++    eprintln!("actual Desktop post-history connect payload rejection: {message}");
++    assert!(message.contains("duplicate Agent Plugin name: demo"));
++    server.shutdown().await;
++}

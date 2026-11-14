@@ -1,0 +1,67 @@
+Traceback (most recent call last):
+  File "/workspace/shared/extensions-line-audit/package.py", line 253, in <module>
+    main()
+  File "/workspace/shared/extensions-line-audit/package.py", line 243, in main
+    assemble(args.bundle, build=not args.no_build)
+  File "/workspace/shared/extensions-line-audit/package.py", line 54, in assemble
+    built = binaries(build=build)
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/shared/extensions-line-audit/package.py", line 30, in binaries
+    outputs = built_binaries(crates, ["cargo", "build", "--release", "--locked", "--quiet",
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/shared/extensions-line-audit/package.py", line 113, in built_binaries
+    result = subprocess.run(command,
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'cargo'
+ETraceback (most recent call last):
+  File "/workspace/shared/extensions-line-audit/package.py", line 253, in <module>
+    main()
+  File "/workspace/shared/extensions-line-audit/package.py", line 232, in main
+    binary = selected_binary(package)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/shared/extensions-line-audit/package.py", line 105, in selected_binary
+    return built_binaries([package], command)[package]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/shared/extensions-line-audit/package.py", line 113, in built_binaries
+    result = subprocess.run(command,
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1026, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 1955, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'cargo'
+E........................................................
+======================================================================
+ERROR: test_every_standalone_package_runs_without_checkout_imports (tests.test_bundle.BundleTests.test_every_standalone_package_runs_without_checkout_imports)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/shared/extensions-line-audit/tests/test_bundle.py", line 36, in test_every_standalone_package_runs_without_checkout_imports
+    subprocess.run([sys.executable, str(ROOT / "package.py"), "--bundle", directory], check=True)
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python', '/workspace/shared/extensions-line-audit/package.py', '--bundle', '/tmp/tmp76s3yp7o']' returned non-zero exit status 1.
+
+======================================================================
+ERROR: test_selected_zip_runs_without_checkout_or_other_packages (tests.test_bundle.BundleTests.test_selected_zip_runs_without_checkout_or_other_packages)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/shared/extensions-line-audit/tests/test_bundle.py", line 18, in test_selected_zip_runs_without_checkout_or_other_packages
+    subprocess.run([sys.executable, str(ROOT / "package.py"),
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python', '/workspace/shared/extensions-line-audit/package.py', '--package', 'quota', '--output', '/tmp/tmpczdmiye5/archives']' returned non-zero exit status 1.
+
+----------------------------------------------------------------------
+Ran 58 tests in 0.217s
+
+FAILED (errors=2)

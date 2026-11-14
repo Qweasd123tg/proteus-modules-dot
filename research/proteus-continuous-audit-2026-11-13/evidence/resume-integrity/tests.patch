@@ -1,0 +1,188 @@
+diff --git a/crates/proteus-core/tests/execution_boundary/images.rs b/crates/proteus-core/tests/execution_boundary/images.rs
+index 3fd188f..c81bcfd 100644
+--- a/crates/proteus-core/tests/execution_boundary/images.rs
++++ b/crates/proteus-core/tests/execution_boundary/images.rs
+@@ -270,3 +270,90 @@ async fn codex_compaction_strips_working_images_but_keeps_original_journal_and_s
+         .collect::<Vec<_>>();
+     assert_eq!(image_counts, [1, 1, 1, 1, 0]);
+ }
++
++#[tokio::test]
++async fn audit_round9_rejected_image_poisoning_persists_after_cold_resume() {
++    let workspace = tempfile::tempdir().unwrap();
++    let capture = workspace.path().join("poisoned-requests.jsonl");
++    let config = config(false, &capture);
++    let config_path = workspace.path().join("config.toml");
++    let thread = new_thread_id();
++    let runtime = AgentRuntime::builder(config.clone(), workspace.path().into())
++        .with_config_path(Some(&config_path))
++        .with_session_ids(new_session_id(), thread)
++        .build_async().await.unwrap();
++    let baseline = runtime.run("Plain text baseline".into()).await.unwrap();
++    assert_eq!(baseline.text, "Images received: 0");
++    let error = runtime.run_input(input("Describe this"), CancellationToken::new())
++        .await.unwrap_err();
++    assert!(format!("{error:#}").contains("does not support image input"));
++    let warm = runtime.run("No image this time".into()).await;
++    println!("warm text-only followup: {warm:#?}");
++    assert!(format!("{:#}", warm.unwrap_err()).contains("does not support image input"));
++    let dir = runtime.session_dir().unwrap().to_path_buf();
++    drop(runtime);
++    let resumed = AgentRuntime::builder(config, workspace.path().into())
++        .resume_from_session_dir(&dir, thread).unwrap()
++        .build_async().await.unwrap();
++    let cold = resumed.run("Still plain text after reopening".into()).await;
++    println!("cold text-only followup: {cold:#?}");
++    assert!(format!("{:#}", cold.unwrap_err()).contains("does not support image input"));
++    let requests = std::fs::read_to_string(&capture).unwrap();
++    assert_eq!(requests.lines().count(), 1, "only baseline reaches provider");
++    let records = SessionStore::open(dir).unwrap().load_records().unwrap();
++    let settlements: Vec<_> = records.iter().filter_map(|r| match &r.entry {
++        JournalEntry::TurnSettled(s) => Some(s.status), _ => None
++    }).collect();
++    println!("settlements: {settlements:?}");
++    assert_eq!(settlements, [TurnSettlementStatus::Success, TurnSettlementStatus::Error,
++        TurnSettlementStatus::Error, TurnSettlementStatus::Error]);
++    resumed.clear_history().await.unwrap();
++    assert_eq!(resumed.run("Plain text after clear".into()).await.unwrap().text, "Images received: 0");
++    assert_eq!(std::fs::read_to_string(&capture).unwrap().lines().count(), 2);
++}
++
++#[tokio::test]
++async fn audit_round9_supported_session_relocation_breaks_image_context() {
++    let root = tempfile::tempdir().unwrap();
++    let source_workspace = tempfile::tempdir().unwrap();
++    let target_workspace = tempfile::tempdir().unwrap();
++    let capture = root.path().join("relocation-requests.jsonl");
++    let config = config(true, &capture);
++    let config_path = root.path().join("config.toml");
++    let thread = new_thread_id();
++    let runtime = AgentRuntime::builder(config.clone(), source_workspace.path().into())
++        .with_config_path(Some(&config_path))
++        .with_session_ids(new_session_id(), thread)
++        .build_async().await.unwrap();
++    assert_eq!(runtime.run_input(input("Image before moving"), CancellationToken::new())
++        .await.unwrap().text, "Images received: 1");
++    let image = runtime.history().await.unwrap()[0].parts.iter().find_map(|part| match &part.payload {
++        ContentPart::Image { image } => Some(image.clone()), _ => None
++    }).unwrap();
++    let source = runtime.session_dir().unwrap().to_path_buf();
++    drop(runtime);
++    let target_parent = source.parent().unwrap().parent().unwrap()
++        .join(proteus_core::core::encode_workspace_path(target_workspace.path()).unwrap());
++    std::fs::create_dir_all(&target_parent).unwrap();
++    let target = target_parent.join(source.file_name().unwrap());
++    std::fs::rename(&source, &target).unwrap();
++    let resumed = AgentRuntime::builder(config, source_workspace.path().into())
++        .resume_from_session_dir(&target, thread).unwrap()
++        .build_async().await.unwrap();
++    assert_eq!(SessionStore::open(target.clone()).unwrap().workspace_path().unwrap(),
++        target_workspace.path().canonicalize().unwrap());
++    // The image physically travelled with the canonical session and reads correctly by id.
++    assert_eq!(resumed.image_bytes(&image.id).unwrap().0, PNG);
++    assert_eq!(std::fs::read(target.join("images").join(&image.id)).unwrap(), PNG);
++    assert!(!image.path.exists());
++    let restored = resumed.history().await.unwrap()[0].parts.iter().find_map(|part| match &part.payload {
++        ContentPart::Image { image } => Some(image.clone()), _ => None
++    }).unwrap();
++    assert_eq!(restored.path, image.path, "resume retained old absolute path");
++    let result = resumed.run("Continue after supported move".into()).await;
++    println!("relocated image result: {result:#?}");
++    let error = format!("{:#}", result.unwrap_err());
++    assert!(error.contains("No such file or directory"), "{error}");
++    assert!(error.contains(&image.id), "{error}");
++    assert_eq!(std::fs::read_to_string(capture).unwrap().lines().count(), 1);
++}
+diff --git a/crates/proteus-core/tests/hook_runtime.rs b/crates/proteus-core/tests/hook_runtime.rs
+index e3bf304..7f86955 100644
+--- a/crates/proteus-core/tests/hook_runtime.rs
++++ b/crates/proteus-core/tests/hook_runtime.rs
+@@ -347,3 +347,88 @@ async fn interruption_during_after_hook_preserves_already_completed_effect() {
+         }
+     }
+ }
++
++#[tokio::test]
++async fn audit_round9_crash_prefix_discards_durable_effect_from_next_model_context() {
++    use proteus_contracts::{contracts::CancellationToken, model_standard::ContentPart};
++    use std::{sync::Arc, time::Duration};
++    let workspace = tempfile::tempdir().unwrap();
++    let snapshot_root = tempfile::tempdir().unwrap();
++    let marker = workspace.path().join("round9-after-hook-entered");
++    let mut config = config().await;
++    config.modules.hooks = vec!["fixture".into()];
++    config.components.insert("hook-fixture".into(), serde_json::from_value(json!({
++        "command":"python3",
++        "args":[workspace_file("crates/proteus-core/tests/fixtures/process_hook.py"),"after_wait","fixture","hook-fixture",marker],
++        "exports":{"hook":{"fixture":{"timeout_ms":5000}}}
++    })).unwrap());
++    config.tools.enabled = vec!["apply_patch".into()];
++    config.runtime.workflow_timeout_ms = 10000;
++    let runtime = Arc::new(AgentRuntime::builder(config.clone(), workspace.path().into())
++        .with_config_path(Some(&workspace.path().join("config.toml")))
++        .build_async().await.unwrap());
++    let cancellation = CancellationToken::new();
++    let running = tokio::spawn({
++        let runtime = runtime.clone();
++        let cancellation = cancellation.clone();
++        async move { runtime.run_with_cancellation("apply_patch".into(), cancellation).await }
++    });
++    tokio::time::timeout(Duration::from_secs(3), async {
++        while !marker.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
++    }).await.expect("after-tool barrier");
++    assert!(workspace.path().join("smoke.txt").exists());
++    let source = runtime.session_dir().unwrap().to_path_buf();
++    let target = snapshot_root.path().join("sessions")
++        .join(source.parent().unwrap().file_name().unwrap())
++        .join(source.file_name().unwrap());
++    // A closed, complete journal prefix at the exact effect -> after-hook boundary.
++    // Copying this prefix simulates restart after loss of the process, without
++    // killing a shared test process or truncating an active source journal.
++    fn copy_tree(source: &Path, target: &Path) {
++        std::fs::create_dir_all(target).unwrap();
++        for entry in std::fs::read_dir(source).unwrap() {
++            let entry = entry.unwrap();
++            if entry.file_type().unwrap().is_dir() { copy_tree(&entry.path(), &target.join(entry.file_name())); }
++            else { std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap(); }
++        }
++    }
++    copy_tree(&source, &target);
++    cancellation.cancel();
++    assert!(running.await.unwrap().is_err());
++    let settled_history = SessionStore::open(source).unwrap().load_messages().unwrap();
++    assert!(settled_history.iter().flat_map(|m| &m.parts).any(|p| matches!(&p.payload,
++        ContentPart::ToolResult { result } if result.ok && result.output == "added smoke.txt")));
++    drop(runtime);
++    let store = SessionStore::open(target.clone()).unwrap();
++    let crashed = store.load_projection().unwrap();
++    let effect = crashed.records.iter().find_map(|record| match &record.entry {
++        JournalEntry::ToolEffectRecorded(effect) => Some(effect.result.clone()), _ => None
++    }).expect("actual completed effect durably present");
++    assert!(effect.ok);
++    assert_eq!(crashed.unsettled_turns.len(), 1);
++    assert!(crashed.unresolved_tool_calls.is_empty(), "effect classified as known, not unresolved");
++    assert!(!crashed.history.iter().flat_map(|m| &m.parts).any(|p| matches!(&p.payload,
++        ContentPart::ToolResult { result } if result.call_id == effect.call_id)));
++    assert!(!crashed.records.iter().any(|r| matches!(r.entry, JournalEntry::TurnSettled(_))));
++    let resumed = proteus_core::app_server::AgentAppServer::launch_resumed(
++        config, workspace.path().into(), Some(&snapshot_root.path().join("config.toml")), target)
++        .await.unwrap();
++    let transcript = resumed.transcript().await.unwrap();
++    let row = transcript.iter().filter_map(|row| row.tool.as_ref())
++        .find(|tool| tool.call_id == effect.call_id).unwrap();
++    println!("cold transcript: status={}, result={:?}", row.status, row.result);
++    assert_eq!(row.status, "done");
++    assert_eq!(row.result.as_deref(), Some("added smoke.txt"));
++    resumed.send_user_message("continue without tools".into()).await.unwrap();
++    let next_request = store.load_records().unwrap().into_iter().rev().find_map(|record| match record.entry {
++        JournalEntry::ModelRequestRecorded(model) => Some(model.request), _ => None
++    }).unwrap();
++    let presented = next_request.messages.iter().flat_map(|m| &m.parts).find_map(|part| match &part.payload {
++        ContentPart::ToolResult { result } if result.call_id == effect.call_id => Some(result.clone()), _ => None
++    }).unwrap();
++    println!("durable effect: {effect:?}\nnext model sees: {presented:?}");
++    assert!(!presented.ok);
++    assert_eq!(presented.error.as_deref(), Some("aborted"));
++    assert!(workspace.path().join("smoke.txt").exists());
++    resumed.shutdown().await;
++}

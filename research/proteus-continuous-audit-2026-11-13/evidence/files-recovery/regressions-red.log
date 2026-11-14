@@ -1,0 +1,31 @@
+   Compiling extension-files v0.1.0 (/workspace/shared/trace-files-recovery-evidence/source/packages/files)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.42s
+     Running unittests src/main.rs (/workspace/shared/trace-files-recovery-evidence/target/debug/deps/files-1f2096da6f0a04d0)
+
+running 4 tests
+test tree::tests::trace_root_listing_recovers_after_one_transient_failure ... ok
+test tree::tests::trace_folded_regular_expand_reloads_chain_ancestors ... ok
+test tree::tests::trace_nested_listing_recovers_after_one_transient_failure ... FAILED
+test tree::tests::trace_folded_expand_all_must_reload_chain_ancestors ... FAILED
+
+failures:
+
+---- tree::tests::trace_nested_listing_recovers_after_one_transient_failure stdout ----
+
+thread 'tree::tests::trace_nested_listing_recovers_after_one_transient_failure' (191) panicked at packages/files/src/tree_tests.rs:202:5:
+healthy API no longer retried: [Line { path: "", label: "project", depth: 0, kind: Directory, expanded: Some(true) }, Line { path: "src", label: "src", depth: 1, kind: Directory, expanded: Some(false) }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tree::tests::trace_folded_expand_all_must_reload_chain_ancestors stdout ----
+
+thread 'tree::tests::trace_folded_expand_all_must_reload_chain_ancestors' (189) panicked at packages/files/src/tree_tests.rs:167:5:
+new sibling remains invisible: [Line { path: "", label: "project", depth: 0, kind: Directory, expanded: Some(true) }, Line { path: "src/lib", label: "src/lib", depth: 1, kind: Directory, expanded: Some(true) }, Line { path: "src/lib/existing.rs", label: "existing.rs", depth: 2, kind: File, expanded: None }]
+
+
+failures:
+    tree::tests::trace_folded_expand_all_must_reload_chain_ancestors
+    tree::tests::trace_nested_listing_recovers_after_one_transient_failure
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p extension-files --bin files`

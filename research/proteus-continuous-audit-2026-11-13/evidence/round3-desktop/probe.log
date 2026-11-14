@@ -1,0 +1,43 @@
+   Compiling desktop-round3-probe v0.0.0 (/workspace/scratch/3ba0fff8d310/desktop-behaviour/audit-round3/probe)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.34s
+     Running unittests src/lib.rs (desktop-behaviour/audit-round3/probe/target/debug/deps/desktop_round3_probe-0f5204d2acd7de1d)
+
+running 3 tests
+resumed active row streaming=false
+after continuation "Hello"
+
+thread 'audit::active_history_snapshot_ignores_following_delta' (278) panicked at src/audit.rs:64:2:
+assertion `left == right` failed: active resumed row must accept further deltas
+  left: "Hello"
+ right: "Hello world"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test audit::active_history_snapshot_ignores_following_delta ... FAILED
+overlapped output: "Hello world world"
+
+thread 'audit::resume_overlap_must_not_replay_tool_delta_already_in_history' (279) panicked at src/audit.rs:120:2:
+assertion `left == right` failed: snapshot already contains this buffered output delta
+  left: "Hello world world"
+ right: "Hello world"
+recovery event: SubscriptionSuspended
+test audit::resume_overlap_must_not_replay_tool_delta_already_in_history ... FAILED
+recovery event: ResyncStarted
+recovery event: TextDelta { id: "i", turn_id: "t", delta: " world" }
+recovery event: Resynced { current_turn: Some("t"), history: [] }
+after repair "Hello world"
+
+thread 'audit::resync_delta_must_not_discard_authoritative_prefix' (280) panicked at src/audit.rs:89:2:
+assertion `left == right` failed: live delta does not contain missed prefix from detached interval
+  left: "Hello world"
+ right: "Hello missed world"
+test audit::resync_delta_must_not_discard_authoritative_prefix ... FAILED
+
+failures:
+
+failures:
+    audit::active_history_snapshot_ignores_following_delta
+    audit::resume_overlap_must_not_replay_tool_delta_already_in_history
+    audit::resync_delta_must_not_discard_authoritative_prefix
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`

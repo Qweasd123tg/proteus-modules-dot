@@ -1,0 +1,45 @@
+   Compiling proteus-core v0.1.0-alpha.3 (/workspace/shared/core-functionality-round3/crates/proteus-core)
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:40:19
+   |
+11 | impl Polling {
+   | ------------ associated function in this implementation
+...
+40 |     pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:84:19
+   |
+58 | impl Poll {
+   | --------- associated function in this implementation
+...
+84 |     pub(super) fn controlled(
+   |                   ^^^^^^^^^^
+
+warning: `proteus-core` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.39s
+     Running unittests src/lib.rs (/workspace/shared/proteus-review-20261112/core/target/debug/deps/proteus_core-e2a62bb02752de7c)
+
+running 1 test
+attempt 1: error=synthetic transient SteeringQueued sink failure, admitted=[(c8f47ba8-6742-4c8a-ab2e-a16c31f35aff, "same client request")]
+attempt 2: error=synthetic transient SteeringQueued sink failure, admitted=[(c8f47ba8-6742-4c8a-ab2e-a16c31f35aff, "same client request"), (2ff9221f-f9d4-4878-acd7-8a9d83936b1e, "same client request")]
+executed tasks after caller received two errors: ["initial", "same client request", "same client request"]
+
+thread 'core::runtime::tests::steering_integration::repro_failed_steering_ack_does_not_admit_retry_twice' (293) panicked at crates/proteus-core/src/core/runtime/tests/steering_integration.rs:812:5:
+assertion `left == right` failed: a failed reservation must not execute work without a receipt, including a retry
+  left: ["initial", "same client request", "same client request"]
+ right: ["initial"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test core::runtime::tests::steering_integration::repro_failed_steering_ack_does_not_admit_retry_twice ... FAILED
+
+failures:
+
+failures:
+    core::runtime::tests::steering_integration::repro_failed_steering_ack_does_not_admit_retry_twice
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 726 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p proteus-core --lib`

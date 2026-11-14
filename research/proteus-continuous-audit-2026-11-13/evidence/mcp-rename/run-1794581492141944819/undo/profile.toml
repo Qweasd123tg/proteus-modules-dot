@@ -1,0 +1,63 @@
+[modules]
+workflow = "audit_tool_driver"
+policy = "fixture_allow_all"
+hooks = []
+[addons]
+disabled_skills = []
+disabled_mcp_servers = ["db2"]
+plugins = []
+
+[tools]
+enabled = []
+[providers]
+
+[permissions]
+mode = "normal"
+
+[agent_control]
+surface = "task"
+[module_config]
+[components.workflow]
+command = "python3"
+args = ["-B", "/workspace/shared/trace-mcp-rename-evidence/workflow.py", "/workspace/shared/proteus-review-20261112/core/examples/modules"]
+
+[[tools.mcp_servers]]
+name = "db"
+command = "python3"
+enabled = true
+args = [
+    "-B",
+    "/workspace/shared/trace-mcp-rename-evidence/mcp.py",
+    "original_db",
+    "/workspace/shared/trace-mcp-rename-evidence/run-1794581492141944819/undo/mcp-events.log",
+]
+env_allowlist = []
+protocol_version = "2025-11-25"
+safety = "RunsCommands"
+supports_parallel_tool_calls = false
+timeout_ms = 2000
+[components.workflow.exports.workflow.audit_tool_driver]
+
+[tools.mcp_servers.env]
+[components.policy]
+command = "python3"
+args = ["-B", "/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+
+[[tools.mcp_servers]]
+name = "db2"
+command = "python3"
+enabled = true
+args = [
+    "-B",
+    "/workspace/shared/trace-mcp-rename-evidence/mcp.py",
+    "existing_db2",
+    "/workspace/shared/trace-mcp-rename-evidence/run-1794581492141944819/undo/mcp-events.log",
+]
+env_allowlist = []
+protocol_version = "2025-11-25"
+safety = "RunsCommands"
+supports_parallel_tool_calls = false
+timeout_ms = 2000
+[components.policy.exports.policy.fixture_allow_all]
+
+[tools.mcp_servers.env]

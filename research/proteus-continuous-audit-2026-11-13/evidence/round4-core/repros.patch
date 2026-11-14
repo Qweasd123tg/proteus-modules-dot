@@ -1,0 +1,83 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+index 97209af..5d3ee9a 100644
+--- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
++++ b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+@@ -227,3 +227,52 @@ async fn watcher_does_not_keep_a_dropped_handle_alive() {
+     .await
+     .unwrap();
+ }
++
++#[cfg(unix)]
++#[tokio::test]
++async fn repro_round4_profile_retries_after_component_dependency_recovers() {
++    async fn tick(sender: &tokio::sync::mpsc::UnboundedSender<super::polling::Poll>, at: Instant) -> super::polling::PollReport {
++        let (done, result) = tokio::sync::oneshot::channel();
++        sender.send(super::polling::Poll::controlled(at, done)).unwrap();
++        tokio::time::timeout(Duration::from_secs(10), result).await.unwrap().unwrap()
++    }
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let initial = crate::test_model::config();
++    std::fs::write(&path, toml::to_string(&initial).unwrap()).unwrap();
++    // Disable the ordinary watcher, then drive the real loop deterministically.
++    let server = AgentAppServer::launch(initial.clone(), root.path().to_path_buf(), None).await.unwrap();
++    let (polling, sender) = super::polling::Polling::controlled();
++    super::start_with_polling(&server, path.clone(), polling).await;
++    let t = Instant::now();
++    tick(&sender, t).await;
++    tick(&sender, t + Duration::from_secs(4)).await;
++    let epoch = server.runtime.module_epoch().await;
++    let replacement = root.path().join("replacement-reference-module");
++    let mut updated = initial.clone();
++    let mut component = serde_json::to_value(&updated.components["test-model"]).unwrap();
++    component["command"] = serde_json::to_value(&replacement).unwrap();
++    updated.components.insert("test-model".into(), serde_json::from_value(component).unwrap());
++    std::fs::write(&path, toml::to_string(&updated).unwrap()).unwrap();
++    tick(&sender, t + Duration::from_secs(8)).await;
++    let first = tick(&sender, t + Duration::from_secs(12)).await;
++    assert!(first.refresh_attempted);
++    let first_error = server.profile_error.lock().await.clone();
++    assert!(first_error.is_some());
++    eprintln!("initial replacement failure={first_error:?}");
++    std::os::unix::fs::symlink(crate::test_model::reference_module(), &replacement).unwrap();
++    // The exact same profile can now prepare successfully with the recovered dependency.
++    let validated = super::prepare_assembly(&updated, root.path(), Some(&path)).await.unwrap();
++    drop(validated);
++    let mut refreshes = 0;
++    for step in 4..8 {
++        let report = tick(&sender, t + Duration::from_secs(step * 4)).await;
++        assert!(report.scanned, "bounded-age semantic revalidation ran");
++        refreshes += usize::from(report.refresh_attempted);
++    }
++    let after = server.runtime.module_epoch().await;
++    let stale_error = server.profile_error.lock().await.clone();
++    eprintln!("after dependency recovered: retry_attempts={refreshes}, epoch_before={epoch:?}, epoch_after={after:?}, stale_error={stale_error:?}");
++    server.shutdown().await;
++    assert!(after != epoch && stale_error.is_none(), "valid recovered profile must eventually apply; failed fingerprint must not poison it indefinitely");
++}
+diff --git a/crates/proteus-core/src/core/agent_control/workspace.rs b/crates/proteus-core/src/core/agent_control/workspace.rs
+index 0728a73..52ff0cf 100644
+--- a/crates/proteus-core/src/core/agent_control/workspace.rs
++++ b/crates/proteus-core/src/core/agent_control/workspace.rs
+@@ -441,3 +441,21 @@ mod tests {
+         assert!(create_worktree(repo.path(), ".hidden").is_err());
+     }
+ }
++
++#[cfg(test)]
++mod round4_path_repro {
++    use super::*;
++
++    #[test]
++    fn repro_round4_worktree_preserves_significant_trailing_space_in_root() {
++        let root = tempfile::tempdir().unwrap();
++        let repo = root.path().join("repo with trailing space ");
++        fs::create_dir(&repo).unwrap();
++        for args in [vec!["init", "-q", "-b", "main"], vec!["config", "user.email", "test@example.test"], vec!["config", "user.name", "test"], vec!["commit", "--allow-empty", "-qm", "base"]] {
++            run_git(&repo, &args).unwrap();
++        }
++        let result = create_worktree(&repo, "child");
++        eprintln!("root={repo:?}, result={result:?}");
++        assert!(result.is_ok(), "worktree must use Git's exact path, not whitespace-trimmed path");
++    }
++}

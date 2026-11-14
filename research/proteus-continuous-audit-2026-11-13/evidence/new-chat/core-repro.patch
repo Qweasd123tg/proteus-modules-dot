@@ -1,0 +1,29 @@
+--- a/crates/proteus-core/src/app_server/http/tests/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/tests/sessions.rs
+@@ -512,3 +512,26 @@
+     next.shutdown().await;
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn audit_new_chat_explicit_source_preserves_session_mode_but_none_uses_profile() {
++    let (state, server, _config_dir) = test_state().await;
++    server.set_permission_mode(crate::domain::PermissionMode::Plan).await;
++    let source = PathBuf::from(server.config_summary().await["session_dir"].as_str().unwrap());
++    for (label, source, expected) in [
++        ("launch_folder_branch", None, crate::domain::PermissionMode::Normal),
++        ("other_folder_branch", Some(source), crate::domain::PermissionMode::Plan),
++    ] {
++        let response = execute_new_session(&state, None, source, None).await;
++        let StdioOutput::Response { ok: true, output: Some(opened), .. } = response else {
++            panic!("{response:?}");
++        };
++        let opened: proteus_contracts::app_protocol::http::SessionOpened = serde_json::from_value(opened).unwrap();
++        let next = state.server_for_session_dir(&opened.session_dir).await.unwrap();
++        let actual = next.permission_mode().await;
++        println!("{label}: {actual:?}");
++        assert_eq!(actual, expected);
++        next.shutdown().await;
++    }
++    server.shutdown().await;
++}

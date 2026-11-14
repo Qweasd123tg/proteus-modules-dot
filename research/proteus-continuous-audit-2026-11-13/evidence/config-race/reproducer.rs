@@ -1,0 +1,168 @@
+//! Audit reproducer: external editor races a partial UI save during preparation.
+use super::*;
+use std::time::Duration;
+
+fn gated_profile(root: &Path) -> AppConfig {
+    let gate = root.join("gate");
+    let entered = root.join("entered");
+    let wrapper = root.join("gated_worker.py");
+    std::fs::write(
+        &wrapper,
+        r#"import pathlib, runpy, sys, time
+fixture, gate, entered = sys.argv[1:]
+gate, entered = pathlib.Path(gate), pathlib.Path(entered)
+if gate.exists():
+    entered.write_text('preparing')
+    while gate.exists(): time.sleep(0.005)
+runpy.run_path(fixture, run_name='__main__')
+"#,
+    )
+    .unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_commands.py");
+    let mut config = AppConfig::default();
+    config.active_provider = None;
+    config.providers.clear();
+    config.agent_control.surface = crate::core::AgentControlSurface::None;
+    config.tools.enabled = vec!["probe_command".into()];
+    config.components.insert(
+        "audit-probe".into(),
+        serde_json::from_value(serde_json::json!({
+            "command": "python3", "args": [wrapper, fixture, gate, entered],
+            "exports": {"tool": {"probe.commands": {}}}
+        }))
+        .unwrap(),
+    );
+    config
+}
+
+fn write_source(path: &Path, config: &AppConfig) {
+    let bytes = if path.extension().unwrap() == "json" {
+        serde_json::to_vec_pretty(config).unwrap()
+    } else {
+        toml::to_string(config).unwrap().into_bytes()
+    };
+    std::fs::write(path, bytes).unwrap();
+}
+
+async fn wait_entered(root: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !root.join("entered").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("UI save reached process preparation gate");
+}
+
+#[tokio::test]
+async fn audit_round11_partial_save_overwrites_concurrent_external_tool_edit_without_history() {
+    for extension in ["toml", "json"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(format!("config.{extension}"));
+        let config = gated_profile(root.path());
+        write_source(&source, &config);
+        let server = AgentAppServer::launch(config.clone(), root.path().into(), Some(&source))
+            .await
+            .unwrap();
+        // Leave the production watcher active; only component startup is gated.
+        std::fs::write(root.path().join("gate"), "wait").unwrap();
+        let save = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .set_config_builder(
+                        BTreeMap::new(),
+                        None,
+                        BTreeMap::new(),
+                        None,
+                        None,
+                        Some(PermissionMode::Plan),
+                    )
+                    .await
+            })
+        };
+        wait_entered(root.path()).await;
+        let mut external = config.clone();
+        external.tools.enabled.clear();
+        write_source(&source, &external);
+        assert!(
+            AppConfig::load(Some(&source))
+                .await
+                .unwrap()
+                .tools
+                .enabled
+                .is_empty()
+        );
+        // The editor finished before save commit. It never requested a mode change.
+        std::fs::remove_file(root.path().join("gate")).unwrap();
+        let response = save.await.unwrap().unwrap();
+        let saved = AppConfig::load(Some(&source)).await.unwrap();
+        assert_eq!(saved.permissions.mode, PermissionMode::Plan);
+        assert_eq!(saved.tools.enabled, vec!["probe_command".to_string()]);
+        assert_eq!(response.tools_enabled, saved.tools.enabled);
+        let history = server.config_history().await.unwrap();
+        assert!(!history.revisions.is_empty());
+        assert!(
+            history
+                .revisions
+                .iter()
+                .all(|revision| !revision.state.tools_enabled.is_empty())
+        );
+        // Bounded-age semantic scan cannot recover the overwritten disk value.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(
+            server.config.read().await.tools.enabled,
+            saved.tools.enabled
+        );
+        assert!(server.addons_snapshot().await.reload_error.is_none());
+        eprintln!(
+            "ROUND11 LOST UPDATE ({extension}): UI requested only mode=Plan; external tools=[]; disk/live/response={:?}; history has no tools=[]; watcher error=None",
+            saved.tools.enabled
+        );
+        server.shutdown().await;
+        let cold = AgentAppServer::launch(saved, root.path().into(), Some(&source))
+            .await
+            .unwrap();
+        assert_eq!(
+            cold.config.read().await.tools.enabled,
+            vec!["probe_command".to_string()]
+        );
+        eprintln!("ROUND11 COLD ({extension}): overwritten tools remain enabled");
+        cold.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn audit_round11_control_external_edit_completed_before_save_is_preserved() {
+    for extension in ["toml", "json"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(format!("config.{extension}"));
+        let config = gated_profile(root.path());
+        write_source(&source, &config);
+        let server = AgentAppServer::launch(config.clone(), root.path().into(), Some(&source))
+            .await
+            .unwrap();
+        let mut external = config;
+        external.tools.enabled.clear();
+        write_source(&source, &external);
+        server
+            .set_config_builder(
+                BTreeMap::new(),
+                None,
+                BTreeMap::new(),
+                None,
+                None,
+                Some(PermissionMode::Plan),
+            )
+            .await
+            .unwrap();
+        let saved = AppConfig::load(Some(&source)).await.unwrap();
+        assert!(saved.tools.enabled.is_empty());
+        assert_eq!(saved.permissions.mode, PermissionMode::Plan);
+        assert!(server.config.read().await.tools.enabled.is_empty());
+        eprintln!(
+            "ROUND11 CONTROL ({extension}): same external edit before save survives disk/live, mode=Plan"
+        );
+        server.shutdown().await;
+    }
+}

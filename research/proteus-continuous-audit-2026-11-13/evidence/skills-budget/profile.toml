@@ -1,0 +1,35 @@
+active_provider = "fake"
+[providers.fake]
+provider = "fake"
+model = "fake-tool-model"
+[modules]
+workflow = "coding.codex_loop"
+context = "codex_context"
+policy = "fixture_allow_all"
+[components.policy]
+command = "python3"
+args = ["-B", "/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+[components.workflow]
+command = "/workspace/shared/disabled-skill-context-target/debug/proteus-coding-workflow-module"
+[components.workflow.exports.workflow."coding.codex_loop"]
+[components.context]
+command = "/workspace/shared/disabled-skill-context-target/debug/proteus-context-pack-module"
+[components.context.exports.context.codex_context]
+[module_config.context.codex_context]
+providers = ["project_instructions", "skills", "environment"]
+[components.skills]
+command = "/workspace/shared/disabled-skill-context-target/debug/proteus-skill-pack-module"
+[components.skills.exports.context_provider.skills]
+[components.skills.exports.tool.skill_tool]
+[components.test-model]
+command = "python3"
+args = ["-B", "/workspace/shared/skills-budget-evidence/capture_model.py"]
+[components.test-model.exports.model.fake]
+[module_config.model.fake]
+capture_path = "/workspace/shared/skills-budget-evidence/model-requests.jsonl"
+[tools]
+enabled = ["skill"]
+[agent_control]
+surface = "none"
+max_depth = 0

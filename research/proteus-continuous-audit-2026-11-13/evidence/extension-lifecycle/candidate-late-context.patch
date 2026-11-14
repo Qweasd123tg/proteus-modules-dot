@@ -1,0 +1,28 @@
+--- a/src/ui/extensions/host.rs
++++ b/src/ui/extensions/host.rs
+@@ -125,7 +125,7 @@
+         cx: &mut Context<T>,
+         mut on_event: impl FnMut(&mut T, &super::session::SessionChanged, &mut Context<T>) + 'static,
+     ) -> Option<Subscription> {
+-        if !self.runtime_scope.lifetime.session() || !self.supports_core(cx) {
++        if !self.runtime_scope.lifetime.session() {
+             return None;
+         }
+         let host = self.clone();
+--- a/src/ui/extensions/declarative/runtime/scopes.rs
++++ b/src/ui/extensions/declarative/runtime/scopes.rs
+@@ -240,7 +240,13 @@
+         if event == HostEvent::ContextChanged {
+             // A late catalog changes folder metadata only. Do not announce
+             // SessionOpened or resend a potentially large session snapshot.
+-            if !scope.announced || self.process.is_none() {
++            if self.process.is_none() {
++                if self.error.is_none() {
++                    self.start(cx);
++                }
++                return;
++            }
++            if !scope.announced {
+                 return;
+             }
+             let workspace = scope.host.workspace_path(cx).unwrap_or_default();

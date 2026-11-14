@@ -1,0 +1,283 @@
+diff --git a/crates/proteus-core/src/core/workflow_replay/tests.rs b/crates/proteus-core/src/core/workflow_replay/tests.rs
+index 9c169bb..6193e9b 100644
+--- a/crates/proteus-core/src/core/workflow_replay/tests.rs
++++ b/crates/proteus-core/src/core/workflow_replay/tests.rs
+@@ -26,6 +26,7 @@ use crate::{
+     },
+ };
+ 
++mod audit_capabilities;
+ mod compaction;
+ mod context_builds;
+ mod model_free;
+diff --git a/crates/proteus-core/src/core/workflow_replay/tests/audit_capabilities.rs b/crates/proteus-core/src/core/workflow_replay/tests/audit_capabilities.rs
+new file mode 100644
+index 0000000..01a213a
+--- /dev/null
++++ b/crates/proteus-core/src/core/workflow_replay/tests/audit_capabilities.rs
+@@ -0,0 +1,265 @@
++use super::*;
++use crate::{
++    domain::{ModelLimits, ToolSurface},
++    model_standard::{ModelCapabilities, RequestShaper},
++};
++
++#[derive(Clone, Copy)]
++struct TwoBudgets([u32; 2], Option<bool>);
++
++#[async_trait]
++impl Workflow for TwoBudgets {
++    async fn run(
++        &self,
++        _task: AgentTask,
++        mut history: Vec<CanonicalMessage>,
++        ctx: crate::contracts::WorkflowInvocationContext,
++    ) -> anyhow::Result<WorkflowOutput> {
++        let ctx = ctx.into_agent()?;
++        let mut output = Vec::new();
++        for budget in self.0 {
++            let request =
++                CanonicalModelRequest::new(ctx.model_ref.clone().unwrap(), history.clone())
++                    .with_tools(vec![probe_tool_spec()])
++                    .with_limits(ModelLimits::new(None, Some(budget)));
++            let response = ctx.execution.require_model()?.complete(request).await?;
++            history.extend(response.messages.clone());
++            output.extend(response.messages);
++        }
++        if let Some(freeform) = self.1 {
++            let request = CanonicalModelRequest::new(ctx.model_ref.clone().unwrap(), history)
++                .with_tools(if freeform {
++                    vec![freeform_spec()]
++                } else {
++                    vec![probe_tool_spec()]
++                });
++            let result = ctx.execution.require_model()?.complete(request).await;
++            eprintln!("extra call freeform={freeform}: {:?}", result.err());
++        }
++        Ok(WorkflowOutput::new(AgentOutput::text("done"), output))
++    }
++}
++
++fn freeform_spec() -> ToolSpec {
++    ToolSpec::new(
++        "patch",
++        "A registered freeform tool",
++        json!({}),
++        ToolSafety::WritesFiles,
++    )
++    .with_surface(ToolSurface::freeform_lark("start: \"x\""))
++}
++
++async fn replay_two_budgets(budgets: [u32; 2]) -> WorkflowReplayReport {
++    replay_scenario(budgets, None).await
++}
++
++async fn replay_scenario(budgets: [u32; 2], extra: Option<bool>) -> WorkflowReplayReport {
++    let config_dir = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let session_id = new_session_id();
++    let thread_id = new_thread_id();
++    let turn_id = new_turn_id();
++    let execution_id = new_execution_id();
++    let attribution = ExecutionAttribution::for_turn(execution_id, session_id, thread_id, turn_id);
++    let store = SessionStore::new(config_dir.path(), workspace.path(), session_id).unwrap();
++    let task = AgentTask::new(
++        "two valid model output budgets",
++        workspace.path().to_path_buf(),
++    );
++    let user = CanonicalMessage::text(MessageRole::User, task.text.clone());
++    let spec = probe_tool_spec();
++    let mut config_snapshot = snapshot(&spec);
++    config_snapshot.tools.push(SessionConfigTool {
++        source: "test".into(),
++        spec: freeform_spec(),
++        model_visible: true,
++    });
++    store
++        .append_execution_journal_entry(
++            attribution,
++            JournalEntry::TurnOpened(TurnOpened {
++                intent: None,
++                task,
++                base_history_revision: 0,
++                module_epoch: 1,
++                config_snapshot: serde_json::to_value(config_snapshot).unwrap(),
++            }),
++        )
++        .await
++        .unwrap();
++    store
++        .append_history(thread_id, Some(turn_id), std::slice::from_ref(&user))
++        .await
++        .unwrap();
++    let mut history = vec![user];
++    let mut output = Vec::new();
++    let live_capabilities = ModelCapabilities::empty()
++        .with_tools(true)
++        .with_freeform_tools(true)
++        .with_max_output_tokens(Some(4096));
++    RequestShaper
++        .shape(
++            CanonicalModelRequest::new(
++                ModelRef::new("missing-provider", "offline-model"),
++                history.clone(),
++            )
++            .with_tools(vec![freeform_spec()]),
++            &live_capabilities,
++        )
++        .expect("the source provider supports the later freeform request");
++    for (index, budget) in budgets.into_iter().enumerate() {
++        let request = recorded_request(
++            session_id,
++            thread_id,
++            turn_id,
++            history.clone(),
++            spec.clone(),
++        )
++        .with_limits(ModelLimits::new(None, Some(budget)));
++        let shaped = RequestShaper
++            .shape(request.clone(), &live_capabilities)
++            .unwrap();
++        assert_eq!(
++            request.limits, shaped.limits,
++            "normal live model keeps both valid per-call budgets"
++        );
++        let response = CanonicalModelResponse::new(
++            CanonicalMessage::text(MessageRole::Assistant, format!("step {index}")),
++            vec![],
++            FinishReason::Stop,
++        );
++        append_exchange(
++            &store,
++            execution_id,
++            thread_id,
++            turn_id,
++            shaped,
++            response.clone(),
++        )
++        .await;
++        history.extend(response.messages.clone());
++        output.extend(response.messages);
++    }
++    store
++        .append_history(thread_id, Some(turn_id), &output)
++        .await
++        .unwrap();
++    store
++        .append_journal_entry(
++            thread_id,
++            Some(turn_id),
++            JournalEntry::TurnSettled(TurnSettled {
++                status: TurnSettlementStatus::Success,
++                output: Some(AgentOutput::text("done")),
++                error: None,
++            }),
++        )
++        .await
++        .unwrap();
++    let mut catalog = ModuleCatalog::new();
++    catalog.register_test_workflow(WORKFLOW_ID, Arc::new(TwoBudgets(budgets, extra)));
++    catalog.register_test_policy(POLICY_ID, Arc::new(ReplayAllowAll));
++    let report = replay_workflow(
++        store.session_dir(),
++        &AppConfig::default(),
++        &catalog,
++        WorkflowReplayOptions::default(),
++    )
++    .await
++    .unwrap();
++    eprintln!(
++        "budgets {budgets:?}, replay {}/{}, matched {}, issues {:?}",
++        report.model_exchanges.replayed,
++        report.model_exchanges.recorded,
++        report.comparison.matched,
++        report.comparison.issues
++    );
++    assert!(report.source_journal_unchanged);
++    if let Ok(base) = std::env::var("PROTEUS_REPLAY_AUDIT_EVIDENCE") {
++        let label = match extra {
++            None => "unchanged",
++            Some(false) => "extra-normal",
++            Some(true) => "extra-freeform",
++        };
++        let destination =
++            std::path::Path::new(&base).join(format!("{}-{}-{label}", budgets[0], budgets[1]));
++        std::fs::create_dir_all(&destination).unwrap();
++        for entry in std::fs::read_dir(store.session_dir()).unwrap() {
++            let entry = entry.unwrap();
++            if entry.file_type().unwrap().is_file() {
++                std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
++            }
++        }
++        std::fs::write(
++            destination.join("replay-report.json"),
++            serde_json::to_vec_pretty(&report).unwrap(),
++        )
++        .unwrap();
++    }
++    report
++}
++
++#[tokio::test]
++async fn audit_equal_and_decreasing_budgets_replay() {
++    for budgets in [[100, 100], [200, 100]] {
++        let report = replay_two_budgets(budgets).await;
++        assert!(report.comparison.matched, "{:?}", report.comparison.issues);
++        assert_eq!(report.model_exchanges.replayed, 2);
++    }
++}
++
++#[tokio::test]
++async fn audit_increasing_budget_is_falsely_rejected() {
++    let report = replay_two_budgets([100, 200]).await;
++    assert!(!report.comparison.matched);
++    assert_eq!(report.model_exchanges.replayed, 1);
++    assert!(
++        report
++            .comparison
++            .issues
++            .iter()
++            .any(|issue| issue.contains("limits"))
++    );
++    assert_eq!(report.recorded.status, TurnSettlementStatus::Success);
++    assert_eq!(report.replay.status, TurnSettlementStatus::Error);
++}
++
++#[tokio::test]
++#[ignore = "desired replay-equivalence invariant, fails on audited baseline"]
++async fn audit_increasing_budget_must_replay_unchanged_workflow() {
++    let report = replay_two_budgets([100, 200]).await;
++    assert!(report.comparison.matched, "{:?}", report.comparison.issues);
++}
++
++#[tokio::test]
++async fn audit_added_normal_call_is_detected_but_added_freeform_call_is_falsely_accepted() {
++    let normal = replay_scenario([100, 100], Some(false)).await;
++    assert!(!normal.comparison.matched);
++    assert!(
++        normal
++            .comparison
++            .issues
++            .iter()
++            .any(|issue| issue.contains("unexpected model request"))
++    );
++    let freeform = replay_scenario([100, 100], Some(true)).await;
++    assert!(
++        freeform.comparison.matched,
++        "false green observed: {:?}",
++        freeform.comparison.issues
++    );
++    assert_eq!(freeform.model_exchanges.replayed, 2);
++    assert_eq!(freeform.recorded.status, TurnSettlementStatus::Success);
++    assert_eq!(freeform.replay.status, TurnSettlementStatus::Success);
++}
++
++#[tokio::test]
++#[ignore = "desired added-call detection invariant, fails on audited baseline"]
++async fn audit_added_supported_freeform_call_must_diverge() {
++    let report = replay_scenario([100, 100], Some(true)).await;
++    assert!(
++        !report.comparison.matched,
++        "an extra valid provider call cannot be equivalent"
++    );
++}

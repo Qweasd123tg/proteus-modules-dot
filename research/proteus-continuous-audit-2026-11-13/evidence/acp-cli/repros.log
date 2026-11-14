@@ -1,0 +1,55 @@
+   Compiling proteus-contracts v0.1.0-alpha.2 (/workspace/shared/core-acp-cli-chain/crates/proteus-contracts)
+   Compiling proteus-process-host v0.1.0-alpha.2 (/workspace/shared/core-acp-cli-chain/crates/proteus-process-host)
+   Compiling proteus-core v0.1.0-alpha.3 (/workspace/shared/core-acp-cli-chain/crates/proteus-core)
+   Compiling proteus-module-protocol v0.1.0-alpha.2 (/workspace/shared/core-acp-cli-chain/crates/proteus-module-protocol)
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:40:19
+   |
+11 | impl Polling {
+   | ------------ associated function in this implementation
+...
+40 |     pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:84:19
+   |
+58 | impl Poll {
+   | --------- associated function in this implementation
+...
+84 |     pub(super) fn controlled(
+   |                   ^^^^^^^^^^
+
+warning: `proteus-core` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 19s
+     Running unittests src/lib.rs (/workspace/shared/proteus-runtime-audit-target/debug/deps/proteus_core-e2a62bb02752de7c)
+
+running 2 tests
+ACP immediately after session/new: [AppMcpServerState { name: "editor", enabled: true, tools: ["editor__echo", "editor__fail", "editor__delay_write", "editor__oversize"], error: None }]
+CLI initial override mode Plan -> Normal; unchanged profile default Normal
+
+thread 'app_server::acp::tests::repro_chain_cli_initial_mode_survives_unchanged_profile' (1090) panicked at crates/proteus-core/src/app_server/acp/tests.rs:230:5:
+assertion `left == right` failed: CLI-selected launch mode must survive idle profile scans
+  left: Normal
+ right: Plan
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test app_server::acp::tests::repro_chain_cli_initial_mode_survives_unchanged_profile ... FAILED
+ACP after idle: []; epoch ModuleEpoch(0) -> ModuleEpoch(1); reload_error=None
+
+thread 'app_server::acp::tests::repro_chain_acp_editor_mcp_survives_unchanged_profile' (1089) panicked at crates/proteus-core/src/app_server/acp/tests.rs:209:5:
+assertion `left == right` failed: unchanged disk profile must not discard session/new editor MCP servers
+  left: 0
+ right: 1
+test app_server::acp::tests::repro_chain_acp_editor_mcp_survives_unchanged_profile ... FAILED
+
+failures:
+
+failures:
+    app_server::acp::tests::repro_chain_acp_editor_mcp_survives_unchanged_profile
+    app_server::acp::tests::repro_chain_cli_initial_mode_survives_unchanged_profile
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 726 filtered out; finished in 0.98s
+
+error: test failed, to rerun pass `-p proteus-core --lib`

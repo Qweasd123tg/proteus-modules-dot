@@ -1,0 +1,114 @@
+diff --git a/tool/rust-lsp/tests/protocol.rs b/tool/rust-lsp/tests/protocol.rs
+index d28ef8b..bbd8f4a 100644
+--- a/tool/rust-lsp/tests/protocol.rs
++++ b/tool/rust-lsp/tests/protocol.rs
+@@ -20,6 +20,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+ fn main() {
+     let result = if env::args().nth(1).as_deref() == Some("__mock_lsp") {
+         run_mock_lsp()
++    } else if env::args().nth(1).as_deref() == Some("__stale_overlay_mock") {
++        run_stale_overlay_mock()
+     } else {
+         run_tests()
+     };
+@@ -33,6 +35,10 @@ type NamedTest = (&'static str, fn() -> Result<()>);
+ 
+ fn run_tests() -> Result<()> {
+     let tests: &[NamedTest] = &[
++        (
++            "disk_edit_to_previously_opened_dependency_is_visible",
++            disk_edit_to_previously_opened_dependency_is_visible,
++        ),
+         (
+             "persistent_did_open_and_did_change_diagnostics",
+             persistent_did_open_and_did_change_diagnostics,
+@@ -366,3 +372,89 @@ fn integer_at(message: &Value, pointer: &str) -> Result<i64> {
+         .and_then(Value::as_i64)
+         .ok_or_else(|| anyhow!("missing integer at {pointer}: {message}"))
+ }
++
++// Audit-only regression: LSP open overlays supersede disk until didChange/didClose.
++fn disk_edit_to_previously_opened_dependency_is_visible() -> Result<()> {
++    let workspace = tempfile::tempdir()?;
++    let dep = workspace.path().join("dep.rs");
++    fs::write(&dep, "pub const VALUE: u32 = 1;\n")?;
++    fs::write(
++        workspace.path().join("lib.rs"),
++        "mod dep; pub fn value() -> u32 { dep::VALUE }\n",
++    )?;
++    let make_tool = || {
++        RustLspDiagnosticsTool::with_process(
++            env::current_exe().unwrap().to_string_lossy(),
++            ["__stale_overlay_mock"],
++            TEST_TIMEOUT,
++            TEST_TIMEOUT,
++        )
++    };
++    let persistent = make_tool();
++    let first = invoke(&persistent, workspace.path(), "dep.rs")?;
++    if !first.ok || first.metadata["diagnostic_count"] != 0 {
++        bail!("bad setup {first:?}");
++    }
++    fs::write(&dep, "pub const VALUE: &str = \"changed\";\n")?;
++    let stale = invoke(&persistent, workspace.path(), "lib.rs")?;
++    let fresh = invoke(&make_tool(), workspace.path(), "lib.rs")?;
++    println!(
++        "\nAUDIT persistent={}\nAUDIT fresh={}",
++        stale.output, fresh.output
++    );
++    if !stale.ok || !fresh.ok {
++        bail!("unexpected transport/tool error {stale:?} {fresh:?}");
++    }
++    if fresh.metadata["diagnostic_count"] != 1 {
++        bail!("control failed to see disk edit: {fresh:?}");
++    }
++    let refresh = invoke(&persistent, workspace.path(), "dep.rs")?;
++    let synced = invoke(&persistent, workspace.path(), "lib.rs")?;
++    println!("AUDIT after refreshing dep.rs={}", synced.output);
++    if !refresh.ok || !synced.ok || synced.metadata["diagnostic_count"] != 1 {
++        bail!("resync control failed: {synced:?}");
++    }
++    if stale.metadata["diagnostic_count"] != fresh.metadata["diagnostic_count"] {
++        bail!(
++            "persistent LSP returned stale cross-file diagnostics: persistent={} fresh={}",
++            stale.metadata["diagnostic_count"],
++            fresh.metadata["diagnostic_count"]
++        );
++    }
++    Ok(())
++}
++
++fn run_stale_overlay_mock() -> Result<()> {
++    use std::collections::HashMap;
++    let framing = ContentLengthFraming::default();
++    let stdin = io::stdin();
++    let stdout = io::stdout();
++    let mut reader = BufReader::new(stdin.lock());
++    let mut writer = stdout.lock();
++    let mut docs = HashMap::<String, String>::new();
++    loop {
++        let msg = framing.read_frame(&mut reader)?;
++        match msg.get("method").and_then(Value::as_str) {
++            Some("initialize") => framing.write_frame(&mut writer, &json!({"jsonrpc":"2.0", "id":msg["id"],"result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":1}}}}))?,
++            Some("initialized") => {},
++            Some("textDocument/didClose") => { docs.remove(&string_at(&msg,"/params/textDocument/uri")?); },
++            Some(method @ ("textDocument/didOpen"|"textDocument/didChange")) => {
++                let uri = string_at(&msg,"/params/textDocument/uri")?;
++                let version = integer_at(&msg,"/params/textDocument/version")?;
++                let text = string_at(&msg, if method.ends_with("didOpen") {"/params/textDocument/text"} else {"/params/contentChanges/0/text"})?;
++                docs.insert(uri.clone(),text);
++                let path = url::Url::parse(&uri)?.to_file_path().map_err(|_|anyhow!("not a file"))?;
++                let errors = if path.file_name().is_some_and(|f|f=="lib.rs") {
++                    let dependency = path.with_file_name("dep.rs");
++                    let dep_uri = url::Url::from_file_path(&dependency).map_err(|_|anyhow!("bad dependency URI"))?.to_string();
++                    let source = docs.get(&dep_uri).cloned().unwrap_or(fs::read_to_string(dependency)?);
++                    source.contains("&str")
++                } else { false };
++                let diagnostics = if errors { vec![json!({"range":{"start":{"line":0,"character":40},"end":{"line":0,"character":50}},"severity":1,"code":"E0308","message":"expected u32, found &str"})] } else {vec![]};
++                framing.write_frame(&mut writer,&json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"version":version,"diagnostics":diagnostics}}))?;
++            },
++            Some(method) => bail!("unexpected method {method}"),
++            None => bail!("unexpected response"),
++        }
++    }
++}

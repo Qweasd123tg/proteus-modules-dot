@@ -1,0 +1,70 @@
+diff --git a/packages/files/src/tree_tests.rs b/packages/files/src/tree_tests.rs
+index c3d55a3..b62da2a 100644
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -135,3 +135,29 @@ fn an_unlistable_root_is_an_error() {
+             .is_err()
+     );
+ }
++
++#[test]
++fn line_audit_deep_folded_row_can_open_its_leaf() {
++    for levels in [31, 32, 33] {
++        let mut folders = HashMap::new();
++        let mut current = String::new();
++        for _ in 0..levels {
++            let next = paths::join(&current, "d").unwrap();
++            folders.insert(current.clone(), Listing { entries: vec![Entry {
++                name: "d".into(), path: next.clone(), kind: Kind::Directory,
++            }], truncated: false });
++            current = next;
++        }
++        let leaf = paths::join(&current, "leaf.txt").unwrap();
++        folders.insert(current, Listing { entries: vec![Entry {
++            name: "leaf.txt".into(), path: leaf.clone(), kind: Kind::File,
++        }], truncated: false });
++        let mut project = Project::default();
++        let mut load = loader(&folders);
++        let folded = project.lines("root", &mut load).unwrap()[1].path.clone();
++        for _ in 0..3 { project.expand(&folded, &mut load); }
++        let lines = project.lines("root", &mut load).unwrap();
++        eprintln!("levels={levels} shown={:?}", shown(&lines));
++        assert!(lines.iter().any(|line| line.path == leaf), "folded row must be openable at {levels} levels");
++    }
++}
+diff --git a/packages/markdown-render/src/render.rs b/packages/markdown-render/src/render.rs
+index b54cf19..97d46bb 100644
+--- a/packages/markdown-render/src/render.rs
++++ b/packages/markdown-render/src/render.rs
+@@ -904,3 +904,31 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod line_audit_tests {
++    use super::*;
++
++    #[test]
++    fn changed_closing_line_must_invalidate_cached_fence() {
++        let languages = vec!["mermaid".to_string()];
++        let mut warm = Document::default();
++        warm.render("```mermaid\nA-->B\n```\n", &languages).unwrap();
++        let edited = "```mermaid\nA-->B\n``` no longer a closing fence\n";
++        let warm = warm.render(edited, &languages).unwrap();
++        let cold = Document::default().render(edited, &languages).unwrap();
++        eprintln!("warm={warm}\ncold={cold}");
++        assert_eq!(warm, cold, "same current source must render identically warm/cold");
++    }
++
++    #[test]
++    fn footnote_definition_must_survive_separating_code_fence() {
++        let source = "Read this note[^n].\n\n```rust\nlet x = 1;\n```\n\n[^n]: Important footnote text.\n";
++        let output = Document::default().render(source, &[]).unwrap();
++        let html = output["children"].as_array().unwrap().iter()
++            .filter_map(|child| child["html"].as_str()).collect::<Vec<_>>().join("\n");
++        eprintln!("rendered={output}");
++        assert!(html.contains("Important footnote text"), "the canonical footnote content was lost");
++        assert!(html.contains("data-footnote-ref"), "footnote reference must resolve across code segments");
++    }
++}

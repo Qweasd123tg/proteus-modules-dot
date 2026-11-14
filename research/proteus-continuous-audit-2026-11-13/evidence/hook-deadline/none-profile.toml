@@ -1,0 +1,43 @@
+active_provider = "local"
+[providers.local]
+provider = "openai"
+model = "fixture-model"
+stream = true
+[modules]
+workflow = "coding.codex_loop"
+context = "codex_context"
+policy = "fixture_allow_all"
+hooks = []
+[components.policy]
+command = "python3"
+args = ["-B", "/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+[components.workflow]
+command = "/workspace/shared/disabled-skill-context-target/debug/proteus-coding-workflow-module"
+[components.workflow.exports.workflow."coding.codex_loop"]
+[components.context]
+command = "/workspace/shared/disabled-skill-context-target/debug/proteus-context-pack-module"
+[components.context.exports.context.codex_context]
+[module_config.context.codex_context]
+providers = ["environment"]
+[components.native-model]
+command = "/workspace/shared/proteus-review-20261112/core/target/sources/modules/target/debug/proteus-model-pack-module"
+[components.native-model.exports.model.openai]
+timeout_ms = 6000
+[module_config.model.openai]
+implementation = "openai"
+api_key = "synthetic-not-a-credential"
+base_url = "http://127.0.0.1:32907"
+[tools]
+enabled = []
+[agent_control]
+surface = "none"
+max_depth = 0
+
+[runtime]
+model_timeout_ms = 400
+workflow_timeout_ms = 6000
+[components.fixture]
+command = "python3"
+args = ["-B", "/workspace/shared/hook-deadline-evidence/hook.py", "before_model", "0", "0", "/workspace/shared/hook-deadline-evidence/none-hook.jsonl"]
+[components.fixture.exports.hook.fixture_hook]

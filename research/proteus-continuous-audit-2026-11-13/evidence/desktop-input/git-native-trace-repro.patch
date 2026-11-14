@@ -1,0 +1,34 @@
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -690,3 +690,31 @@
+         2
+     );
+ }
++
++#[test]
++fn audit_native_clear_before_echo_trace_restores_git_commit_draft() {
++    let mut fake = Fake::new();
++    let initial = fake.git.panel(&fake.host, "main").unwrap();
++    let input = find(&initial, "input").unwrap();
++    assert_eq!(input.str("id"), "message");
++    assert_eq!(input.str("value"), "");
++    assert_eq!(input["lines"], 6);
++    // Recorded by unchanged Desktop Input arm: user types x, then clears
++    // before receiving the first tree. No real Git write is performed.
++    let actions: Vec<(String, Value)> =
++        serde_json::from_str(include_str!("../../../../native-actions.json")).unwrap();
++    assert_eq!(actions, [("message".to_owned(), json!("x"))]);
++    fake.calls.lock().unwrap().clear();
++    for (action, value) in actions {
++        fake.act(&action, value);
++    }
++    let echoed = fake.git.panel(&fake.host, "main").unwrap();
++    let input = find(&echoed, "input").unwrap();
++    assert_eq!(input.str("value"), "x");
++    assert_eq!(fake.git.message, "x");
++    assert!(fake.calls.lock().unwrap().is_empty());
++    // Control: if Desktop actually sends the cleared value, Git clears it.
++    fake.act("message", json!(""));
++    let cleared = fake.git.panel(&fake.host, "main").unwrap();
++    assert_eq!(find(&cleared, "input").unwrap().str("value"), "");
++}

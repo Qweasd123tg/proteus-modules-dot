@@ -1,0 +1,41 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling proteus-core v0.1.0-alpha.3 (/workspace/shared/proteus-replay-integrity-89997df9/crates/proteus-core)
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:40:19
+   |
+11 | impl Polling {
+   | ------------ associated function in this implementation
+...
+40 |     pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:84:19
+   |
+58 | impl Poll {
+   | --------- associated function in this implementation
+...
+84 |     pub(super) fn controlled(
+   |                   ^^^^^^^^^^
+
+warning: `proteus-core` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized] target(s) in 25.95s
+     Running unittests src/lib.rs (/workspace/shared/proteus-runtime-audit-target/debug/deps/proteus_core-ebc6e4830f22b8df)
+
+running 4 tests
+test core::workflow_replay::tests::audit_capabilities::audit_increasing_budget_must_replay_unchanged_workflow ... ignored, desired replay-equivalence invariant, fails on audited baseline
+extra call freeform=false: Some(workflow emitted unexpected model request #3 after the recorded exchange script ended)
+budgets [100, 100], replay 2/2, matched true, issues []
+budgets [100, 100], replay 2/2, matched false, issues ["workflow emitted unexpected model request #3 after the recorded exchange script ended"]
+budgets [100, 200], replay 1/2, matched false, issues ["model request #2 does not match recorded exchange b86614e1-e512-41b9-bef0-b4b0f2623f99 (differing fields: limits)", "workflow consumed 1 of 2 recorded model exchanges", "turn settlement differs: recorded=Success, replay=Error", "workflow output differs from recorded turn output", "workflow error differs from recorded turn error", "workflow persistent history differs from the recorded journal projection"]
+test core::workflow_replay::tests::audit_capabilities::audit_increasing_budget_is_falsely_rejected ... ok
+budgets [200, 100], replay 2/2, matched true, issues []
+extra call freeform=true: Some(model 'offline-model' does not support freeform tools: 'patch')
+budgets [100, 100], replay 2/2, matched true, issues []
+test core::workflow_replay::tests::audit_capabilities::audit_equal_and_decreasing_budgets_replay ... ok
+test core::workflow_replay::tests::audit_capabilities::audit_added_normal_call_is_detected_but_added_freeform_call_is_falsely_accepted ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 726 filtered out; finished in 0.03s
+

@@ -1,0 +1,200 @@
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -201,3 +201,197 @@
+     );
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn audit_round10_unrelated_save_freezes_inherited_provider_models() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    for directory in [false, true] {
++        let home = tempfile::tempdir().unwrap();
++        let fragment = home.path().join("provider.toml");
++        let mut original = crate::test_model::config();
++        original.providers.get_mut("fake").unwrap().model = "inherited-v1".into();
++        std::fs::write(&fragment, toml::to_string_pretty(&original).unwrap()).unwrap();
++        let path = if directory {
++            home.path().to_path_buf()
++        } else {
++            let path = home.path().join("profile.toml");
++            std::fs::write(&path, "include = ['provider.toml']\n").unwrap();
++            path
++        };
++        let loaded = AppConfig::load(Some(&path)).await.unwrap();
++        let server = AgentAppServer::launch(loaded, home.path().into(), Some(&path))
++            .await
++            .unwrap();
++        server
++            .set_profile_config(SetConfigBuilderRequest {
++                permission_mode: Some(PermissionMode::Plan),
++                ..Default::default()
++            })
++            .await
++            .unwrap();
++        let target = config_builder_target_path(Some(&path)).unwrap();
++        let saved: toml::Value =
++            toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
++        assert_eq!(
++            saved["providers"]["fake"]["model"].as_str(),
++            Some("inherited-v1")
++        );
++        original.providers.get_mut("fake").unwrap().model = "inherited-v2".into();
++        std::fs::write(&fragment, toml::to_string_pretty(&original).unwrap()).unwrap();
++        let control = AppConfig::load(Some(&fragment)).await.unwrap();
++        let after = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(control.providers["fake"].model, "inherited-v2");
++        assert_eq!(after.providers["fake"].model, "inherited-v1");
++        server.reload_tools().await.unwrap();
++        assert_eq!(
++            server.runtime.model_ref().await.unwrap().model,
++            "inherited-v1"
++        );
++        println!(
++            "round10 directory={directory}: fragment={}, merged={}, runtime={}, saved_providers=true",
++            control.providers["fake"].model,
++            after.providers["fake"].model,
++            server.runtime.model_ref().await.unwrap().model
++        );
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn audit_round10_route_setting_save_preserves_live_choice_but_drops_it_on_resume() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    for change in ["mode", "module_config", "component_package"] {
++        let home = tempfile::tempdir().unwrap();
++        let path = home.path().join("profile.toml");
++        let mut original = crate::test_model::config();
++        original.providers.get_mut("fake").unwrap().model = "profile-baseline".into();
++        std::fs::write(&path, toml::to_string_pretty(&original).unwrap()).unwrap();
++        let server = AgentAppServer::launch(original.clone(), home.path().into(), Some(&path))
++            .await
++            .unwrap();
++        server.set_model_name("user-selected".into()).await.unwrap();
++        let session = server.session_dir_path().unwrap();
++        let mut request = SetConfigBuilderRequest::default();
++        if change == "module_config" {
++            request.module_config = original.module_config.clone();
++            request
++                .module_config
++                .get_mut("model")
++                .unwrap()
++                .get_mut("fake")
++                .unwrap()["stream_delay_ms"] = serde_json::json!(2);
++        } else if change == "component_package" {
++            use proteus_contracts::app_protocol::http::{
++                ComponentPackageInstall, ComponentReplacement,
++            };
++            let old = crate::test_model::reference_module();
++            let package_dir = home.path().join("installed-v2");
++            std::fs::create_dir(&package_dir).unwrap();
++            let new = package_dir.join(old.file_name().unwrap());
++            std::fs::copy(&old, &new).unwrap();
++            request.component_packages = vec![ComponentPackageInstall {
++                id: "model-package".into(),
++                command: vec![new.to_str().unwrap().into()],
++                exports: BTreeMap::from([("model".into(), vec!["fake".into()])]),
++                replace: vec![ComponentReplacement {
++                    id: "test-model".into(),
++                    command: old.to_str().unwrap().into(),
++                    expected_executable: Some(old),
++                }],
++            }];
++        } else {
++            request.permission_mode = Some(PermissionMode::Plan);
++        }
++        server.set_profile_config(request).await.unwrap();
++        let live = server.runtime.model_ref().await.unwrap().model;
++        assert_eq!(live, "user-selected");
++        server.shutdown().await;
++        drop(server);
++        let reloaded = AppConfig::load(Some(&path)).await.unwrap();
++        let resumed =
++            AgentAppServer::launch_resumed(reloaded, home.path().into(), Some(&path), session)
++                .await
++                .unwrap();
++        let cold = resumed.runtime.model_ref().await.unwrap().model;
++        assert_eq!(
++            cold,
++            if change != "mode" {
++                "profile-baseline"
++            } else {
++                "user-selected"
++            }
++        );
++        println!("round10 change={change}: after_save={live}, after_resume={cold}");
++        resumed.shutdown().await;
++    }
++}
++
++#[cfg(unix)]
++#[tokio::test]
++async fn audit_round10_symlink_profiles_with_equal_target_basename_share_history() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    let home = tempfile::tempdir().unwrap();
++    let store = home.path().join("app");
++    let configs = store.join("configs");
++    std::fs::create_dir_all(&configs).unwrap();
++    let mut handles = Vec::new();
++    let mut history_dirs = Vec::new();
++    for (name, source_mode, target_mode) in [
++        ("work", PermissionMode::Normal, PermissionMode::Plan),
++        ("personal", PermissionMode::Auto, PermissionMode::Normal),
++    ] {
++        let repository = home.path().join(name);
++        std::fs::create_dir(&repository).unwrap();
++        let source = repository.join("config.toml");
++        let alias = configs.join(format!("{name}.toml"));
++        let mut config = crate::test_model::config();
++        config.profile.name = name.into();
++        config.permissions.mode = source_mode;
++        config.providers.get_mut("fake").unwrap().model = name.into();
++        config
++            .module_config
++            .get_mut("model")
++            .unwrap()
++            .get_mut("fake")
++            .unwrap()["stream_delay_ms"] = serde_json::json!(if name == "work" { 1 } else { 2 });
++        std::fs::write(&source, toml::to_string_pretty(&config).unwrap()).unwrap();
++        std::os::unix::fs::symlink(&source, &alias).unwrap();
++        let server = AgentAppServer::launch(
++            AppConfig::load(Some(&alias)).await.unwrap(),
++            repository.clone(),
++            Some(&alias),
++        )
++        .await
++        .unwrap();
++        server
++            .set_profile_config(SetConfigBuilderRequest {
++                permission_mode: Some(target_mode),
++                ..Default::default()
++            })
++            .await
++            .unwrap();
++        history_dirs.push(super::super::config_history::config_history_dir(&alias));
++        handles.push(server);
++    }
++    assert_eq!(history_dirs[0], history_dirs[1]);
++    let work = handles[0].config_history().await.unwrap();
++    let personal = handles[1].config_history().await.unwrap();
++    assert_eq!(work.revisions.len(), 2);
++    assert_eq!(personal.revisions.len(), 2);
++    assert_eq!(work.revisions[0].id, personal.revisions[0].id);
++    assert_eq!(work.revisions[0].state.permission_mode, "auto");
++    assert_eq!(
++        work.revisions[0].state.module_config["model"]["fake"]["stream_delay_ms"],
++        serde_json::json!(2)
++    );
++    println!(
++        "round10 symlink collision: two profiles, history_dirs_equal=true, work.revisions={}, personal.revisions={}, work.latest.mode={}, work.latest.stream_delay_ms={}",
++        work.revisions.len(),
++        personal.revisions.len(),
++        work.revisions[0].state.permission_mode,
++        work.revisions[0].state.module_config["model"]["fake"]["stream_delay_ms"]
++    );
++    for handle in handles {
++        handle.shutdown().await;
++    }
++}

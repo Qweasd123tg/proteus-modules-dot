@@ -1,0 +1,28 @@
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -690,3 +690,25 @@
+         2
+     );
+ }
++
++/// Audit: the event sent by Desktop Tree::key for Space is `select`.
++/// Exercise the real package/SDK/loopback path, without desktop or real Git writes.
++#[test]
++fn audit_keyboard_space_event_previews_but_does_not_stage_one_file() {
++    let mut fake = Fake::new();
++    fake.calls.lock().unwrap().clear();
++    fake.act("tree", json!({"id": "file:b.py", "event": "select"}));
++    let calls = fake.calls.lock().unwrap().clone();
++    assert!(!calls.iter().any(|(path, _)| path == "/workspace/stage" || path == "/workspace/unstage"));
++    assert_eq!(fake.git.selected.as_deref(), Some("file:b.py"));
++    println!("Space/select: no stage/unstage request; selected={:?}", fake.git.selected);
++
++    fake.calls.lock().unwrap().clear();
++    fake.act("tree", json!({"id": "file:b.py", "event": "check"}));
++    let calls = fake.calls.lock().unwrap().clone();
++    let writes: Vec<_> = calls.iter().filter(|(path, _)| path == "/workspace/stage" || path == "/workspace/unstage").collect();
++    assert_eq!(writes.len(), 1);
++    assert_eq!(writes[0].0, "/workspace/stage");
++    assert_eq!(writes[0].1["paths"], json!(["b.py"]));
++    println!("Pointer/check control: one /workspace/stage for b.py");
++}

@@ -1,0 +1,72 @@
+diff --git a/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs b/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs
+index b01ba50..f74ddde 100644
+--- a/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs
++++ b/crates/proteus-core/src/core/runtime/tests/reasoning_reload.rs
+@@ -126,3 +126,67 @@ async fn failed_profile_commit_keeps_reasoning_defaults_until_successful_publica
+     assert_eq!(runtime.reasoning().await, ReasoningConfig::default());
+     assert!(runtime.model_ref().await.is_none());
+ }
++
++struct AuditTwoEffortModel;
++
++#[async_trait]
++impl crate::contracts::Model for AuditTwoEffortModel {
++    fn id(&self) -> std::borrow::Cow<'static, str> { "fake".into() }
++    fn capabilities(&self, _model: &crate::domain::ModelRef)
++        -> Result<crate::model_standard::ModelCapabilities>
++    {
++        Ok(crate::model_standard::ModelCapabilities::empty().with_reasoning_config(true))
++    }
++    async fn catalog(&self) -> Result<Option<crate::contracts::ModelCatalog>> {
++        let catalog: crate::contracts::ModelCatalog = serde_json::from_value(serde_json::json!({
++            "models": [
++                {"id":"model-a", "display_name":"A", "description":null,
++                 "hidden":false, "reasoning_efforts":["xhigh"], "default_reasoning_effort":"xhigh"},
++                {"id":"model-b", "display_name":"B", "description":null,
++                 "hidden":false, "reasoning_efforts":["low"], "default_reasoning_effort":"low"}
++            ]
++        }))?;
++        catalog.validate().map_err(anyhow::Error::msg)?;
++        Ok(Some(catalog))
++    }
++    async fn stream(&self, _request: CanonicalModelRequest)
++        -> Result<crate::contracts::ModelEventStream>
++    {
++        anyhow::bail!("audit fixture does not make model requests")
++    }
++}
++
++#[tokio::test]
++async fn audit_reasoning_reenable_bypasses_active_model_catalog_after_model_switch() {
++    let cwd = tempfile::tempdir().unwrap();
++    let mut config = profile_with_reasoning(ReasoningConfig::new(Some("xhigh".into()), false));
++    config.providers.get_mut("fake").unwrap().model = "model-a".into();
++    let catalog = crate::test_support::module_catalog_for(&config);
++    let runtime = AgentRuntime::builder(config, cwd.path().into())
++        .with_module_catalog(catalog).build().unwrap();
++    runtime.services.execution_state.write().await.runtime.registry
++        .replace_model_for_test(Arc::new(AuditTwoEffortModel));
++    runtime.set_model_name("model-b".into()).await.unwrap();
++    assert_eq!(runtime.reasoning().await.effort.as_deref(), Some("low"));
++    let direct = runtime.set_reasoning_effort(Some("xhigh".into())).await;
++    assert!(format!("{:#}", direct.unwrap_err()).contains("unsupported reasoning effort"));
++    runtime.set_reasoning_enabled(false).await;
++    assert!(!runtime.reasoning().await.is_enabled());
++    let committed = Arc::new(std::sync::Mutex::new(None));
++    let destination = committed.clone();
++    runtime.set_reasoning_enabled_with_commit(true, move |_, model, reasoning| async move {
++        *destination.lock().unwrap() = Some((model, reasoning));
++        Ok(())
++    }).await.unwrap();
++    let after = runtime.capture_execution_snapshot().await;
++    let effort = after.reasoning.effort.as_deref();
++    assert_eq!(after.model_ref.as_ref().unwrap().model, "model-b");
++    assert_eq!(effort, Some("xhigh"));
++    let persisted = committed.lock().unwrap().clone().unwrap();
++    assert_eq!(persisted.0.model, "model-b");
++    assert_eq!(persisted.1.effort.as_deref(), Some("xhigh"));
++    let catalog = runtime.model_catalog().await.unwrap().unwrap();
++    let selected = catalog.models.iter().find(|m| m.id == "model-b").unwrap();
++    assert!(!selected.reasoning_efforts.contains(after.reasoning.effort.as_ref().unwrap()));
++    eprintln!("reasoning toggle: active=model-b, supported={:?}, after_model_switch=low, direct_xhigh=rejected, after_off_on={effort:?}, commit=xhigh", selected.reasoning_efforts);
++}

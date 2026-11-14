@@ -1,0 +1,470 @@
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['cargo', 'generate-lockfile', '--offline']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['git', 'init', '-q']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['git', 'add', '.']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['git', '-c', 'user.name=Local Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'core B']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['git', 'rev-parse', 'HEAD']
+b0c453055b1498fb373986d5bd69d95d84397006
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/modules ['cargo', 'generate-lockfile', '--offline']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['sh', 'install.sh']
+Installed: /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin/proteus
+Snapshot:  /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-runtime/releases/20261113T141538Z-100
+Modules:   /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-runtime/current/bin
+Configs:   /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-config/configs
+Next:      /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin/proteus --config codex doctor
+Add this to your shell config if needed: export PATH="/workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin:$PATH"
+   Compiling proteus-core v0.0.0 (/workspace/shared/release-manifests-round15-evidence/fixture-3/core/crates/proteus-core)
+    Finished `release` profile [optimized] target(s) in 0.26s
++ cargo build --locked --profile release --message-format=json-render-diagnostics -p proteus-code-mode-module -p proteus-model-pack-module --bins
+   Compiling proteus-code-mode-module v0.0.0 (/workspace/shared/release-manifests-round15-evidence/fixture-3/modules/components/code-mode-module)
+   Compiling proteus-model-pack-module v0.0.0 (/workspace/shared/release-manifests-round15-evidence/fixture-3/modules/components/model-pack-module)
+    Finished `release` profile [optimized] target(s) in 0.10s
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/cli-runtime/current/bin/proteus-code-mode-module')]
+MODULE-code-mode
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/launcher-control/proteus-native'), '--version']
+FIXTURE-NATIVE
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/core ['sh', 'install.sh']
+Installed: /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin/proteus
+Snapshot:  /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-runtime/releases/20261113T141538Z-308
+Modules:   /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-runtime/current/bin
+Configs:   /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-config/configs
+Next:      /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin/proteus --config codex doctor
+Add this to your shell config if needed: export PATH="/workspace/shared/release-manifests-round15-evidence/fixture-3/cli-bin:$PATH"
+    Finished `release` profile [optimized] target(s) in 0.00s
++ cargo build --locked --profile release --message-format=json-render-diagnostics -p proteus-code-mode-module -p proteus-model-pack-module --bins
+    Finished `release` profile [optimized] target(s) in 0.00s
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/trace-integration-round8-target/debug/proteus'), '--config', 'code-mode', 'inspect', 'topology', '--format', 'json']
+Error: config name 'code-mode' was not found; looked for /workspace/shared/release-manifests-round15-evidence/fixture-3/cli-config/configs/code-mode.config.toml
+
+EXIT 1
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/trace-integration-round8-target/debug/proteus'), '--config', 'code-mode', 'inspect', 'topology', '--format', 'json']
+{
+  "profile": "code-mode",
+  "cwd": "/workspace/shared/release-manifests-round15-evidence/fixture-3",
+  "config_path": "/workspace/shared/release-manifests-round15-evidence/fixture-3/portable-config/configs/code-mode.config.toml",
+  "config_files": [
+    "/workspace/shared/release-manifests-round15-evidence/fixture-3/portable-config/configs/code-mode.config.toml"
+  ],
+  "module_epoch": 0,
+  "permission_mode": "Normal",
+  "model": {
+    "provider": "openai_codex",
+    "name": "gpt-5.6-luna",
+    "stream": true
+  },
+  "slots": [
+    {
+      "id": "workflow",
+      "title": "Workflow",
+      "responsibility": "Controls the agent turn loop: planning, model calls, tool calls, review.",
+      "active_module": "coding.codex_loop",
+      "required": true,
+      "category": "orchestrator",
+      "order": 0
+    },
+    {
+      "id": "context",
+      "title": "Context",
+      "responsibility": "Builds context chunks before model calls.",
+      "active_module": "codex_context",
+      "required": true,
+      "category": "pipeline",
+      "order": 1
+    },
+    {
+      "id": "model",
+      "title": "Model",
+      "responsibility": "Adapts canonical model requests to provider APIs.",
+      "active_module": "openai_codex",
+      "required": false,
+      "category": "pipeline",
+      "order": 4
+    },
+    {
+      "id": "policy",
+      "title": "Policy",
+      "responsibility": "Evaluates tool execution and approval requirements.",
+      "active_module": "codex_policy",
+      "required": true,
+      "category": "pipeline",
+      "order": 5
+    },
+    {
+      "id": "hook",
+      "title": "Hooks",
+      "responsibility": "Applies ordered typed execution contributions.",
+      "active_module": null,
+      "required": false,
+      "category": "pipeline",
+      "order": 6
+    }
+  ],
+  "hooks": [
+    "codex_compact"
+  ],
+  "modules": [
+    {
+      "id": "codex_context",
+      "slot": "context",
+      "active": true,
+      "source": {
+        "kind": "process"
+      },
+      "version": "external",
+      "api_version": "v3",
+      "capabilities": [
+        "process",
+        "component",
+        "stdio",
+        "newline_json"
+      ],
+      "description": "Process component reference-context export context/codex_context."
+    },
+    {
+      "id": "codex_compact",
+      "slot": "hook",
+      "active": true,
+      "source": {
+        "kind": "process"
+      },
+      "version": "external",
+      "api_version": "v6",
+      "capabilities": [
+        "process",
+        "component",
+        "stdio",
+        "newline_json"
+      ],
+      "description": "Process component codex-context-preparation export hook/codex_compact."
+    },
+    {
+      "id": "openai_codex",
+      "slot": "model",
+      "active": true,
+      "source": {
+        "kind": "process"
+      },
+      "version": "external",
+      "api_version": "v13",
+      "capabilities": [
+        "process",
+        "component",
+        "stdio",
+        "newline_json"
+      ],
+      "description": "Process component reference-model export model/openai_codex."
+    },
+    {
+      "id": "codex_policy",
+      "slot": "policy",
+      "active": true,
+      "source": {
+        "kind": "process"
+      },
+      "version": "external",
+      "api_version": "v2",
+      "capabilities": [
+        "process",
+        "component",
+        "stdio",
+        "newline_json"
+      ],
+      "description": "Process component policy-pack export policy/codex_policy."
+    },
+    {
+      "id": "coding.codex_loop",
+      "slot": "workflow",
+      "active": true,
+      "source": {
+        "kind": "process"
+      },
+      "version": "external",
+      "api_version": "v20",
+      "capabilities": [
+        "process",
+        "component",
+        "stdio",
+        "newline_json"
+      ],
+      "description": "Process component reference-workflow export workflow/coding.codex_loop."
+    }
+  ],
+  "tools": [],
+  "edges": [
+    {
+      "from": "config",
+      "to": "slot:context",
+      "kind": "selects",
+      "label": "codex_context"
+    },
+    {
+      "from": "config",
+      "to": "slot:model",
+      "kind": "selects",
+      "label": "openai_codex"
+    },
+    {
+      "from": "config",
+      "to": "slot:policy",
+      "kind": "selects",
+      "label": "codex_policy"
+    },
+    {
+      "from": "config",
+      "to": "slot:workflow",
+      "kind": "selects",
+      "label": "coding.codex_loop"
+    },
+    {
+      "from": "slot:context",
+      "to": "module:context:codex_context",
+      "kind": "active_module",
+      "label": "active"
+    },
+    {
+      "from": "slot:hook",
+      "to": "module:hook:codex_compact",
+      "kind": "active_module",
+      "label": "active"
+    },
+    {
+      "from": "slot:hook",
+      "to": "tools",
+      "kind": "runtime",
+      "label": "tool selection"
+    },
+    {
+      "from": "slot:model",
+      "to": "module:model:openai_codex",
+      "kind": "active_module",
+      "label": "active"
+    },
+    {
+      "from": "slot:policy",
+      "to": "module:policy:codex_policy",
+      "kind": "active_module",
+      "label": "active"
+    },
+    {
+      "from": "slot:policy",
+      "to": "tools",
+      "kind": "runtime",
+      "label": "execution policy"
+    },
+    {
+      "from": "slot:workflow",
+      "to": "module:workflow:coding.codex_loop",
+      "kind": "active_module",
+      "label": "active"
+    },
+    {
+      "from": "slot:workflow",
+      "to": "slot:context",
+      "kind": "runtime",
+      "label": "builds context"
+    },
+    {
+      "from": "slot:workflow",
+      "to": "slot:hook",
+      "kind": "runtime",
+      "label": "typed contributions"
+    },
+    {
+      "from": "slot:workflow",
+      "to": "slot:model",
+      "kind": "runtime",
+      "label": "model call"
+    },
+    {
+      "from": "slot:workflow",
+      "to": "slot:policy",
+      "kind": "runtime",
+      "label": "approval gate"
+    },
+    {
+      "from": "config",
+      "to": "module:hook:codex_compact",
+      "kind": "ordered_hook",
+      "label": "1"
+    }
+  ],
+  "warnings": [
+    {
+      "severity": "error",
+      "message": "inspect could not build model-hosted tools: No such file or directory (os error 2)"
+    },
+    {
+      "severity": "error",
+      "message": "inspect could not build ToolRegistry: No such file or directory (os error 2)"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains apply_patch, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains code_mode, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains exec_command, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains find_files, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains git_diff, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains git_status, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains grep, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains list_dir, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains lsp_diagnostics, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains read_file, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains read_many_files, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains remember_fact, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains request_permissions, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains request_user_input, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains search, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains shell, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains skill, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains update_plan, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains write_file, but no registered tool provides it"
+    },
+    {
+      "severity": "warning",
+      "message": "tools.enabled contains write_stdin, but no registered tool provides it"
+    }
+  ]
+}
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/extensions ['cargo', 'generate-lockfile', '--offline']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/extensions ['git', 'init', '-q']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/extensions ['git', 'add', '.']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/extensions ['git', '-c', 'user.name=Local Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'extension B']
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/extensions ['git', 'rev-parse', 'HEAD']
+cf2976242ec96093201f2ac61a7ad3403114c9d3
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop ['/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3', PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/scripts/portable.py'), '--components', 'extensions', '--no-archive']
+Base: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+desktop: reuse ready base
+core: reuse ready base
+modules: reuse ready base
+extensions: build
++ /opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3 /workspace/shared/release-manifests-round15-evidence/fixture-3/extensions/package.py --bundle /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus.next-0n0p_332/share/extensions
+Portable: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus/share/extensions/demo/bin/demo')]
+EXTENSION-B
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus/share/extensions/demo/bin/demo')]
+EXTENSION-A
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus/bin/proteus')]
+CORE-B
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop ['/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3', PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/scripts/portable.py'), '--components', 'extensions', '--no-archive']
+Base: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+desktop: reuse ready base
+core: reuse ready base
+modules: reuse ready base
+extensions: build
++ /opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3 /workspace/shared/release-manifests-round15-evidence/fixture-3/extensions/package.py --bundle /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus.next-u5o41qlu/share/extensions
+Portable: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop ['/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3', '/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/scripts/portable.py', '--components', 'core', '--no-archive']
+Base: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+desktop: reuse ready base
+core: build
+modules: reuse ready base
+extensions: reuse ready base
++ cargo build --locked --release -p proteus-core --bin proteus --message-format=json-render-diagnostics
+Portable: /workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus
+   Compiling proteus-core v0.0.0 (/workspace/shared/release-manifests-round15-evidence/fixture-3/core/crates/proteus-core)
+    Finished `release` profile [optimized] target(s) in 0.06s
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus/share/extensions/demo/bin/demo')]
+EXTENSION-B
+
+EXIT 0
+$ cwd=/workspace/shared/release-manifests-round15-evidence/fixture-3 [PosixPath('/workspace/shared/release-manifests-round15-evidence/fixture-3/desktop/build/Proteus/bin/proteus')]
+CORE-B
+
+EXIT 0
