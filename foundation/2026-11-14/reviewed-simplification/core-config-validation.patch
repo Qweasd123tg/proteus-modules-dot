@@ -1,0 +1,484 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+index 22ac0cf..8562b81 100644
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -186,13 +186,9 @@ impl AppServerHandle {
+             next_config.addons = update.addons;
+             next_config.tools.mcp_servers = update.mcp_servers;
+         }
+-        if let Some(active_provider) = &active_provider {
+-            validate_config_builder_provider(active_provider, &next_config)?;
+-        }
+         if let Some(hooks) = hooks {
+             next_config.modules.hooks = hooks;
+         }
+-        next_config.modules.validate_hooks()?;
+         for (slot, module_id) in modules {
+             set_module_slot(&mut next_config.modules, &slot, module_id)?;
+         }
+@@ -208,6 +204,7 @@ impl AppServerHandle {
+         if let Some(mode) = permission_mode {
+             next_config.permissions.mode = mode;
+         }
++        next_config.validate_semantics()?;
+         let target = config_builder_target_path(Some(config_path))
+             .context("config target is not available")?;
+         if !target
+@@ -386,16 +383,6 @@ fn config_builder_providers(config: &AppConfig) -> Vec<ConfigBuilderProvider> {
+         .collect()
+ }
+ 
+-pub(super) fn validate_config_builder_provider(
+-    active_provider: &str,
+-    config: &AppConfig,
+-) -> Result<()> {
+-    if !config.providers.contains_key(active_provider) {
+-        anyhow::bail!("active_provider is not defined in [providers]: {active_provider}");
+-    }
+-    Ok(())
+-}
+-
+ pub(super) fn validate_config_builder_modules(
+     modules: &BTreeMap<String, String>,
+     catalog_entries: &[ModuleCatalogEntrySummary],
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+index f69bdab..55c2d5c 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -1,3 +1,5 @@
++mod validation;
++
+ use super::super::AgentAppServer;
+ use super::*;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/validation.rs b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+new file mode 100644
+index 0000000..46920d2
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+@@ -0,0 +1,309 @@
++use super::*;
++use crate::app_server::AppServerEvent;
++use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++
++fn fixture_config() -> AppConfig {
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    config.agent_control.surface = crate::core::AgentControlSurface::None;
++    config.tools.enabled = vec!["probe_command".into()];
++    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_commands.py");
++    config.components.insert(
++        "probe".into(),
++        serde_json::from_value(serde_json::json!({
++            "command": "python3", "args": [fixture],
++            "exports": {"tool": {"probe.commands": {}}}
++        }))
++        .unwrap(),
++    );
++    config
++}
++
++fn write_config(path: &Path, config: &AppConfig) {
++    let bytes = if path
++        .extension()
++        .is_some_and(|extension| extension == "json")
++    {
++        serde_json::to_vec_pretty(config).unwrap()
++    } else {
++        toml::to_string_pretty(config).unwrap().into_bytes()
++    };
++    std::fs::write(path, bytes).unwrap();
++}
++
++async fn launch(
++    root: &Path,
++    format: &str,
++    config: AppConfig,
++) -> (PathBuf, PathBuf, AppServerHandle) {
++    let source = root.join(format!("config.{format}"));
++    let target = if format == "directory" {
++        std::fs::create_dir(&source).unwrap();
++        write_config(&source.join("base.toml"), &config);
++        config_builder_target_path(Some(&source)).unwrap()
++    } else {
++        if !format.starts_with("missing.") {
++            write_config(&source, &config);
++        }
++        source.clone()
++    };
++    let config = if source.exists() {
++        AppConfig::load(Some(&source)).await.unwrap()
++    } else {
++        config
++    };
++    let cwd = root.join("workspace");
++    std::fs::create_dir(&cwd).unwrap();
++    let server = AgentAppServer::launch(config, cwd, Some(&source))
++        .await
++        .unwrap();
++    (source, target, server)
++}
++
++#[tokio::test]
++async fn invalid_save_preserves_disk_live_epoch_and_history_then_valid_save_succeeds() {
++    for format in ["toml", "json", "directory", "missing.toml", "missing.json"] {
++        let root = tempfile::tempdir().unwrap();
++        let (source, target, server) = launch(root.path(), format, fixture_config()).await;
++        let disk = std::fs::read(&target).ok();
++        let live = serde_json::to_value(&*server.config.read().await).unwrap();
++        let epoch = server.runtime.module_epoch().await;
++        let history = serde_json::to_value(server.config_history().await.unwrap()).unwrap();
++        for (request, message) in [
++            (
++                serde_json::json!({"module_config":{"unknown_slot":{"unused":{"value":1}}}}),
++                "unknown module_config slot",
++            ),
++            (
++                serde_json::json!({"hooks":["same", "same"]}),
++                "duplicate id",
++            ),
++            (serde_json::json!({"hooks":[" "]}), "blank id"),
++            (
++                serde_json::json!({"active_provider":"missing"}),
++                "not defined",
++            ),
++            (
++                serde_json::json!({"active_provider":" "}),
++                "must not be empty",
++            ),
++        ] {
++            let request: SetConfigBuilderRequest = serde_json::from_value(request).unwrap();
++            let error = server.set_profile_config(request).await.unwrap_err();
++            assert!(
++                format!("{error:#}").contains(message),
++                "{format}: {error:#}"
++            );
++            assert_eq!(std::fs::read(&target).ok(), disk, "{format}: disk changed");
++            assert_eq!(
++                serde_json::to_value(&*server.config.read().await).unwrap(),
++                live
++            );
++            assert_eq!(server.runtime.module_epoch().await, epoch);
++            assert_eq!(
++                serde_json::to_value(server.config_history().await.unwrap()).unwrap(),
++                history
++            );
++        }
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            AppConfig::load(Some(&source))
++                .await
++                .unwrap()
++                .permissions
++                .mode,
++            PermissionMode::Plan
++        );
++        assert_eq!(server.permission_mode().await, PermissionMode::Plan);
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn empty_profile_save_remains_model_free_and_cold_loadable() {
++    for format in ["toml", "json", "directory"] {
++        let root = tempfile::tempdir().unwrap();
++        let source = root.path().join(format!("empty.{format}"));
++        match format {
++            "directory" => std::fs::create_dir(&source).unwrap(),
++            "json" => std::fs::write(&source, "{}").unwrap(),
++            _ => std::fs::write(&source, "").unwrap(),
++        }
++        let config = AppConfig::load(Some(&source)).await.unwrap();
++        assert!(config.active_provider.is_none());
++        assert!(config.components.is_empty());
++        let initial = serde_json::to_value(&config).unwrap();
++        let server = AgentAppServer::launch(config, root.path().into(), Some(&source))
++            .await
++            .unwrap();
++        server
++            .set_profile_config(serde_json::from_value(serde_json::json!({})).unwrap())
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert_eq!(serde_json::to_value(cold).unwrap(), initial, "{format}");
++        assert_eq!(
++            serde_json::to_value(&*server.config.read().await).unwrap(),
++            initial
++        );
++        assert!(server.config_history().await.unwrap().revisions.is_empty());
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert!(cold.active_provider.is_none());
++        assert!(cold.components.is_empty());
++        assert_eq!(cold.permissions.mode, PermissionMode::Plan);
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn supported_slot_save_preserves_resolved_file_instructions_and_cold_load() {
++    for (format, relative) in ["toml", "json", "directory"]
++        .into_iter()
++        .flat_map(|format| [(format, false), (format, true)])
++    {
++        let root = tempfile::tempdir().unwrap();
++        let mut config = serde_json::to_value(fixture_config()).unwrap();
++        let prompt = root.path().join("instructions.md");
++        std::fs::write(&prompt, "File instructions.").unwrap();
++        let instruction_path = if relative {
++            PathBuf::from(if format == "directory" {
++                "../instructions.md"
++            } else {
++                "instructions.md"
++            })
++        } else {
++            prompt
++        };
++        config["instructions"] = serde_json::json!([
++            {"kind":"System", "file":instruction_path, "priority":100},
++            {"kind":"Developer", "text":"Inline instructions.", "priority":90}
++        ]);
++        let (source, _, server) =
++            launch(root.path(), format, serde_json::from_value(config).unwrap()).await;
++        let instructions = server.config.read().await.instructions.clone();
++        assert_eq!(instructions[0].file.as_ref(), Some(&instruction_path));
++        assert_eq!(instructions[0].text.as_deref(), Some("File instructions."));
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::from([(
++                    "tool".into(),
++                    BTreeMap::from([("unused".into(), serde_json::json!({"value":1}))]),
++                )]),
++                None,
++                None,
++                None,
++            )
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert_eq!(cold.module_config["tool"]["unused"]["value"], 1);
++        assert_eq!(
++            serde_json::to_value(cold.instructions).unwrap(),
++            serde_json::to_value(&instructions).unwrap()
++        );
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            AppConfig::load(Some(&source))
++                .await
++                .unwrap()
++                .permissions
++                .mode,
++            PermissionMode::Plan
++        );
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn watcher_rejects_same_invalid_slot_and_recovers_without_replacing_valid_runtime() {
++    for format in ["toml", "json"] {
++        let root = tempfile::tempdir().unwrap();
++        let config = fixture_config();
++        let (source, _, server) = launch(root.path(), format, config.clone()).await;
++        let epoch = server.runtime.module_epoch().await;
++        let mut events = server.subscribe();
++        let mut invalid = config.clone();
++        invalid
++            .module_config
++            .insert("unknown_slot".into(), BTreeMap::new());
++        write_config(&source, &invalid);
++        let expected_error = AppConfig::load(Some(&source))
++            .await
++            .unwrap_err()
++            .to_string();
++        tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            loop {
++                if let AppServerEvent::ProfileReloadStatus { error: Some(error) } =
++                    events.recv().await.unwrap()
++                {
++                    assert_eq!(error, expected_error);
++                    break;
++                }
++            }
++        })
++        .await
++        .unwrap();
++        assert_eq!(server.runtime.module_epoch().await, epoch);
++        assert!(
++            !server
++                .config
++                .read()
++                .await
++                .module_config
++                .contains_key("unknown_slot")
++        );
++        assert!(server.config_history().await.unwrap().revisions.is_empty());
++        let mut recovered = config;
++        recovered.permissions.mode = PermissionMode::Plan;
++        write_config(&source, &recovered);
++        tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            loop {
++                if matches!(
++                    events.recv().await.unwrap(),
++                    AppServerEvent::ModulesReloaded { .. }
++                ) {
++                    break;
++                }
++            }
++        })
++        .await
++        .unwrap();
++        assert_eq!(server.permission_mode().await, PermissionMode::Plan);
++        assert!(server.addons_snapshot().await.reload_error.is_none());
++        server.shutdown().await;
++    }
++}
+diff --git a/crates/proteus-core/src/core/config.rs b/crates/proteus-core/src/core/config.rs
+index 7b92357..3c44f80 100644
+--- a/crates/proteus-core/src/core/config.rs
++++ b/crates/proteus-core/src/core/config.rs
+@@ -17,6 +17,7 @@ mod commands;
+ mod files;
+ mod inputs;
+ mod loading;
++mod validation;
+ pub use commands::PromptCommandConfig;
+ pub(crate) use files::config_files;
+ pub(crate) use inputs::ConfigInputs;
+diff --git a/crates/proteus-core/src/core/config/loading.rs b/crates/proteus-core/src/core/config/loading.rs
+index 919ca7c..78e160f 100644
+--- a/crates/proteus-core/src/core/config/loading.rs
++++ b/crates/proteus-core/src/core/config/loading.rs
+@@ -7,8 +7,6 @@ use std::{
+ use anyhow::{Context, Result, bail};
+ use serde_json::{Map, Value};
+ 
+-use crate::core::core_slots::{CoreSlotSelection, core_slot_descriptor_by_id};
+-
+ use super::{AppConfig, ConfigInputs};
+ 
+ impl AppConfig {
+@@ -76,30 +74,10 @@ impl AppConfig {
+                 path.display()
+             )
+         })?;
+-        config.selected_model_config()?;
+-        config.validate_module_config_slots()?;
+-        config.modules.validate_hooks()?;
+-        config.validate_commands()?;
++        config.validate_semantics()?;
+         Ok(config)
+     }
+ 
+-    fn validate_module_config_slots(&self) -> Result<()> {
+-        for slot in self.module_config.keys() {
+-            if matches!(
+-                slot.as_str(),
+-                "tool" | "context_provider" | "model" | "hook"
+-            ) {
+-                continue;
+-            }
+-            match core_slot_descriptor_by_id(slot) {
+-                Some(descriptor) if descriptor.selection == CoreSlotSelection::ModulesConfig => {}
+-                Some(_) => bail!("module_config is not supported for slot {slot:?}"),
+-                None => bail!("unknown module_config slot {slot:?}"),
+-            }
+-        }
+-        Ok(())
+-    }
+-
+     pub fn default_user_config_path() -> Option<PathBuf> {
+         default_config_path()
+     }
+diff --git a/crates/proteus-core/src/core/config/validation.rs b/crates/proteus-core/src/core/config/validation.rs
+new file mode 100644
+index 0000000..f4dbae1
+--- /dev/null
++++ b/crates/proteus-core/src/core/config/validation.rs
+@@ -0,0 +1,36 @@
++//! Source-independent profile rules shared by loading and edited configs.
++use anyhow::{Result, bail};
++
++use crate::core::core_slots::{CoreSlotSelection, core_slot_descriptor_by_id};
++
++use super::AppConfig;
++
++impl AppConfig {
++    /// Validate typed profile semantics without rereading sources or resolving
++    /// instructions. Loaded file instructions already carry both file and text;
++    /// their source-shape checks belong to the loader, not this shared pass.
++    pub(crate) fn validate_semantics(&self) -> Result<()> {
++        self.selected_model_config()?;
++        self.validate_module_config_slots()?;
++        self.modules.validate_hooks()?;
++        self.validate_commands()?;
++        Ok(())
++    }
++
++    fn validate_module_config_slots(&self) -> Result<()> {
++        for slot in self.module_config.keys() {
++            if matches!(
++                slot.as_str(),
++                "tool" | "context_provider" | "model" | "hook"
++            ) {
++                continue;
++            }
++            match core_slot_descriptor_by_id(slot) {
++                Some(descriptor) if descriptor.selection == CoreSlotSelection::ModulesConfig => {}
++                Some(_) => bail!("module_config is not supported for slot {slot:?}"),
++                None => bail!("unknown module_config slot {slot:?}"),
++            }
++        }
++        Ok(())
++    }
++}
+diff --git a/docs/guides/configuration.md b/docs/guides/configuration.md
+index 0a16b44..5477caa 100644
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -1625,6 +1625,12 @@ host, клиент не редактирует его напрямую.
+ 
+ Save сериализует read/prepare/persist/publish по каноническому пути профиля;
+ повторное сохранение читает актуальный source, а файл заменяется atomic rename.
++После применения request итоговый config проходит те же semantic checks,
++что загрузка с диска: выбор provider, допустимые `module_config` slots, hooks
++и prompt commands. Неизвестный slot отвергается до подготовки сборки, записи
++истории и файла; live config и epoch остаются прежними. Разрешение instruction
++files остаётся в reader: уже загруженный текст не проверяется как новый source.
++TOML-представимость значений и подготовка runtime остаются отдельными проверками.
+ Все fallible проверки runtime проходят до persistence. Выбор модели и reload
+ используют один lock, поэтому изменение selection не может сорвать publication
+ уже записанного config. Принятый save завершается и при отключении HTTP caller.
