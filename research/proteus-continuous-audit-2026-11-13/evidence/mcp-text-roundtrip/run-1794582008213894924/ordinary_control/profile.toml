@@ -1,0 +1,50 @@
+[modules]
+workflow = "audit_tool_driver"
+policy = "fixture_allow_all"
+hooks = []
+[providers]
+
+[permissions]
+mode = "normal"
+
+[agent_control]
+surface = "task"
+[module_config]
+[addons]
+disabled_skills = []
+disabled_mcp_servers = []
+plugins = []
+[components.workflow]
+command="python3"
+args=["-B","/workspace/shared/trace-mcp-text-roundtrip-evidence/workflow.py","/workspace/shared/proteus-review-20261112/core/examples/modules"]
+
+[[tools.mcp_servers]]
+name = "fixture"
+command = "python3"
+enabled = true
+args = [
+    "-B",
+    "/workspace/shared/trace-mcp-text-roundtrip-evidence/mcp.py",
+    "ordinary_control",
+    "/workspace/shared/trace-mcp-text-roundtrip-evidence/run-1794582008213894924/ordinary_control/mcp-events.jsonl",
+    "--value",
+    "normal",
+    "--tag",
+    "new",
+]
+env_allowlist = []
+protocol_version = "2025-11-25"
+safety = "RunsCommands"
+supports_parallel_tool_calls = false
+timeout_ms = 2000
+[components.workflow.exports.workflow.audit_tool_driver]
+
+[tools.mcp_servers.env]
+PREFIX = "  synthetic-prefix  "
+[components.policy]
+command="python3"
+args=["-B","/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+
+[tools]
+enabled = []

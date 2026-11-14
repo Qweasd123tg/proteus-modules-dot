@@ -1,0 +1,161 @@
+diff --git a/crates/proteus-core/src/core/runtime/tests.rs b/crates/proteus-core/src/core/runtime/tests.rs
+index 7f8fbf3..e486663 100644
+--- a/crates/proteus-core/src/core/runtime/tests.rs
++++ b/crates/proteus-core/src/core/runtime/tests.rs
+@@ -614,3 +614,97 @@ async fn reload_assembly_publishes_matching_plan_without_mutating_running_turn()
+     let next_output = runtime.run("probe after reload".to_owned()).await.unwrap();
+     assert_eq!(next_output.text, "has_late_tool=true");
+ }
++
++struct AuditSettlementBarrier {
++    entered: Arc<tokio::sync::Notify>,
++    release: Arc<tokio::sync::Notify>,
++}
++#[async_trait]
++impl crate::contracts::HookHandler for AuditSettlementBarrier {
++    async fn invoke(
++        &self,
++        input: crate::contracts::HookInput,
++        _host: Arc<dyn crate::contracts::HookHost>,
++    ) -> Result<crate::contracts::HookResponse> {
++        if let crate::contracts::HookEvent::TurnSettled { status, .. } = input.event {
++            assert_eq!(status, crate::contracts::HookTurnStatus::Success);
++            self.entered.notify_one();
++            self.release.notified().await;
++        }
++        Ok(crate::contracts::HookResponse::Continue)
++    }
++}
++
++#[tokio::test]
++async fn audit_cancel_during_settled_hook_returns_error_but_persists_success() {
++    let cwd = tempfile::tempdir().unwrap();
++    let runtime = Arc::new(
++        AgentRuntime::builder(AppConfig::default(), cwd.path().into())
++            .with_config_path(Some(&cwd.path().join("config.toml")))
++            .with_module_catalog(test_catalog())
++            .build()
++            .unwrap(),
++    );
++    replace_workflow_for_test(&runtime, Arc::new(DelayedWorkflow)).await;
++    let entered = Arc::new(tokio::sync::Notify::new());
++    let release = Arc::new(tokio::sync::Notify::new());
++    runtime
++        .services
++        .execution_state
++        .write()
++        .await
++        .runtime
++        .registry
++        .hooks = vec![(
++        "review.settlement_barrier".into(),
++        Arc::new(AuditSettlementBarrier {
++            entered: entered.clone(),
++            release: release.clone(),
++        }),
++    )];
++    let cancellation = crate::contracts::CancellationToken::new();
++    let task = tokio::spawn({
++        let runtime = runtime.clone();
++        let cancellation = cancellation.clone();
++        async move {
++            runtime
++                .run_with_cancellation("complete then cancel in cleanup".into(), cancellation)
++                .await
++        }
++    });
++    tokio::time::timeout(Duration::from_secs(5), entered.notified())
++        .await
++        .unwrap();
++    cancellation.cancel();
++    release.notify_one();
++    let result = tokio::time::timeout(Duration::from_secs(5), task)
++        .await
++        .unwrap()
++        .unwrap();
++    let error = result.expect_err("late cancel turns successful root result into an error");
++    let projection = runtime
++        .session
++        .session_store
++        .as_ref()
++        .unwrap()
++        .load_projection()
++        .unwrap();
++    let settlement = projection
++        .records
++        .iter()
++        .rev()
++        .find_map(|r| match &r.entry {
++            crate::core::JournalEntry::TurnSettled(s) => Some(s),
++            _ => None,
++        })
++        .unwrap();
++    eprintln!(
++        "returned error={error:#}, persisted status={:?}, output={:?}",
++        settlement.status, settlement.output
++    );
++    assert_eq!(
++        settlement.status,
++        crate::core::TurnSettlementStatus::Success
++    );
++    assert!(settlement.output.is_some());
++}
+diff --git a/crates/proteus-module-protocol/src/v3/runtime_tests.rs b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+index d9d34e3..9762b52 100644
+--- a/crates/proteus-module-protocol/src/v3/runtime_tests.rs
++++ b/crates/proteus-module-protocol/src/v3/runtime_tests.rs
+@@ -657,3 +657,54 @@ fn side_control_uses_reserved_lane_while_root_is_active_and_stale_is_rejected()
+     assert!(root_terminal.recv_timeout(WAIT).is_ok());
+     Ok(())
+ }
++
++/// Review reproduction: callback was emitted before cancel, but the broker's
++/// control-first tick processes Cancel before its already buffered input frame.
++#[tokio::test]
++async fn audit_inflight_callback_cancel_resets_unrelated_sibling() -> Result<()> {
++    let mut state = state(fixture())?;
++    state.options.max_active_roots = 2;
++    let (mut start, ack, parent_result) = request(&state, json!({"op": "callback"}), None);
++    start.executor = Some(tokio::runtime::Handle::current());
++    state.accept_start(start);
++    let parent = ack.recv_timeout(WAIT)??;
++    // Receive a real callback from the cooperative worker and retain it exactly
++    // as the transport's receive queue can while a control command arrives.
++    let callback = receive(&mut state)?;
++    ensure!(callback["method"] == "host.context.build");
++    ensure!(callback["params"]["invocation_id"].as_str() == Some(parent.invocation.id()));
++    let (sibling, sibling_result) = admit(
++        &mut state,
++        json!({"op":"wait_cancel", "notify_started":true}),
++        None,
++    )?;
++    let started = receive(&mut state)?;
++    ensure!(started["params"]["invocation_id"].as_str() == Some(sibling.invocation.id()));
++    state.handle_frame(started);
++    state.cancel(
++        parent.invocation.id(),
++        parent.invocation.generation,
++        CancelCause::User,
++    )?;
++    ensure!(state.generation == 1 && state.worker.is_some());
++    state.handle_frame(callback);
++    eprintln!(
++        "observed generation={}, failure={:?}, reason={:?}",
++        state.generation, state.last_failure, state.last_failure_reason
++    );
++    terminal(&parent_result, InvocationTerminal::Canceled)?;
++    terminal(
++        &sibling_result,
++        InvocationTerminal::ComponentLost(ComponentFailure::Protocol),
++    )?;
++    ensure!(state.generation == 2);
++    ensure!(
++        state
++            .last_failure_reason
++            .as_ref()
++            .unwrap()
++            .contains("arrived after parent")
++    );
++    assert_clean(&state)?;
++    Ok(())
++}

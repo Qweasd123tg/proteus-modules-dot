@@ -1,0 +1,138 @@
+   Compiling desktop-catalog-round2-probe v0.0.0 (/workspace/scratch/3ba0fff8d310/desktop-behaviour/audit-round2/catalog-probe)
+warning: unused import: `source_export::export_source`
+  --> src/catalog/git/mod.rs:24:9
+   |
+24 | pub use source_export::export_source;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MAX_BYTES` is never used
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:12:7
+   |
+12 | const MAX_BYTES: u64 = 128 * 1024 * 1024;
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `MAX_FILES` is never used
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:13:7
+   |
+13 | const MAX_FILES: usize = 4096;
+   |       ^^^^^^^^^
+
+warning: struct `File` is never constructed
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:15:8
+   |
+15 | struct File {
+   |        ^^^^
+
+warning: struct `Contents` is never constructed
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:19:12
+   |
+19 | pub struct Contents(BTreeMap<PathBuf, File>);
+   |            ^^^^^^^^
+
+warning: multiple associated items are never used
+   --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:22:12
+    |
+ 21 | impl Contents {
+    | ------------- associated items in this implementation
+ 22 |     pub fn zip(path: &Path) -> Result<Self> {
+    |            ^^^
+...
+ 30 |     pub fn zip_bytes(bytes: &[u8]) -> Result<Self> {
+    |            ^^^^^^^^^
+...
+ 64 |     pub fn folder(path: &Path) -> Result<Self> {
+    |            ^^^^^^
+...
+ 70 |     fn collect(&mut self, root: &Path, parent: &Path, total: &mut u64) -> Result<()> {
+    |        ^^^^^^^
+...
+106 |     pub fn text(&self, name: &str) -> Result<&str> {
+    |            ^^^^
+...
+115 |     pub fn install(&self, root: &Path, id: &str, replace: bool) -> Result<PathBuf> {
+    |            ^^^^^^^
+...
+121 |     pub fn install_checked(
+    |            ^^^^^^^^^^^^^^^
+
+warning: function `relative` is never used
+   --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:172:4
+    |
+172 | fn relative(name: &str) -> Result<PathBuf> {
+    |    ^^^^^^^^
+
+warning: function `try_change_guard` is never used
+   --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/packages.rs:187:15
+    |
+187 | pub(crate) fn try_change_guard() -> Result<Option<std::sync::MutexGuard<'static, ()>>> {
+    |               ^^^^^^^^^^^^^^^^
+
+warning: method `title` is never used
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/catalog/schema.rs:27:12
+   |
+26 | impl Kind {
+   | --------- method in this implementation
+27 |     pub fn title(self) -> &'static str {
+   |            ^^^^^
+
+warning: field `description` is never read
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/catalog/schema.rs:52:9
+   |
+47 | pub struct Entry {
+   |            ----- field in this struct
+...
+52 |     pub description: String,
+   |         ^^^^^^^^^^^
+   |
+   = note: `Entry` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `command` is never used
+  --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/catalog/schema.rs:76:12
+   |
+75 | impl SourcePackage {
+   | ------------------ method in this implementation
+76 |     pub fn command(&self) -> String {
+   |            ^^^^^^^
+
+warning: fields `title`, `categories`, and `problems` are never read
+   --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/catalog/schema.rs:109:9
+    |
+105 | pub struct Catalog {
+    |            ------- fields in this struct
+...
+109 |     pub title: String,
+    |         ^^^^^
+110 |     pub categories: Vec<Category>,
+    |         ^^^^^^^^^^
+111 |     pub entries: Vec<Entry>,
+112 |     pub problems: Vec<String>,
+    |         ^^^^^^^^
+    |
+    = note: `Catalog` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `readme` is never used
+   --> /workspace/scratch/3ba0fff8d310/desktop-behaviour/src/catalog/schema.rs:263:8
+    |
+263 | pub fn readme(catalog: &Catalog, entry: &Entry) -> Result<Option<String>> {
+    |        ^^^^^^
+
+warning: `desktop-catalog-round2-probe` (bin "desktop-catalog-round2-probe" test) generated 13 warnings (run `cargo fix --bin "desktop-catalog-round2-probe" -p desktop-catalog-round2-probe --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.08s
+     Running unittests src/main.rs (/workspace/shared/proteus-review-20261112/desktop-round2-target/debug/deps/desktop_catalog_round2_probe-cdccf27df54ec1a1)
+
+running 8 tests
+test catalog::git::source_export::tests::source_export_never_replaces_existing_destinations ... ok
+test catalog::git::source_export::tests::source_export_keeps_git_blob_bytes_without_checkout_filters ... ok
+test catalog::git::source_export::tests::source_export_enforces_file_and_byte_budgets_before_publication ... ok
+test catalog::schema::skill_document_tests::packaged_skill_does_not_follow_a_document_outside_its_package ... ok
+test catalog::schema::skill_document_tests::packaged_skill_uses_catalog_frontmatter_and_document_budget ... ok
+test catalog::git::source_export::tests::source_export_checks_revision_and_root_and_can_export_a_subtree ... ok
+test catalog::git::source_export::tests::source_export_removes_partial_stage_if_materialization_fails ... ok
+test catalog::git::source_export::tests::source_export_retains_selected_revision_workspace_modes_and_links_after_refresh ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+

@@ -1,0 +1,82 @@
+diff --git a/tool/direct-patch/src/tests.rs b/tool/direct-patch/src/tests.rs
+index e7b998f..a415380 100644
+--- a/tool/direct-patch/src/tests.rs
++++ b/tool/direct-patch/src/tests.rs
+@@ -283,3 +283,27 @@ fn move_rejects_final_destination_symlink_and_preserves_both_files() {
+         "destination\n"
+     );
+ }
++
++#[test]
++fn audit_crlf_patch_is_unrepresentable_even_with_matching_crlf_patch_transport() {
++    let dir = tempfile::tempdir().unwrap();
++    for (name, original, patch_newline) in [
++        ("lf.txt", "old\nkeep\n", "\n"),
++        ("crlf_lfpatch.txt", "old\r\nkeep\r\n", "\n"),
++        ("crlf_crlfpatch.txt", "old\r\nkeep\r\n", "\r\n"),
++    ] {
++        fs::write(dir.path().join(name), original).unwrap();
++        let patch = ["*** Begin Patch".to_owned(), format!("*** Update File: {name}"),
++            "@@".to_owned(), "-old".to_owned(), "+new".to_owned(), " keep".to_owned(),
++            "*** End Patch".to_owned()].join(patch_newline);
++        let result = apply_patch(&patch, dir.path());
++        println!("AUDIT {name}: {result:?}; after={:?}", fs::read_to_string(dir.path().join(name)).unwrap());
++        if name == "lf.txt" {
++            assert!(result.is_ok());
++            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), "new\nkeep\n");
++        } else {
++            assert_eq!(result.unwrap_err(), "failed to match update hunk against current file content");
++            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), original);
++        }
++    }
++}
+diff --git a/tool/file-tools/src/tests.rs b/tool/file-tools/src/tests.rs
+index 92c2b21..e7df529 100644
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -387,3 +387,45 @@ fn grep_distinguishes_no_matches_from_invalid_regex() {
+         "{invalid}"
+     );
+ }
++
++#[test]
++fn audit_ranged_read_to_edit_normalizes_crlf_and_breaks_exact_multiline_edit() {
++    for newline in ["\n", "\r\n"] {
++        let dir = tempfile::tempdir().unwrap();
++        let original = format!("old{newline}keep{newline}");
++        let write = invoke(&WriteFileTool, dir.path(), json!({"path":"f", "content":original}));
++        assert_eq!(write["ok"], true);
++        let read = invoke(&ReadFileTool, dir.path(), json!({"path":"f", "start_line":1, "limit":2}));
++        assert_eq!(read["ok"], true);
++        assert_eq!(read["output"], "old\nkeep");
++        let edit = invoke(&EditFileTool, dir.path(), json!({"path":"f", "old_string":read["output"], "new_string":"new\nkeep"}));
++        println!("AUDIT newline={newline:?} read={} edit={} after={:?}", read, edit, std::fs::read_to_string(dir.path().join("f")).unwrap());
++        assert_eq!(edit["ok"], newline == "\n");
++        if newline == "\r\n" {
++            assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), original);
++            // A whole-file read preserves CRLF, confirming that the fault is the
++            // range representation, not unsupported UTF-8 or file creation.
++            let full = invoke(&ReadFileTool, dir.path(), json!({"path":"f"}));
++            assert_eq!(full["output"], original);
++        }
++    }
++}
++
++#[cfg(unix)]
++#[test]
++fn audit_find_limit_splits_a_single_legal_filename_into_unreadable_result() {
++    let dir = tempfile::tempdir().unwrap();
++    let name = "first\nsecond.txt";
++    let create = invoke(&WriteFileTool, dir.path(), json!({"path":name, "content":"payload"}));
++    assert_eq!(create["ok"], true);
++    let direct = invoke(&ReadFileTool, dir.path(), json!({"path":name}));
++    assert_eq!(direct["output"], "payload");
++    let found = invoke(&FindFilesTool, dir.path(), json!({"pattern":"**/*.txt", "max_results":1}));
++    let followup = invoke(&ReadFileTool, dir.path(), json!({"path":found["output"]}));
++    let all = invoke(&FindFilesTool, dir.path(), json!({"pattern":"**/*.txt"}));
++    println!("AUDIT find_limit={found}; followup={followup}; find_all={all}");
++    assert_eq!(found["ok"], true);
++    assert_eq!(found["output"], "first");
++    assert_eq!(followup["ok"], false);
++    assert_eq!(all["metadata"]["match_count"], 2);
++}

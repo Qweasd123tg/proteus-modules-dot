@@ -1,0 +1,54 @@
+diff --git a/crates/proteus-core/src/core/runtime/tests/steering_integration.rs b/crates/proteus-core/src/core/runtime/tests/steering_integration.rs
+index 62f34ba..f714a92 100644
+--- a/crates/proteus-core/src/core/runtime/tests/steering_integration.rs
++++ b/crates/proteus-core/src/core/runtime/tests/steering_integration.rs
+@@ -766,3 +766,49 @@ async fn queued_message_without_tool_boundary_runs_as_followup_turn() {
+     assert!(replay.comparison.matched, "{:?}", replay.comparison.issues);
+     assert!(replay.source_journal_unchanged);
+ }
++
++#[derive(Default)]
++struct FailingSteeringQueuedSink;
++
++#[async_trait]
++impl EventSink for FailingSteeringQueuedSink {
++    async fn append(&self, envelope: EventEnvelope) -> Result<()> {
++        if matches!(envelope.event, Event::SteeringQueued { .. }) {
++            anyhow::bail!("synthetic transient SteeringQueued sink failure");
++        }
++        Ok(())
++    }
++}
++
++#[tokio::test]
++async fn repro_failed_steering_ack_does_not_admit_retry_twice() {
++    let cwd = tempfile::tempdir().expect("temp dir");
++    let runtime = AgentRuntime::builder(AppConfig::default(), cwd.path().to_path_buf())
++        .with_module_catalog(test_catalog())
++        .with_event_sink(Arc::new(FailingSteeringQueuedSink))
++        .build()
++        .expect("runtime");
++    let workflow = Arc::new(BlockingFollowupWorkflow {
++        first_started: Arc::new(tokio::sync::Notify::new()),
++        continue_first: Arc::new(tokio::sync::Notify::new()),
++        tasks: Default::default(),
++        execution_ids: Default::default(),
++        options: Default::default(),
++    });
++    workflow.continue_first.notify_one();
++    replace_workflow_for_test(&runtime, workflow.clone()).await;
++    let initial = match runtime.reserve_user_message("initial".into()).await.unwrap() {
++        UserMessageReservation::Start(reserved) => reserved,
++        UserMessageReservation::Queued(_) => unreachable!(),
++    };
++    for attempt in 1..=2 {
++        let outcome = runtime.reserve_user_message("same client request".into()).await;
++        assert!(outcome.is_err(), "sink failure must reach caller");
++        eprintln!("attempt {attempt}: error={}, admitted={:?}", outcome.err().unwrap(), runtime.queued_user_messages().await);
++    }
++    runtime.run_reserved_with_cancellation(initial, CancellationToken::new()).await.unwrap();
++    let tasks = workflow.tasks.lock().await.clone();
++    eprintln!("executed tasks after caller received two errors: {tasks:?}");
++    assert_eq!(tasks, vec!["initial"],
++        "a failed reservation must not execute work without a receipt, including a retry");
++}

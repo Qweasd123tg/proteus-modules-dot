@@ -1,0 +1,69 @@
+   Compiling file-tools v0.1.0-alpha.2 (/workspace/shared/tools-integration-audit/tool/file-tools)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+     Running unittests src/lib.rs (/workspace/shared/tools-integration-evidence/target/debug/deps/direct_patch-ed90795d5085fed7)
+
+running 18 tests
+AUDIT lf.txt: Ok("updated lf.txt"); after="new\nkeep\n"
+test tests::add_file_rejects_dangling_final_symlink_without_creating_outside_file ... AUDIT crlf_lfpatch.txt: Err("failed to match update hunk against current file content"); after="old\r\nkeep\r\n"
+ok
+AUDIT crlf_crlfpatch.txt: Err("failed to match update hunk against current file content"); after="old\r\nkeep\r\n"
+test tests::add_file_rejects_symlink_parent_without_creating_outside_dirs ... ok
+test tests::adds_new_file_from_internal_format ... ok
+test tests::audit_crlf_patch_is_unrepresentable_even_with_matching_crlf_patch_transport ... ok
+test tests::delete_rejects_internal_final_symlink_and_preserves_target ... ok
+test tests::move_rejects_final_destination_symlink_and_preserves_both_files ... ok
+test tests::later_preflight_error_leaves_earlier_files_unchanged ... ok
+test tests::delete_then_move_preserves_source_mode_when_destination_bytes_match ... ok
+test tests::move_rejects_internal_final_source_symlink_and_preserves_target ... ok
+test tests::rejects_parent_traversal ... ok
+test tests::rejects_positional_hunk_header_without_modifying_repeated_text ... ok
+test tests::preflight_failure_does_not_create_directories_for_an_earlier_add ... ok
+test tests::replaces_exact_text_once ... ok
+test tests::update_rejects_internal_final_symlink_and_preserves_target ... ok
+test tests::sequential_operations_use_the_planned_result_of_the_previous_operation ... ok
+test transaction::commit::tests::failed_install_rolls_back_already_installed_files ... ok
+test tests::update_preserves_file_permissions ... ok
+test transaction::commit::tests::incomplete_rollback_retains_originals_for_manual_recovery ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/workspace/shared/tools-integration-evidence/target/debug/deps/file_tools-4f3cba23ba2c85a0)
+
+running 19 tests
+test read::budget_tests::line_limit_stops_before_an_enormous_tail_and_does_not_claim_total_lines ... ok
+test read::budget_tests::full_read_rechecks_the_actual_bytes_instead_of_trusting_old_metadata ... ok
+test read::budget_tests::every_range_option_preserves_output_and_line_byte_budgets ... ok
+test tests::edit_file_errors_when_old_string_is_missing_or_degenerate ... ok
+AUDIT newline="\n" read={"call_id":"call_test","content":[],"error":null,"metadata":{"end_line":2,"limit":2,"line_numbers":false,"path":"/tmp/.tmpUYXnPM/f","returned_lines":2,"scanned_bytes":9,"start_line":1,"tool":"read_file","total_lines":null,"truncated":true,"truncation_reason":"line_limit"},"ok":true,"output":"old\nkeep"} edit={"call_id":"call_test","content":[],"error":null,"metadata":{"bytes_written":9,"path":"/tmp/.tmpUYXnPM/f","replacements":1,"tool":"edit_file"},"ok":true,"output":"Replaced 1 occurrence(s) in /tmp/.tmpUYXnPM/f"} after="new\nkeep\n"
+test tests::edit_file_replaces_unique_match ... ok
+AUDIT newline="\r\n" read={"call_id":"call_test","content":[],"error":null,"metadata":{"end_line":2,"limit":2,"line_numbers":false,"path":"/tmp/.tmp9v5EXb/f","returned_lines":2,"scanned_bytes":11,"start_line":1,"tool":"read_file","total_lines":null,"truncated":true,"truncation_reason":"line_limit"},"ok":true,"output":"old\nkeep"} edit={"call_id":"call_test","content":[],"error":"old_string not found in file content; make sure it matches exactly, including whitespace","metadata":{"tool":"edit_file"},"ok":false,"output":""} after="old\r\nkeep\r\n"
+test tests::edit_file_requires_unique_match_unless_replace_all ... ok
+test tests::audit_ranged_read_to_edit_normalizes_crlf_and_breaks_exact_multiline_edit ... ok
+test tests::find_files_returns_glob_matches ... ok
+test tests::list_dir_returns_sorted_entries_with_kind ... ok
+test tests::read_and_edit_tools_report_missing_files ... ok
+test tests::read_file_rejects_full_read_above_size_limit_but_allows_ranges ... ok
+test tests::read_file_supports_line_ranges_and_line_numbers ... ok
+test tests::read_many_files_enforces_shared_budget ... ok
+test tests::read_many_files_reads_multiple_files_with_line_numbers ... ok
+AUDIT find_limit={"call_id":"call_test","content":[],"error":null,"metadata":{"exclude":[],"match_count":1,"max_results":1,"path":"/tmp/.tmpxPfkMp","pattern":"**/*.txt","tool":"find_files","truncated":true},"ok":true,"output":"first"}; followup={"call_id":"call_test","content":[],"error":"failed to canonicalize /tmp/.tmpxPfkMp/first: No such file or directory (os error 2)","metadata":{"tool":"read_file"},"ok":false,"output":""}; find_all={"call_id":"call_test","content":[],"error":null,"metadata":{"exclude":[],"match_count":2,"max_results":100,"path":"/tmp/.tmpxPfkMp","pattern":"**/*.txt","tool":"find_files","truncated":false},"ok":true,"output":"first\nsecond.txt"}
+test tests::read_many_files_reports_truncated_with_line_numbers_when_rendered_output_is_longer ... ok
+test tests::audit_find_limit_splits_a_single_legal_filename_into_unreadable_result ... ok
+test tests::write_file_creates_file_inside_workspace ... ok
+test tests::grep_distinguishes_no_matches_from_invalid_regex ... ok
+test read::budget_tests::skipping_a_huge_prefix_is_bounded_and_utf8_truncation_is_valid ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+   Doc-tests direct_patch
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests file_tools
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,22 @@
+[modules]
+workflow="lifecycle_probe"
+policy="fixture_allow_all"
+[components.workflow]
+command="python3"
+args=["-B","/workspace/shared/trace-peer-tree-lifecycle-evidence/workflow.py","/workspace/shared/proteus-review-20261112/core/examples/modules"]
+[components.workflow.exports.workflow.lifecycle_probe]
+timeout_ms = 25000
+[components.policy]
+command="python3"
+args=["-B","/workspace/shared/proteus-review-20261112/core/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+
+[agent_control]
+surface="collaboration"
+max_depth=2
+[[agent_control.roles]]
+name="helper"
+parallel_safe=true
+description="Local lifecycle diagnostic"
+config="/workspace/shared/trace-peer-tree-lifecycle-evidence/run-1794583099794922761/role_timeout/child.toml"
+timeout_ms=2500

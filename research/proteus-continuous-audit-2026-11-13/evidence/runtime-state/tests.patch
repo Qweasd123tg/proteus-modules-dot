@@ -1,0 +1,87 @@
+diff --git a/crates/proteus-core/src/app_server/events/tests/active_followup.rs b/crates/proteus-core/src/app_server/events/tests/active_followup.rs
+index 9c02c51..376cad7 100644
+--- a/crates/proteus-core/src/app_server/events/tests/active_followup.rs
++++ b/crates/proteus-core/src/app_server/events/tests/active_followup.rs
+@@ -278,3 +278,45 @@ async fn active_followup_reopen_preserves_completed_prefix_cursor_and_partial_on
+         server.shutdown().await;
+     }
+ }
++
++#[tokio::test]
++async fn audit_clear_history_retains_completed_background_agent_snapshot() {
++    use crate::domain::{EventEnvelope, ToolCall, ToolResult, new_thread_id, new_turn_id};
++    let root = tempfile::tempdir().unwrap();
++    let (server, workflow) = launch(root.path(), true).await;
++    let run_server = server.clone();
++    let run = tokio::spawn(async move { run_server.send_user_message("Первый запрос".into()).await });
++    bounded(workflow.first_started.notified()).await;
++    let root_thread = reopen_snapshot(&server).await.root_thread_id.unwrap();
++    let context = EventContext::new(server.session_id(), root_thread, Some(new_turn_id()));
++    let child = new_thread_id();
++    for (index, event) in [
++        Event::ToolCallRequested {
++            call: ToolCall::new("spawn-audit", "spawn_agent", serde_json::json!({"task_name":"old-audit"})),
++        },
++        Event::SubagentStarted { role: "explore".into(), description: Some("old-audit".into()), child_thread_id: child },
++        Event::ToolFinished { result: ToolResult::ok("spawn-audit".into(), "started") },
++        Event::SubagentFinished { role: "explore".into(), status: "completed".into(), iterations: 1, child_thread_id: child },
++    ].into_iter().enumerate() {
++        let _ = server.events.send(AppServerEvent::Runtime {
++            envelope: Box::new(EventEnvelope::new(context.clone(), index as u64, event)),
++        });
++    }
++    workflow.release_first.notify_one();
++    bounded(run).await.unwrap().unwrap();
++    assert_eq!(server.runtime.history_len().await, 2);
++    assert_eq!(reopen_snapshot(&server).await.transcript.len(), 3);
++    // Invoke the actual public clear API: it durably appends Replace([]), clears
++    // canonical history, and publishes a new authoritative session snapshot.
++    server.clear_history().await.unwrap();
++    assert_eq!(server.runtime.history_len().await, 0);
++    let snapshot = reopen_snapshot(&server).await;
++    println!("AUDIT clear: canonical_messages={}, snapshot_rows={}, stale_child_status={}",
++        server.runtime.history_len().await, snapshot.transcript.len(),
++        snapshot.transcript[0].subagent.as_ref().unwrap().status);
++    assert_eq!(snapshot.transcript.len(), 1, "reproduces stale child after clear");
++    let child = snapshot.transcript[0].subagent.as_ref().unwrap();
++    assert_eq!(child.description.as_deref(), Some("old-audit"));
++    assert_eq!(child.status, "completed");
++    server.shutdown().await;
++}
+diff --git a/crates/proteus-core/src/app_server/tests.rs b/crates/proteus-core/src/app_server/tests.rs
+index 55bf8f2..959e9f4 100644
+--- a/crates/proteus-core/src/app_server/tests.rs
++++ b/crates/proteus-core/src/app_server/tests.rs
+@@ -1035,3 +1035,32 @@ async fn app_server_remember_uses_a_process_tool_without_a_turn() {
+ 
+ mod context_resume;
+ mod startup;
++
++#[tokio::test]
++async fn audit_parallel_child_user_inputs_with_same_provider_call_id_replace_each_other() {
++    use crate::contracts::{RequestOrigin, UserInputQuestion, UserInputQuestionOption};
++    let (events, _) = events::test_event_channel(32);
++    let pending: user_inputs::PendingUserInputResponders = Arc::new(Mutex::new(HashMap::new()));
++    let (first_tx, first_rx) = oneshot::channel();
++    let (second_tx, second_rx) = oneshot::channel();
++    let child_one = crate::domain::new_thread_id();
++    let child_two = crate::domain::new_thread_id();
++    for (child, seq, sender) in [(child_one, 1, first_tx), (child_two, 2, second_tx)] {
++        let origin = RequestOrigin::for_turn(
++            crate::domain::new_execution_id(), child, crate::domain::new_turn_id(),
++        );
++        let request = UserInputRequest::new("call_0", "/synthetic".into(), vec![
++            UserInputQuestion::new("choice", "Choice", format!("Child {seq}?"), vec![UserInputQuestionOption::new("Yes", "Proceed")]),
++        ]).with_origin(origin).with_seq(seq);
++        user_inputs::register_pending_user_input(&pending, &events, request, sender).await;
++    }
++    let first = tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap();
++    assert!(first.is_err(), "first child loses its responder without a user answer");
++    let projection = events.pending_snapshot();
++    assert_eq!(projection.user_inputs.len(), 1);
++    assert_eq!(projection.user_inputs[0].origin.as_ref().unwrap().thread_id, Some(child_two));
++    assert_eq!(pending.lock().await.len(), 1);
++    user_inputs::resolve_pending_user_input(&pending, &events, "call_0", UserInputResponse::empty()).await.unwrap();
++    second_rx.await.unwrap();
++    println!("AUDIT identical call_id across distinct child threads: first response channel dropped; only second remains; answer routes to second");
++}

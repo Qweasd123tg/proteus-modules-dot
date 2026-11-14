@@ -1,0 +1,51 @@
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 3fbb46e..1f5ce4a 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -690,3 +690,46 @@ fn closing_one_preview_keeps_sibling_data_and_session_change_discards_cache() {
+         2
+     );
+ }
++
++// Round 3 audit regression: legitimate Unix filenames must not alias folder IDs.
++#[test]
++fn audit_commit_file_with_dir_prefix_is_opened_as_a_file() {
++    let mut fake = Fake::new();
++    fake.git.commit = Some("abc1234".into());
++    fake.responses.lock().unwrap().insert("/workspace/commit".into(), json!({
++        "hash":"abc1234", "short":"abc1234", "summary":"Synthetic paths",
++        "files":[{"path":"dir:notes.txt", "status":"added", "added":1, "deleted":0}]
++    }));
++    fake.git.history_cache = Default::default();
++    let root = fake.git.document(&fake.host, &crate::document::Document::Graph);
++    let tree = find(&root, "tree").expect("graph commit inspector");
++    let id = tree.list("rows").iter()
++        .find(|row| row.str("hint") == "dir:notes.txt")
++        .expect("legitimate filename row").str("id").to_owned();
++    fake.act("detail_file", json!({"id":id, "event":"select"}));
++    assert_eq!(
++        fake.git.commit_files.get("abc1234").map(String::as_str),
++        Some("dir:notes.txt"),
++        "A legitimate filename was interpreted as a folder toggle"
++    );
++    assert!(fake.git.detail_folders.is_empty());
++}
++
++#[test]
++fn audit_commit_inspector_file_and_folder_ids_are_distinct() {
++    let mut fake = Fake::new();
++    fake.git.commit = Some("abc1234".into());
++    fake.responses.lock().unwrap().insert("/workspace/commit".into(), json!({
++        "hash":"abc1234", "short":"abc1234", "summary":"Synthetic paths",
++        "files":[
++            {"path":"dir:notes.txt", "status":"added", "added":1, "deleted":0},
++            {"path":"notes.txt/inside.txt", "status":"added", "added":1, "deleted":0}
++        ]
++    }));
++    fake.git.history_cache = Default::default();
++    let root = fake.git.document(&fake.host, &crate::document::Document::Graph);
++    let tree = find(&root, "tree").expect("graph commit inspector");
++    let ids: Vec<_> = tree.list("rows").iter().map(|row| row.str("id")).collect();
++    let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
++    assert_eq!(ids.len(), unique.len(), "Distinct file and folder share tree ID: {ids:?}");
++}

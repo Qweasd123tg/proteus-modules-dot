@@ -1,0 +1,199 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+index f69bdab..3dabd73 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -201,3 +201,5 @@ async fn json_profile_save_does_not_apply_toml_value_restrictions() {
+     );
+     server.shutdown().await;
+ }
++
++mod round12_config_validation;
+diff --git a/crates/proteus-core/src/app_server/http/tests/config.rs b/crates/proteus-core/src/app_server/http/tests/config.rs
+index 4d96cf0..8b96743 100644
+--- a/crates/proteus-core/src/app_server/http/tests/config.rs
++++ b/crates/proteus-core/src/app_server/http/tests/config.rs
+@@ -414,3 +414,66 @@ async fn route_config_builder_creates_complete_provider_config() {
+ 
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn audit_round12_http_save_accepts_unknown_slot_then_rejects_valid_save() {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join("config.json");
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    config.agent_control.surface = crate::core::AgentControlSurface::None;
++    config.tools.enabled = vec!["probe_command".into()];
++    let fixture =
++        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_commands.py");
++    config.components.insert(
++        "audit-probe".into(),
++        serde_json::from_value(json!({
++            "command": "python3", "args": [fixture],
++            "exports": {"tool": {"probe.commands": {}}}
++        }))
++        .unwrap(),
++    );
++    std::fs::write(&source, serde_json::to_vec(&config).unwrap()).unwrap();
++    let server = AgentAppServer::launch(config, root.path().into(), Some(&source))
++        .await
++        .unwrap();
++    let (shutdown, _) = broadcast::channel(1);
++    let state = HttpAppState::new(server.clone(), shutdown, test_security()).await;
++    let uri = session_uri("/config/builder", &server);
++    let first = route_request(
++        state.clone(),
++        authed_json_request(
++            &uri,
++            json!({
++                "module_config": {"unknown_slot": {"unselected": {"audit": 1}}}
++            }),
++        ),
++    )
++    .await
++    .unwrap();
++    assert_eq!(first.status(), StatusCode::OK);
++    let body: Value = serde_json::from_slice(&response_bytes(first).await).unwrap();
++    assert_eq!(
++        body["module_config"]["unknown_slot"]["unselected"]["audit"],
++        1
++    );
++    let second = route_request(
++        state,
++        authed_json_request(
++            &uri,
++            json!({
++                "permission_mode": "plan"
++            }),
++        ),
++    )
++    .await
++    .unwrap();
++    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
++    let error = String::from_utf8(response_bytes(second).await.to_vec()).unwrap();
++    assert!(error.contains("unknown module_config slot"));
++    eprintln!(
++        "ROUND12 HTTP ROUTE: malformed slot Save HTTP 200; subsequent valid permission-mode Save HTTP 400: {error}"
++    );
++    server.shutdown().await;
++}
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/round12_config_validation.rs b/crates/proteus-core/src/app_server/config_builder/tests/round12_config_validation.rs
+new file mode 100644
+index 0000000..1dcff2f
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/round12_config_validation.rs
+@@ -0,0 +1,112 @@
++//! Diagnostic tests: assert the observed malformed-save behavior, not a fix.
++use super::*;
++
++fn fixture_config() -> AppConfig {
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    config.agent_control.surface = crate::core::AgentControlSurface::None;
++    config.tools.enabled = vec!["probe_command".into()];
++    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_commands.py");
++    config.components.insert(
++        "audit-probe".into(),
++        serde_json::from_value(serde_json::json!({
++            "command": "python3", "args": [fixture],
++            "exports": {"tool": {"probe.commands": {}}}
++        }))
++        .unwrap(),
++    );
++    config
++}
++
++async fn launch(extension: &str) -> (tempfile::TempDir, PathBuf, AppServerHandle) {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join(format!("config.{extension}"));
++    let config = fixture_config();
++    let bytes = if extension == "json" {
++        serde_json::to_vec_pretty(&config).unwrap()
++    } else {
++        toml::to_string_pretty(&config).unwrap().into_bytes()
++    };
++    std::fs::write(&source, bytes).unwrap();
++    let loaded = AppConfig::load(Some(&source)).await.unwrap();
++    let server = AgentAppServer::launch(loaded, root.path().into(), Some(&source))
++        .await
++        .unwrap();
++    (root, source, server)
++}
++
++#[tokio::test]
++async fn audit_round12_save_unknown_module_config_slot_bricks_subsequent_save_and_cold_load() {
++    for extension in ["toml", "json"] {
++        let (_root, source, server) = launch(extension).await;
++        let slot = "unknown_slot";
++        let mutation = BTreeMap::from([(
++            slot.to_string(),
++            BTreeMap::from([("unselected".to_string(), serde_json::json!({"audit": 1}))]),
++        )]);
++        let response = server
++            .set_config_builder(BTreeMap::new(), None, mutation, None, None, None)
++            .await
++            .expect("Save unexpectedly accepts unknown module_config slot");
++        assert!(response.module_config.contains_key(slot));
++        assert!(server.config.read().await.module_config.contains_key(slot));
++        let error = AppConfig::load(Some(&source)).await.unwrap_err();
++        assert!(format!("{error:#}").contains("unknown module_config slot"));
++        let retry = server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::from([(slot.to_string(), BTreeMap::new())]),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap_err();
++        assert!(format!("{retry:#}").contains("unknown module_config slot"));
++        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
++        let watch_error = server.addons_snapshot().await.reload_error;
++        assert!(
++            watch_error
++                .as_deref()
++                .is_some_and(|e| e.contains("unknown module_config slot"))
++        );
++        eprintln!(
++            "ROUND12 ({extension}): save=OK; ACK/live contain unknown_slot; cold load={error:#}; attempted correction={retry:#}; watcher={watch_error:?}"
++        );
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn audit_round12_control_supported_slot_save_roundtrips() {
++    for extension in ["toml", "json"] {
++        let (_root, source, server) = launch(extension).await;
++        let mutation = BTreeMap::from([(
++            "tool".to_string(),
++            BTreeMap::from([("unselected".to_string(), serde_json::json!({"audit": 1}))]),
++        )]);
++        server
++            .set_config_builder(BTreeMap::new(), None, mutation, None, None, None)
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert_eq!(cold.module_config["tool"]["unselected"]["audit"], 1);
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        eprintln!(
++            "ROUND12 CONTROL ({extension}): supported slot save, cold load and follow-up Save all succeed"
++        );
++        server.shutdown().await;
++    }
++}

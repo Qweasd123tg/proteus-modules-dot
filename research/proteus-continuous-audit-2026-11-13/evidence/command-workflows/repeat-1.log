@@ -1,0 +1,33 @@
+Preparation: 0.00s
+    Finished `test` profile [unoptimized] target(s) in 0.10s
+     Running tests/command_workflow_review.rs (/workspace/shared/command-workflows-target/debug/deps/command_workflow_review-a5426baebf2455b4)
+
+running 2 tests
+first task: ok=true, resumable=true, task_id=ccc320a8-1da6-4803-87f5-7fc1982ca2af
+capacity full: ok=false, error=Some("too many concurrent subagent children (max_parallel 1); wait for spawned tasks before starting new ones\n[worktree left at /tmp/.tmpW5Ibuh/.proteus/worktrees/coder_a-capacity-first | branch: proteus/coder_a-capacity-first]")
+control wrong shared-role then corrected resume: ok=true
+wrong worktree role: ok=false, error=Some("task_id belongs to agent profile coder_a, but request profile is coder_b\n[worktree left at /tmp/.tmpTlRPAe/.proteus/worktrees/coder_a-first | branch: proteus/coder_a-first]")
+corrected worktree role: ok=false, error=Some("worktree for task_id ccc320a8-1da6-4803-87f5-7fc1982ca2af is gone (removed, merged, or lost on restart); start a fresh task instead")
+same backend task_id remains resumable=true, checkout_present=true, new_children_on_rejection=0
+
+thread 'repro_worktree_wrong_role_must_not_destroy_valid_resume' (540) panicked at crates/proteus-core/tests/command_workflow_review.rs:224:5:
+pre-dispatch validation failure must not consume the worktree resume mapping: ToolResult { call_id: "corrected", ok: false, output: "", content: [], error: Some("worktree for task_id ccc320a8-1da6-4803-87f5-7fc1982ca2af is gone (removed, merged, or lost on restart); start a fresh task instead"), metadata: Object {"tool": String("task")} }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+capacity freed: retry ok=false, error=Some("worktree for task_id 964f0619-9626-4a0e-86fc-a027cc19f32c is gone (removed, merged, or lost on restart); start a fresh task instead")
+test repro_worktree_wrong_role_must_not_destroy_valid_resume ... FAILED
+after capacity reject: same backend resume ok=true, checkout_present=true
+
+thread 'repro_worktree_capacity_rejection_must_not_destroy_valid_resume' (539) panicked at crates/proteus-core/tests/command_workflow_review.rs:357:5:
+temporary capacity failure must not consume the worktree resume mapping: ToolResult { call_id: "capacity-retry", ok: false, output: "", content: [], error: Some("worktree for task_id 964f0619-9626-4a0e-86fc-a027cc19f32c is gone (removed, merged, or lost on restart); start a fresh task instead"), metadata: Object {"tool": String("task")} }
+test repro_worktree_capacity_rejection_must_not_destroy_valid_resume ... FAILED
+
+failures:
+
+failures:
+    repro_worktree_capacity_rejection_must_not_destroy_valid_resume
+    repro_worktree_wrong_role_must_not_destroy_valid_resume
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p proteus-core --test command_workflow_review`
+Test phase: 0.26s; total: 0.26s

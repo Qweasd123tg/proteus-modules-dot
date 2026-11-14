@@ -1,0 +1,263 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+index 97209af..dc0c394 100644
+--- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
++++ b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+@@ -227,3 +227,5 @@ async fn watcher_does_not_keep_a_dropped_handle_alive() {
+     .await
+     .unwrap();
+ }
++
++mod runtime_isolation;
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests/runtime_isolation.rs b/crates/proteus-core/src/app_server/profile_watch/tests/runtime_isolation.rs
+new file mode 100644
+index 0000000..f531adb
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/profile_watch/tests/runtime_isolation.rs
+@@ -0,0 +1,247 @@
++use super::*;
++
++fn isolation_process_profile(log: &Path, persist_deltas: bool) -> AppConfig {
++    let mut config = crate::test_model::config();
++    config.event_log.path = log.into();
++    config.event_log.persist_deltas = persist_deltas;
++    config.components.insert(
++        "audit-flow".into(),
++        serde_json::from_value(serde_json::json!({
++            "command": crate::test_model::reference_module(),
++            "exports": {"workflow": {"coding.single_loop": {}}, "context": {"simple": {}}}
++        }))
++        .unwrap(),
++    );
++    config.modules.workflow = Some("coding.single_loop".into());
++    config.modules.context = Some("simple".into());
++    config
++}
++
++fn isolation_delta_count(path: &Path) -> usize {
++    std::fs::read_to_string(path)
++        .unwrap()
++        .lines()
++        .map(|line| serde_json::from_str::<crate::domain::EventEnvelope>(line).unwrap())
++        .filter(|envelope| crate::contracts::is_streaming_delta(&envelope.event))
++        .count()
++}
++
++#[tokio::test]
++async fn audit_isolation_hot_log_path_loses_context_telemetry_but_writer_stays_old() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let old_log = root.path().join("events-a.jsonl");
++    let new_log = root.path().join("events-b.jsonl");
++    let mut config = isolation_process_profile(&old_log, true);
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    let server = AgentAppServer::launch(config.clone(), root.path().into(), Some(&path))
++        .await
++        .unwrap();
++    let mut events = server.subscribe();
++    server
++        .runtime
++        .run("Reply with a short greeting.".into())
++        .await
++        .unwrap();
++    let before = server.context_map_snapshot(None).await.unwrap();
++    assert!(before.latest_usage.is_some());
++    assert!(before.latest_context.is_some());
++    let old_len = std::fs::metadata(&old_log).unwrap().len();
++    config.event_log.path = new_log.clone();
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    next_reload(&mut events).await;
++    assert_eq!(server.config.read().await.event_log.path, new_log);
++    assert!(server.addons_snapshot().await.reload_error.is_none());
++    server
++        .runtime
++        .run("Reply with another short greeting.".into())
++        .await
++        .unwrap();
++    let after = server.context_map_snapshot(None).await.unwrap();
++    let old_after_len = std::fs::metadata(&old_log).unwrap().len();
++    assert!(old_after_len > old_len);
++    assert!(
++        !new_log.exists(),
++        "hot event sink still appends exclusively to old path"
++    );
++    assert!(after.latest_usage.is_none());
++    assert!(after.latest_context.is_none());
++    assert!(
++        after
++            .diagnostics
++            .iter()
++            .any(|s| s.contains("event log not found"))
++    );
++    eprintln!(
++        "ISOLATION path: epoch={}, old_log_bytes={old_len}->{old_after_len}, new_exists={}, usage_before={}, usage_after={}, diagnostics={:?}",
++        server.runtime.module_epoch().await.as_u64(),
++        new_log.exists(),
++        before.latest_usage.is_some(),
++        after.latest_usage.is_some(),
++        after.diagnostics
++    );
++    server.shutdown().await;
++    let cold = AgentAppServer::launch(
++        AppConfig::load(Some(&path)).await.unwrap(),
++        root.path().into(),
++        Some(&path),
++    )
++    .await
++    .unwrap();
++    cold.runtime
++        .run("Reply with a cold-start greeting.".into())
++        .await
++        .unwrap();
++    assert!(new_log.exists());
++    assert!(
++        cold.context_map_snapshot(None)
++            .await
++            .unwrap()
++            .latest_usage
++            .is_some()
++    );
++    eprintln!("ISOLATION path cold control: new_exists=true, usage=true");
++    cold.shutdown().await;
++}
++
++#[tokio::test]
++async fn audit_isolation_hot_persist_deltas_setting_does_not_change_the_writer() {
++    for initial in [false, true] {
++        let root = tempfile::tempdir().unwrap();
++        let path = root.path().join("config.toml");
++        let log = root.path().join("events.jsonl");
++        let mut config = isolation_process_profile(&log, initial);
++        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++        let server = AgentAppServer::launch(config.clone(), root.path().into(), Some(&path))
++            .await
++            .unwrap();
++        let mut events = server.subscribe();
++        server
++            .runtime
++            .run("Reply with a short greeting.".into())
++            .await
++            .unwrap();
++        let before = isolation_delta_count(&log);
++        assert_eq!(before > 0, initial);
++        config.event_log.persist_deltas = !initial;
++        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++        next_reload(&mut events).await;
++        assert_eq!(
++            server.config.read().await.event_log.persist_deltas,
++            !initial
++        );
++        server
++            .runtime
++            .run("Reply with another short greeting.".into())
++            .await
++            .unwrap();
++        let after = isolation_delta_count(&log);
++        assert_eq!(
++            after > before,
++            initial,
++            "writer keeps launch-time filtering despite new published config"
++        );
++        eprintln!(
++            "ISOLATION deltas: launch={initial}, published={}, before={before}, after={after}",
++            !initial
++        );
++        server.shutdown().await;
++        let cold = AgentAppServer::launch(
++            AppConfig::load(Some(&path)).await.unwrap(),
++            root.path().into(),
++            Some(&path),
++        )
++        .await
++        .unwrap();
++        cold.runtime
++            .run("Reply with a cold-start greeting.".into())
++            .await
++            .unwrap();
++        let after_cold = isolation_delta_count(&log);
++        assert_eq!(after_cold > after, !initial);
++        eprintln!(
++            "ISOLATION deltas cold control: published={}, after={after}, after_cold={after_cold}",
++            !initial
++        );
++        cold.shutdown().await;
++    }
++}
++
++async fn isolation_next_question(
++    events: &mut tokio::sync::broadcast::Receiver<AppServerEvent>,
++) -> String {
++    tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            if let AppServerEvent::UserInputRequested { request } = events.recv().await.unwrap() {
++                return request.request_id;
++            }
++        }
++    })
++    .await
++    .unwrap()
++}
++
++#[tokio::test]
++async fn audit_isolation_hot_question_timeout_keeps_launch_value_for_new_requests() {
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let mut config = isolation_process_profile(&root.path().join("events.jsonl"), false);
++    crate::test_model::add_allow_all_policy(&mut config);
++    config.tools.enabled = vec!["request_user_input".into()];
++    config.app_server.approval_timeout_ms = 50;
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    let server = AgentAppServer::launch(config.clone(), root.path().into(), Some(&path))
++        .await
++        .unwrap();
++    let mut events = server.subscribe();
++    config.app_server.approval_timeout_ms = 0;
++    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
++    next_reload(&mut events).await;
++    assert_eq!(server.config.read().await.app_server.approval_timeout_ms, 0);
++    let runtime = server.runtime.clone();
++    let running = tokio::spawn(async move { runtime.run("request_user_input".into()).await });
++    let request_id = isolation_next_question(&mut events).await;
++    let started = Instant::now();
++    tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            if let AppServerEvent::UserInputResolved {
++                request_id: resolved,
++            } = events.recv().await.unwrap()
++                && resolved == request_id
++            {
++                break;
++            }
++        }
++    })
++    .await
++    .expect("new post-reload question incorrectly expires despite configured no-timeout");
++    assert!(!server.has_pending_user_input(&request_id).await);
++    eprintln!(
++        "ISOLATION question: launch_timeout=50, published_timeout=0, expired_after_ms={}",
++        started.elapsed().as_millis()
++    );
++    running.await.unwrap().unwrap();
++    server.shutdown().await;
++    let cold = AgentAppServer::launch(
++        AppConfig::load(Some(&path)).await.unwrap(),
++        root.path().into(),
++        Some(&path),
++    )
++    .await
++    .unwrap();
++    let mut cold_events = cold.subscribe();
++    let runtime = cold.runtime.clone();
++    let running = tokio::spawn(async move { runtime.run("request_user_input".into()).await });
++    let request_id = isolation_next_question(&mut cold_events).await;
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    assert!(cold.has_pending_user_input(&request_id).await);
++    assert!(!running.is_finished());
++    cold.respond_user_input(&request_id, crate::contracts::UserInputResponse::empty())
++        .await
++        .unwrap();
++    running.await.unwrap().unwrap();
++    eprintln!(
++        "ISOLATION question cold control: timeout=0, still_pending_after_ms=200, manually_resolved=true"
++    );
++    cold.shutdown().await;
++}

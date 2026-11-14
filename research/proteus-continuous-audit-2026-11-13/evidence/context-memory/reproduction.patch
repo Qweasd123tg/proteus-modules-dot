@@ -1,0 +1,363 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 642446b..f33bf14 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -483,10 +483,13 @@ dependencies = [
+ name = "coding-workflow"
+ version = "0.1.0-alpha.2"
+ dependencies = [
++ "codex-context-preparation",
++ "model-pack",
+  "proteus-contracts",
+  "rand",
+  "serde",
+  "serde_json",
++ "tokio",
+ ]
+ 
+ [[package]]
+diff --git a/context_provider/sqlite-memory/src/lib.rs b/context_provider/sqlite-memory/src/lib.rs
+index c4a4446..1d01a9e 100644
+--- a/context_provider/sqlite-memory/src/lib.rs
++++ b/context_provider/sqlite-memory/src/lib.rs
+@@ -314,3 +314,30 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod audit_query_tokenization {
++    use super::*;
++
++    #[test]
++    fn audit_exact_saved_developer_terms_do_not_recall_after_punctuation_merging() {
++        for (stored, positive_query, expected_broken_expression) in [
++            ("src/config.rs", "src config rs", "\"srcconfigrs\"*"),
++            ("Config::load", "Config load", "\"Configload\"*"),
++            ("v1.2.3", "v1 2 3", "\"v123\"*"),
++        ] {
++            let conn = Connection::open_in_memory().unwrap();
++            conn.execute_batch(SCHEMA).unwrap();
++            let conn = Mutex::new(conn);
++            let store = SqliteMemoryStore { conn };
++            store.remember(&MemoryItem::new("fact", stored, Value::Null)).unwrap();
++            let exact = store.recall(&MemoryQuery::new(stored, 10)).unwrap();
++            let words = store.recall(&MemoryQuery::new(positive_query, 10)).unwrap();
++            assert_eq!(fts_match_expression(stored), expected_broken_expression);
++            assert_eq!(exact.len(), 0);
++            assert_eq!(words.len(), 1);
++            assert_eq!(words[0].content, stored);
++            eprintln!("exact query={stored:?}, expression={expected_broken_expression:?}: {} results; separated words={positive_query:?}: {}", exact.len(), words.len());
++        }
++    }
++}
+diff --git a/workflow/coding-workflow/Cargo.toml b/workflow/coding-workflow/Cargo.toml
+index 7f6c656..7036743 100644
+--- a/workflow/coding-workflow/Cargo.toml
++++ b/workflow/coding-workflow/Cargo.toml
+@@ -9,3 +9,8 @@ rand = "0.9"
+ proteus-contracts = { workspace = true }
+ serde = "1"
+ serde_json = "1"
++
++[dev-dependencies]
++codex-context-preparation = { path = "../../hook/codex-context-preparation" }
++model-pack = { path = "../../model/model-pack" }
++tokio = { version = "1", features = ["rt-multi-thread"] }
+diff --git a/workflow/coding-workflow/src/tests.rs b/workflow/coding-workflow/src/tests.rs
+index 7d6d195..49146db 100644
+--- a/workflow/coding-workflow/src/tests.rs
++++ b/workflow/coding-workflow/src/tests.rs
+@@ -1,6 +1,7 @@
+ use super::*;
+ use std::{collections::VecDeque, sync::Mutex};
+ 
++mod audit_request_context;
+ mod cache;
+ mod codex_loop;
+ mod codex_stream_recovery;
+@@ -28,6 +29,7 @@ use proteus_contracts::{
+ 
+ #[derive(Default)]
+ struct FakeHost {
++    audit_compactor: bool,
+     stream_items: Mutex<VecDeque<proteus_contracts::contracts::WorkflowModelStreamItem>>,
+     checkpoints: Mutex<Vec<proteus_contracts::contracts::WorkflowHistoryCheckpoint>>,
+     events: Mutex<Vec<Event>>,
+@@ -97,7 +99,7 @@ impl WorkflowModuleHost for FakeHost {
+         if let Some(error) = &self.checkpoint_failure {
+             return Err(error.clone());
+         }
+-        let ack = self
++        let mut ack = self
+             .checkpoint_ack
+             .lock()
+             .unwrap()
+@@ -115,6 +117,7 @@ impl WorkflowModuleHost for FakeHost {
+                     revision: None,
+                 }
+             });
++        if self.audit_compactor { ack.revision = Some(1); }
+         Ok(serde_json::to_string(&ack).unwrap())
+     }
+     fn is_cancelled(&self) -> Result<bool, ProcessModuleError> {
+@@ -210,14 +213,16 @@ impl WorkflowModuleHost for FakeHost {
+             .lock()
+             .expect("compactions")
+             .push(input.clone());
+-        let output = self
++        let output = if self.audit_compactor {
++            audit_request_context::compact_with_real_hook(&input)
++        } else { self
+             .compaction_outputs
+             .lock()
+             .expect("compaction outputs")
+             .pop_front()
+             .unwrap_or_else(|| {
+                 proteus_contracts::contracts::ContextPreparationOutput::unchanged(input.messages)
+-            });
++            }) };
+         Ok(String::from(
+             serde_json::to_string(&proteus_contracts::contracts::ContextPreparationResult {
+                 output,
+diff --git a/workflow/coding-workflow/src/tests/audit_request_context.rs b/workflow/coding-workflow/src/tests/audit_request_context.rs
+new file mode 100644
+index 0000000..410bfda
+--- /dev/null
++++ b/workflow/coding-workflow/src/tests/audit_request_context.rs
+@@ -0,0 +1,235 @@
++use super::*;
++use proteus_contracts::{
++    contracts::*,
++    model_standard::{PartScope, RequestShaper},
++    process_module::*,
++};
++use std::{
++    io::{Read, Write},
++    net::TcpListener,
++    thread,
++};
++
++struct Registry {
++    config: Value,
++    hook: Option<HookModuleObject>,
++}
++impl ModuleRegistry for Registry {
++    fn module_config(&self) -> &Value {
++        &self.config
++    }
++    fn register_hook(&mut self, _: String, hook: HookModuleObject) -> ProcessModuleResult<()> {
++        self.hook = Some(hook);
++        Ok(())
++    }
++    fn register_model(&mut self, _: String, _: ModelModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_tool(&mut self, _: ToolModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_policy(&mut self, _: String, _: PolicyModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_context_provider(
++        &mut self,
++        _: String,
++        _: ContextProviderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_context(
++        &mut self,
++        _: String,
++        _: ContextBuilderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_workflow(&mut self, _: String, _: WorkflowModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++}
++struct SummaryHost;
++impl HookModuleHost for SummaryHost {
++    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
++        Ok(false)
++    }
++    fn complete_model_json(&self, request: String) -> ProcessModuleResult<String> {
++        let request: CanonicalModelRequest = serde_json::from_str(&request).unwrap();
++        assert!(!request.messages.is_empty());
++        Ok(serde_json::to_string(&CanonicalModelResponse::new(
++            CanonicalMessage::text(MessageRole::Assistant, "Previous task was interrupted."),
++            vec![],
++            FinishReason::Stop,
++        ))
++        .unwrap())
++    }
++}
++pub(super) fn compact_with_real_hook(input: &ContextPreparationInput) -> ContextPreparationOutput {
++    let mut registry = Registry {
++        config: json!({"trigger_tokens": 1}),
++        hook: None,
++    };
++    codex_context_preparation::register_modules(&mut registry).unwrap();
++    let event = HookEvent::BeforeContext {
++        input: input.clone(),
++        output: ContextPreparationOutput::unchanged(input.messages.clone()),
++        target: None,
++    };
++    let input_json = serde_json::to_string(&HookInput {
++        event: event.clone(),
++        attribution: ExecutionAttribution::detached(proteus_contracts::domain::new_execution_id()),
++        cwd: std::env::current_dir().unwrap(),
++        conversation: None,
++    })
++    .unwrap();
++    let response = registry
++        .hook
++        .unwrap()
++        .invoke_json(input_json, &mut SummaryHost)
++        .unwrap();
++    let response: HookResponse = serde_json::from_str(&response).unwrap();
++    // Use the real contract composition/validation, not only the hook response.
++    let event = apply_hook_response(&event, &response).unwrap();
++    match event {
++        HookEvent::BeforeContext { output, .. } => output,
++        _ => unreachable!(),
++    }
++}
++
++fn tool_counts(messages: &[CanonicalMessage]) -> (usize, usize) {
++    let mut calls = 0;
++    let mut results = 0;
++    for part in messages.iter().flat_map(|m| &m.parts) {
++        match &part.payload {
++            ContentPart::ToolCall { .. } => calls += 1,
++            ContentPart::ToolResult { .. } => results += 1,
++            _ => {}
++        }
++    }
++    (calls, results)
++}
++
++fn capture_anthropic_request(request: CanonicalModelRequest) -> Value {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let endpoint = format!("http://{}", listener.local_addr().unwrap());
++    let server = thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        stream
++            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
++            .unwrap();
++        let mut raw = Vec::new();
++        let mut buf = [0u8; 4096];
++        let header_end = loop {
++            let n = stream.read(&mut buf).unwrap();
++            assert!(n > 0);
++            raw.extend_from_slice(&buf[..n]);
++            if let Some(i) = raw.windows(4).position(|b| b == b"\r\n\r\n") {
++                break i + 4;
++            }
++        };
++        let headers = String::from_utf8_lossy(&raw[..header_end]);
++        let length: usize = headers
++            .lines()
++            .find_map(|line| {
++                let (key, value) = line.split_once(':')?;
++                key.eq_ignore_ascii_case("content-length")
++                    .then(|| value.trim().parse().unwrap())
++            })
++            .unwrap();
++        while raw.len() < header_end + length {
++            let n = stream.read(&mut buf).unwrap();
++            assert!(n > 0);
++            raw.extend_from_slice(&buf[..n]);
++        }
++        let body: Value = serde_json::from_slice(&raw[header_end..header_end + length]).unwrap();
++        let response = r#"{"id":"fixture","type":"message","role":"assistant","content":[{"type":"text","text":"accepted by fixture"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
++        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
++        body
++    });
++    let client = model_pack::adapters::anthropic::AnthropicMessagesClient::from_provider_config(
++        json!({"base_url":endpoint,"api_key":"fixture-not-a-secret","stream":false}),
++    )
++    .unwrap();
++    let capabilities = client.capabilities(&request.model).unwrap();
++    let request = RequestShaper.shape(request, &capabilities).unwrap();
++    tokio::runtime::Runtime::new()
++        .unwrap()
++        .block_on(client.complete(request))
++        .unwrap();
++    server.join().unwrap()
++}
++
++#[test]
++fn audit_interrupted_tool_result_survives_compaction_without_tool_call() {
++    for (compact, completed) in [(false, false), (true, false), (true, true)] {
++        let mut input = workflow_input("continue");
++        let current = input.history.pop().unwrap();
++        let call = ToolCall::new("interrupted-call", "read_file", json!({"path":"README.md"}));
++        input.history = vec![
++            CanonicalMessage::text(MessageRole::User, "Read README and explain it"),
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall { call: call.clone() }],
++            ),
++        ];
++        if completed {
++            input
++                .history
++                .push(crate::history::tool_result_message(ToolResult::ok(
++                    call.id.clone(),
++                    "read succeeded",
++                )));
++        } else {
++            input.runtime.interrupted_turns = vec![WorkflowHistoryInterruption {
++                turn_id: new_turn_id(),
++                after_message_id: input.history[1].id,
++            }];
++        }
++        input.history.push(current);
++        let mut host = FakeHost {
++            audit_compactor: compact,
++            ..FakeHost::default()
++        };
++        let output = CodingCodexLoopWorkflow
++            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++            .unwrap();
++        let output: WorkflowModuleOutput = serde_json::from_str(&output).unwrap();
++        let requests = host.requests.lock().unwrap();
++        assert_eq!(requests.len(), 1);
++        let canonical = &requests[0];
++        let expected = match (compact, completed) {
++            (false, false) => (1, 1),
++            (true, false) => (0, 1),
++            (true, true) => (0, 0),
++            _ => unreachable!(),
++        };
++        assert_eq!(tool_counts(&canonical.messages), expected);
++        if compact && !completed {
++            let result = canonical
++                .messages
++                .iter()
++                .find(|m| tool_counts(std::slice::from_ref(m)).1 == 1)
++                .unwrap();
++            assert_eq!(result.parts[0].scope, PartScope::Request);
++            assert_eq!(
++                output.history_replacement.as_ref().map(|m| tool_counts(m)),
++                Some((0, 0))
++            );
++            assert_eq!(tool_counts(&output.new_messages), (0, 0));
++        }
++        let wire = capture_anthropic_request(canonical.clone());
++        let blocks: Vec<_> = wire["messages"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .flat_map(|m| m["content"].as_array().unwrap())
++            .collect();
++        let calls = blocks.iter().filter(|b| b["type"] == "tool_use").count();
++        let results = blocks.iter().filter(|b| b["type"] == "tool_result").count();
++        assert_eq!((calls, results), expected);
++        eprintln!(
++            "compact={compact} completed={completed}: canonical {expected:?}; real Anthropic HTTP {calls} tool_use / {results} tool_result; wire={wire}"
++        );
++    }
++}

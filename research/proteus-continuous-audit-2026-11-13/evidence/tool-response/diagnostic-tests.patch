@@ -1,0 +1,129 @@
+diff --git a/crates/proteus-core/src/app_server/events/tests.rs b/crates/proteus-core/src/app_server/events/tests.rs
+index e5266d8..746efdd 100644
+--- a/crates/proteus-core/src/app_server/events/tests.rs
++++ b/crates/proteus-core/src/app_server/events/tests.rs
+@@ -305,3 +305,51 @@ async fn reconnect_snapshot_replaces_live_progress_with_committed_transcript_onc
+             .is_err()
+     );
+ }
++
++
++#[tokio::test]
++async fn audit_lifecycle_stream_reconnect_and_cold_tool_result_agree() {
++    use crate::domain::{ToolCall, ToolResult};
++    use crate::model_standard::{CanonicalMessage, ContentPart, MessageRole};
++    let (events, _) = test_event_channel(8);
++    let sink = RuntimeEventSink::default();
++    assert!(sink.0.set(events.clone()).is_ok());
++    let context = EventContext::new(events.pending_snapshot().session_id,
++        new_thread_id(), Some(new_turn_id()));
++    let mut streaming_client = events.subscribe();
++    let call = ToolCall::new("large-root-result", "read_file", serde_json::json!({"path": "synthetic"}));
++    let output = format!("{}FINAL_DIAGNOSTIC", "x".repeat(10_001));
++    let result = ToolResult::ok(call.id.clone(), output.clone());
++    for (seq, event) in [
++        Event::TurnStarted { session_id: context.session_id, thread_id: context.thread_id,
++            turn_id: context.turn_id.unwrap() },
++        Event::ToolCallRequested { call: call.clone() },
++        Event::ToolFinished { result: result.clone() },
++    ].into_iter().enumerate() {
++        sink.append(EventEnvelope::new(context.clone(), seq as u64 + 1, event)).await.unwrap();
++    }
++    let mut streaming_output = String::new();
++    while let Ok(event) = streaming_client.try_recv() {
++        if let AppServerEvent::Runtime { envelope } = event {
++            if let Event::ToolFinished { result } = envelope.event {
++                streaming_output = result.text_or_status();
++            }
++        }
++    }
++    let mut reconnecting_client = events.subscribe_session();
++    assert!(matches!(reconnecting_client.recv().await.unwrap(),
++        AppServerEvent::PendingRequestsUpdated { .. }));
++    let AppServerEvent::SessionSnapshot { snapshot } = reconnecting_client.recv().await.unwrap()
++        else { panic!("reconnect baseline") };
++    let restored = snapshot.transcript[0].tool.as_ref().unwrap().result.as_ref().unwrap();
++    let cold = crate::app_server::transcript_messages(&[
++        CanonicalMessage::new(MessageRole::Assistant, vec![ContentPart::ToolCall { call }]),
++        CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult { result }]),
++    ]);
++    let cold_output = cold[0].tool.as_ref().unwrap().result.as_ref().unwrap();
++    eprintln!("stream_bytes={}, reconnect_bytes={}, cold_bytes={}",
++        streaming_output.len(), restored.len(), cold_output.len());
++    assert_eq!(streaming_output, output);
++    assert_eq!(cold_output, &output);
++    assert_eq!(restored, &output, "reconnect snapshot loses output that stream and cold history retain");
++}
+diff --git a/crates/proteus-core/src/app_server/tests.rs b/crates/proteus-core/src/app_server/tests.rs
+index 55bf8f2..e1db2a2 100644
+--- a/crates/proteus-core/src/app_server/tests.rs
++++ b/crates/proteus-core/src/app_server/tests.rs
+@@ -1035,3 +1035,43 @@ async fn app_server_remember_uses_a_process_tool_without_a_turn() {
+ 
+ mod context_resume;
+ mod startup;
++
++
++#[tokio::test]
++async fn audit_lifecycle_approval_after_requester_cancel_is_not_acknowledged() {
++    let (events, _) = super::events::test_event_channel(8);
++    let pending: PendingApprovalResponders = Arc::new(Mutex::new(HashMap::new()));
++    let (responder, receiver) = oneshot::channel();
++    register_test_approval(&pending, &events, "cancel-race", responder).await;
++    let mut event_rx = events.subscribe();
++    // The runtime has already abandoned the approval before the UI answers.
++    // Current-thread Tokio makes the schedule deterministic: the spawned
++    // watcher has not polled yet, and the unlocked map does not yield.
++    drop(receiver);
++    let ack = approvals::resolve_pending_approval(
++        &pending, &events, "cancel-race", ApprovalResponse::approve(),
++    ).await;
++    let published = event_rx.try_recv().expect("resolution event");
++    tokio::task::yield_now().await;
++    eprintln!("ack={ack:?}, published={published:?}, pending={}", pending.lock().await.len());
++    assert!(ack.is_err(), "approval was acknowledged after its requester was already gone");
++}
++
++
++#[tokio::test]
++async fn audit_lifecycle_user_answer_after_requester_cancel_is_not_acknowledged() {
++    let (events, _) = super::events::test_event_channel(8);
++    let pending: user_inputs::PendingUserInputResponders = Arc::new(Mutex::new(HashMap::new()));
++    let (responder, receiver) = oneshot::channel();
++    register_test_user_input(&pending, &events, "answer-cancel-race", responder).await;
++    let mut event_rx = events.subscribe();
++    drop(receiver);
++    let response = UserInputResponse::new(HashMap::from([("scope".into(),
++        crate::contracts::UserInputAnswer::new(vec!["synthetic answer".into()]))]));
++    let ack = user_inputs::resolve_pending_user_input(&pending, &events,
++        "answer-cancel-race", response).await;
++    let published = event_rx.try_recv().expect("resolution event");
++    tokio::task::yield_now().await;
++    eprintln!("user_answer_ack={ack:?}, published={published:?}, pending={}", pending.lock().await.len());
++    assert!(ack.is_err(), "user answer was acknowledged after its requester was already gone");
++}
+diff --git a/crates/proteus-core/src/app_server/turn_progress/tests.rs b/crates/proteus-core/src/app_server/turn_progress/tests.rs
+index 1df71ca..b289d51 100644
+--- a/crates/proteus-core/src/app_server/turn_progress/tests.rs
++++ b/crates/proteus-core/src/app_server/turn_progress/tests.rs
+@@ -594,3 +594,20 @@ fn terminal_button_is_bound_before_tool_result_and_survives_final_metadata() {
+     assert_eq!(tool.status, "done");
+     assert_eq!(tool.terminal, Some(terminal));
+ }
++
++
++#[test]
++fn audit_lifecycle_root_tool_reconnect_preserves_result_or_marks_truncation() {
++    let mut progress = TurnProgress::default();
++    let call = ToolCall::new("root-output", "read_file", json!({"path": "synthetic.txt"}));
++    let output = format!("{}FINAL_DIAGNOSTIC", "x".repeat(10_001));
++    let result = ToolResult::ok(call.id.clone(), output.clone());
++    apply(&mut progress, Event::ToolCallRequested { call });
++    apply(&mut progress, Event::ToolFinished { result });
++    let tool = progress.messages[0].tool.as_ref().unwrap();
++    let restored = tool.result.as_ref().unwrap();
++    eprintln!("source_bytes={}, reconnect_bytes={}, tail_retained={}, metadata={}",
++        output.len(), restored.len(), restored.contains("FINAL_DIAGNOSTIC"), tool.metadata);
++    assert!(restored == &output || restored.contains("truncated") || tool.metadata.get("truncated").is_some(),
++        "root live snapshot silently loses the result tail");
++}

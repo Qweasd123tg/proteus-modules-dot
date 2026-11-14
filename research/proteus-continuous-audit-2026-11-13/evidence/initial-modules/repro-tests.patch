@@ -1,0 +1,118 @@
+diff --git a/tool/file-tools/src/tests.rs b/tool/file-tools/src/tests.rs
+index 92c2b21..0f06cc2 100644
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -387,3 +387,46 @@ fn grep_distinguishes_no_matches_from_invalid_regex() {
+         "{invalid}"
+     );
+ }
++
++
++#[test]
++fn review_concurrent_edits_lose_successful_update() {
++    use std::sync::{Arc, Barrier};
++    let dir = tempfile::tempdir().unwrap();
++    let target = dir.path().join("shared.txt");
++    let input = format!("OLD_A\n{}\nOLD_B\n", "x".repeat(1024*1024));
++    let mut reproduced = false;
++    for attempt in 0..20 {
++        std::fs::write(&target, &input).unwrap();
++        let gate = Arc::new(Barrier::new(3));
++        let mut workers = Vec::new();
++        for (old,new) in [("OLD_A","NEW_A"),("OLD_B","NEW_B")] {
++            let gate = gate.clone(); let cwd = dir.path().to_path_buf();
++            workers.push(std::thread::spawn(move || {
++                gate.wait();
++                invoke(&EditFileTool, &cwd, json!({"path":"shared.txt","old_string":old,"new_string":new}))
++            }));
++        }
++        gate.wait();
++        let results = workers.into_iter().map(|w|w.join().unwrap()).collect::<Vec<_>>();
++        assert!(results.iter().all(|r|r["ok"] == true), "{results:?}");
++        let content = std::fs::read_to_string(&target).unwrap();
++        let a = content.contains("NEW_A"); let b = content.contains("NEW_B");
++        if !(a && b) {
++            eprintln!("attempt={attempt}; both tool calls ok=true; NEW_A={a}, NEW_B={b}");
++            reproduced = true; break;
++        }
++    }
++    assert!(reproduced, "candidate not reproduced in 20 attempts");
++}
++
++#[test]
++fn review_read_many_silently_accepts_invalid_utf8_suffix() {
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::write(dir.path().join("broken.txt"), b"valid\xc3").unwrap();
++    let result = invoke(&ReadManyFilesTool, dir.path(), json!({"paths":["broken.txt"]}));
++    eprintln!("{result}");
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["metadata"]["files"][0]["truncated"], false);
++    assert_eq!(result["output"], "== broken.txt ==\nvalid");
++}
+diff --git a/tool/shell-tool/src/unified_exec/tests.rs b/tool/shell-tool/src/unified_exec/tests.rs
+index b108807..07727c4 100644
+--- a/tool/shell-tool/src/unified_exec/tests.rs
++++ b/tool/shell-tool/src/unified_exec/tests.rs
+@@ -517,3 +517,62 @@ fn truncate_head_tail_respects_char_boundaries() {
+ }
+ 
+ mod pipe_exec;
++
++
++// Review-only reproducer; production sources unchanged.
++#[test]
++fn review_large_pty_input_does_not_observe_cancellation() {
++    let dir = tempfile::tempdir().unwrap();
++    let context = invocation_context(dir.path());
++    let started = exec_command_with_context(&context, json!({
++        "cmd": "stty raw -echo; printf READY; exec sleep 10",
++        "tty": true, "yield_time_ms": 250,
++    }));
++    assert!(started["output"].as_str().unwrap().contains("READY"), "{started}");
++    let id = started["metadata"]["session_id"].as_i64().unwrap();
++    let session = owned_session(id, &context).unwrap();
++    let canceled = Arc::new(AtomicBool::new(false));
++    let canceled_task = canceled.clone();
++    let call = json!({"id":"review","name":"write_stdin","args":{
++        "session_id":id,"chars":"x".repeat(64*1024),"yield_time_ms":250}});
++    let context = serde_json::to_string(&context).unwrap();
++    let (send,recv) = std::sync::mpsc::channel();
++    let worker = std::thread::spawn(move || {
++        let result = with_host(canceled_task, |host| write_stdin_impl(&call.to_string(), &context, None, host));
++        send.send(result.map_err(|e| e.to_string())).unwrap();
++    });
++    std::thread::sleep(Duration::from_millis(200));
++    canceled.store(true, AtomicOrdering::SeqCst);
++    let result = recv.recv_timeout(Duration::from_millis(500));
++    let blocked_after_cancel = result.is_err();
++    // Cleanup is independent of the blocked writer and the tool cancellation.
++    session.kill();
++    let after_kill = if blocked_after_cancel { recv.recv_timeout(Duration::from_secs(1)) } else { result };
++    let blocked_after_kill = after_kill.is_err();
++    let leader_exited = lock(&session.output).exited;
++    lock(sessions()).remove(&id);
++    // If blocked, dropping JoinHandle detaches only within this short-lived
++    // isolated test executable; the killed child is already reaped by owner.
++    if !blocked_after_kill { worker.join().unwrap(); } else { drop(worker); }
++    eprintln!("input_bytes=65536; blocked_500ms_after_cancel={blocked_after_cancel}; blocked_1s_after_kill={blocked_after_kill}; leader_exited={leader_exited}");
++    assert!(blocked_after_cancel, "candidate not reproduced");
++
++}
++
++
++#[test]
++fn review_utf8_split_across_polls_is_corrupted() {
++    let dir = tempfile::tempdir().unwrap();
++    let context = invocation_context(dir.path());
++    let first = exec_command_with_context(&context, json!({
++        "cmd": "printf '\\360\\237'; sleep 0.8; printf '\\230\\200'",
++        "yield_time_ms":250
++    }));
++    let id = first["metadata"]["session_id"].as_i64().unwrap();
++    let second = write_stdin(&context, json!({"session_id":id,"yield_time_ms":1000}));
++    eprintln!("first={first}\nsecond={second}");
++    assert!(first["output"].as_str().unwrap().contains('\u{fffd}'));
++    assert!(second["output"].as_str().unwrap().contains('\u{fffd}'));
++    assert!(!first["output"].as_str().unwrap().contains('😀'));
++    assert!(!second["output"].as_str().unwrap().contains('😀'));
++}

@@ -1,0 +1,245 @@
+# item.rs
+Source: https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/item.rs
+Blob SHA: 932212343c7c0ddfa94120d59de108aec30ef5eb
+Lines: 254-348
+
+254: /// A thread item and its recorded lifecycle times. The payload stays flat on the wire.
+255: #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+256: #[serde(rename_all = "camelCase")]
+257: #[ts(export_to = "v2/")]
+258: pub struct ThreadItem {
+259:     #[serde(flatten)]
+260:     pub payload: ThreadItemPayload,
+261:     /// Unix timestamp in milliseconds when the item started, if recorded.
+262:     #[serde(default)]
+263:     #[ts(type = "number | null", optional)]
+264:     pub started_at_ms: Option<i64>,
+265:     /// Unix timestamp in milliseconds when the item completed, if recorded.
+266:     #[serde(default)]
+267:     #[ts(type = "number | null", optional)]
+268:     pub completed_at_ms: Option<i64>,
+269: }
+270: 
+271: impl ThreadItem {
+272:     /// Creates an item with no recorded start or completion time.
+273:     pub fn untimed(payload: ThreadItemPayload) -> Self {
+274:         Self {
+275:             payload,
+276:             started_at_ms: None,
+277:             completed_at_ms: None,
+278:         }
+279:     }
+280: 
+281:     fn completed(
+282:         payload: ThreadItemPayload,
+283:         started_at_ms: Option<i64>,
+284:         completed_at_ms: i64,
+285:     ) -> Self {
+286:         Self {
+287:             payload,
+288:             started_at_ms,
+289:             // Older rollout events default a missing completion time to zero.
+290:             completed_at_ms: (completed_at_ms != 0).then_some(completed_at_ms),
+291:         }
+292:     }
+293: 
+294:     pub fn id(&self) -> &str {
+295:         self.payload.id()
+296:     }
+297: }
+298: 
+299: impl From<&codex_protocol::protocol::ItemCompletedEvent> for ThreadItem {
+300:     fn from(event: &codex_protocol::protocol::ItemCompletedEvent) -> Self {
+301:         ThreadItem::completed(
+302:             ThreadItemPayload::from(event.item.clone()),
+303:             event.started_at_ms,
+304:             event.completed_at_ms,
+305:         )
+306:     }
+307: }
+308: 
+309: impl std::borrow::Borrow<ThreadItemPayload> for ThreadItem {
+310:     fn borrow(&self) -> &ThreadItemPayload {
+311:         &self.payload
+312:     }
+313: }
+314: 
+315: #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+316: #[serde(tag = "type", rename_all = "camelCase")]
+317: #[ts(tag = "type")]
+318: #[ts(export_to = "v2/")]
+319: pub enum ThreadItemPayload {
+320:     #[serde(rename_all = "camelCase")]
+321:     #[ts(rename_all = "camelCase")]
+322:     UserMessage {
+323:         id: String,
+324:         client_id: Option<String>,
+325:         content: Vec<UserInput>,
+326:     },
+327:     #[serde(rename_all = "camelCase")]
+328:     #[ts(rename_all = "camelCase")]
+329:     HookPrompt {
+330:         id: String,
+331:         fragments: Vec<HookPromptFragment>,
+332:     },
+333:     #[serde(rename_all = "camelCase")]
+334:     #[ts(rename_all = "camelCase")]
+335:     AgentMessage {
+336:         #[serde(default)]
+337:         moderation: Option<AgentMessageModeration>,
+338:         id: String,
+339:         text: String,
+340:         #[serde(default)]
+341:         phase: Option<MessagePhase>,
+342:         #[serde(default)]
+343:         memory_citation: Option<MemoryCitation>,
+344:         #[serde(default)]
+345:         delivery: Option<AgentMessageDelivery>,
+346:         #[serde(default)]
+347:         questions: Option<Vec<AsyncUserInputQuestion>>,
+348:     },
+
+# thread.rs
+Source: https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+Blob SHA: dca33cb61170ca49b56befc98709832f3c98a2fc
+Lines: 1960-2014
+
+1960: pub struct ThreadItemEntry {
+1961:     /// Turn containing this item.
+1962:     pub turn_id: String,
+1963:     pub item: ThreadItem,
+1964:     /// The saved output was omitted. Fetch the complete item with `thread/items/read`.
+1965:     #[experimental("thread/items/list.outputDeferred")]
+1966:     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+1967:     pub output_deferred: bool,
+1968:     /// Unix timestamp (milliseconds) when the item started, if recorded by the producer.
+1969:     #[ts(type = "number | null")]
+1970:     pub started_at_ms: Option<i64>,
+1971:     /// Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
+1972:     #[ts(type = "number | null")]
+1973:     pub completed_at_ms: Option<i64>,
+1974: }
+1975: 
+1976: /// Identifies the item to fetch with `thread/items/read` to obtain its full output.
+1977: #[derive(Debug, thiserror::Error)]
+1978: #[error("output for item {item_id} in turn {turn_id} is deferred")]
+1979: pub struct DeferredItemOutput {
+1980:     pub turn_id: String,
+1981:     pub item_id: String,
+1982: }
+1983: 
+1984: impl TryFrom<ThreadItemEntry> for ThreadItem {
+1985:     type Error = DeferredItemOutput;
+1986: 
+1987:     fn try_from(entry: ThreadItemEntry) -> Result<Self, Self::Error> {
+1988:         if entry.output_deferred {
+1989:             return Err(DeferredItemOutput {
+1990:                 item_id: entry.item.id().to_owned(),
+1991:                 turn_id: entry.turn_id,
+1992:             });
+1993:         }
+1994: 
+1995:         Ok(Self {
+1996:             started_at_ms: entry.item.started_at_ms.or(entry.started_at_ms),
+1997:             completed_at_ms: entry.item.completed_at_ms.or(entry.completed_at_ms),
+1998:             ..entry.item
+1999:         })
+2000:     }
+2001: }
+2002: 
+2003: #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+2004: #[serde(rename_all = "camelCase")]
+2005: #[ts(export_to = "v2/")]
+2006: pub struct ThreadItemsListResponse {
+2007:     pub data: Vec<ThreadItemEntry>,
+2008:     /// Opaque cursor to pass to the next call to continue after the last item.
+2009:     /// if None, there are no more items to return.
+2010:     pub next_cursor: Option<String>,
+2011:     /// Opaque cursor to pass as `cursor` when reversing `sortDirection`.
+2012:     /// This is only populated when the page contains at least one item.
+2013:     pub backwards_cursor: Option<String>,
+2014: }
+
+# upstream-thread
+Source: https://github.com/openai/codex/blob/main/codex-rs/app-server/src/request_processors/thread_processor.rs
+Blob SHA: f019d79ad5be482413624178f0dc2d759bfd028a
+Lines: 3721-3798
+
+3721:     async fn thread_items_list_response_inner(
+3722:         &self,
+3723:         params: ThreadItemsListParams,
+3724:     ) -> Result<ThreadItemsListResponse, JSONRPCErrorError> {
+3725:         let ThreadItemsListParams {
+3726:             thread_id,
+3727:             turn_id,
+3728:             cursor,
+3729:             limit,
+3730:             sort_direction,
+3731:             defer_output,
+3732:         } = params;
+3733:         let defer_output = defer_output.filter(|_| turn_id.is_some());
+3734:         let position = cursor.map(|cursor| match cursor {
+3735:             ThreadItemsListCursor::Opaque(cursor) => StoreListItemsPosition::Cursor(cursor),
+3736:             ThreadItemsListCursor::Anchor(ThreadItemsListAnchor::Item { item_id }) => {
+3737:                 StoreListItemsPosition::ItemAnchor { item_id }
+3738:             }
+3739:         });
+3740:         let has_anchor = matches!(position, Some(StoreListItemsPosition::ItemAnchor { .. }));
+3741:         if has_anchor && turn_id.as_deref().is_none_or(str::is_empty) {
+3742:             return Err(invalid_params(
+3743:                 "turnId is required when cursor is an item anchor",
+3744:             ));
+3745:         }
+3746:         let thread_id = ThreadId::from_string(&thread_id)
+3747:             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+3748:         let page_size = limit
+3749:             .map(|value| value as usize)
+3750:             .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
+3751:             .clamp(1, THREAD_ITEMS_MAX_LIMIT);
+3752:         let page = self
+3753:             .thread_store
+3754:             .list_items(StoreListItemsParams {
+3755:                 item_ids: None,
+3756:                 thread_id,
+3757:                 turn_id,
+3758:                 include_archived: true,
+3759:                 position,
+3760:                 page_size,
+3761:                 sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
+3762:                     SortDirection::Asc => StoreSortDirection::Asc,
+3763:                     SortDirection::Desc => StoreSortDirection::Desc,
+3764:                 },
+3765:                 sort_key: StoreItemSortKey::CreatedAtOrdinal,
+3766:                 after_updated_at_ordinal: None,
+3767:                 before_updated_at_ordinal: None,
+3768:             })
+3769:             .await
+3770:             .map_err(|err| match err {
+3771:                 ThreadStoreError::InvalidRequest { message } if has_anchor => {
+3772:                     invalid_params(message)
+3773:                 }
+3774:                 ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+3775:                 ThreadStoreError::Unsupported { .. } => {
+3776:                     method_not_found("thread/items/list is not supported yet")
+3777:                 }
+3778:                 ThreadStoreError::ThreadNotFound { thread_id } => {
+3779:                     invalid_request(format!("no rollout found for thread id {thread_id}"))
+3780:                 }
+3781:                 err => internal_error(format!("failed to list thread items: {err}")),
+3782:             })?;
+3783:         let mut data = Vec::with_capacity(page.items.len());
+3784:         for stored_item in page.items {
+3785:             let mut entry = stored_thread_item_to_entry(stored_item)?;
+3786:             if let Some(options) = &defer_output
+3787:                 && entry.completed_at_ms.is_some()
+3788:             {
+3789:                 entry.output_deferred = defer_item_output(&mut entry.item.payload, options);
+3790:             }
+3791:             data.push(entry);
+3792:         }
+3793: 
+3794:         Ok(ThreadItemsListResponse {
+3795:             data,
+3796:             next_cursor: page.next_cursor,
+3797:             backwards_cursor: page.backwards_cursor,
+3798:         })

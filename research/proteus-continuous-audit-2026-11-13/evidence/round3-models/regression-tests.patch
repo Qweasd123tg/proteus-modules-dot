@@ -1,0 +1,143 @@
+diff --git a/model/model-pack/src/adapters/anthropic/image_tests.rs b/model/model-pack/src/adapters/anthropic/image_tests.rs
+index a8e9230..caeaa24 100644
+--- a/model/model-pack/src/adapters/anthropic/image_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/image_tests.rs
+@@ -37,3 +37,20 @@ fn local_image_is_encoded_as_base64_image_block_before_text() {
+     );
+     assert_eq!(body["messages"][0]["content"][1]["text"], "Describe");
+ }
++
++#[test]
++fn audit_tool_result_image_reaches_anthropic_vision_request() {
++    use crate::domain::{ToolCall, ToolContent, ToolResult};
++    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++    let call = ToolCall::new("read-1", "read", serde_json::json!({"path":"image.png"}));
++    let result = ToolResult::ok("read-1".into(), "Read image file [image/png]").with_content(vec![
++        ToolContent::Image { mime_type:"image/png".into(), data:data.into() }
++    ]);
++    let request = CanonicalModelRequest::new(ModelRef::new("anthropic", "vision"), vec![
++        CanonicalMessage::new(MessageRole::Assistant, vec![ContentPart::ToolCall{call}]),
++        CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult{result}]),
++    ]);
++    let body = to_anthropic_request(&request).unwrap();
++    println!("ANTHROPIC_TOOL_IMAGE_BODY={body}");
++    assert!(body.to_string().contains(data), "tool result image bytes silently lost");
++}
+diff --git a/model/model-pack/src/adapters/anthropic/tests.rs b/model/model-pack/src/adapters/anthropic/tests.rs
+index 86e8c03..eacf2cb 100644
+--- a/model/model-pack/src/adapters/anthropic/tests.rs
++++ b/model/model-pack/src/adapters/anthropic/tests.rs
+@@ -851,3 +851,36 @@ fn truncated_stream_discards_partial_tool_arguments_without_hiding_length() {
+         matches!(&events[0], ModelStreamEvent::Response { response } if response.finish_reason == FinishReason::Length && response.tool_calls.is_empty())
+     );
+ }
++
++#[test]
++fn audit_no_argument_tool_stream_matches_json_response() {
++    let block = json!({"type":"tool_use","id":"call-clock","name":"clock","input":{}});
++    let events = run_trace(&[
++        ("message_start", json!({"message":{"id":"fixture","type":"message","role":"assistant","model":"fixture","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}})),
++        ("content_block_start", json!({"index":0,"content_block":block})),
++        ("content_block_delta", json!({"index":0,"delta":{"type":"input_json_delta","partial_json":""}})),
++        ("content_block_stop", json!({"index":0})),
++        ("message_delta", json!({"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
++        ("message_stop", json!({})),
++    ]);
++    let ModelStreamEvent::Response { response: streamed } = events.last().unwrap() else { panic!("terminal") };
++    let plain = from_anthropic_response(json!({"stop_reason":"tool_use","content":[block]})).unwrap();
++    println!("EMPTY_TOOL_STREAM_ARGS={:?}; JSON_ARGS={:?}", streamed.tool_calls[0].args, plain.tool_calls[0].args);
++    assert_eq!(streamed.tool_calls[0].args, plain.tool_calls[0].args);
++}
++
++#[test]
++fn audit_initial_text_stream_matches_json_response() {
++    let events = run_trace(&[
++        ("message_start", json!({"message":{"id":"fixture","type":"message","role":"assistant","model":"fixture","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}})),
++        ("content_block_start", json!({"index":0,"content_block":{"type":"text","text":"1 + 1"}})),
++        ("content_block_delta", json!({"index":0,"delta":{"type":"text_delta","text":" = 2"}})),
++        ("content_block_stop", json!({"index":0})),
++        ("message_delta", json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})),
++        ("message_stop", json!({})),
++    ]);
++    let ModelStreamEvent::Response { response: streamed } = events.last().unwrap() else { panic!("terminal") };
++    let plain = from_anthropic_response(json!({"stop_reason":"end_turn","content":[{"type":"text","text":"1 + 1 = 2"}]})).unwrap();
++    println!("INITIAL_TEXT_STREAM={:?}; JSON_TEXT={:?}", streamed.messages[0].display_text(), plain.messages[0].display_text());
++    assert_eq!(streamed.messages[0].display_text(), plain.messages[0].display_text());
++}
+diff --git a/model/model-pack/src/adapters/openai/image_tests.rs b/model/model-pack/src/adapters/openai/image_tests.rs
+index 5abc743..9bd0113 100644
+--- a/model/model-pack/src/adapters/openai/image_tests.rs
++++ b/model/model-pack/src/adapters/openai/image_tests.rs
+@@ -43,3 +43,20 @@ fn local_image_is_encoded_as_image_input_and_missing_file_fails_explicitly() {
+             .contains("cannot read attached image")
+     );
+ }
++
++#[test]
++fn audit_tool_result_image_reaches_openai_vision_request() {
++    use crate::domain::{ToolCall, ToolContent, ToolResult};
++    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++    let call = ToolCall::new("read-1", "read", serde_json::json!({"path":"image.png"}));
++    let result = ToolResult::ok("read-1".into(), "Read image file [image/png]").with_content(vec![
++        ToolContent::Image { mime_type:"image/png".into(), data:data.into() }
++    ]);
++    let request = CanonicalModelRequest::new(ModelRef::new("openai", "vision"), vec![
++        CanonicalMessage::new(MessageRole::Assistant, vec![ContentPart::ToolCall{call}]),
++        CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult{result}]),
++    ]);
++    let body = to_openai_request(&request).unwrap();
++    println!("OPENAI_TOOL_IMAGE_BODY={body}");
++    assert!(body.to_string().contains(data), "tool result image bytes silently lost");
++}
+diff --git a/model/model-pack/src/adapters/stream_fallback_tests.rs b/model/model-pack/src/adapters/stream_fallback_tests.rs
+index 02aadfd..6af58ee 100644
+--- a/model/model-pack/src/adapters/stream_fallback_tests.rs
++++ b/model/model-pack/src/adapters/stream_fallback_tests.rs
+@@ -119,3 +119,47 @@ async fn anthropic_stream_failure_does_not_start_another_inference() {
+     );
+     server.await.unwrap();
+ }
++
++#[tokio::test]
++async fn audit_http_clients_preserve_tool_result_image_payload() {
++    use crate::domain::{ToolCall, ToolContent, ToolResult};
++    use crate::model_standard::ContentPart;
++    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++    let mut missing = Vec::new();
++    for anthropic in [false, true] {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let endpoint = format!("http://{}", listener.local_addr().unwrap());
++        let server = tokio::spawn(async move {
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let request = test_http::read(&mut socket).await;
++            let response = if anthropic {
++                json!({"type":"message","role":"assistant","content":[{"type":"text","text":"fixture response"}],"stop_reason":"end_turn"})
++            } else {
++                json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixture response"}]}]})
++            };
++            test_http::reply(&mut socket, 200, "application/json", &response.to_string()).await;
++            request.body
++        });
++        let config = json!({"base_url":endpoint,"api_key":"local-fixture-only","stream":false,"capabilities":{"supports_image_input":true}});
++        let client: Box<dyn Model> = if anthropic {
++            Box::new(AnthropicMessagesClient::from_provider_config(config).unwrap())
++        } else {
++            Box::new(OpenAiResponsesClient::from_provider_config(config).unwrap())
++        };
++        let request = CanonicalModelRequest::new(ModelRef::new("fixture", "vision"), vec![
++            CanonicalMessage::new(MessageRole::Assistant, vec![ContentPart::ToolCall {call:ToolCall::new("read-1", "read", json!({"path":"image.png"}))}]),
++            CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult {result:ToolResult::ok("read-1".into(), "Read image file [image/png]").with_content(vec![ToolContent::Image {mime_type:"image/png".into(), data:image_data.into()}])}]),
++        ]);
++        let capabilities = client.capabilities(&request.model).unwrap();
++        assert!(capabilities.supports_image_input);
++        let request = crate::model_standard::RequestShaper.shape(request, &capabilities).unwrap();
++        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            client.stream(request).await.unwrap().collect::<Vec<_>>().await
++        }).await.unwrap();
++        assert!(matches!(events.as_slice(), [Ok(ModelStreamEvent::Response { .. })]));
++        let body = server.await.unwrap();
++        println!("HTTP_TOOL_IMAGE {}={body}", if anthropic { "Anthropic" } else { "OpenAI" });
++        if !body.contains(image_data) { missing.push(if anthropic { "Anthropic" } else { "OpenAI" }); }
++    }
++    assert!(missing.is_empty(), "tool image missing on actual HTTP wire: {missing:?}");
++}

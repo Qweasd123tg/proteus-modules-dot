@@ -1,0 +1,25 @@
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -361,20 +361,14 @@
+                     }
+                 } else {
+                     let multi = *lines > 1;
+-                    let (action, submit, identity) = (action.clone(), submit.clone(), id.clone());
++                    let (action, submit) = (action.clone(), submit.clone());
+                     let handle =
+                         move |this: &mut DeclarativeView,
+                               text: SharedString,
+                               event: &InputEvent,
+                               cx: &mut Context<DeclarativeView>| {
+                             match event {
+-                                InputEvent::Change
+-                                    if this
+-                                        .fields
+-                                        .inputs
+-                                        .get(&identity)
+-                                        .is_some_and(|input| input.value != text.as_ref()) =>
+-                                {
++                                InputEvent::Change => {
+                                     this.act(
+                                         action.clone(),
+                                         Some(serde_json::json!(text.to_string())),

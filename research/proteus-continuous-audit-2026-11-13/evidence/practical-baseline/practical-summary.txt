@@ -1,0 +1,46 @@
+Proteus: дополнительные практические проверки, 12 ноября 2026
+
+Версии (повторно проверены через git ls-remote):
+Core 89997df995df7c39b713e16aba216ecb19c8f497
+Modules 3270dc0f894eaf4d0360306052b806099b8f5351
+Core repositories.json закрепляет эту же версию Modules.
+Rust 1.95.0 установлен в изолированную папку, системный профиль не изменён.
+
+ПРОШЛИ
+- Core штатный library gate: 722 passed, 0 failed, 4 ignored.
+  Команда: python3 scripts/test.py -p proteus-core --lib --no-fail-fast
+  PROTEUS_MODULES_SOURCE и PROTEUS_TEST_REFERENCE_MODULE указывают на закреплённый Modules.
+- CLI binary tests: 50 passed; malformed-command dispatch: 1 passed.
+  cargo test --locked -p proteus-core --test cli_dispatch --bin proteus --no-fail-fast
+- Python benchmark adapters 5/5, runner selfcheck 9/9.
+- Python build stamp 6/6, conformance selection 3/3.
+- Настоящий CLI читает UTF-8 файл с кириллицей и emoji.
+- Один stdio server: 30 отправок; перед каждой неверная cancel и malformed JSON;
+  после каждой успешный new_session; 31 начальная/новая сессия, без повторных ID.
+  Каждый history_summary = 2 сообщения. Cold journal каждого из 30 ходов:
+  ровно один Success, ровно две записи истории (user + assistant), текст не
+  перетекает между сессиями. Штатный shutdown завершился с exit 0.
+- request_user_input, затем EOF / Cancel / Shutdown: три отдельных настоящих
+  процесса. Во всех ровно один TurnSettled Canceled; последующий CLI resume
+  той же сессии выполняет новый ход с exit 0.
+- SIGINT группы foreground CLI во время длинного streaming fake-ответа:
+  CLI завершён сигналом; исходных живых server/module процессов через 1с нет.
+  Идентичность проверялась по PID + starttime, а не только по номеру PID.
+
+НЕ ПРОШЛИ ИЗ-ЗА СРЕДЫ
+- Два штатных restricted component integration tests завершились до handshake.
+- Минимальный bwrap --unshare-all ... /bin/true отдельно вернул:
+  bwrap: loopback: Failed to create NETLINK_ROUTE socket: Operation not permitted
+  Ограничение не обходилось. Успех benchmark bwrap без --unshare-net не заменяет
+  проверку restricted sandbox. Полный gate нельзя объявлять зелёным.
+
+ГРАНИЦЫ
+- Это fake-model / real-runtime / real-process проверки, не live LLM benchmark.
+- GUI и полный portable здесь не тестировались.
+- В этой части новых подтверждённых продуктовых ошибок нет. Зелёный штатный
+  набор не опровергает отдельные adversarial findings других проверок.
+- Production исходники Core/Modules не изменялись; git status проверен чистым.
+
+Файлы practical/*.py — дополнительные сценарии; absolute ROOT требуется
+заменить на локальный audit root перед повтором в другой рабочей папке.
+Логи содержат только синтетические задания, без credentials.

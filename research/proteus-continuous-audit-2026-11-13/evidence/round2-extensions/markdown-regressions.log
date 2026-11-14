@@ -1,0 +1,30 @@
+   Compiling proteus-extension v0.1.0 (/workspace/shared/extensions-line-audit/sdk)
+   Compiling extension-markdown-render v0.1.0 (/workspace/shared/extensions-line-audit/packages/markdown-render)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.98s
+     Running unittests src/main.rs (/workspace/scratch/3ba0fff8d310/protocol-extensions/target/debug/deps/markdown_render-fe6607b86b545c47)
+
+running 2 tests
+warm={"type":"stack","direction":"column","gap":"medium","children":[{"type":"content","id":"code-0","language":"mermaid","source":"A-->B\n"},{"type":"rich_text","id":"prose-1","html":"<p>no longer a closing fence</p>\n"}]}
+cold={"type":"stack","direction":"column","gap":"medium","children":[{"type":"code","id":"code-0","text":"A-->B\n``` no longer a closing fence","language":"mermaid","embedded":true}]}
+
+thread 'render::line_audit_tests::changed_closing_line_must_invalidate_cached_fence' (600) panicked at packages/markdown-render/src/render.rs:921:9rendered=:
+assertion `left == right` failed: same current source must render identically warm/cold
+  left: Object {"type": String("stack"), "direction": String("column"), "gap": String("medium"), "children": Array [Object {"type": String("content"), "id": String("code-0"), "language": String("mermaid"), "source": String("A-->B\n")}, Object {"type": String("rich_text"), "id": String("prose-1"), "html": String("<p>no longer a closing fence</p>\n")}]}
+ right: Object {"type": String("stack"), "direction": String("column"), "gap": String("medium"), "children": Array [Object {"type": String("code"), "id": String("code-0"), "text": String("A-->B\n``` no longer a closing fence"), "language": String("mermaid"), "embedded": Bool(true)}]}{
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+"type":"stack","direction":"column","gap":"medium","children":[{"type":"rich_text","id":"prose-0","html":"<p>Read this note[^n].</p>\n"},{"type":"code","id":"code-0","text":"let x = 1;\n","language":"rust","embedded":true}]}
+
+thread 'render::line_audit_tests::footnote_definition_must_survive_separating_code_fence' (601) panicked at packages/markdown-render/src/render.rs:931:9:
+the canonical footnote content was lost
+test render::line_audit_tests::changed_closing_line_must_invalidate_cached_fence ... FAILED
+test render::line_audit_tests::footnote_definition_must_survive_separating_code_fence ... FAILED
+
+failures:
+
+failures:
+    render::line_audit_tests::changed_closing_line_must_invalidate_cached_fence
+    render::line_audit_tests::footnote_definition_must_survive_separating_code_fence
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p extension-markdown-render --bin markdown-render`

@@ -1,0 +1,49 @@
+   Compiling model-pack v0.1.0-alpha.2 (/workspace/shared/model-adapters-audit/model/model-pack)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.14s
+     Running unittests src/lib.rs (/workspace/shared/proteus-review-20261112/modules/target/debug/deps/model_pack-f6a9d6da99671479)
+
+running 5 tests
+OPENAI_TOOL_IMAGE_BODY={"model":"vision","input":[{"type":"function_call","call_id":"read-1","name":"read","arguments":"{\"path\":\"image.png\"}"},{"type":"function_call_output","call_id":"read-1","output":"Read image file [image/png]"}],"tool_choice":"auto","parallel_tool_calls":true,"store":false,"temperature":0.0,"include":[]}
+EMPTY_TOOL_STREAM_ARGS=Null; JSON_ARGS=Object {}
+
+thread 'adapters::anthropic::tests::audit_no_argument_tool_stream_matches_json_response' (305) panicked at model/model-pack/src/adapters/anthropic/tests.rs:869:5:
+assertion `left == right` failed
+  left: Null
+ right: Object {}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+INITIAL_TEXT_STREAM="= 2"; JSON_TEXT="1 + 1 = 2"
+
+thread 'adapters::anthropic::tests::audit_initial_text_stream_matches_json_response' (304) panicked at model/model-pack/src/adapters/anthropic/tests.rs:885:5:
+assertion `left == right` failed
+  left: "= 2"
+ right: "1 + 1 = 2"
+ANTHROPIC_TOOL_IMAGE_BODY={"model":"vision","max_tokens":2048,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"read","input":{"path":"image.png"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"Read image file [image/png]","is_error":false}]}],"temperature":0.0}
+
+thread 'adapters::anthropic::image_tests::audit_tool_result_image_reaches_anthropic_vision_request' (303) panicked at model/model-pack/src/adapters/anthropic/image_tests.rs:55:5:
+tool result image bytes silently lost
+
+thread 'adapters::openai::image_tests::audit_tool_result_image_reaches_openai_vision_request' (306) panicked at model/model-pack/src/adapters/openai/image_tests.rs:61:5:
+tool result image bytes silently lost
+test adapters::anthropic::tests::audit_no_argument_tool_stream_matches_json_response ... FAILED
+test adapters::anthropic::tests::audit_initial_text_stream_matches_json_response ... FAILED
+test adapters::anthropic::image_tests::audit_tool_result_image_reaches_anthropic_vision_request ... FAILED
+test adapters::openai::image_tests::audit_tool_result_image_reaches_openai_vision_request ... FAILED
+HTTP_TOOL_IMAGE OpenAI={"model":"vision","input":[{"type":"function_call","call_id":"read-1","name":"read","arguments":"{\"path\":\"image.png\"}"},{"type":"function_call_output","call_id":"read-1","output":"Read image file [image/png]"}],"tool_choice":"auto","parallel_tool_calls":false,"store":false,"temperature":0.0,"include":[]}
+HTTP_TOOL_IMAGE Anthropic={"model":"vision","max_tokens":64000,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"read","input":{"path":"image.png"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"Read image file [image/png]","is_error":false}]}],"temperature":0.0}
+
+thread 'adapters::stream_fallback_tests::audit_http_clients_preserve_tool_result_image_payload' (307) panicked at model/model-pack/src/adapters/stream_fallback_tests.rs:164:5:
+tool image missing on actual HTTP wire: ["OpenAI", "Anthropic"]
+test adapters::stream_fallback_tests::audit_http_clients_preserve_tool_result_image_payload ... FAILED
+
+failures:
+
+failures:
+    adapters::anthropic::image_tests::audit_tool_result_image_reaches_anthropic_vision_request
+    adapters::anthropic::tests::audit_initial_text_stream_matches_json_response
+    adapters::anthropic::tests::audit_no_argument_tool_stream_matches_json_response
+    adapters::openai::image_tests::audit_tool_result_image_reaches_openai_vision_request
+    adapters::stream_fallback_tests::audit_http_clients_preserve_tool_result_image_payload
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p model-pack --lib`

@@ -1,0 +1,27 @@
+
+[modules]
+workflow = "audit_tool_driver"
+policy = "fixture_allow_all"
+
+[components.workflow]
+command = "python3"
+args = ["-B", "/workspace/shared/trace-integration-round8-evidence/workflow.py"]
+[components.workflow.exports.workflow.audit_tool_driver]
+
+[components.policy]
+command = "python3"
+args = ["-B", "/workspace/shared/trace-integration-round8/crates/proteus-core/tests/fixtures/process_allow_all_policy.py"]
+[components.policy.exports.policy.fixture_allow_all]
+
+[agent_control]
+binary = "/workspace/shared/trace-integration-round8-target/debug/proteus"
+surface = "collaboration"
+max_idle_processes = 8
+
+[[agent_control.roles]]
+name = "helper"
+description = "Local model-free child"
+config = "/workspace/shared/trace-integration-round8-evidence/run-1794562892385443937/configs/child.toml"
+parallel_safe = true
+max_processes = 4
+timeout_ms = 30000

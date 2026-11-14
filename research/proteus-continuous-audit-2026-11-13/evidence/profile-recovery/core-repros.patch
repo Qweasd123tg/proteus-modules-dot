@@ -1,0 +1,158 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+index f69bdab..0af1985 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -201,3 +201,46 @@ async fn json_profile_save_does_not_apply_toml_value_restrictions() {
+     );
+     server.shutdown().await;
+ }
++
++#[tokio::test]
++async fn audit_save_after_missing_profile_serializes_resolved_instruction_twice() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("profile.toml");
++    std::fs::write(root.path().join("rules.md"), "Keep the fixture answer short.").unwrap();
++    let mut config = crate::test_model::config();
++    config.instructions = vec![serde_json::from_value(serde_json::json!({
++        "kind": "System", "priority": 100, "file": "rules.md"
++    })).unwrap()];
++    std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
++    let loaded = AppConfig::load(Some(&path)).await.unwrap();
++    assert!(loaded.instructions[0].text.is_some());
++    assert!(loaded.instructions[0].file.is_some());
++    let handle = AgentAppServer::launch(loaded, root.path().into(), Some(&path)).await.unwrap();
++    // Control: ordinary Save of an existing file keeps the file reference only.
++    handle.set_profile_config(SetConfigBuilderRequest::default()).await.unwrap();
++    AppConfig::load(Some(&path)).await.unwrap();
++    let existing: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
++    assert!(existing["instructions"][0].get("file").is_some());
++    assert!(existing["instructions"][0].get("text").is_none());
++    // Source is gone while a valid live profile still exists, for example after
++    // a mistaken local move/delete. Save advertises recovery by recreating it.
++    std::fs::remove_file(&path).unwrap();
++    let snapshot = handle.set_profile_config(SetConfigBuilderRequest {
++        permission_mode: Some(PermissionMode::Plan),
++        ..Default::default()
++    }).await.unwrap();
++    assert_eq!(snapshot.permission_mode, "plan");
++    assert!(path.is_file());
++    let bytes = std::fs::read_to_string(&path).unwrap();
++    let saved: toml::Value = toml::from_str(&bytes).unwrap();
++    let instruction = &saved["instructions"][0];
++    assert!(instruction.get("text").is_some());
++    assert!(instruction.get("file").is_some());
++    let error = AppConfig::load(Some(&path)).await.unwrap_err();
++    eprintln!("missing-profile save ACK={}; reload error={error:#}; saved instruction={instruction}", snapshot.permission_mode);
++    assert!(format!("{error:#}").contains("either text or file, not both"));
++    let second = handle.set_profile_config(SetConfigBuilderRequest::default()).await;
++    assert!(second.is_err(), "next UI save cannot recover the invalid profile");
++    handle.shutdown().await;
++}
+diff --git a/crates/proteus-core/src/app_server/profile_watch/tests.rs b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+index 97209af..28f6a13 100644
+--- a/crates/proteus-core/src/app_server/profile_watch/tests.rs
++++ b/crates/proteus-core/src/app_server/profile_watch/tests.rs
+@@ -227,3 +227,102 @@ async fn watcher_does_not_keep_a_dropped_handle_alive() {
+     .await
+     .unwrap();
+ }
++
++// Audit-only probe. The existing production watcher is replaced by its
++// repository-provided controlled Polling seam; save/load/publication are real.
++async fn audit_controlled_watch(
++    handle: AppServerHandle,
++    path: PathBuf,
++) -> (AppServerHandle, tokio::sync::mpsc::UnboundedSender<polling::Poll>) {
++    handle.profile_stop.cancel();
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while std::sync::Arc::strong_count(&handle.inner) != 1 {
++            tokio::task::yield_now().await;
++        }
++    }).await.unwrap();
++    let mut state = std::sync::Arc::try_unwrap(handle.inner)
++        .unwrap_or_else(|_| panic!("watcher still owns handle"));
++    state.profile_stop = CancellationToken::new();
++    let handle = AppServerHandle { inner: std::sync::Arc::new(state) };
++    let (polling, sender) = Polling::controlled();
++    start_with_polling(&handle, path, polling).await;
++    (handle, sender)
++}
++
++async fn audit_poll(
++    sender: &tokio::sync::mpsc::UnboundedSender<polling::Poll>,
++    now: Instant,
++) -> polling::PollReport {
++    let (completed, receiver) = tokio::sync::oneshot::channel();
++    sender.send(polling::Poll::controlled(now, completed)).unwrap();
++    tokio::time::timeout(Duration::from_secs(5), receiver).await.unwrap().unwrap()
++}
++
++#[tokio::test]
++async fn audit_fast_external_revert_after_ui_save_leaves_live_profile_stale() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let mut baseline = crate::test_model::config();
++    baseline.permissions.mode = PermissionMode::Normal;
++    let original = toml::to_string_pretty(&baseline).unwrap();
++    std::fs::write(&path, &original).unwrap();
++    let handle = AgentAppServer::launch(baseline.clone(), root.path().into(), Some(&path)).await.unwrap();
++    let (handle, polls) = audit_controlled_watch(handle, path.clone()).await;
++    let now = Instant::now();
++    audit_poll(&polls, now).await;
++    audit_poll(&polls, now + Duration::from_secs(4)).await;
++    handle.set_profile_config(SetConfigBuilderRequest {
++        permission_mode: Some(PermissionMode::Auto),
++        ..Default::default()
++    }).await.unwrap();
++    let saved_epoch = handle.runtime.module_epoch().await;
++    assert_eq!(handle.permission_mode().await, PermissionMode::Auto);
++    // E.g. editor Undo or git checkout, before watcher observed the UI save.
++    std::fs::write(&path, &original).unwrap();
++    for seconds in [8, 12, 16, 20] {
++        let report = audit_poll(&polls, now + Duration::from_secs(seconds)).await;
++        assert!(report.scanned);
++        assert!(!report.refresh_attempted);
++    }
++    let disk = AppConfig::load(Some(&path)).await.unwrap().permissions.mode;
++    let published = handle.config.read().await.permissions.mode;
++    let live = handle.permission_mode().await;
++    eprintln!("fast revert: disk={disk:?}; published={published:?}; live={live:?}; reload_error={:?}", handle.profile_error.lock().await);
++    assert_eq!(disk, PermissionMode::Normal);
++    assert_eq!(published, PermissionMode::Auto);
++    assert_eq!(live, PermissionMode::Auto);
++    assert_eq!(handle.runtime.module_epoch().await, saved_epoch);
++    assert!(handle.profile_error.lock().await.is_none());
++    handle.shutdown().await;
++}
++
++#[tokio::test]
++async fn audit_external_revert_after_watcher_observed_ui_save_is_applied_control() {
++    use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++    let root = tempfile::tempdir().unwrap();
++    let path = root.path().join("config.toml");
++    let mut baseline = crate::test_model::config();
++    baseline.permissions.mode = PermissionMode::Normal;
++    let original = toml::to_string_pretty(&baseline).unwrap();
++    std::fs::write(&path, &original).unwrap();
++    let handle = AgentAppServer::launch(baseline.clone(), root.path().into(), Some(&path)).await.unwrap();
++    let (handle, polls) = audit_controlled_watch(handle, path.clone()).await;
++    let now = Instant::now();
++    audit_poll(&polls, now).await;
++    audit_poll(&polls, now + Duration::from_secs(4)).await;
++    handle.set_profile_config(SetConfigBuilderRequest {
++        permission_mode: Some(PermissionMode::Auto),
++        ..Default::default()
++    }).await.unwrap();
++    audit_poll(&polls, now + Duration::from_secs(8)).await;
++    audit_poll(&polls, now + Duration::from_secs(12)).await;
++    std::fs::write(&path, &original).unwrap();
++    audit_poll(&polls, now + Duration::from_secs(16)).await;
++    let report = audit_poll(&polls, now + Duration::from_secs(20)).await;
++    assert!(report.refresh_attempted);
++    assert_eq!(handle.config.read().await.permissions.mode, PermissionMode::Normal);
++    assert_eq!(handle.permission_mode().await, PermissionMode::Normal);
++    eprintln!("observed save control: disk=Normal; published=Normal; live=Normal");
++    handle.shutdown().await;
++}

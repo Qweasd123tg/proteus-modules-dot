@@ -1,0 +1,177 @@
+diff --git a/crates/proteus-core/src/core/extension_operations_tests/nested_scheduling.rs b/crates/proteus-core/src/core/extension_operations_tests/nested_scheduling.rs
+index ef33c35..d51e674 100644
+--- a/crates/proteus-core/src/core/extension_operations_tests/nested_scheduling.rs
++++ b/crates/proteus-core/src/core/extension_operations_tests/nested_scheduling.rs
+@@ -302,3 +302,98 @@ async fn cancellation_rejects_a_queued_sibling_before_any_child_effect() {
+     timeout(GUARD, first).await.unwrap().unwrap().unwrap();
+     parent.finish().await;
+ }
++
++// Audit-only diagnostic: exercises the real per-hook InvocationOperations facade.
++struct ConcurrentSerialHook;
++#[async_trait]
++impl HookHandler for ConcurrentSerialHook {
++    async fn invoke(&self, input: HookInput, host: Arc<dyn HookHost>) -> Result<HookResponse> {
++        if matches!(input.event, HookEvent::BeforeStop { .. }) {
++            let (first, second) = tokio::join!(
++                host.execute_tool(call("serial")),
++                host.execute_tool(call("serial")),
++            );
++            assert!(first?.ok);
++            assert!(second?.ok);
++        }
++        Ok(HookResponse::Continue)
++    }
++}
++
++#[tokio::test]
++async fn audit_hook_siblings_ignore_serial_tool_permission() {
++    let activity = Arc::new(Activity::default());
++    let release = Arc::new(Semaphore::new(0));
++    let (started, mut receiver) = mpsc::unbounded_channel();
++    let mut registry = ToolRegistry::new();
++    registry
++        .register_arc(
++            ToolSource::builtin("hook-scheduling-audit"),
++            Arc::new(Probe {
++                name: "serial",
++                parallel: false,
++                activity: activity.clone(),
++                entered: started,
++                release: release.clone(),
++            }),
++        )
++        .unwrap();
++    let scope = ExecutionScope::fresh(CancellationToken::new());
++    let facts = Arc::new(Facts::default());
++    let hooks = Arc::new(RuntimeHookChain::new(
++        vec![("concurrent-hook".into(), Arc::new(ConcurrentSerialHook))],
++        scope.clone(),
++        facts.clone(),
++        None,
++    ));
++    let tools = BoundTools::new(
++        registry,
++        Arc::new(AskChild),
++        Arc::new(Approval {
++            calls: AtomicUsize::new(0),
++            approved: true,
++        }),
++        Arc::default(),
++        ToolExecutionBinding::detached(scope.clone()).with_recorder(facts.clone()),
++    );
++    let erased: Arc<dyn ExecutionHooks> = hooks.clone();
++    hooks.bind_operations(ExtensionOperations {
++        model: None,
++        tools: tools.with_hooks(Arc::new(WeakExecutionHooks(Arc::downgrade(&erased)))),
++    });
++    let running = tokio::spawn(async move {
++        hooks
++            .apply(HookInput {
++                event: HookEvent::BeforeStop {
++                    task: AgentTask::new("audit", "/tmp".into()),
++                    history: vec![],
++                    output: AgentOutput::text("candidate"),
++                    attempt: 0,
++                    continuation: None,
++                },
++                attribution: ExecutionAttribution::detached(scope.execution_id),
++                cwd: "/tmp".into(),
++                conversation: None,
++            })
++            .await
++    });
++    entered(&mut receiver, "serial").await;
++    entered(&mut receiver, "serial").await;
++    let maximum = activity.maximum.load(Ordering::SeqCst);
++    release.add_permits(2);
++    timeout(GUARD, running).await.unwrap().unwrap().unwrap();
++    eprintln!("audit hook serial tool maximum overlap: {maximum}");
++    assert_eq!(
++        maximum, 2,
++        "diagnostic asserts current behavior, not desired invariant"
++    );
++    assert_eq!(facts.tools.lock().unwrap().len(), 2);
++    assert!(
++        facts
++            .tools
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|(_, owner)| matches!(owner, OperationOwner::Hook { .. }))
++    );
++}
+diff --git a/crates/proteus-core/src/core/workflow_replay/replay_runtime/hook_tests.rs b/crates/proteus-core/src/core/workflow_replay/replay_runtime/hook_tests.rs
+index de1a20e..9c0fd9d 100644
+--- a/crates/proteus-core/src/core/workflow_replay/replay_runtime/hook_tests.rs
++++ b/crates/proteus-core/src/core/workflow_replay/replay_runtime/hook_tests.rs
+@@ -413,3 +413,69 @@ async fn recorded_nested_auxiliary_and_tool_hooks_are_injected_without_calls() {
+     assert_eq!(summary.tool_calls, 1);
+     assert!(summary.issues.is_empty(), "{:?}", summary.issues);
+ }
++
++#[tokio::test]
++async fn audit_replay_rewrites_literal_hook_output_equal_to_call_id() {
++    let call = ToolCall::new("recorded-call", "read_file", serde_json::json!({}));
++    let raw = ToolResult::ok(call.id.clone(), "raw fixture text");
++    let before = input(HookEvent::AfterTool {
++        call: call.clone(),
++        result: raw.clone(),
++    });
++    // A literal string is valid output data, not a typed identity reference.
++    let response = HookResponse::ToolOutput {
++        output: "recorded-call".into(),
++    };
++    let output = apply_hook_response(&before.event, &response).unwrap();
++    let state = state(
++        vec![HookTrace {
++            owner: crate::contracts::OperationOwner::Workflow,
++            input: before,
++            steps: vec![HookStep {
++                invocation_id: uuid::Uuid::new_v4(),
++                module_id: "budget".into(),
++                outcome: HookStepOutcome::Accepted { response },
++            }],
++            output: Some(output),
++        }],
++        vec![RecordedToolInvocation {
++            owner: crate::contracts::OperationOwner::Workflow,
++            call: call.clone(),
++            approval_reason: None,
++            resolution: ToolCallResolution::Allowed,
++            result: ToolResult::ok(call.id.clone(), "recorded-call"),
++            raw_result: Some(raw),
++        }],
++    );
++    let mut actual = call;
++    actual.id = "actual-call".into();
++    state.record_tool_requested(&actual).unwrap();
++    let raw = state.replay_tool_result(&actual.id).unwrap();
++    let replay = ReplayHooks::new(state.clone(), vec!["budget".into()]);
++    let rewritten = rewrite_response(
++        &HookResponse::ToolOutput {
++            output: "recorded-call".into(),
++        },
++        &state.lock().expected_to_actual,
++    )
++    .unwrap();
++    assert_eq!(
++        rewritten,
++        HookResponse::ToolOutput {
++            output: "actual-call".into()
++        }
++    );
++    let error = replay
++        .apply(input(HookEvent::AfterTool {
++            call: actual.clone(),
++            result: raw,
++        }))
++        .await
++        .unwrap_err();
++    eprintln!("literal hook output rewrite: {rewritten:?}; oracle error: {error:#}");
++    assert!(
++        error
++            .to_string()
++            .contains("replayed output differs from recorded output")
++    );
++}

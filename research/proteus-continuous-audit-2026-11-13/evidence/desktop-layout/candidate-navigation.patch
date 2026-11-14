@@ -1,0 +1,26 @@
+--- a/src/ui/tabs/mod.rs
++++ b/src/ui/tabs/mod.rs
+@@ -338,6 +338,7 @@
+ 
+     pub(super) fn focus_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+         if self.layout.focused != pane {
++            self.invalidate_navigation();
+             self.update_tabs(cx, |tabs| tabs.focus(pane));
+         }
+     }
+@@ -352,6 +353,7 @@
+         if self.settings.is_some() {
+             return;
+         }
++        self.invalidate_navigation();
+         let mut next = None;
+         self.update_tabs(cx, |tabs| next = tabs.focus_neighbor(edge));
+         if let Some(id) = next {
+@@ -364,6 +366,7 @@
+         if self.settings.is_some() {
+             return;
+         }
++        self.invalidate_navigation();
+         let mut next = None;
+         self.update_tabs(cx, |tabs| next = tabs.step(offset));
+         if let Some(id) = next {

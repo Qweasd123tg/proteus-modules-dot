@@ -1,0 +1,71 @@
+diff --git a/sdk/src/host/tests.rs b/sdk/src/host/tests.rs
+index 96da570..d153387 100644
+--- a/sdk/src/host/tests.rs
++++ b/sdk/src/host/tests.rs
+@@ -1167,3 +1167,66 @@ fn generic_surface_invalidation_is_explicit_and_independent_of_content_capabilit
+     );
+     assert!(host.invalidate_content().is_err());
+ }
++
++// Audit-only regressions, 2026-11-12; no production change.
++#[test]
++fn audit_rehost_error_must_not_reuse_tree_from_old_session() {
++    #[derive(Default)]
++    struct FailsInSecondSession;
++    impl Extension for FailsInSecondSession {
++        fn render(&mut self, host: &mut Host, view: &str, _: Surface, _: Option<&str>) -> Result {
++            if host.session.as_deref() == Some("/two") {
++                bail!("synthetic destination unavailable");
++            }
++            host.show(view, ui::text("OLD_SESSION_PRIVATE_CONTENT"));
++            Ok(())
++        }
++    }
++    let mut host = Host::default();
++    let mut extension = FailsInSecondSession;
++    host.handle(&mut extension, json!({"type":"context","context":"a","workspace":"/one","session_dir":"/one"})).unwrap();
++    host.handle(&mut extension, json!({"type":"render","context":"a","surface":"panel","view":"panel","session_dir":"/one"})).unwrap();
++    host.handle(&mut extension, json!({"type":"context","context":"b","workspace":"/two","session_dir":"/two"})).unwrap();
++    host.handle(&mut extension, json!({"type":"rehost","view":"panel","context":"b"})).unwrap();
++    let reply = host.sent.borrow().last().unwrap().clone();
++    eprintln!("rehost reply = {reply}");
++    assert_eq!(reply["session_dir"], "/two");
++    assert!(!reply.to_string().contains("OLD_SESSION_PRIVATE_CONTENT"), "old session tree must be invalidated before rendering a different session");
++}
++
++#[test]
++fn audit_setting_ack_after_source_switch_updates_live_original_session() {
++    let mut host = Host::default();
++    let mut extension = Ordered::default();
++    host.features.insert("session.settings.v1".into());
++    let original = json!({"session_settings":[{"id":"mode","control":{"type":"select","value":"plan","options":[]}}]});
++    let changed = json!({"session_settings":[{"id":"mode","control":{"type":"select","value":"auto","options":[]}}]});
++    host.handle(&mut extension, json!({"type":"context","context":"source","workspace":"/one","session_dir":"/one"})).unwrap();
++    host.handle(&mut extension, json!({"type":"session_snapshot","context":"source","session_dir":"/one","state":{"config":original},"entries":[]})).unwrap();
++    host.handle(&mut extension, json!({"type":"context","context":"sibling","workspace":"/one","session_dir":"/one"})).unwrap();
++    host.activate_context("source");
++    host.set_session("mode", json!("auto")).unwrap();
++    let id = host.pending[0].0.clone();
++    host.handle(&mut extension, json!({"type":"context","context":"source","workspace":"/two","session_dir":"/two"})).unwrap();
++    host.handle(&mut extension, json!({"type":"command_result","context":"source","id":id,"session_dir":"/one","config":changed,"error":null})).unwrap();
++    host.activate_context("sibling");
++    assert!(host.pending.is_empty());
++    eprintln!("sibling setting after successful ACK = {:?}", host.setting_value("mode"));
++    assert_eq!(host.setting_value("mode"), Some(json!("auto")), "successful ACK must update the live sibling session, not merely clear its optimistic pending value");
++}
++
++#[test]
++fn audit_local_coreless_extension_poll_is_not_preview() {
++    #[derive(Default)]
++    struct Ticker;
++    impl Extension for Ticker {
++        fn poll(&self) -> Option<Duration> { Some(Duration::from_millis(10)) }
++        fn render(&mut self, _: &mut Host, _: &str, _: Surface, _: Option<&str>) -> Result { Ok(()) }
++    }
++    let mut host = Host::default();
++    let mut extension = Ticker;
++    host.handle(&mut extension, json!({"type":"hello","protocol":4,"features":[],"workspace":"/project","server":{"origin":"","token":""}})).unwrap();
++    host.handle(&mut extension, json!({"type":"context","context":"workspace","workspace":"/project","session_dir":null})).unwrap();
++    host.handle(&mut extension, json!({"type":"render","context":"workspace","view":"panel","surface":"panel","session_dir":null})).unwrap();
++    assert_eq!(host.poll(&extension), Some(Duration::from_millis(10)), "a production core:false panel must not be treated as an isolated Preview");
++}

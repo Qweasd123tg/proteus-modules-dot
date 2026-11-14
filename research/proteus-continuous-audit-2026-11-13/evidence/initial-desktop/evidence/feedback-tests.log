@@ -1,0 +1,58 @@
+   Compiling desktop-feedback-repro v0.0.0 (/workspace/scratch/3ba0fff8d310/desktop-behaviour/audit-repros)
+warning: methods `preparing_tools` and `clear_activity` are never used
+   --> src/../../src/ui/chat/feedback/mod.rs:197:12
+    |
+ 37 | impl Feedback {
+    | ------------- methods in this implementation
+...
+197 |     pub fn preparing_tools(&self) -> bool {
+    |            ^^^^^^^^^^^^^^^
+...
+201 |     pub fn clear_activity(&mut self) {
+    |            ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `preview` and `status` are never used
+   --> src/../../src/ui/chat/feedback/mod.rs:218:12
+    |
+217 | impl PendingSend {
+    | ---------------- methods in this implementation
+218 |     pub fn preview(&self) -> String {
+    |            ^^^^^^^
+...
+222 |     pub fn status(&self) -> &'static str {
+    |            ^^^^^^
+
+warning: `desktop-feedback-repro` (bin "desktop-feedback-repro" test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s
+     Running unittests src/main.rs (audit-repros/target/debug/deps/desktop_feedback_repro-81b8aa8f688b1d8e)
+
+running 11 tests
+test audit_regressions::rejected_send_must_be_recoverable_after_another_identical_send_echoes ... FAILED
+test feedback::tests::an_image_only_send_requires_the_image_echo_and_preserves_the_receipt ... ok
+test feedback::tests::echo_before_http_failure_does_not_restore_a_delivered_draft ... ok
+test feedback::tests::activity_survives_text_and_yields_to_tools_questions_cancel_and_settlement ... ok
+test feedback::tests::http_acceptance_keeps_receipt_until_the_server_echo ... ok
+test feedback::tests::identical_concurrent_sends_need_independent_echoes ... ok
+test feedback::tests::reconnect_uses_run_or_queued_message_identity ... ok
+test feedback::tests::old_and_repeated_queue_snapshots_do_not_acknowledge_another_send ... ok
+test feedback::tests::many_pending_sends_have_one_latest_receipt_without_losing_earlier_drafts ... ok
+test feedback::tests::large_drafts_keep_the_pending_receipt_bounded_in_both_dimensions ... ok
+test feedback::tests::runtime_error_does_not_reappear_on_an_unchanged_execution_update ... ok
+
+failures:
+
+---- audit_regressions::rejected_send_must_be_recoverable_after_another_identical_send_echoes stdout ----
+
+thread 'audit_regressions::rejected_send_must_be_recoverable_after_another_identical_send_echoes' (92) panicked at src/main.rs:35:9:
+A was not accepted and must be restored
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    audit_regressions::rejected_send_must_be_recoverable_after_another_identical_send_echoes
+
+test result: FAILED. 10 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin desktop-feedback-repro`

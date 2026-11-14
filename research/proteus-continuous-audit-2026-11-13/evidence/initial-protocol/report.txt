@@ -1,0 +1,47 @@
+Proteus Extensions / SDK / IPC audit, 2026-11-12
+
+Pinned sources:
+- Proteus-harness/Proteus-desktop-extensions: 4df3d0f7c168aa2947a5b014cf02f92984499d3f
+- Proteus-harness/Proteus-desktop: 75bf201764278eac4b50d156650edcf1429101ff
+- Core source cross-check (shared checkout): 89997df995df7c39b713e16aba216ecb19c8f497
+No external writes, commits or PRs. Only audit tests added to the isolated Extensions checkout.
+
+A. P2: A delayed settings ACK clears optimistic state but loses confirmed config after origin context switches chats.
+Sources: sdk/src/host.rs:659-671; sdk/src/host/scopes.rs:103-115,150-154.
+Native producer: Desktop src/ui/extensions/declarative/runtime/commands.rs:136-158. It sends the original session_dir with the live origin route/context. Dynamic composer hosts are created by src/ui/badges/mod.rs:38 and Host::for_command_chat; their scope is stable while active command chat changes (host.rs:149-158,262ff,400-436).
+Repro on the real production `mode` binary: two contexts show /one; choose AUTO in source, close its popup while its badge remains; source switches to /two before synthetic successful set_session response for /one; redraw still-open sibling /one. Observed sibling labels PLAN -> AUTO -> PLAN, despite confirmed config AUTO. Process exits zero.
+Why: route_message uses the existing origin context even if now attached to another session. acknowledge removes pending from parked /one, then handle returns on session mismatch without applying config to live /one. Subsequent render falls back to pre-command config.
+Impact: stale permission-mode UI on a subsequent redraw, or lost error on failed ACK; do not describe as permission escalation. Actual GPUI + network round trip was not run. The synthetic wire faithfully exercises production binary and native producer supports the source/context mismatch. Core set_permission_mode merely mutates execution state (core/runtime.rs:260-263); set_session_setting response includes config (app_server/http/commands.rs:261-271), so don't assume a separate state broadcast immediately repairs this.
+Fix direction: route ACK by its immutable session when its origin context changed sessions, updating/re-rendering the existing sibling session while preserving current source context/state. No resurrection of a closed session/context. Existing stale/no-sibling tests must continue passing.
+Evidence: repro_mode_ack.py, mode-wire.log, mode-wire-transcript.json; SDK regression audit_setting_ack_after_source_switch_updates_live_original_session.
+
+B. P2 SDK capability regression: core:false production extensions never poll.
+Sources: sdk/src/host.rs:145-153; PROTOCOL.md:77-83; sdk/src/lib.rs:60-63.
+Host::poll unconditionally requires self.server, using absent Core server as the marker for Preview isolation. Yet documented dependencies.core=false production panels/documents always receive empty hello.server, even alongside Core. A production local Ticker panel with poll()=10ms gets None.
+Impact: third-party/local extensions relying on the public timer API freeze between external messages. Shipped Terminal does not override poll(), so this is NOT a reproduced Terminal bug.
+Fix direction: distinguish isolated Preview/settings lifecycle from core:false production explicitly. Preserve nested Preview Content isolation; simply removing the server guard is insufficient.
+Evidence: SDK regression audit_local_coreless_extension_poll_is_not_preview.
+
+C. P3, SDK contract corner only: rehost across sessions keeps old shown tree if destination render errors.
+Sources: sdk/src/host.rs:617-637 + 515-529; PROTOCOL.md:192-198 documents changed-session close/render behavior.
+Synthetic panel renders OLD_SESSION_PRIVATE_CONTENT under /one, then rehosts to live /two whose renderer returns an error. The output is addressed to session_dir=/two but embeds the old tree under the error notice. Normal session change clears shown; rehost omits that invalidation.
+Impact: stale content and controls labelled as new session. Not demonstrated as cross-user leakage. Desktop review found ordinary document moves preserve ChatKey/space/bound/source, so current UI reachability of a cross-session rehost is UNCONFIRMED. Keep separate from high-confidence shipped paths.
+Fix direction: clear shown[view] on changed-session rehost before calling new session render, preserving same-session fallback behavior.
+Evidence: SDK regression audit_rehost_error_must_not_reuse_tree_from_old_session.
+
+Tests:
+- Original SDK baseline: 51 passed.
+- Three added expected-invariant SDK tests: 3 failed on pinned unmodified production sources.
+- Full existing workspace suite: 218 passed with one Linux /proc lifecycle test skipped; added three audit_ tests also skipped for baseline.
+- Initial full suite reaches Mermaid integration but different_sessions_share_one_worker_and_last_close_and_eof_reap_it fails at children.len()==1 (got 0) after successful SVG generation. An independent Python child test showed os.getpid()==5 but /proc/5/task/5/children absent: PID and /proc namespaces in the command environment do not correspond. Treat lifecycle test as environment-limited, NOT a product finding.
+- No live LLM providers, credentials, actual user-session payloads or GUI execution.
+
+Replay commands (from /workspace/scratch/3ba0fff8d310):
+source /workspace/shared/proteus-toolchain/env.sh
+cargo test --locked --manifest-path protocol-extensions/Cargo.toml -p proteus-extension audit_ -- --nocapture
+cargo build --locked --manifest-path protocol-extensions/Cargo.toml -p extension-mode
+python3 /workspace/shared/protocol-audit-evidence/repro_mode_ack.py
+cargo test --locked --manifest-path protocol-extensions/Cargo.toml --workspace -- --skip audit_ --skip different_sessions_share_one_worker_and_last_close_and_eof_reap_it
+
+Audit test diff: sdk-audit-tests.patch
+Log files: sdk-regressions.log, workspace-baseline.log, workspace-baseline-proc-skip.log.
