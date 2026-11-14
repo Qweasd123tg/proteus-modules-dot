@@ -1,0 +1,459 @@
+diff --git a/hook/codex-context-preparation/src/history.rs b/hook/codex-context-preparation/src/history.rs
+index 519dcdf..5c3ea93 100644
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -22,11 +22,20 @@ pub(crate) fn split_history(messages: &[CanonicalMessage]) -> HistoryParts {
+     let mut compactable_history = Vec::new();
+ 
+     for message in messages {
++        summary_history.push(message.clone());
+         if is_structured_ephemeral_context_message(message) {
+-            ephemeral_context.push(message.clone());
+-            summary_history.push(message.clone());
++            // Request scope alone does not make a message independent context.
++            // Tool pairs belong in the summary input, but this replacement
++            // retains only users and a summary, not the calls they refer to.
++            if !message.parts.iter().any(|part| {
++                matches!(
++                    part.payload,
++                    ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
++                )
++            }) {
++                ephemeral_context.push(message.clone());
++            }
+         } else {
+-            summary_history.push(message.clone());
+             compactable_history.push(message.clone());
+         }
+     }
+diff --git a/hook/codex-context-preparation/src/tests.rs b/hook/codex-context-preparation/src/tests.rs
+index dae3b3a..f38e5f4 100644
+--- a/hook/codex-context-preparation/src/tests.rs
++++ b/hook/codex-context-preparation/src/tests.rs
+@@ -120,6 +120,7 @@ use crate::{
+     summary::{COMPACTION_PROMPT, SUMMARY_PREFIX, validate_summary_response_for_test},
+ };
+ 
++mod history_recovery;
+ mod stream_recovery;
+ 
+ #[derive(Default)]
+diff --git a/hook/codex-context-preparation/src/tests/history_recovery.rs b/hook/codex-context-preparation/src/tests/history_recovery.rs
+new file mode 100644
+index 0000000..48f11d0
+--- /dev/null
++++ b/hook/codex-context-preparation/src/tests/history_recovery.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use proteus_contracts::model_standard::PartScope;
++
++#[test]
++fn request_tool_pairs_are_summarized_not_reinjected_without_their_calls() {
++    for call_scope in [PartScope::Conversation, PartScope::Request] {
++        for compact in [false, true] {
++            let mut context = CanonicalMessage::text(MessageRole::User, "workspace context");
++            context.parts[0].scope = PartScope::Request;
++            let mut marker = CanonicalMessage::text(
++                MessageRole::User,
++                "<turn_aborted>interrupted</turn_aborted>",
++            );
++            marker.parts[0].scope = PartScope::Request;
++            let mut call = CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("old-call", "read_file", json!({"path":"old"})),
++                }],
++            );
++            call.parts[0].scope = call_scope;
++            let mut result = CanonicalMessage::new(
++                MessageRole::Tool,
++                vec![ContentPart::ToolResult {
++                    result: ToolResult::error("old-call".into(), "aborted"),
++                }],
++            )
++            .with_tool_call_id("old-call".into());
++            result.parts[0].scope = PartScope::Request;
++            let messages = vec![
++                context.clone(),
++                CanonicalMessage::text(MessageRole::User, "previous request"),
++                call.clone(),
++                result.clone(),
++                marker.clone(),
++                CanonicalMessage::text(MessageRole::User, "continue"),
++            ];
++            let mut host = TestHost::with_response("summary");
++            let prepared = input(messages.clone(), if compact { 500 } else { 0 });
++            let original = prepared.preparation();
++            let output = compact_with_host(prepared, &mut host);
++            proteus_contracts::contracts::validate_context_preparation_output(&original, &output)
++                .unwrap();
++            assert_eq!(output.changed, compact);
++            if compact {
++                assert!(
++                    !output
++                        .messages
++                        .iter()
++                        .flat_map(|message| &message.parts)
++                        .any(|part| matches!(
++                            part.payload,
++                            ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
++                        ))
++                );
++                assert!(output.messages.contains(&context));
++                assert!(output.messages.contains(&marker));
++                let requests = host.requests.lock().unwrap();
++                assert_eq!(requests.len(), 1);
++                assert!(requests[0].messages.contains(&call));
++                assert!(requests[0].messages.contains(&result));
++            } else {
++                assert_eq!(output.messages, messages);
++                assert!(host.requests.lock().unwrap().is_empty());
++            }
++        }
++    }
++}
+diff --git a/workflow/coding-workflow/src/codex_loop.rs b/workflow/coding-workflow/src/codex_loop.rs
+index 73a6378..5dbe0c1 100644
+--- a/workflow/coding-workflow/src/codex_loop.rs
++++ b/workflow/coding-workflow/src/codex_loop.rs
+@@ -36,7 +36,7 @@ pub(crate) fn run_codex_loop(
+         &mut turn.model_messages,
+         &input.runtime.interrupted_turns,
+     );
+-    super::codex_recovery::normalize_missing_tool_outputs(&mut turn.model_messages);
++    super::history::normalize_missing_tool_outputs(&mut turn.model_messages);
+     match run_loop(&input, host, module_id, &mut turn, stream_retry) {
+         Ok((text, metadata)) => turn
+             .finish(host, text, metadata)
+diff --git a/workflow/coding-workflow/src/codex_recovery.rs b/workflow/coding-workflow/src/codex_recovery.rs
+index 95898a2..481e334 100644
+--- a/workflow/coding-workflow/src/codex_recovery.rs
++++ b/workflow/coding-workflow/src/codex_recovery.rs
+@@ -1,9 +1,6 @@
+-use std::collections::HashSet;
+-
+ use proteus_contracts::{
+     contracts::WorkflowHistoryInterruption,
+-    domain::ToolResult,
+-    model_standard::{CanonicalMessage, ContentPart, MessageRole, PartProvenance, PartScope},
++    model_standard::{CanonicalMessage, MessageRole, PartProvenance, PartScope},
+ };
+ 
+ const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+@@ -41,38 +38,6 @@ pub(crate) fn prepare_interrupted_turns(
+     }
+ }
+ 
+-/// Pinned Codex context_manager/normalize.rs: missing call outputs become
+-/// prompt-only "aborted" outputs. This does not assert whether an effect ran.
+-/// The journal and durable history retain the original unresolved call.
+-pub(crate) fn normalize_missing_tool_outputs(messages: &mut Vec<CanonicalMessage>) {
+-    let completed = messages
+-        .iter()
+-        .flat_map(|message| &message.parts)
+-        .filter_map(|part| match &part.payload {
+-            ContentPart::ToolResult { result } => Some(result.call_id.clone()),
+-            _ => None,
+-        })
+-        .collect::<HashSet<_>>();
+-    let mut inserts = Vec::new();
+-    for (index, message) in messages.iter().enumerate() {
+-        for part in &message.parts {
+-            if let ContentPart::ToolCall { call } = &part.payload
+-                && !completed.contains(&call.id)
+-            {
+-                let mut output = crate::history::tool_result_message(ToolResult::error(
+-                    call.id.clone(),
+-                    "aborted",
+-                ));
+-                output.parts[0].scope = PartScope::Request;
+-                inserts.push((index + 1, output));
+-            }
+-        }
+-    }
+-    for (index, output) in inserts.into_iter().rev() {
+-        messages.insert(index, output);
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/workflow/coding-workflow/src/history.rs b/workflow/coding-workflow/src/history.rs
+index a7eec67..c2db61e 100644
+--- a/workflow/coding-workflow/src/history.rs
++++ b/workflow/coding-workflow/src/history.rs
+@@ -1,3 +1,5 @@
++use std::collections::HashSet;
++
+ use proteus_contracts::{
+     domain::{MessageId, ToolResult},
+     model_standard::{CanonicalMessage, ContentPart, MessageRole, PartScope},
+@@ -11,6 +13,35 @@ pub(crate) fn tool_result_message(result: ToolResult) -> CanonicalMessage {
+         .with_tool_call_id(call_id)
+ }
+ 
++/// Pinned Codex context_manager/normalize.rs: missing call outputs become
++/// prompt-only "aborted" outputs. This does not assert whether an effect ran.
++/// The journal and durable history retain the original unresolved call.
++pub(crate) fn normalize_missing_tool_outputs(messages: &mut Vec<CanonicalMessage>) {
++    let completed = messages
++        .iter()
++        .flat_map(|message| &message.parts)
++        .filter_map(|part| match &part.payload {
++            ContentPart::ToolResult { result } => Some(result.call_id.clone()),
++            _ => None,
++        })
++        .collect::<HashSet<_>>();
++    let mut inserts = Vec::new();
++    for (index, message) in messages.iter().enumerate() {
++        for part in &message.parts {
++            if let ContentPart::ToolCall { call } = &part.payload
++                && !completed.contains(&call.id)
++            {
++                let mut output = tool_result_message(ToolResult::error(call.id.clone(), "aborted"));
++                output.parts[0].scope = PartScope::Request;
++                inserts.push((index + 1, output));
++            }
++        }
++    }
++    for (index, output) in inserts.into_iter().rev() {
++        messages.insert(index, output);
++    }
++}
++
+ pub(crate) fn current_user_index(
+     messages: &[CanonicalMessage],
+     current_user_message_id: MessageId,
+diff --git a/workflow/coding-workflow/src/scaffold.rs b/workflow/coding-workflow/src/scaffold.rs
+index a90e83f..b3658d6 100644
+--- a/workflow/coding-workflow/src/scaffold.rs
++++ b/workflow/coding-workflow/src/scaffold.rs
+@@ -142,6 +142,7 @@ impl TurnScaffold {
+         input: &WorkflowModuleInput,
+     ) -> Result<Self, ProcessModuleError> {
+         let mut turn = Self::begin_without_context(host, input)?;
++        crate::history::normalize_missing_tool_outputs(&mut turn.model_messages);
+         turn.inject_context(host, input, 0)?;
+         Ok(turn)
+     }
+diff --git a/workflow/coding-workflow/src/tests.rs b/workflow/coding-workflow/src/tests.rs
+index 7d6d195..2540372 100644
+--- a/workflow/coding-workflow/src/tests.rs
++++ b/workflow/coding-workflow/src/tests.rs
+@@ -13,6 +13,7 @@ mod plan_execute_review;
+ mod preparation;
+ mod project_check_workflow;
+ mod request_accounting;
++mod resumed_history;
+ mod single_loop;
+ 
+ use serde_json::Value;
+diff --git a/workflow/coding-workflow/src/tests/resumed_history.rs b/workflow/coding-workflow/src/tests/resumed_history.rs
+new file mode 100644
+index 0000000..aeb7d85
+--- /dev/null
++++ b/workflow/coding-workflow/src/tests/resumed_history.rs
+@@ -0,0 +1,202 @@
++use super::*;
++use crate::history::normalize_missing_tool_outputs;
++use proteus_contracts::{
++    contracts::{WorkflowCheckpointAck, WorkflowHistoryInterruption, WorkflowHistoryUpdate},
++    model_standard::PartScope,
++};
++
++fn resumed_input(result: Option<ToolResult>) -> WorkflowModuleInput {
++    let mut input = workflow_input("continue");
++    let current = input.history.pop().unwrap();
++    input.history = vec![
++        CanonicalMessage::text(MessageRole::User, "previous request"),
++        tool_call_response(ToolCall::new(
++            "old-call",
++            "read_file",
++            json!({"path":"old"}),
++        ))
++        .messages
++        .remove(0),
++    ];
++    if let Some(result) = result {
++        input
++            .history
++            .push(crate::history::tool_result_message(result));
++    }
++    input.history.push(current);
++    input
++}
++
++fn results_for<'a>(messages: &'a [CanonicalMessage], id: &str) -> Vec<(&'a ToolResult, PartScope)> {
++    messages
++        .iter()
++        .flat_map(|message| &message.parts)
++        .filter_map(|part| match &part.payload {
++            ContentPart::ToolResult { result } if result.call_id == id => {
++                Some((result, part.scope))
++            }
++            _ => None,
++        })
++        .collect()
++}
++
++fn assert_resumed(workflow: &dyn WorkflowModule, expected_requests: usize) {
++    for real_result in [
++        None,
++        Some(ToolResult::ok("old-call".into(), "known result")),
++        Some(ToolResult::error("old-call".into(), "known failure")),
++    ] {
++        let input = resumed_input(real_result.clone());
++        let mut host = FakeHost::default();
++        let output: WorkflowModuleOutput = serde_json::from_str(
++            &workflow
++                .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++                .unwrap(),
++        )
++        .unwrap();
++        let requests = host.requests.lock().unwrap();
++        assert_eq!(requests.len(), expected_requests);
++        for request in requests.iter() {
++            let results = results_for(&request.messages, "old-call");
++            assert_eq!(results.len(), 1, "resumed request must close the old call");
++            match &real_result {
++                Some(real) => assert_eq!(results[0].0, real),
++                None => {
++                    assert_eq!(
++                        results[0].0,
++                        &ToolResult::error("old-call".into(), "aborted")
++                    );
++                    assert_eq!(results[0].1, PartScope::Request);
++                }
++            }
++        }
++        // The recovery must precede context preparation, not only provider encoding.
++        for compaction in host.compactions.lock().unwrap().iter() {
++            assert_eq!(results_for(&compaction.messages, "old-call").len(), 1);
++        }
++        assert_no_executed_calls(&host);
++        assert!(results_for(&output.new_messages, "old-call").is_empty());
++        assert!(output.history_replacement.is_none());
++        for checkpoint in host.checkpoints.lock().unwrap().iter() {
++            assert!(results_for(&checkpoint.history.new_messages, "old-call").is_empty());
++            assert!(checkpoint.history.history_replacement.is_none());
++            assert!(checkpoint.tool_results.is_empty());
++        }
++    }
++}
++
++#[test]
++fn resumed_single_loop_closes_history_without_recording_a_fake_execution() {
++    assert_resumed(&CodingSingleLoopWorkflow::default(), 1);
++}
++
++#[test]
++fn resumed_plan_execute_review_closes_history_in_all_three_phases() {
++    assert_resumed(&CodingPlanExecuteReviewWorkflow, 3);
++}
++
++#[test]
++fn resumed_codex_loop_keeps_existing_recovery_contract() {
++    assert_resumed(&CodingCodexLoopWorkflow, 1);
++}
++
++#[test]
++fn missing_outputs_preserve_real_results_order_and_are_idempotent() {
++    let calls = ["a", "b", "c"].map(|id| ToolCall::new(id, "read_file", json!({"path":id})));
++    let mut messages = vec![
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            calls
++                .iter()
++                .cloned()
++                .map(|call| ContentPart::ToolCall { call })
++                .collect(),
++        ),
++        crate::history::tool_result_message(ToolResult::ok("b".into(), "real")),
++        CanonicalMessage::text(MessageRole::User, "continue"),
++    ];
++    let original = messages.clone();
++    normalize_missing_tool_outputs(&mut messages);
++    assert_eq!(messages[0], original[0]);
++    assert_eq!(messages[3..], original[1..]);
++    assert_eq!(results_for(&messages[1..2], "a").len(), 1);
++    assert_eq!(results_for(&messages[2..3], "c").len(), 1);
++    assert_eq!(
++        results_for(&messages, "b")[0].0,
++        &ToolResult::ok("b".into(), "real")
++    );
++    let normalized = messages.clone();
++    normalize_missing_tool_outputs(&mut messages);
++    assert_eq!(messages, normalized);
++}
++
++#[test]
++fn codex_interruption_marker_follows_the_synthetic_result() {
++    let mut input = resumed_input(None);
++    let boundary = input.history[1].id;
++    let turn_id = new_turn_id();
++    input
++        .runtime
++        .interrupted_turns
++        .push(WorkflowHistoryInterruption {
++            turn_id,
++            after_message_id: boundary,
++        });
++    let mut host = FakeHost::default();
++    CodingCodexLoopWorkflow
++        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .unwrap();
++    let requests = host.requests.lock().unwrap();
++    let messages = &requests[0].messages;
++    let call_index = messages
++        .iter()
++        .position(|message| message.id == boundary)
++        .unwrap();
++    assert_eq!(
++        results_for(&messages[call_index + 1..call_index + 2], "old-call").len(),
++        1
++    );
++    assert_eq!(messages[call_index + 2].id, turn_id);
++    assert_eq!(messages[call_index + 2].parts[0].part_id, turn_id);
++    assert_eq!(messages[call_index + 2].parts[0].scope, PartScope::Request);
++    assert_eq!(messages[call_index + 3], *input.history.last().unwrap());
++}
++
++#[test]
++fn canonical_ack_retains_request_result_without_persisting_it() {
++    let input = resumed_input(None);
++    let mut host = FakeHost::default();
++    let mut turn = crate::scaffold::TurnScaffold::begin(&mut host, &input).unwrap();
++    assert_eq!(results_for(&turn.model_messages, "old-call").len(), 1);
++    let candidate = turn.model_messages.clone();
++    let material = ContextPreparationInput::new(candidate.clone(), None);
++    let compacted = proteus_contracts::contracts::ContextPreparationOutput::changed(
++        candidate.clone(),
++        Some("retained history".into()),
++    );
++    let report =
++        proteus_contracts::domain::HistoryCompactionReport::from_context_preparation_output(
++            &material, &compacted,
++        );
++    turn.apply_compaction_report(
++        Some(&report),
++        None,
++        &candidate,
++        crate::scaffold::PersistentRepair::Rebuild,
++    )
++    .unwrap();
++    assert!(results_for(&turn.persistent_messages, "old-call").is_empty());
++    *host.checkpoint_ack.lock().unwrap() = Some(WorkflowCheckpointAck {
++        history: WorkflowHistoryUpdate::new(vec![])
++            .with_history_replacement(input.history.clone())
++            .with_compactions(vec![report]),
++        messages: input.history.clone(),
++        revision: Some(1),
++    });
++    turn.checkpoint(&host, &[]).unwrap();
++    assert_eq!(turn.persistent_messages, input.history);
++    assert_eq!(results_for(&turn.model_messages, "old-call").len(), 1);
++    let checkpoints = host.checkpoints.lock().unwrap();
++    let persisted = checkpoints[0].history.history_replacement.as_ref().unwrap();
++    assert!(results_for(persisted, "old-call").is_empty());
++}
