@@ -1,0 +1,270 @@
+From 7bd840ad7f85c86e9b4fc1158593b5f4af6ece33 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 14 Nov 2026 21:14:12 +0800
+Subject: [PATCH] fix: give app-server user inputs independent queue identities
+
+---
+ crates/proteus-core/src/app_server/tests.rs   |  16 +-
+ .../src/app_server/user_inputs.rs             |  13 +-
+ .../src/app_server/user_inputs/tests.rs       | 151 ++++++++++++++++++
+ docs/guides/runtime-and-events.md             |  10 +-
+ 4 files changed, 179 insertions(+), 11 deletions(-)
+ create mode 100644 crates/proteus-core/src/app_server/user_inputs/tests.rs
+
+diff --git a/crates/proteus-core/src/app_server/tests.rs b/crates/proteus-core/src/app_server/tests.rs
+index 55bf8f2..97b527c 100644
+--- a/crates/proteus-core/src/app_server/tests.rs
++++ b/crates/proteus-core/src/app_server/tests.rs
+@@ -394,10 +394,16 @@ async fn user_input_forwarder_waits_without_timeout_when_timeout_is_zero() {
+         .await
+         .expect("user input request event should arrive")
+         .expect("event stream should stay open");
+-    assert!(matches!(
+-        request_event,
+-        AppServerEvent::UserInputRequested { request } if request.request_id == request_id
+-    ));
++    let request_id = match request_event {
++        AppServerEvent::UserInputRequested { request } => {
++            assert_ne!(
++                request.request_id, request_id,
++                "app-server owns queue identity"
++            );
++            request.request_id
++        }
++        other => panic!("expected user input request, got {other:?}"),
++    };
+ 
+     tokio::time::sleep(Duration::from_millis(30)).await;
+ 
+@@ -701,7 +707,7 @@ async fn zero_timeout_pending_user_input_resolves_on_shutdown() {
+         .expect("event stream should stay open");
+     assert!(matches!(
+         request_event,
+-        AppServerEvent::UserInputRequested { request } if request.request_id == request_id
++        AppServerEvent::UserInputRequested { request } if request.request_id != request_id
+     ));
+ 
+     user_inputs::resolve_pending_user_inputs_empty(pending_user_inputs.clone(), &events).await;
+diff --git a/crates/proteus-core/src/app_server/user_inputs.rs b/crates/proteus-core/src/app_server/user_inputs.rs
+index dc3f97c..98776ca 100644
+--- a/crates/proteus-core/src/app_server/user_inputs.rs
++++ b/crates/proteus-core/src/app_server/user_inputs.rs
+@@ -26,7 +26,7 @@ pub(super) struct PendingUserInputEntry {
+ pub(super) type PendingUserInputResponders =
+     Arc<Mutex<HashMap<AppUserInputRequestId, PendingUserInputEntry>>>;
+ 
+-/// Принимает user inputs из `ChannelUserInputTransport`, присваивает
++/// Принимает user inputs из `ChannelUserInputTransport`, присваивает id и
+ /// монотонный `seq` (attribution — `origin` — уже проставлен orchestrator-ом)
+ /// и регистрирует запись с watcher-таской.
+ pub(super) fn spawn_user_input_forwarder(
+@@ -39,8 +39,12 @@ pub(super) fn spawn_user_input_forwarder(
+         let mut next_seq: u64 = 0;
+         while let Some(PendingUserInput { request, responder }) = user_input_rx.recv().await {
+             next_seq += 1;
+-            let request = request.with_seq(next_seq);
+-            let request_id = request.request_id.clone();
++            let mut request = request.with_seq(next_seq);
++            // The caller's request ID is not an app-server queue identity:
++            // independent peers can share local call IDs. As with approvals,
++            // bind the reply to this invocation's responder, not its local ID.
++            let request_id = uuid::Uuid::new_v4().to_string();
++            request.request_id = request_id.clone();
+ 
+             register_pending_user_input(&pending_user_inputs, &events, request, responder).await;
+ 
+@@ -168,3 +172,6 @@ async fn watch_pending_user_input(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/app_server/user_inputs/tests.rs b/crates/proteus-core/src/app_server/user_inputs/tests.rs
+new file mode 100644
+index 0000000..28aaa9f
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/user_inputs/tests.rs
+@@ -0,0 +1,151 @@
++//! Queue identity belongs to the app-server, not to a local tool call.
++use super::*;
++use crate::{contracts::UserInputAnswer, domain::new_call_id};
++
++struct Queue {
++    send: mpsc::Sender<PendingUserInput>,
++    receive: tokio::sync::broadcast::Receiver<AppServerEvent>,
++    pending: PendingUserInputResponders,
++    events: AppEventPublisher,
++}
++
++impl Queue {
++    fn new() -> Self {
++        let (send, receive) = mpsc::channel(8);
++        let (events, _) = crate::app_server::events::test_event_channel(32);
++        let pending = Arc::new(Mutex::new(HashMap::new()));
++        spawn_user_input_forwarder(receive, events.clone(), pending.clone(), Duration::ZERO);
++        Self {
++            send,
++            receive: events.subscribe(),
++            pending,
++            events,
++        }
++    }
++
++    async fn request(
++        &mut self,
++        label: &str,
++    ) -> (UserInputRequest, oneshot::Receiver<UserInputResponse>) {
++        let (responder, receiver) = oneshot::channel();
++        self.send
++            .send(PendingUserInput {
++                request: UserInputRequest::new("call_0", "/workspace".into(), vec![])
++                    .with_title(label),
++                responder,
++            })
++            .await
++            .unwrap();
++        loop {
++            if let AppServerEvent::UserInputRequested { request } =
++                tokio::time::timeout(Duration::from_secs(2), self.receive.recv())
++                    .await
++                    .unwrap()
++                    .unwrap()
++            {
++                assert_eq!(request.title.as_deref(), Some(label));
++                return (*request, receiver);
++            }
++        }
++    }
++
++    async fn resolve(&self, id: &str, value: &str) -> Result<()> {
++        resolve_pending_user_input(
++            &self.pending,
++            &self.events,
++            id,
++            UserInputResponse::new(HashMap::from([(
++                "answer".into(),
++                UserInputAnswer::new(vec![value.into()]),
++            )])),
++        )
++        .await
++    }
++}
++
++#[tokio::test]
++async fn user_input_identity_is_unique_for_concurrent_local_call_ids() {
++    let mut queue = Queue::new();
++    let (first, first_response) = queue.request("first").await;
++    let (second, second_response) = queue.request("second").await;
++    assert_ne!(first.request_id, second.request_id);
++    assert_ne!(first.request_id, "call_0");
++    assert_eq!(first.seq, 1);
++    assert_eq!(second.seq, 2);
++    assert_eq!(queue.pending.lock().await.len(), 2);
++    queue
++        .resolve(&second.request_id, "second only")
++        .await
++        .unwrap();
++    queue
++        .resolve(&first.request_id, "first only")
++        .await
++        .unwrap();
++    assert_eq!(
++        first_response.await.unwrap().answers["answer"].answers,
++        ["first only"]
++    );
++    assert_eq!(
++        second_response.await.unwrap().answers["answer"].answers,
++        ["second only"]
++    );
++    assert!(queue.pending.lock().await.is_empty());
++}
++
++#[tokio::test]
++async fn user_input_identity_does_not_reuse_a_completed_generation() {
++    let mut queue = Queue::new();
++    let (first, first_response) = queue.request("old generation").await;
++    queue
++        .resolve(&first.request_id, "old result")
++        .await
++        .unwrap();
++    first_response.await.unwrap();
++    let (second, mut second_response) = queue.request("new generation").await;
++    // This is also the callback used by an already-scheduled old timeout.
++    // A delayed client response or timeout cannot close the replacement.
++    assert!(
++        queue
++            .resolve(&first.request_id, "stale result")
++            .await
++            .is_err()
++    );
++    assert_eq!(queue.pending.lock().await.len(), 1);
++    assert!(matches!(
++        second_response.try_recv(),
++        Err(oneshot::error::TryRecvError::Empty)
++    ));
++    assert!(queue.resolve(&new_call_id(), "unknown").await.is_err());
++    queue
++        .resolve(&second.request_id, "new result")
++        .await
++        .unwrap();
++    assert_eq!(
++        second_response.await.unwrap().answers["answer"].answers,
++        ["new result"]
++    );
++}
++
++#[tokio::test]
++async fn user_input_identity_cancellation_preserves_same_id_sibling() {
++    let mut queue = Queue::new();
++    let (first, first_response) = queue.request("cancelled").await;
++    let (second, second_response) = queue.request("survivor").await;
++    drop(first_response);
++    let resolved = tokio::time::timeout(Duration::from_secs(2), queue.receive.recv())
++        .await
++        .unwrap()
++        .unwrap();
++    assert!(
++        matches!(resolved, AppServerEvent::UserInputResolved { request_id } if request_id == first.request_id)
++    );
++    let pending = queue.pending.lock().await;
++    assert!(!pending.contains_key(&first.request_id));
++    assert!(pending.contains_key(&second.request_id));
++    drop(pending);
++    queue.resolve(&second.request_id, "survived").await.unwrap();
++    assert_eq!(
++        second_response.await.unwrap().answers["answer"].answers,
++        ["survived"]
++    );
++}
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 119149a..6a31b9b 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -2164,8 +2164,12 @@ MathJax запускается только после
+ пользователя до cancel или shutdown. Как и approvals, pending user inputs
+ атрибуцированы и per-request scoped: `UserInputRequest.origin` несёт
+ `RequestOrigin` (`ExecutionId` + optional thread/turn + метка роли субагента),
+-`UserInputRequest.seq` —
+-порядок очереди, а watcher app-server-а убирает запись, когда запросивший
++`UserInputRequest.seq` — порядок очереди. App-server назначает собственный
++непрозрачный `request_id` каждой записи, независимо от локального tool call ID.
++Клиент отвечает по ID из `UserInputRequested`, не вычисляет его из call ID и
++не переиспользует его в следующем turn. Process bridge возвращает ответ по
++исходному ID дочернего app-server-а; совпадающие локальные IDs разных peers
++не объединяют их pending requests. Watcher app-server-а убирает запись, когда запросивший
+ умирает (cancel turn-а), не трогая pending user inputs других turn-ов;
+ blanket-resolve остаётся только на shutdown (см.
+ `docs/guides/security-and-policy.md`).
+@@ -2224,7 +2228,7 @@ permission mode одной записью runtime state. Уже admitted Turn п
+   "event": {
+     "type": "user_input_requested",
+     "request": {
+-      "request_id": "call_1",
++      "request_id": "f4e9ccda-57c6-4a7f-b104-ed0135286ecb",
+       "title": "Telegram bot",
+       "questions": [
+         {
+-- 
+2.52.0
+
