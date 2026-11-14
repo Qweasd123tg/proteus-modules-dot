@@ -1,0 +1,840 @@
+From 1e96d9bf0e649ed9c1983436532b256df74a559d Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 14 Nov 2026 20:58:17 +0800
+Subject: [PATCH] fix: share bounded peer cancellation settlement with role
+ timeout
+
+---
+ .../src/core/agent_control/process/child.rs   |  11 ++
+ .../src/core/agent_control/process/mod.rs     |  56 +++---
+ .../src/core/agent_control/process/turn.rs    | 170 ++++++------------
+ .../tests/fixtures/agent_output_peer.py       |  17 +-
+ .../tests/process_agent_control.rs            | 127 +++++++------
+ .../process_agent_control/output_limits.rs    | 148 ++++++++++++++-
+ docs/architecture/subagents.md                |  11 ++
+ 7 files changed, 344 insertions(+), 196 deletions(-)
+
+diff --git a/crates/proteus-core/src/core/agent_control/process/child.rs b/crates/proteus-core/src/core/agent_control/process/child.rs
+index b98ed8c..1515ca6 100644
+--- a/crates/proteus-core/src/core/agent_control/process/child.rs
++++ b/crates/proteus-core/src/core/agent_control/process/child.rs
+@@ -28,6 +28,8 @@ pub(super) struct ChildProcess {
+     deadline: Option<Instant>,
+     cancellation: Option<CancellationToken>,
+     session: Option<AppSubagentSession>,
++    // Remains set if an outer deadline drops send before a complete JSONL frame.
++    write_in_flight: bool,
+ }
+ 
+ impl ChildProcess {
+@@ -80,6 +82,7 @@ impl ChildProcess {
+             deadline: None,
+             cancellation: None,
+             session: None,
++            write_in_flight: false,
+         })
+     }
+ 
+@@ -90,6 +93,7 @@ impl ChildProcess {
+         let health = self.outputs.health();
+         let deadline = self.deadline;
+         let cancellation = self.cancellation.clone();
++        self.write_in_flight = true;
+         let result = tokio::select! {
+             biased;
+             _ = async {
+@@ -108,10 +112,16 @@ impl ChildProcess {
+         // Such a connection must never be returned to the process pool.
+         if result.is_err() {
+             self.kill().await;
++        } else {
++            self.write_in_flight = false;
+         }
+         result
+     }
+ 
++    pub(super) fn has_complete_write(&self) -> bool {
++        !self.write_in_flight
++    }
++
+     pub(super) fn set_write_budget(
+         &mut self,
+         deadline: Option<Instant>,
+@@ -240,6 +250,7 @@ impl ChildProcess {
+             deadline: None,
+             cancellation: None,
+             session: None,
++            write_in_flight: false,
+         }
+     }
+ }
+diff --git a/crates/proteus-core/src/core/agent_control/process/mod.rs b/crates/proteus-core/src/core/agent_control/process/mod.rs
+index db4dfe1..2365e3c 100644
+--- a/crates/proteus-core/src/core/agent_control/process/mod.rs
++++ b/crates/proteus-core/src/core/agent_control/process/mod.rs
+@@ -67,7 +67,7 @@ use outcome::{status_label, truncate_summary};
+ use pool::{PooledChild, ProcessPool, ReleaseOutcome, ResumeReservation};
+ #[cfg(test)]
+ use turn::should_forward_child_event;
+-use turn::{ChildEventForwarder, TurnEnd, TurnTracker, drive_turn};
++use turn::{ChildEventForwarder, TurnEnd, TurnTracker, drive_turn, finish_interrupted};
+ 
+ pub(super) struct ProcessAgentControl {
+     inner: Arc<RunnerInner>,
+@@ -289,7 +289,6 @@ impl RunnerInner {
+             Some(forwarder.ctx.execution.scope.cancellation.clone()),
+         );
+         let send_id = new_call_id();
+-        let active_send_id = StdMutex::new(send_id.clone());
+         let body = async {
+             leased.child.drain_stale_outputs()?;
+             if !is_resume && leased.used {
+@@ -306,21 +305,18 @@ impl RunnerInner {
+                     text: request.prompt.clone(),
+                 })
+                 .await?;
+-            drive_turn(
+-                &mut leased.child,
+-                forwarder,
+-                &send_id,
+-                tracker,
+-                self.cancel_grace,
+-                mailbox,
+-                &active_send_id,
+-            )
+-            .await
++            tracker.active_send_id = Some(send_id.clone());
++            drive_turn(&mut leased.child, forwarder, &send_id, tracker, mailbox).await
+         };
+         let result = match deadline {
+-            Some(deadline) => timeout_at(deadline, body)
+-                .await
+-                .unwrap_or_else(|_| Err(anyhow!("subagent role deadline exceeded"))),
++            Some(deadline) => timeout_at(deadline, body).await.unwrap_or_else(|_| {
++                let status = if forwarder.ctx.execution.scope.cancellation.is_cancelled() {
++                    AgentLifecycleStatus::Cancelled
++                } else {
++                    AgentLifecycleStatus::TimedOut
++                };
++                Ok(TurnEnd::Interrupted(status))
++            }),
+             None => body.await,
+         };
+         let interrupted = if forwarder.ctx.execution.scope.cancellation.is_cancelled() {
+@@ -330,17 +326,27 @@ impl RunnerInner {
+         } else {
+             None
+         };
+-        if result.is_err() {
+-            // Setup or an in-flight write may have stopped midway through a
+-            // frame. Invalidate the connection instead of appending Cancel.
+-            leased.child.kill().await;
+-        }
++        let result = match result {
++            Ok(TurnEnd::Interrupted(status)) => Ok(finish_interrupted(
++                &mut leased.child,
++                forwarder,
++                tracker,
++                self.cancel_grace,
++                status,
++            )
++            .await),
++            Err(error) => {
++                // A protocol/setup/write error remains fatal even if a cancel
++                // or deadline became visible at the same time.
++                leased.child.kill().await;
++                match interrupted {
++                    Some(status) => Ok(TurnEnd::Interrupted(status)),
++                    None => Err(error),
++                }
++            }
++            completed => completed,
++        };
+         leased.child.set_write_budget(None, None);
+-        if result.is_err()
+-            && let Some(status) = interrupted
+-        {
+-            return Ok(TurnEnd::Interrupted(status));
+-        }
+         result
+     }
+ 
+diff --git a/crates/proteus-core/src/core/agent_control/process/turn.rs b/crates/proteus-core/src/core/agent_control/process/turn.rs
+index 0b30b08..e56232e 100644
+--- a/crates/proteus-core/src/core/agent_control/process/turn.rs
++++ b/crates/proteus-core/src/core/agent_control/process/turn.rs
+@@ -1,7 +1,7 @@
+ //! One stdio turn on a leased process child: event forwarding, interactive
+ //! request bridging, usage tracking and cancel/timeout protocol.
+ 
+-use std::{sync::Mutex, time::Duration};
++use std::time::Duration;
+ 
+ use anyhow::{Context as _, Result, bail};
+ use proteus_contracts::app_protocol::{AppServerEvent, StdioOutput, StdioRequest};
+@@ -33,7 +33,9 @@ pub(super) struct TurnTracker {
+     /// источник partial summary при cancel/timeout.
+     last_text: Option<String>,
+     stream_buffer: String,
+-    cancel_sent: bool,
++    // A cancel target is published only after its complete Send frame.
++    pub(super) active_send_id: Option<String>,
++    message_delivery: PeerMessageDelivery,
+     /// Messages confirmed by the peer app-server during this logical
+     /// generation. The initial task prompt is not counted.
+     pub(super) delivered_messages: u64,
+@@ -209,54 +211,40 @@ pub(super) async fn drive_turn(
+     forwarder: &ChildEventForwarder<'_>,
+     send_id: &str,
+     tracker: &mut TurnTracker,
+-    cancel_grace: Duration,
+     mailbox: &ChildMailbox,
+-    published_active_send_id: &Mutex<String>,
+ ) -> Result<TurnEnd> {
+     let mut active_send_id = send_id.to_owned();
+     let mut active_started_by_message = false;
+     let mut active_terminal_seen = false;
+-    let mut message_delivery = PeerMessageDelivery::default();
+     let mut pending_terminal = None;
+     let mut pending_from_message_turn = false;
+ 
+     loop {
+-        if forwarder.ctx.execution.scope.cancellation.is_cancelled() && !tracker.cancel_sent {
+-            return finish_cancelled(
+-                child,
+-                forwarder,
+-                &active_send_id,
+-                tracker,
+-                cancel_grace,
+-                message_delivery.is_settled(),
+-            )
+-            .await;
++        if forwarder.ctx.execution.scope.cancellation.is_cancelled() {
++            return Ok(TurnEnd::Interrupted(AgentLifecycleStatus::Cancelled));
+         }
+ 
+         let delivery_guard = mailbox.lock_delivery().await;
+-        if forwarder.ctx.execution.scope.cancellation.is_cancelled() && !tracker.cancel_sent {
++        if forwarder.ctx.execution.scope.cancellation.is_cancelled() {
+             drop(delivery_guard);
+-            return finish_cancelled(
+-                child,
+-                forwarder,
+-                &active_send_id,
+-                tracker,
+-                cancel_grace,
+-                message_delivery.is_settled(),
+-            )
+-            .await;
++            return Ok(TurnEnd::Interrupted(AgentLifecycleStatus::Cancelled));
+         }
+-        if active_terminal_seen && message_delivery.is_settled() && pending_terminal.is_some() {
++        if active_terminal_seen
++            && tracker.message_delivery.is_settled()
++            && pending_terminal.is_some()
++        {
+             let messages = mailbox.drain_or_close()?;
+             if messages.is_empty() {
+                 return Ok(pending_terminal
+                     .take()
+                     .expect("terminal checked before mailbox close"));
+             }
+-            active_send_id = message_delivery.start_continuation(child, messages).await?;
+-            *published_active_send_id
+-                .lock()
+-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = active_send_id.clone();
++            tracker.active_send_id = None;
++            active_send_id = tracker
++                .message_delivery
++                .start_continuation(child, messages)
++                .await?;
++            tracker.active_send_id = Some(active_send_id.clone());
+             active_started_by_message = true;
+             active_terminal_seen = false;
+             pending_terminal = None;
+@@ -264,7 +252,7 @@ pub(super) async fn drive_turn(
+         } else {
+             let messages = mailbox.drain()?;
+             if !messages.is_empty() {
+-                message_delivery.queue(child, messages).await?;
++                tracker.message_delivery.queue(child, messages).await?;
+             }
+         }
+         drop(delivery_guard);
+@@ -272,15 +260,7 @@ pub(super) async fn drive_turn(
+         let output = tokio::select! {
+             output = child.next_output() => output,
+             _ = forwarder.ctx.execution.scope.cancellation.cancelled() => {
+-                return finish_cancelled(
+-                    child,
+-                    forwarder,
+-                    &active_send_id,
+-                    tracker,
+-                    cancel_grace,
+-                    message_delivery.is_settled(),
+-                )
+-                .await;
++                return Ok(TurnEnd::Interrupted(AgentLifecycleStatus::Cancelled));
+             }
+             _ = mailbox.notified() => continue,
+         };
+@@ -288,16 +268,7 @@ pub(super) async fn drive_turn(
+             bail!("subagent child process exited unexpectedly");
+         };
+ 
+-        match handle_output(
+-            child,
+-            forwarder,
+-            &active_send_id,
+-            tracker,
+-            &mut message_delivery,
+-            output,
+-        )
+-        .await?
+-        {
++        match handle_output(child, forwarder, &active_send_id, tracker, output).await? {
+             OutputVerdict::Continue => {}
+             OutputVerdict::Finished(TurnEnd::Completed(text)) => {
+                 active_terminal_seen = true;
+@@ -315,58 +286,43 @@ pub(super) async fn drive_turn(
+             }
+             OutputVerdict::Finished(end) => return Ok(end),
+             OutputVerdict::CancelRequested => {
+-                return finish_cancelled(
+-                    child,
+-                    forwarder,
+-                    &active_send_id,
+-                    tracker,
+-                    cancel_grace,
+-                    message_delivery.is_settled(),
+-                )
+-                .await;
++                return Ok(TurnEnd::Interrupted(AgentLifecycleStatus::Cancelled));
+             }
+         }
+     }
+ }
+ 
+-async fn finish_cancelled(
++/// One owner for user cancellation and role timeout. Only a complete Send with
++/// no ambiguous message receipts can be canceled by id and safely pooled again.
++pub(super) async fn finish_interrupted(
+     child: &mut ChildProcess,
+     forwarder: &ChildEventForwarder<'_>,
+-    send_id: &str,
+-    tracker: &mut TurnTracker,
+-    cancel_grace: Duration,
+-    messages_settled: bool,
+-) -> Result<TurnEnd> {
+-    // A pending Send may have started a new turn after the original terminal
+-    // response. Targeted cancellation of the old request cannot prove idle.
+-    if !messages_settled {
+-        child.kill().await;
+-        return Ok(TurnEnd::Interrupted(AgentLifecycleStatus::Cancelled));
+-    }
+-    finish_interrupted_with(
+-        child,
+-        forwarder,
+-        send_id,
+-        tracker,
+-        cancel_grace,
+-        AgentLifecycleStatus::Cancelled,
+-    )
+-    .await
+-}
+-
+-async fn finish_interrupted_with(
+-    child: &mut ChildProcess,
+-    forwarder: &ChildEventForwarder<'_>,
+-    send_id: &str,
+     tracker: &mut TurnTracker,
+     cancel_grace: Duration,
+     status: AgentLifecycleStatus,
+-) -> Result<TurnEnd> {
+-    let clean = cancel_child_turn(child, forwarder, send_id, tracker, cancel_grace).await;
++) -> TurnEnd {
++    let clean = if child.has_complete_write() && tracker.message_delivery.is_settled() {
++        if let Some(send_id) = tracker.active_send_id.clone() {
++            let deadline = Instant::now() + cancel_grace;
++            child.set_write_budget(Some(deadline), None);
++            // The whole settlement is bounded, including event forwarding and
++            // the Cancel write, not only reads from the peer's stdout.
++            timeout_at(
++                deadline,
++                cancel_child_turn(child, forwarder, &send_id, tracker),
++            )
++            .await
++            .unwrap_or(false)
++        } else {
++            false
++        }
++    } else {
++        false
++    };
+     if !clean {
+         child.kill().await;
+     }
+-    Ok(TurnEnd::Interrupted(status))
++    TurnEnd::Interrupted(status)
+ }
+ 
+ enum OutputVerdict {
+@@ -381,7 +337,6 @@ async fn handle_output(
+     forwarder: &ChildEventForwarder<'_>,
+     send_id: &str,
+     tracker: &mut TurnTracker,
+-    message_delivery: &mut PeerMessageDelivery,
+     output: StdioOutput,
+ ) -> Result<OutputVerdict> {
+     match output {
+@@ -440,7 +395,9 @@ async fn handle_output(
+             error,
+         } => {
+             if let Some(response) =
+-                message_delivery.confirm(&id, ok, output.as_ref(), error.as_deref())?
++                tracker
++                    .message_delivery
++                    .confirm(&id, ok, output.as_ref(), error.as_deref())?
+             {
+                 return Ok(match response {
+                     PeerMessageResponse::Queued => {
+@@ -463,11 +420,6 @@ async fn handle_output(
+                 forwarder.bind_session(child, tracker).await?;
+                 return Ok(OutputVerdict::Finished(TurnEnd::Completed(text)));
+             }
+-            if tracker.cancel_sent {
+-                return Ok(OutputVerdict::Finished(TurnEnd::Interrupted(
+-                    AgentLifecycleStatus::Cancelled,
+-                )));
+-            }
+             bail!(
+                 "subagent child turn failed: {}",
+                 error.unwrap_or_else(|| "unknown error".to_owned())
+@@ -477,30 +429,26 @@ async fn handle_output(
+     }
+ }
+ 
+-pub(super) async fn cancel_child_turn(
++async fn cancel_child_turn(
+     child: &mut ChildProcess,
+     forwarder: &ChildEventForwarder<'_>,
+     send_id: &str,
+     tracker: &mut TurnTracker,
+-    cancel_grace: Duration,
+ ) -> bool {
+-    let deadline = Instant::now() + cancel_grace;
+-    child.set_write_budget(Some(deadline), None);
+-    if !tracker.cancel_sent {
+-        tracker.cancel_sent = true;
+-        let cancel = StdioRequest::Cancel {
++    if child
++        .send(&StdioRequest::Cancel {
+             id: None,
+             target_id: send_id.to_owned(),
+-        };
+-        if child.send(&cancel).await.is_err() {
+-            return false;
+-        }
++        })
++        .await
++        .is_err()
++    {
++        return false;
+     }
+-
+     loop {
+-        let output = match timeout_at(deadline, child.next_output()).await {
+-            Ok(Ok(Some(output))) => output,
+-            Ok(Ok(None) | Err(_)) | Err(_) => return false,
++        let output = match child.next_output().await {
++            Ok(Some(output)) => output,
++            Ok(None) | Err(_) => return false,
+         };
+         match output {
+             StdioOutput::Response { id, .. } if id.as_deref() == Some(send_id) => return true,
+diff --git a/crates/proteus-core/tests/fixtures/agent_output_peer.py b/crates/proteus-core/tests/fixtures/agent_output_peer.py
+index b54575a..b6d7201 100644
+--- a/crates/proteus-core/tests/fixtures/agent_output_peer.py
++++ b/crates/proteus-core/tests/fixtures/agent_output_peer.py
+@@ -30,6 +30,8 @@ emit({"type": "event", "event": {"type": "runtime", "envelope": {
+ 
+ for line in sys.stdin:
+     request = json.loads(line)
++    with pathlib.Path("requests.jsonl").open("a") as log:
++        log.write(json.dumps({"pid": os.getpid(), "request": request}) + "\n")
+     kind = request["type"]
+     if kind == "send":
+         active_id = request["id"]
+@@ -37,7 +39,11 @@ for line in sys.stdin:
+         if mode == "healthy":
+             result(active_id, "healthy peer")
+             continue
+-        if mode == "input-overflow":
++        if mode == "stop-reading":
++            pathlib.Path("produced").touch()
++            time.sleep(30)
++            continue
++        if mode in ("input-overflow", "input-timeout"):
+             event = {"type": "user_input_requested", "request": {
+                 "request_id": "input", "cwd": str(pathlib.Path.cwd()),
+                 "title": None, "questions": [], "origin": None, "seq": 0}}
+@@ -83,6 +89,15 @@ for line in sys.stdin:
+         result(active_id, "approved result")
+     elif kind == "cancel":
+         pathlib.Path("cancelled").touch()
++        # An unrelated Cancel ACK is not the targeted Send terminal.
++        result(None, "cancel accepted")
++        if mode == "ignore-cancel":
++            continue
++        if mode == "blocked-settlement-event":
++            emit({"type": "event", "event": {"type": "runtime", "envelope": {
++                "schema_version": 2, "event_id": identity, "session_id": identity,
++                "thread_id": identity, "turn_id": identity, "seq": 99,
++                "timestamp_ms": 0, "event": {"Error": {"message": "settling"}}}}})
+         result(request["target_id"], "cancelled result")
+     elif kind == "clear_history":
+         result(request["id"], "cleared")
+diff --git a/crates/proteus-core/tests/process_agent_control.rs b/crates/proteus-core/tests/process_agent_control.rs
+index 0923208..2a1905b 100644
+--- a/crates/proteus-core/tests/process_agent_control.rs
++++ b/crates/proteus-core/tests/process_agent_control.rs
+@@ -469,15 +469,16 @@ async fn process_agent_startup_crash_does_not_fail_a_live_sibling() {
+ #[tokio::test]
+ async fn cancellation_never_pools_peer_with_an_unsettled_message_started_turn() {
+     use std::os::unix::fs::PermissionsExt as _;
+-    let fixture = tempfile::tempdir().unwrap();
+-    let workspace = tempfile::tempdir().unwrap();
+-    let marker = fixture.path().join("first");
+-    let started = fixture.path().join("second");
+-    let pid_file = fixture.path().join("pid");
+-    let binary = fixture.path().join("race.py");
+-    let startup = include_str!("fixtures/agent_session_start.py");
+-    let script = format!(
+-        r#"#!/usr/bin/env python3
++    for cancel in [false, true] {
++        let fixture = tempfile::tempdir().unwrap();
++        let workspace = tempfile::tempdir().unwrap();
++        let marker = fixture.path().join("first");
++        let started = fixture.path().join("second");
++        let pid_file = fixture.path().join("pid");
++        let binary = fixture.path().join("race.py");
++        let startup = include_str!("fixtures/agent_session_start.py");
++        let script = format!(
++            r#"#!/usr/bin/env python3
+ import json, pathlib, sys, os
+ {startup}
+ pathlib.Path({pid_file:?}).write_text(str(os.getpid()))
+@@ -495,57 +496,67 @@ for line in sys.stdin:
+         print(json.dumps({{"type":"response","id":first,"ok":True,
+             "output":{{"text":"old A","metadata":None}},"error":None}}), flush=True)
+ "#,
+-        pid_file = pid_file.to_str().unwrap(),
+-        marker = marker.to_str().unwrap(),
+-        started = started.to_str().unwrap()
+-    );
+-    std::fs::write(&binary, script).unwrap();
+-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+-    let runner = runner_from_json(json!({
+-        "binary":binary,"max_parallel":1,"max_idle_processes":1,
+-        "roles":[{"name":"helper","description":"race","config":"fixture",
+-            "parallel_safe":true,"max_processes":1,"timeout_ms":10000}]
+-    }));
+-    let handle = runner
+-        .spawn(
+-            collaboration_request(
+-                "helper",
+-                "race",
+-                "initial",
+-                AgentTask::new("delegate", workspace.path().into()),
+-            ),
+-            test_runtime_context(),
+-        )
+-        .await
+-        .unwrap();
+-    async fn wait(path: &std::path::Path) {
+-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+-            while !path.exists() {
+-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
++            pid_file = pid_file.to_str().unwrap(),
++            marker = marker.to_str().unwrap(),
++            started = started.to_str().unwrap()
++        );
++        std::fs::write(&binary, script).unwrap();
++        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
++        let runner = runner_from_json(json!({
++            "binary":binary,"max_parallel":1,"max_idle_processes":1,
++            "roles":[{"name":"helper","description":"race","config":"fixture",
++                "parallel_safe":true,"max_processes":1,"timeout_ms":if cancel {10000} else {600}}]
++        }));
++        let handle = runner
++            .spawn(
++                collaboration_request(
++                    "helper",
++                    "race",
++                    "initial",
++                    AgentTask::new("delegate", workspace.path().into()),
++                ),
++                test_runtime_context(),
++            )
++            .await
++            .unwrap();
++        async fn wait(path: &std::path::Path) {
++            tokio::time::timeout(std::time::Duration::from_secs(3), async {
++                while !path.exists() {
++                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
++                }
++            })
++            .await
++            .unwrap();
++        }
++        wait(&marker).await;
++        runner
++            .send(&handle, agent_message("race", "B"))
++            .await
++            .unwrap();
++        wait(&started).await;
++        if cancel {
++            runner.cancel(&handle).await.unwrap();
++        }
++        let result = tokio::time::timeout(std::time::Duration::from_secs(3), runner.wait(&handle))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            result.status,
++            if cancel {
++                AgentLifecycleStatus::Cancelled
++            } else {
++                AgentLifecycleStatus::TimedOut
+             }
+-        })
+-        .await
+-        .unwrap();
++        );
++        assert_eq!(result.metadata["resumable"], false);
++        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
++        assert_eq!(
++            unsafe { libc::kill(pid, 0) },
++            -1,
++            "ambiguous peer must be reaped"
++        );
+     }
+-    wait(&marker).await;
+-    runner
+-        .send(&handle, agent_message("race", "B"))
+-        .await
+-        .unwrap();
+-    wait(&started).await;
+-    runner.cancel(&handle).await.unwrap();
+-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), runner.wait(&handle))
+-        .await
+-        .unwrap()
+-        .unwrap();
+-    assert_eq!(result.status, AgentLifecycleStatus::Cancelled);
+-    assert_eq!(result.metadata["resumable"], false);
+-    let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+-    assert_eq!(
+-        unsafe { libc::kill(pid, 0) },
+-        -1,
+-        "ambiguous peer must be reaped"
+-    );
+ }
+ 
+ #[cfg(unix)]
+diff --git a/crates/proteus-core/tests/process_agent_control/output_limits.rs b/crates/proteus-core/tests/process_agent_control/output_limits.rs
+index 9c99a4c..bb9bf8e 100644
+--- a/crates/proteus-core/tests/process_agent_control/output_limits.rs
++++ b/crates/proteus-core/tests/process_agent_control/output_limits.rs
+@@ -52,6 +52,10 @@ impl UserInputTransport for DelayedInteraction {
+ }
+ 
+ fn runner(root: &std::path::Path) -> Arc<dyn AgentControl> {
++    runner_with_timeout(root, None)
++}
++
++fn runner_with_timeout(root: &std::path::Path, timeout_ms: Option<u64>) -> Arc<dyn AgentControl> {
+     use std::os::unix::fs::PermissionsExt;
+     let binary = root.join("peer.py");
+     std::fs::write(&binary, include_str!("../fixtures/agent_output_peer.py")).unwrap();
+@@ -59,9 +63,11 @@ fn runner(root: &std::path::Path) -> Arc<dyn AgentControl> {
+     runner_from_json(json!({
+         "binary": binary,
+         "max_parallel": 2,
++        "cancel_grace_ms": 100,
+         "roles": [{
+             "name": "helper", "description": "Output limit fixture",
+-            "config": "unused", "parallel_safe": true, "max_processes": 2
++            "config": "unused", "parallel_safe": true, "max_processes": 2,
++            "timeout_ms": timeout_ms
+         }]
+     }))
+ }
+@@ -170,3 +176,143 @@ async fn queued_output_preserves_approval_result_and_targeted_cancel() {
+         }
+     }
+ }
++
++#[tokio::test]
++async fn role_deadline_cancels_pending_interaction_and_reuses_settled_peer() {
++    for mode in ["normal", "input-timeout"] {
++        let root = tempfile::tempdir().unwrap();
++        let runner = runner_with_timeout(root.path(), Some(600));
++        let mut ctx = test_runtime_context();
++        let interaction = Arc::new(DelayedInteraction {
++            waiting: root.path().join("waiting"),
++            release: Notify::new(),
++        });
++        ctx.execution.approval = interaction.clone();
++        ctx.user_input = interaction;
++        let task = AgentTask::new("deadline", root.path().to_path_buf());
++        let handle = runner
++            .spawn(
++                AgentControlRequest::new("helper", mode, task.clone()),
++                ctx.clone(),
++            )
++            .await
++            .unwrap();
++        wait_for(&root.path().join("produced")).await;
++        let result = tokio::time::timeout(Duration::from_secs(3), runner.wait(&handle))
++            .await
++            .expect("bounded role timeout and settlement")
++            .unwrap();
++        assert_eq!(result.status, AgentLifecycleStatus::TimedOut);
++        assert_eq!(result.metadata["resumable"], true);
++        assert!(root.path().join("cancelled").exists());
++        assert!(!root.path().join("answered").exists());
++        if mode == "normal" {
++            assert_eq!(
++                result.summary,
++                (0..32).map(|i| format!("{i:02};")).collect::<String>()
++            );
++        }
++        let resumed = runner
++            .run(
++                AgentControlRequest::new("helper", "healthy", task)
++                    .with_metadata(json!({"task_id": handle.child_thread_id.to_string()})),
++                ctx,
++            )
++            .await
++            .expect("settled peer is resumable");
++        assert_eq!(resumed.status, AgentLifecycleStatus::Completed);
++        assert_eq!(resumed.summary, "healthy peer");
++        let requests = requests(root.path());
++        assert_eq!(requests.len(), 3, "Send, exact Cancel, resumed Send");
++        assert_eq!(
++            requests[1]["request"]["target_id"],
++            requests[0]["request"]["id"]
++        );
++        assert_eq!(requests[0]["pid"], requests[2]["pid"]);
++    }
++}
++
++fn requests(root: &std::path::Path) -> Vec<serde_json::Value> {
++    std::fs::read_to_string(root.join("requests.jsonl"))
++        .unwrap()
++        .lines()
++        .map(|line| serde_json::from_str(line).unwrap())
++        .collect()
++}
++
++struct BlockSettlementEvents(PathBuf);
++
++#[async_trait]
++impl proteus_contracts::contracts::EventSink for BlockSettlementEvents {
++    async fn append(
++        &self,
++        envelope: proteus_contracts::domain::EventEnvelope,
++    ) -> anyhow::Result<()> {
++        if matches!(
++            envelope.event,
++            proteus_contracts::domain::Event::Error { .. }
++        ) {
++            std::fs::write(&self.0, "entered").unwrap();
++            std::future::pending::<()>().await;
++        }
++        Ok(())
++    }
++}
++
++#[tokio::test]
++async fn role_deadline_does_not_pool_unsettled_or_partially_written_peer() {
++    for mode in ["ignore-cancel", "blocked-settlement-event", "stop-reading"] {
++        let root = tempfile::tempdir().unwrap();
++        let runner = runner_with_timeout(root.path(), Some(600));
++        let mut ctx = test_runtime_context();
++        ctx.execution.approval = Arc::new(DelayedInteraction {
++            waiting: root.path().join("waiting"),
++            release: Notify::new(),
++        });
++        if mode == "blocked-settlement-event" {
++            ctx.events = Arc::new(proteus_contracts::contracts::EventEmitter::new(Arc::new(
++                BlockSettlementEvents(root.path().join("event-blocked")),
++            )));
++        }
++        let handle = runner
++            .spawn(
++                collaboration_request(
++                    "helper",
++                    "alpha",
++                    mode,
++                    AgentTask::new("deadline", root.path().to_path_buf()),
++                ),
++                ctx,
++            )
++            .await
++            .unwrap();
++        wait_for(&root.path().join("produced")).await;
++        if mode == "stop-reading" {
++            // Four valid 16 KB envelopes encode above normal pipe capacity;
++            // the peer has stopped reading, so delivery cannot finish.
++            for _ in 0..4 {
++                runner
++                    .send(&handle, agent_message("alpha", &"\nx".repeat(8_000)))
++                    .await
++                    .unwrap();
++            }
++        }
++        let result = tokio::time::timeout(Duration::from_secs(3), runner.wait(&handle))
++            .await
++            .expect("the entire grace including forwarding is bounded")
++            .unwrap();
++        assert_eq!(result.status, AgentLifecycleStatus::TimedOut);
++        assert_eq!(result.metadata["resumable"], false, "{mode}");
++        if mode == "blocked-settlement-event" {
++            assert!(root.path().join("event-blocked").exists());
++        }
++        if mode != "stop-reading" {
++            assert!(root.path().join("cancelled").exists(), "{mode}");
++            let requests = requests(root.path());
++            assert_eq!(
++                requests[1]["request"]["target_id"],
++                requests[0]["request"]["id"]
++            );
++        }
++    }
++}
+diff --git a/docs/architecture/subagents.md b/docs/architecture/subagents.md
+index a4f62f6..d6cb34f 100644
+--- a/docs/architecture/subagents.md
++++ b/docs/architecture/subagents.md
+@@ -126,6 +126,17 @@ Bootstrap/rotation включены в role timeout
+ от idle cap и сохранности процесса. Отмена после admission остаётся обычным
+ cancel/write-failure путём; это не обещание отката уже начатого turn-а.
+ 
++Отмена и role timeout активного process turn используют один bounded
++cancel-and-settle путь: адресный `Cancel` и ожидание terminal response исходного
++`Send` в пределах `cancel_grace_ms`. Это отдельный cleanup budget после role
++deadline; ожидание включает запись, чтение и пересылку событий. Кооперативно
++завершившийся peer может остаться resumable, сохраняя `cancelled` или `timed_out`
++как причину завершения. ACK самого `Cancel` не заменяет terminal response.
++Если setup ещё не завершён, запись JSONL могла быть прервана, доставка сообщений
++не подтверждена или grace истёк, connection не переиспользуется и прямой peer
++завершается. Принудительный fallback не гарантирует остановку всех потомков:
++components и terminal commands могут владеть отдельными process groups.
++
+ Real-process boundary test одновременно запускает два полных Proteus,
+ передаёт им разные payload, проверяет отсутствие cross-delivery, адресный
+ cancel и изоляцию падения соседнего process. Успешная terminal-гонка не теряет
+-- 
+2.52.0
+
