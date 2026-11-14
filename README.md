@@ -4,6 +4,8 @@
 
 ## С чего начать
 
+- **Origin вложенных агентов 14 ноября:** [Core source patch](foundation/2026-11-14/descendant-origin/README.md), 63 scoped tests и реальная root → parent → leaf цепочка. После PR87/88; background routing и call-ID projection остаются открытыми, upstream не изменён.
+
 - **Identity очереди user-input 14 ноября:** [Core source patch](foundation/2026-11-14/user-input-queue-identity/README.md), 16 user-input + 35 process tests; применять после cancel-and-settle из PR87. Upstream, origin/Desktop reducer/worktree naming не изменены.
 
 - **Общий cancel-and-settle 14 ноября:** [Core source patch](foundation/2026-11-14/peer-cancel-settlement/README.md), 35 scoped tests и 4 native случая; timeout + grace, без гарантии принудительной остановки всех OS-потомков. Не применён upstream.
