@@ -4,6 +4,8 @@
 
 ## С чего начать
 
+- **Общий cancel-and-settle 14 ноября:** [Core source patch](foundation/2026-11-14/peer-cancel-settlement/README.md), 35 scoped tests и 4 native случая; timeout + grace, без гарантии принудительной остановки всех OS-потомков. Не применён upstream.
+
 - **Проверенные рефакторы 14 ноября:** [общая проверка конфигурации и восстановление model history](foundation/2026-11-14/reviewed-simplification/README.md). Два source patches, 48/121 scoped tests; не применены к upstream, без обещания ускорения.
 
 - **Практический аудит 12–13 ноября:** [95 наборов проверок и межкомпонентные находки](research/proteus-continuous-audit-2026-11-13/README.md). Отчёты, воспроизводители и логи; точные версии и ограничения, без заявления об исправлении upstream.
