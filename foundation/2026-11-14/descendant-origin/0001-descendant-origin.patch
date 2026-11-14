@@ -1,0 +1,590 @@
+From 03c91e807370a47233ea7e9783c39429a82013cf Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 14 Nov 2026 21:31:16 +0800
+Subject: [PATCH] fix: preserve descendant identity across process event
+ forwarding
+
+---
+ .../src/core/agent_control/process/child.rs   |  38 ++-
+ .../src/core/agent_control/process/turn.rs    |  67 +++---
+ .../tests/fixtures/agent_origin_peer.py       |  56 +++++
+ .../tests/process_agent_control.rs            |   4 +
+ .../tests/process_agent_control/origin.rs     | 226 ++++++++++++++++++
+ docs/architecture/subagents.md                |  10 +
+ 6 files changed, 363 insertions(+), 38 deletions(-)
+ create mode 100644 crates/proteus-core/tests/fixtures/agent_origin_peer.py
+ create mode 100644 crates/proteus-core/tests/process_agent_control/origin.rs
+
+diff --git a/crates/proteus-core/src/core/agent_control/process/child.rs b/crates/proteus-core/src/core/agent_control/process/child.rs
+index 1515ca6..fca031b 100644
+--- a/crates/proteus-core/src/core/agent_control/process/child.rs
++++ b/crates/proteus-core/src/core/agent_control/process/child.rs
+@@ -18,7 +18,7 @@ use tokio::{
+ };
+ 
+ use super::output::{ChildOutputs, OutputHealth};
+-use crate::contracts::CancellationToken;
++use crate::{contracts::CancellationToken, domain::ThreadId};
+ use tokio::time::Instant;
+ 
+ pub(super) struct ChildProcess {
+@@ -27,7 +27,8 @@ pub(super) struct ChildProcess {
+     outputs: ChildOutputs,
+     deadline: Option<Instant>,
+     cancellation: Option<CancellationToken>,
+-    session: Option<AppSubagentSession>,
++    // Durable session and its physical root thread are one bound identity.
++    session: Option<(AppSubagentSession, ThreadId)>,
+     // Remains set if an outer deadline drops send before a complete JSONL frame.
+     write_in_flight: bool,
+ }
+@@ -151,7 +152,19 @@ impl ChildProcess {
+     }
+ 
+     pub(super) fn session(&self) -> Option<&AppSubagentSession> {
+-        self.session.as_ref()
++        self.session.as_ref().map(|(session, _)| session)
++    }
++
++    pub(super) fn project_thread(&self, source: ThreadId, logical_child: ThreadId) -> ThreadId {
++        if self
++            .session
++            .as_ref()
++            .is_some_and(|(_, root)| *root == source)
++        {
++            logical_child
++        } else {
++            source
++        }
+     }
+ 
+     /// Bootstrap and rotation obey the same deadline/cancellation as Send.
+@@ -175,7 +188,7 @@ impl ChildProcess {
+                 _ => {}
+             }
+         }
+-        Ok(self.session.clone().expect("session checked"))
++        Ok(self.session().cloned().expect("session checked"))
+     }
+ 
+     pub(super) async fn new_session(&mut self) -> Result<AppSubagentSession> {
+@@ -203,13 +216,13 @@ impl ChildProcess {
+                     )
+                     .context("invalid new session identity")?;
+                     anyhow::ensure!(
+-                        self.session.as_ref() == Some(&session),
++                        self.session() == Some(&session),
+                         "new session response disagrees with SessionStarted"
+                     );
+                     anyhow::ensure!(
+                         previous
+                             .as_ref()
+-                            .is_none_or(|old| old.session_id != session.session_id),
++                            .is_none_or(|(old, _)| old.session_id != session.session_id),
+                         "new session reused the previous identity"
+                     );
+                     return Ok(session);
+@@ -255,7 +268,7 @@ impl ChildProcess {
+     }
+ }
+ 
+-fn observe_session(session: &mut Option<AppSubagentSession>, output: &StdioOutput) {
++fn observe_session(session: &mut Option<(AppSubagentSession, ThreadId)>, output: &StdioOutput) {
+     if let StdioOutput::Event { event } = output
+         && let AppServerEvent::Runtime { envelope } = event.as_ref()
+         && let crate::domain::Event::SessionStarted {
+@@ -264,9 +277,12 @@ fn observe_session(session: &mut Option<AppSubagentSession>, output: &StdioOutpu
+             ..
+         } = &envelope.event
+     {
+-        *session = Some(AppSubagentSession {
+-            session_id: *session_id,
+-            session_dir: session_dir.clone(),
+-        });
++        *session = Some((
++            AppSubagentSession {
++                session_id: *session_id,
++                session_dir: session_dir.clone(),
++            },
++            envelope.thread_id,
++        ));
+     }
+ }
+diff --git a/crates/proteus-core/src/core/agent_control/process/turn.rs b/crates/proteus-core/src/core/agent_control/process/turn.rs
+index e56232e..78b48bb 100644
+--- a/crates/proteus-core/src/core/agent_control/process/turn.rs
++++ b/crates/proteus-core/src/core/agent_control/process/turn.rs
+@@ -17,7 +17,7 @@ use crate::{
+         AgentLifecycleStatus, AgentWorkflowContext, ApprovalRequest, ExecutionAttribution,
+         RequestOrigin, UserInputResponse,
+     },
+-    domain::{AgentOutput, Event, EventContext, ThreadId},
++    domain::{AgentOutput, Event, EventContext, EventEnvelope, ThreadId},
+ };
+ 
+ /// Терминальный исход turn-а ребёнка (fatal-ошибки идут через `Err`).
+@@ -74,8 +74,8 @@ impl TurnTracker {
+     }
+ }
+ 
+-/// Пере-эмиссия событий ребёнка в родительский event stream под
+-/// `child_thread_id` и форвардинг интерактивных запросов.
++/// Project the peer's physical root into its logical child alias. Descendant
++/// threads and source turn/execution identity survive every forwarding hop.
+ pub(super) struct ChildEventForwarder<'a> {
+     pub(super) ctx: &'a AgentWorkflowContext,
+     pub(super) child_thread_id: ThreadId,
+@@ -115,32 +115,43 @@ impl ChildEventForwarder<'_> {
+         Ok(())
+     }
+ 
+-    fn event_context(&self) -> EventContext {
+-        EventContext::new(
+-            self.ctx.session_id,
+-            self.child_thread_id,
+-            Some(self.ctx.turn_id),
+-        )
+-    }
+-
+-    fn origin(&self) -> RequestOrigin {
+-        RequestOrigin::for_turn(
+-            self.ctx.execution.scope.execution_id,
+-            self.child_thread_id,
+-            self.ctx.turn_id,
+-        )
+-        .with_label(self.role.clone())
++    fn origin(&self, child: &ChildProcess, source: Option<RequestOrigin>) -> RequestOrigin {
++        match source {
++            Some(mut origin) => {
++                if let Some(thread) = origin.thread_id {
++                    let projected = child.project_thread(thread, self.child_thread_id);
++                    if projected != thread {
++                        origin.label = Some(self.role.clone());
++                    }
++                    origin.thread_id = Some(projected);
++                }
++                origin
++            }
++            // The contract permits transports outside runtime attribution.
++            None => RequestOrigin::for_turn(
++                self.ctx.execution.scope.execution_id,
++                self.child_thread_id,
++                self.ctx.turn_id,
++            )
++            .with_label(self.role.clone()),
++        }
+     }
+ 
+-    async fn forward_runtime_event(&self, event: Event) {
+-        if !should_forward_child_event(&event) {
++    async fn forward_runtime_event(&self, child: &ChildProcess, envelope: EventEnvelope) {
++        if !should_forward_child_event(&envelope.event) {
+             return;
+         }
+-        let _ = self.ctx.events.emit(self.event_context(), event).await;
++        let context = EventContext::new(
++            self.ctx.session_id,
++            child.project_thread(envelope.thread_id, self.child_thread_id),
++            envelope.turn_id,
++        );
++        let _ = self.ctx.events.emit(context, envelope.event).await;
+     }
+ 
+     async fn forward_approval(
+         &self,
++        child: &ChildProcess,
+         request: proteus_contracts::app_protocol::AppApprovalRequest,
+     ) -> Option<StdioRequest> {
+         let approval_id = request.approval_id.clone();
+@@ -150,7 +161,7 @@ impl ChildEventForwarder<'_> {
+             request.reason.clone(),
+             request.tool_spec.clone(),
+         )
+-        .with_origin(self.origin());
++        .with_origin(self.origin(child, request.origin));
+         let response = tokio::select! {
+             response = self.ctx.execution.approval.request_approval(forwarded) => response,
+             _ = self.ctx.execution.scope.cancellation.cancelled() => return None,
+@@ -174,10 +185,12 @@ impl ChildEventForwarder<'_> {
+ 
+     async fn forward_user_input(
+         &self,
++        child: &ChildProcess,
+         request: crate::contracts::UserInputRequest,
+     ) -> Option<StdioRequest> {
+         let request_id = request.request_id.clone();
+-        let forwarded = request.with_origin(self.origin());
++        let mut forwarded = request;
++        forwarded.origin = Some(self.origin(child, forwarded.origin.take()));
+         let response = tokio::select! {
+             response = self.ctx.user_input.request_user_input(forwarded) => response,
+             _ = self.ctx.execution.scope.cancellation.cancelled() => return None,
+@@ -346,7 +359,7 @@ async fn handle_output(
+                     forwarder.bind_session(child, tracker).await?;
+                 }
+                 tracker.observe(&envelope.event);
+-                forwarder.forward_runtime_event(envelope.event).await;
++                forwarder.forward_runtime_event(child, *envelope).await;
+                 Ok(OutputVerdict::Continue)
+             }
+             AppServerEvent::SessionSnapshot { snapshot } => {
+@@ -360,7 +373,7 @@ async fn handle_output(
+                 let reply = tokio::select! {
+                     biased;
+                     error = health.stopped() => return Err(error),
+-                    reply = forwarder.forward_approval(*request) => reply,
++                    reply = forwarder.forward_approval(child, *request) => reply,
+                 };
+                 match reply {
+                     Some(reply) => {
+@@ -375,7 +388,7 @@ async fn handle_output(
+                 let reply = tokio::select! {
+                     biased;
+                     error = health.stopped() => return Err(error),
+-                    reply = forwarder.forward_user_input(*request) => reply,
++                    reply = forwarder.forward_user_input(child, *request) => reply,
+                 };
+                 match reply {
+                     Some(reply) => {
+@@ -455,7 +468,7 @@ async fn cancel_child_turn(
+             StdioOutput::Event { event } => {
+                 if let AppServerEvent::Runtime { envelope } = *event {
+                     tracker.observe(&envelope.event);
+-                    forwarder.forward_runtime_event(envelope.event).await;
++                    forwarder.forward_runtime_event(child, *envelope).await;
+                 }
+             }
+             _ => {}
+diff --git a/crates/proteus-core/tests/fixtures/agent_origin_peer.py b/crates/proteus-core/tests/fixtures/agent_origin_peer.py
+new file mode 100644
+index 0000000..4788790
+--- /dev/null
++++ b/crates/proteus-core/tests/fixtures/agent_origin_peer.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++"""Synthetic stdio peer: root and descendant retain distinct source identities."""
++import json, os, pathlib, sys, uuid
++os.chdir(sys.argv[sys.argv.index('--cwd') + 1])
++
++def uid(): return str(uuid.uuid4())
++def emit(value): print(json.dumps(value), flush=True)
++def response(id, value): emit({'type':'response','id':id,'ok':True,'output':value,'error':None})
++def event(thread, turn, value):
++    emit({'type':'event','event':{'type':'runtime','envelope':{
++        'schema_version':2,'event_id':uid(),'session_id':session,'thread_id':thread,
++        'turn_id':turn,'seq':1,'timestamp_ms':0,'event':value}}})
++def new_session():
++    global session, root, descendant
++    session, root, descendant = uid(), uid(), uid()
++    event(root, None, {'SessionStarted':{'session_id':session,'cwd':str(pathlib.Path.cwd()),
++          'model':None,'session_dir':str(pathlib.Path.cwd()/session)}})
++def interact(kind, origin):
++    id = uid()
++    common = {'cwd':str(pathlib.Path.cwd()),'origin':origin,'seq':1}
++    if kind == 'user_input':
++        request = dict(common, request_id=id,title=None,questions=[])
++    else:
++        request = dict(common, approval_id=id,call={'id':'local','name':'read','args':{},
++                       'surface':'function','raw_arguments':None},reason='fixture',tool_spec=None,preview=None)
++    emit({'type':'event','event':{'type':kind+'_requested','request':request}})
++    reply = json.loads(next(sys.stdin))
++    assert reply['type'] == kind and reply[('request_id' if kind == 'user_input' else 'approval_id')] == id, reply
++
++new_session()
++for line in sys.stdin:
++    request = json.loads(line)
++    if request['type'] == 'new_session':
++        new_session()
++        response(request['id'], {'session_id':session,'session_dir':str(pathlib.Path.cwd()/session)})
++    elif request['type'] == 'send':
++        active = request['id']; turn = uid(); execution = uid(); descendant_turn = uid(); descendant_execution = uid()
++        info = {'pid':os.getpid(),'session':session,'root':root,'descendant':descendant,'turn':turn,
++                'execution':execution,'descendant_turn':descendant_turn,'descendant_execution':descendant_execution}
++        event(root, turn, {'SubagentStarted':{'role':'leaf','description':'leaf','child_thread_id':descendant}})
++        for thread, source_turn, name in [(root,turn,'root'),(descendant,descendant_turn,'descendant')]:
++            event(thread, source_turn, {'ToolCallRequested':{'call':{'id':name+'-'+turn,'name':'read',
++                  'args':info,'surface':'function','raw_arguments':None}}})
++        if request['text'] == 'cancel':
++            pathlib.Path('ready').touch()
++            continue
++        for kind in ['user_input','approval']:
++            for thread, source_turn, source_execution, label in [(root,turn,execution,'physical-root'),
++                (descendant,descendant_turn,descendant_execution,'leaf')]:
++                interact(kind, {'execution_id':source_execution,'thread_id':thread,'turn_id':source_turn,'label':label})
++            interact(kind, {'execution_id':execution,'label':'standalone'})
++            interact(kind, None)
++        response(active, {'text':json.dumps(info),'metadata':None})
++    elif request['type'] == 'cancel':
++        event(descendant, descendant_turn, {'Error':{'message':'descendant settlement'}})
++        response(request['target_id'], {'text':'settled','metadata':None})
+diff --git a/crates/proteus-core/tests/process_agent_control.rs b/crates/proteus-core/tests/process_agent_control.rs
+index 2a1905b..e7469cc 100644
+--- a/crates/proteus-core/tests/process_agent_control.rs
++++ b/crates/proteus-core/tests/process_agent_control.rs
+@@ -11,6 +11,10 @@ mod agent_context;
+ #[path = "process_agent_control/output_limits.rs"]
+ mod output_limits;
+ 
++#[cfg(unix)]
++#[path = "process_agent_control/origin.rs"]
++mod origin;
++
+ #[path = "process_agent_control/depth.rs"]
+ mod depth;
+ 
+diff --git a/crates/proteus-core/tests/process_agent_control/origin.rs b/crates/proteus-core/tests/process_agent_control/origin.rs
+new file mode 100644
+index 0000000..0d6ea87
+--- /dev/null
++++ b/crates/proteus-core/tests/process_agent_control/origin.rs
+@@ -0,0 +1,226 @@
++//! Root aliasing must not flatten descendant identity, including during settle.
++use super::*;
++use proteus_contracts::{
++    contracts::{
++        ApprovalRequest, ApprovalResponse, ApprovalTransport, UserInputRequest, UserInputResponse,
++        UserInputTransport,
++    },
++    domain::Event,
++};
++use std::sync::Mutex;
++
++#[derive(Default)]
++struct Capture {
++    inputs: Mutex<Vec<UserInputRequest>>,
++    approvals: Mutex<Vec<ApprovalRequest>>,
++}
++#[async_trait::async_trait]
++impl UserInputTransport for Capture {
++    fn can_request_user_input(&self) -> bool {
++        true
++    }
++    async fn request_user_input(
++        &self,
++        request: UserInputRequest,
++    ) -> anyhow::Result<UserInputResponse> {
++        self.inputs.lock().unwrap().push(request);
++        Ok(UserInputResponse::empty())
++    }
++}
++#[async_trait::async_trait]
++impl ApprovalTransport for Capture {
++    fn can_request_approval(&self) -> bool {
++        true
++    }
++    async fn request_approval(&self, request: ApprovalRequest) -> anyhow::Result<ApprovalResponse> {
++        self.approvals.lock().unwrap().push(request);
++        Ok(ApprovalResponse::approve())
++    }
++}
++fn runner(root: &std::path::Path) -> Arc<dyn AgentControl> {
++    use std::os::unix::fs::PermissionsExt;
++    let binary = root.join("origin-peer.py");
++    std::fs::write(&binary, include_str!("../fixtures/agent_origin_peer.py")).unwrap();
++    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
++    runner_from_json(json!({"binary":binary,"max_idle_processes":1,"roles":[{
++        "name":"helper","config":"unused","description":"origin peer","max_processes":1,"timeout_ms":30000}]}))
++}
++
++#[tokio::test]
++async fn descendant_origin_survives_resume_and_session_rotation() {
++    let root = tempfile::tempdir().unwrap();
++    let runner = runner(root.path());
++    let events = Arc::new(InMemoryEventStore::new());
++    let mut ctx = agent_context::test_runtime_context(events.clone());
++    let capture = Arc::new(Capture::default());
++    ctx.user_input = capture.clone();
++    ctx.execution.approval = capture.clone();
++    let mut previous: Option<(String, serde_json::Value)> = None;
++    for generation in 0..3 {
++        let mut request = AgentControlRequest::new(
++            "helper",
++            "normal",
++            AgentTask::new("parent", root.path().into()),
++        );
++        if generation == 1 {
++            request = request.with_metadata(json!({"task_id":previous.as_ref().unwrap().0}));
++        }
++        let result = runner.run(request, ctx.clone()).await.unwrap();
++        let logical = result.child_thread_id.unwrap().to_string();
++        let source: serde_json::Value = serde_json::from_str(&result.summary).unwrap();
++        let envelopes = events.envelopes().await;
++        for (name, expected_thread, expected_turn) in [
++            ("root", logical.clone(), source["turn"].as_str().unwrap()),
++            (
++                "descendant",
++                source["descendant"].as_str().unwrap().to_owned(),
++                source["descendant_turn"].as_str().unwrap(),
++            ),
++        ] {
++            let id = format!("{name}-{}", source["turn"].as_str().unwrap());
++            let forwarded = envelopes
++                .iter()
++                .find(|e| matches!(&e.event,Event::ToolCallRequested{call} if call.id==id))
++                .unwrap();
++            assert_eq!(forwarded.thread_id.to_string(), expected_thread, "{name}");
++            assert_eq!(
++                forwarded.turn_id.unwrap().to_string(),
++                expected_turn,
++                "source turn must survive"
++            );
++            assert_eq!(
++                forwarded.session_id, ctx.session_id,
++                "aggregate belongs to receiving session"
++            );
++        }
++        let origins: Vec<_> = capture
++            .inputs
++            .lock()
++            .unwrap()
++            .iter()
++            .skip(generation * 4)
++            .map(|r| r.origin.clone().unwrap())
++            .chain(
++                capture
++                    .approvals
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .skip(generation * 4)
++                    .map(|r| r.origin.clone().unwrap()),
++            )
++            .collect();
++        assert_eq!(origins.len(), 8);
++        for (index, origin) in origins.iter().enumerate() {
++            if index % 4 == 2 {
++                assert_eq!(
++                    origin.execution_id.to_string(),
++                    source["execution"].as_str().unwrap()
++                );
++                assert_eq!(origin.thread_id, None);
++                assert_eq!(origin.turn_id, None);
++                assert_eq!(origin.label.as_deref(), Some("standalone"));
++                continue;
++            }
++            if index % 4 == 3 {
++                assert_eq!(origin.execution_id, ctx.execution.scope.execution_id);
++                assert_eq!(origin.thread_id.unwrap().to_string(), logical);
++                assert_eq!(origin.turn_id, Some(ctx.turn_id));
++                assert_eq!(origin.label.as_deref(), Some("helper"));
++                continue;
++            }
++            let root = index % 4 == 0;
++            assert_eq!(
++                origin.thread_id.unwrap().to_string(),
++                if root {
++                    logical.clone()
++                } else {
++                    source["descendant"].as_str().unwrap().to_owned()
++                }
++            );
++            assert_eq!(
++                origin.turn_id.unwrap().to_string(),
++                source[if root { "turn" } else { "descendant_turn" }]
++                    .as_str()
++                    .unwrap()
++            );
++            assert_eq!(
++                origin.execution_id.to_string(),
++                source[if root {
++                    "execution"
++                } else {
++                    "descendant_execution"
++                }]
++                .as_str()
++                .unwrap()
++            );
++            assert_eq!(
++                origin.label.as_deref(),
++                Some(if root { "helper" } else { "leaf" })
++            );
++        }
++        if let Some((old_logical, old)) = &previous {
++            assert_eq!(source["pid"], old["pid"], "reuse OS process");
++            if generation == 1 {
++                assert_eq!(&logical, old_logical);
++                assert_eq!(source["root"], old["root"]);
++                assert_eq!(source["session"], old["session"]);
++            } else {
++                assert_ne!(&logical, old_logical);
++                assert_ne!(source["root"], old["root"]);
++                assert_ne!(source["session"], old["session"]);
++            }
++            assert_ne!(source["turn"], old["turn"]);
++        }
++        previous = Some((logical, source));
++    }
++}
++
++#[tokio::test]
++async fn descendant_origin_survives_cancellation_settlement() {
++    let root = tempfile::tempdir().unwrap();
++    let runner = runner(root.path());
++    let events = Arc::new(InMemoryEventStore::new());
++    let ctx = agent_context::test_runtime_context(events.clone());
++    let handle = runner
++        .spawn(
++            AgentControlRequest::new(
++                "helper",
++                "cancel",
++                AgentTask::new("parent", root.path().into()),
++            ),
++            ctx,
++        )
++        .await
++        .unwrap();
++    tokio::time::timeout(std::time::Duration::from_secs(5), async {
++        while !root.path().join("ready").exists() {
++            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
++        }
++    })
++    .await
++    .unwrap();
++    runner.cancel(&handle).await.unwrap();
++    let result = runner.wait(&handle).await.unwrap();
++    assert_eq!(result.status, AgentLifecycleStatus::Cancelled);
++    let envelopes = events.envelopes().await;
++    let source = envelopes
++        .iter()
++        .find_map(|e| match &e.event {
++            Event::ToolCallRequested { call } => Some(&call.args),
++            _ => None,
++        })
++        .unwrap();
++    let settled = envelopes
++        .iter()
++        .find(|e| matches!(&e.event,Event::Error{message} if message=="descendant settlement"))
++        .unwrap();
++    assert_eq!(
++        settled.thread_id.to_string(),
++        source["descendant"].as_str().unwrap()
++    );
++    assert_eq!(
++        settled.turn_id.unwrap().to_string(),
++        source["descendant_turn"].as_str().unwrap()
++    );
++}
+diff --git a/docs/architecture/subagents.md b/docs/architecture/subagents.md
+index d6cb34f..b665ff7 100644
+--- a/docs/architecture/subagents.md
++++ b/docs/architecture/subagents.md
+@@ -119,6 +119,16 @@ Bootstrap/rotation включены в role timeout
+ и cancellation; дополнительные snapshots/полная child history не сохраняются
+ в родителе. Пока binding отсутствует, открывать child session по догадке нельзя.
+ 
++При пересылке runtime events runner переводит только physical root thread
++дочерней session в её logical `child_thread_id`. Thread потомка, исходный
++turn и execution интерактивного запроса сохраняются; label прямого ребёнка
++получает имя его role, label потомка не заменяется. Envelope относится к
++принимающей session и получает её event sequence. Identity physical root
++хранится вместе с durable session и меняется при `NewSession`, но не при
++resume. Это attribution активного forwarding path, не постоянная доставка
++из idle peer: фоновые потомки после завершения foreground turn своего
++родителя пока не имеют независимого dispatcher-а.
++
+ Если отмена уже видна при ожидании role permit, она имеет приоритет даже
+ при одновременно свободном permit. Свежий запуск не арендует и не создаёт
+ процесс; зарезервированный resume возвращается в прежний bounded idle pool
+-- 
+2.52.0
+
