@@ -1,0 +1,1301 @@
+diff --git a/model/model-pack/src/adapters/anthropic.rs b/model/model-pack/src/adapters/anthropic.rs
+--- a/model/model-pack/src/adapters/anthropic.rs
++++ b/model/model-pack/src/adapters/anthropic.rs
+@@ -1,4 +1,4 @@
+-use std::sync::{Arc, Mutex};
++use std::sync::Arc;
+ 
+ use anyhow::{Result, anyhow};
+ use async_trait::async_trait;
+@@ -16,7 +16,7 @@
+     domain::ModelRef,
+     model_standard::{
+         CanonicalModelRequest, CanonicalModelResponse, ModelCapabilities, ModelFailure,
+-        ModelStreamEvent,
++        ModelFailureKind, ModelStreamEvent,
+     },
+ };
+ 
+@@ -26,6 +26,7 @@
+     model_standard::{CanonicalMessage, ContentPart, FinishReason, MessageRole},
+ };
+ 
++mod errors;
+ #[cfg(test)]
+ mod image_tests;
+ mod request;
+@@ -197,11 +198,18 @@
+         let status = response.status();
+         let response_text = response.text().await?;
+         if !status.is_success() {
+-            return Err(anyhow!("Anthropic API error {status}: {response_text}"));
++            return Err(anyhow::Error::new(errors::http_failure(status, &response_text)));
+         }
+ 
+         let response: Value = serde_json::from_str(&response_text)?;
+-        from_anthropic_response(response)
++        let response = from_anthropic_response(response)?;
++        if let Some(failure) = errors::context_window_stop_failure(
++            status,
++            response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++        ) {
++            return Err(failure.into());
++        }
++        Ok(response)
+     }
+ 
+     async fn stream_response(&self, request: CanonicalModelRequest) -> Result<ModelEventStream> {
+@@ -209,26 +217,32 @@
+         body["stream"] = json!(true);
+         let url = format!("{}/v1/messages", self.base_url);
+         let api_key = self.api_key()?;
+-        let response = send_with_transport_retry(|| self.request_builder(&url, &body, &api_key))
+-            .await?
+-            .error_for_status()?;
++        let response =
++            send_with_transport_retry(|| self.request_builder(&url, &body, &api_key)).await?;
++        let status = response.status();
++        if matches!(status.as_u16(), 400 | 529) {
++            let response_text = response.text().await?;
++            return Err(anyhow::Error::new(errors::http_failure(status, &response_text)));
++        }
++        // Preserve the existing handling of every other HTTP status.
++        let response = response.error_for_status()?;
+ 
+         // Anthropic SSE stateful: content_block_start открывает блок,
+         // множество content_block_delta расширяют его, content_block_stop
+         // закрывает. Для tool_use input_json_delta приходит инкрементально;
+         // собираем всё в state и на message_stop отдаём Response.
+-        let state = Arc::new(Mutex::new(AnthropicStreamState::default()));
++        let mut state = AnthropicStreamState::new(status);
+         let mut sse = response.bytes_stream().eventsource();
+         let events = async_stream::stream! {
+             let mut saw_terminal_event = false;
+             while let Some(chunk) = sse.next().await {
+                 match chunk {
+                     Ok(event) => {
+-                        let mapped = {
+-                            let mut guard = state.lock().unwrap();
+-                            guard.translate(&event.event, &event.data)
+-                        };
+-                        for mapped in mapped {
++                        let mapped = state.translate(&event.event, &event.data);
++                        for mut mapped in mapped {
++                            if let ModelStreamEvent::Error { failure } = &mut mapped {
++                                failure.kind = errors::stream_failure_kind(status, failure.kind);
++                            }
+                             if matches!(
+                                 mapped,
+                                 ModelStreamEvent::Response { .. } | ModelStreamEvent::Error { .. }
+@@ -252,7 +266,8 @@
+             }
+             if !saw_terminal_event {
+                 yield Ok(ModelStreamEvent::Error {
+-                    failure: ModelFailure::other(
++                    failure: ModelFailure::new(
++                        errors::stream_failure_kind(status, ModelFailureKind::StreamDisconnected),
+                         "anthropic messages stream ended without a terminal event",
+                     ),
+                 });
+diff --git a/model/model-pack/src/adapters/anthropic/errors.rs b/model/model-pack/src/adapters/anthropic/errors.rs
+new file mode 100644
+--- /dev/null
++++ b/model/model-pack/src/adapters/anthropic/errors.rs
+@@ -0,0 +1,216 @@
++use serde_json::Value;
++
++use crate::model_standard::{ModelFailure, ModelFailureKind};
++
++/// A generated-but-truncated HTTP 200 response needs context recovery, not
++/// an unchanged retry. Output-token limits and unknown statuses remain unchanged.
++pub(super) fn context_window_stop_failure(
++    status: reqwest::StatusCode,
++    stop_reason: Option<&str>,
++) -> Option<ModelFailure> {
++    if status == reqwest::StatusCode::OK
++        && stop_reason == Some("model_context_window_exceeded")
++    {
++        Some(ModelFailure::new(
++            ModelFailureKind::ContextWindowExceeded,
++            "Anthropic response filled the model context window before finishing the turn",
++        ))
++    } else {
++        None
++    }
++}
++
++pub(super) fn http_failure(status: reqwest::StatusCode, body: &str) -> ModelFailure {
++    let parsed = serde_json::from_str::<Value>(body).ok();
++    failure_from_error_value(
++        parsed.as_ref().and_then(|value| value.get("error")),
++        Some(status.as_u16()),
++        format!("Anthropic API error {status}: {body}"),
++    )
++}
++
++/// Only HTTP 200 establishes the documented Messages SSE recovery semantics.
++/// Other statuses previously admitted by error_for_status retain Other failures.
++pub(super) fn stream_failure_kind(
++    status: reqwest::StatusCode,
++    kind: ModelFailureKind,
++) -> ModelFailureKind {
++    if status == reqwest::StatusCode::OK {
++        kind
++    } else {
++        ModelFailureKind::Other
++    }
++}
++
++/// HTTP status plus provider error type identify the narrow recovery cases.
++/// None is an error event in an established SSE stream, not an unknown HTTP status.
++pub(super) fn failure_from_error_value(
++    error: Option<&Value>,
++    http_status: Option<u16>,
++    fallback_message: impl Into<String>,
++) -> ModelFailure {
++    let provider_type = error
++        .and_then(|error| error.get("type"))
++        .and_then(Value::as_str);
++    let provider_message = error
++        .and_then(|error| error.get("message"))
++        .and_then(Value::as_str);
++    let kind = match (http_status, provider_type, provider_message) {
++        (Some(400), Some("invalid_request_error"), Some(message))
++            if message == "prompt is too long" || message.starts_with("prompt is too long:") =>
++        {
++            ModelFailureKind::ContextWindowExceeded
++        }
++        (None | Some(529), Some("overloaded_error"), Some(_)) => {
++            ModelFailureKind::Retryable {
++                retry_delay_ms: None,
++            }
++        }
++        _ => ModelFailureKind::Other,
++    };
++    // Keep the existing non-stream HTTP diagnostic, including status and raw body.
++    // SSE keeps the provider's message or its existing fallback.
++    let message = match (http_status, provider_message) {
++        (None, Some(message)) => message.to_owned(),
++        _ => fallback_message.into(),
++    };
++    ModelFailure::new(kind, message)
++}
++
++#[cfg(test)]
++mod stop_tests;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn only_documented_http_status_and_error_pairs_enable_recovery() {
++        for status in [200, 302, 400, 413, 422, 429, 500, 529, 598] {
++            for (error_type, message, expected_status, expected_kind) in [
++                (
++                    "invalid_request_error",
++                    "prompt is too long: 200001 tokens > 200000 maximum",
++                    400,
++                    ModelFailureKind::ContextWindowExceeded,
++                ),
++                (
++                    "overloaded_error",
++                    "Overloaded",
++                    529,
++                    ModelFailureKind::Retryable { retry_delay_ms: None },
++                ),
++            ] {
++                let body = json!({
++                    "type": "error",
++                    "error": { "type": error_type, "message": message }
++                }).to_string();
++                let status_code = reqwest::StatusCode::from_u16(status).unwrap();
++                let failure = http_failure(status_code, &body);
++                assert_eq!(
++                    failure.kind,
++                    if status == expected_status { expected_kind } else { ModelFailureKind::Other }
++                );
++                assert_eq!(failure.message, format!("Anthropic API error {status_code}: {body}"));
++                assert!(failure.completed_messages.is_empty());
++                let wrapped = anyhow::Error::new(failure.clone()).context("model callback");
++                assert_eq!(ModelFailure::from_error(&wrapped), failure);
++                let wire = serde_json::to_string(&failure).unwrap();
++                assert_eq!(serde_json::from_str::<ModelFailure>(&wire).unwrap(), failure);
++            }
++        }
++    }
++
++    #[test]
++    fn non_200_stream_statuses_never_gain_recovery() {
++        for status in [101, 200, 201, 204, 302, 400, 529, 598] {
++            for kind in [
++                ModelFailureKind::StreamDisconnected,
++                ModelFailureKind::Retryable { retry_delay_ms: None },
++                ModelFailureKind::Other,
++            ] {
++                assert_eq!(
++                    stream_failure_kind(reqwest::StatusCode::from_u16(status).unwrap(), kind),
++                    if status == 200 { kind } else { ModelFailureKind::Other }
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn unrelated_or_malformed_errors_remain_other() {
++        for error in [
++            json!({"type": "invalid_request_error", "message": "max_tokens is invalid"}),
++            json!({"type": "invalid_request_error", "message": "prefix: prompt is too long"}),
++            json!({"type": "invalid_request_error", "message": "prompt is too longish"}),
++            json!({"type": "future_error", "message": "prompt is too long"}),
++            json!({"type": "rate_limit_error", "message": "slow down"}),
++            json!({"type": "overloaded_error", "message": 1}),
++            json!({"type": "overloaded_error"}),
++            json!({"message": "prompt is too long"}),
++            Value::Null,
++        ] {
++            for status in [None, Some(400), Some(529)] {
++                assert_eq!(
++                    failure_from_error_value(Some(&error), status, "fallback").kind,
++                    ModelFailureKind::Other
++                );
++            }
++        }
++        for body in ["not JSON", "null", "{}"] {
++            assert_eq!(
++                http_failure(reqwest::StatusCode::BAD_REQUEST, body).kind,
++                ModelFailureKind::Other
++            );
++        }
++        let exact = json!({"type": "invalid_request_error", "message": "prompt is too long"});
++        assert_eq!(
++            failure_from_error_value(Some(&exact), Some(400), "fallback").kind,
++            ModelFailureKind::ContextWindowExceeded
++        );
++        assert_eq!(
++            failure_from_error_value(Some(&exact), None, "fallback").kind,
++            ModelFailureKind::Other
++        );
++    }
++
++    #[test]
++    fn sse_error_mapping_preserves_message_and_never_completes_partial_text() {
++        for (error, expected_kind, expected_message) in [
++            (
++                json!({"type": "overloaded_error", "message": "Overloaded"}),
++                ModelFailureKind::Retryable { retry_delay_ms: None },
++                "Overloaded",
++            ),
++            (
++                json!({"type": "future_error", "message": "unknown diagnosis"}),
++                ModelFailureKind::Other,
++                "unknown diagnosis",
++            ),
++            (Value::Null, ModelFailureKind::Other, "unknown anthropic error"),
++        ] {
++            let mut state = super::super::stream::AnthropicStreamState::default();
++            let _ = state.translate("content_block_start", &json!({
++                "index": 0, "content_block": {"type": "text", "text": ""}
++            }).to_string());
++            let _ = state.translate("content_block_delta", &json!({
++                "index": 0, "delta": {"type": "text_delta", "text": "partial"}
++            }).to_string());
++            let events = state.translate("error", &json!({"type": "error", "error": error}).to_string());
++            assert_eq!(events.len(), 1);
++            let crate::model_standard::ModelStreamEvent::Error { failure } = &events[0] else {
++                panic!("expected failure, not a completed partial message");
++            };
++            assert_eq!(failure.kind, expected_kind);
++            assert_eq!(failure.message, expected_message);
++            assert!(failure.completed_messages.is_empty());
++        }
++        let mut state = super::super::stream::AnthropicStreamState::default();
++        let events = state.translate("error", "not JSON");
++        let crate::model_standard::ModelStreamEvent::Error { failure } = &events[0] else {
++            panic!("expected parse error");
++        };
++        assert_eq!(failure.kind, ModelFailureKind::Other);
++    }
++}
+diff --git a/model/model-pack/src/adapters/anthropic/errors/stop_tests.rs b/model/model-pack/src/adapters/anthropic/errors/stop_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/model/model-pack/src/adapters/anthropic/errors/stop_tests.rs
+@@ -0,0 +1,126 @@
++use super::*;
++use super::super::{response::from_anthropic_response, stream::AnthropicStreamState};
++use crate::model_standard::{FinishReason, ModelStreamEvent};
++use serde_json::json;
++
++#[test]
++fn only_exact_http_200_context_stop_enables_recovery() {
++    for status in [101, 200, 201, 204, 302, 400, 429, 529, 598] {
++        for stop in [
++            None,
++            Some("model_context_window_exceeded"),
++            Some("model_context_window_exceeded_extra"),
++            Some("max_tokens"),
++            Some("tool_use"),
++            Some("end_turn"),
++            Some("future_stop"),
++            Some(""),
++        ] {
++            let failure = context_window_stop_failure(
++                reqwest::StatusCode::from_u16(status).unwrap(), stop,
++            );
++            assert_eq!(failure.is_some(), status == 200 && stop == Some("model_context_window_exceeded"));
++            if let Some(failure) = failure {
++                assert_eq!(failure.kind, ModelFailureKind::ContextWindowExceeded);
++                assert!(failure.completed_messages.is_empty());
++                let wrapped = anyhow::Error::new(failure.clone()).context("model callback");
++                assert_eq!(ModelFailure::from_error(&wrapped), failure);
++                let wire = serde_json::to_string(&failure).unwrap();
++                assert_eq!(serde_json::from_str::<ModelFailure>(&wire).unwrap(), failure);
++            }
++        }
++    }
++}
++
++fn trace(status: u16, stop: Option<&str>, args: &str) -> Vec<ModelStreamEvent> {
++    let mut state = AnthropicStreamState::new(reqwest::StatusCode::from_u16(status).unwrap());
++    let mut events = Vec::new();
++    for (kind, data) in [
++        ("message_start", json!({"message": {"usage": {"input_tokens": 3, "output_tokens": 1}}})),
++        ("content_block_start", json!({"index": 0, "content_block": {"type": "text", "text": ""}})),
++        ("content_block_delta", json!({"index": 0, "delta": {"type": "text_delta", "text": "partial"}})),
++        ("content_block_stop", json!({"index": 0})),
++        ("content_block_start", json!({"index": 1, "content_block": {"type": "tool_use", "id": "call", "name": "read_file", "input": {}}})),
++        ("content_block_delta", json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": args}})),
++        ("content_block_stop", json!({"index": 1})),
++        ("message_delta", json!({"delta": {"stop_reason": stop}, "usage": {"output_tokens": 4}})),
++        ("message_stop", json!({})),
++    ] {
++        events.extend(state.translate(kind, &data.to_string()));
++    }
++    events
++}
++
++#[test]
++fn context_stop_fails_without_completing_partial_text_or_tools() {
++    let events = trace(200, Some("model_context_window_exceeded"), "{");
++    assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::TextDelta { text, .. } if text == "partial")));
++    assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::ToolCallDelta { .. })));
++    assert!(!events.iter().any(|event| matches!(event,
++        ModelStreamEvent::Response { .. } | ModelStreamEvent::MessageCompleted { .. }
++        | ModelStreamEvent::ToolCallFinished { .. }
++    )));
++    assert_eq!(events.iter().filter(|event| matches!(event, ModelStreamEvent::Error { .. })).count(), 1);
++    let Some(ModelStreamEvent::Error { failure }) = events.last() else {
++        panic!("expected terminal failure");
++    };
++    assert_eq!(failure.kind, ModelFailureKind::ContextWindowExceeded);
++    assert!(failure.completed_messages.is_empty());
++}
++
++#[test]
++fn other_statuses_stops_and_successful_tool_use_keep_their_projection() {
++    for status in [101, 200, 201, 204, 302] {
++        for (stop, finish) in [
++            (Some("model_context_window_exceeded"), FinishReason::Length),
++            (Some("max_tokens"), FinishReason::Length),
++            (Some("future_stop"), FinishReason::Unknown),
++            (None, FinishReason::Unknown),
++            (Some("end_turn"), FinishReason::Stop),
++            (Some("stop_sequence"), FinishReason::Stop),
++            (Some("tool_use"), FinishReason::ToolCalls),
++        ] {
++            if status == 200 && stop == Some("model_context_window_exceeded") {
++                continue;
++            }
++            let events = trace(status, stop, r#"{"x":1}"#);
++            assert!(!events.iter().any(|event| matches!(event, ModelStreamEvent::Error { .. })));
++            let Some(ModelStreamEvent::Response { response }) = events.last() else {
++                panic!("expected original Response shape");
++            };
++            assert_eq!(response.finish_reason, finish);
++            assert_eq!(response.tool_calls.len(), usize::from(finish == FinishReason::ToolCalls));
++            let usage = response.usage.as_ref().unwrap();
++            assert_eq!((usage.input_tokens, usage.output_tokens), (3, 4));
++        }
++    }
++    let events = trace(200, Some("tool_use"), "{");
++    assert!(matches!(events.last(), Some(ModelStreamEvent::Error { failure }) if failure.kind == ModelFailureKind::Other));
++}
++
++#[test]
++fn nonstream_decoder_keeps_error_precedence_and_stop_metadata() {
++    for body in [
++        json!({"error": {"message": "provider error"}, "stop_reason": "model_context_window_exceeded", "content": []}),
++        json!({"stop_reason": "model_context_window_exceeded"}),
++    ] {
++        let error = from_anthropic_response(body).unwrap_err();
++        assert_eq!(ModelFailure::from_error(&error).kind, ModelFailureKind::Other);
++    }
++    for stop in ["model_context_window_exceeded", "max_tokens", "future_stop"] {
++        let response = from_anthropic_response(json!({
++            "content": [{"type": "text", "text": "partial"}],
++            "stop_reason": stop,
++            "usage": {"input_tokens": 3, "output_tokens": 4}
++        })).unwrap();
++        assert_eq!(response.provider_metadata["stop_reason"], stop);
++        assert_eq!(response.usage.as_ref().unwrap().output_tokens, 4);
++        for status in [200, 201, 204] {
++            let failure = context_window_stop_failure(
++                reqwest::StatusCode::from_u16(status).unwrap(),
++                response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++            );
++            assert_eq!(failure.is_some(), status == 200 && stop == "model_context_window_exceeded");
++        }
++    }
++}
+diff --git a/model/model-pack/src/adapters/anthropic/image_tests.rs b/model/model-pack/src/adapters/anthropic/image_tests.rs
+--- a/model/model-pack/src/adapters/anthropic/image_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/image_tests.rs
+@@ -1,6 +1,6 @@
+ use super::request::to_anthropic_request;
+ use crate::{
+-    domain::{ImageRef, ModelRef},
++    domain::{ImageRef, ModelRef, ToolCall, ToolContent, ToolResult},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -37,3 +37,102 @@
+     );
+     assert_eq!(body["messages"][0]["content"][1]["text"], "Describe");
+ }
++
++const TOOL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++const TOOL_GIF: &str = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
++
++fn inline_image(mime_type: &str, data: &str) -> ToolContent {
++    ToolContent::Image {
++        mime_type: mime_type.into(),
++        data: data.into(),
++    }
++}
++
++fn tool_result_request(result: ToolResult, role: MessageRole) -> CanonicalModelRequest {
++    CanonicalModelRequest::new(
++        ModelRef::new("anthropic", "vision"),
++        vec![
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("image-call", "inspect", serde_json::json!({})),
++                }],
++            ),
++            CanonicalMessage::new(role, vec![ContentPart::ToolResult { result }]),
++            CanonicalMessage::new(
++                MessageRole::User,
++                vec![ContentPart::Text { text: "Continue".into() }],
++            ),
++        ],
++    )
++}
++
++#[test]
++fn tool_images_preserve_text_order_and_result_grouping_in_both_message_paths() {
++    for role in [MessageRole::Tool, MessageRole::User] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption").with_content(vec![
++            inline_image("image/png", TOOL_PNG),
++            ToolContent::Binary { mime_type: "application/pdf".into(), data: "not an image".into() },
++            inline_image("image/gif", TOOL_GIF),
++        ]);
++        let body = to_anthropic_request(&tool_result_request(result, role)).unwrap();
++        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
++        assert_eq!(body["messages"][1]["role"], "user");
++        assert_eq!(body["messages"][1]["content"], serde_json::json!([
++            {
++                "type": "tool_result", "tool_use_id": "image-call", "is_error": false,
++                "content": [
++                    { "type": "text", "text": "Tool caption" },
++                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": TOOL_PNG } },
++                    { "type": "image", "source": { "type": "base64", "media_type": "image/gif", "data": TOOL_GIF } }
++                ]
++            },
++            { "type": "text", "text": "Continue" }
++        ]));
++    }
++}
++
++#[test]
++fn image_results_keep_error_precedence_and_content_only_fallback() {
++    let mut error = ToolResult::error("image-call".into(), "Tool error");
++    error.output = "Lower-priority output".into();
++    let cases = [error, ToolResult::ok("image-call".into(), "")];
++    for (result, expected) in cases.into_iter().zip([
++        "Tool error",
++        "[image tool content: image/png]",
++    ]) {
++        let is_error = !result.ok;
++        let result = result.with_content(vec![inline_image("image/png", TOOL_PNG)]);
++        let body = to_anthropic_request(&tool_result_request(result, MessageRole::Tool)).unwrap();
++        let block = &body["messages"][1]["content"][0];
++        assert_eq!(block["is_error"], is_error);
++        assert_eq!(block["content"][0], serde_json::json!({ "type": "text", "text": expected }));
++        assert_eq!(block["content"][1]["source"]["data"], TOOL_PNG);
++        assert_eq!(block["content"].as_array().unwrap().len(), 2);
++    }
++}
++
++#[test]
++fn non_image_results_keep_string_wire_shape_and_text_semantics() {
++    let mut error = ToolResult::error("image-call".into(), "Tool error");
++    error.output = "Lower-priority output".into();
++    let structured = ToolResult::ok("image-call".into(), "").with_content(vec![
++        ToolContent::Text { text: "Text block".into() },
++        ToolContent::Json { value: serde_json::json!({"count": 2}) },
++        ToolContent::Binary { mime_type: "image/png".into(), data: TOOL_PNG.into() },
++    ]);
++    for result in [
++        ToolResult::ok("image-call".into(), "Output"),
++        ToolResult::ok("image-call".into(), ""),
++        ToolResult::error("image-call".into(), ""),
++        error,
++        structured,
++    ] {
++        let expected = result.text_or_status();
++        let is_error = !result.ok;
++        let body = to_anthropic_request(&tool_result_request(result, MessageRole::Tool)).unwrap();
++        assert_eq!(body["messages"][1]["content"][0], serde_json::json!({
++            "type": "tool_result", "tool_use_id": "image-call", "content": expected, "is_error": is_error,
++        }));
++    }
++}
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -4,7 +4,7 @@
+ use super::AnthropicPromptCacheConfig;
+ use crate::{
+     adapters::context_render::context_text,
+-    domain::{ToolCallSurface, ToolChoice, ToolSpec, ToolSurface},
++    domain::{ToolCallSurface, ToolChoice, ToolContent, ToolSpec, ToolSurface},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -317,12 +317,37 @@
+ }
+ 
+ fn tool_result_block(result: &crate::domain::ToolResult) -> Value {
+-    json!({
++    let mut images = result
++        .content
++        .iter()
++        .filter_map(|content| match content {
++            ToolContent::Image { mime_type, data } => Some((mime_type, data)),
++            _ => None,
++        })
++        .peekable();
++    let content = if images.peek().is_some() {
++        // Retain the existing text/error projection, then preserve inline images.
++        let mut text = json!({ "type": "text", "text": null });
++        text["text"] = Value::String(result.text_or_status());
++        let mut blocks = vec![text];
++        for (mime_type, data) in images {
++            blocks.push(json!({
++                "type": "image",
++                "source": { "type": "base64", "media_type": mime_type, "data": data },
++            }));
++        }
++        Value::Array(blocks)
++    } else {
++        Value::String(result.text_or_status())
++    };
++    let mut block = json!({
+         "type": "tool_result",
+         "tool_use_id": result.call_id,
+-        "content": result.text_or_status(),
++        "content": null,
+         "is_error": !result.ok,
+-    })
++    });
++    block["content"] = content;
++    block
+ }
+ 
+ fn push_message(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+diff --git a/model/model-pack/src/adapters/anthropic/stream.rs b/model/model-pack/src/adapters/anthropic/stream.rs
+--- a/model/model-pack/src/adapters/anthropic/stream.rs
++++ b/model/model-pack/src/adapters/anthropic/stream.rs
+@@ -12,8 +12,9 @@
+ 
+ /// Stateful аккумулятор для Anthropic SSE-потока: копит text parts и
+ /// tool_use блоки по мере прихода, на `message_stop` отдаёт финальный
+-/// CanonicalModelResponse.
++/// CanonicalModelResponse или typed context-window failure.
+ pub(super) struct AnthropicStreamState {
++    http_status: reqwest::StatusCode,
+     message_id: crate::domain::MessageId,
+     blocks: Vec<AnthropicBlock>,
+     usage: AnthropicUsage,
+@@ -25,6 +26,7 @@
+ impl Default for AnthropicStreamState {
+     fn default() -> Self {
+         Self {
++            http_status: reqwest::StatusCode::OK,
+             message_id: crate::domain::new_message_id(),
+             blocks: Vec::new(),
+             usage: AnthropicUsage::default(),
+@@ -49,11 +51,16 @@
+     ToolUse {
+         id: String,
+         name: String,
++        initial_input: Value,
+         input_json: String,
+     },
+ }
+ 
+ impl AnthropicStreamState {
++    pub(super) fn new(http_status: reqwest::StatusCode) -> Self {
++        Self { http_status, ..Self::default() }
++    }
++
+     pub(super) fn translate(&mut self, event_type: &str, data: &str) -> Vec<ModelStreamEvent> {
+         let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+             return vec![ModelStreamEvent::Error {
+@@ -120,6 +127,11 @@
+                         Some(AnthropicBlock::ToolUse {
+                             id,
+                             name,
++                            // SSE без JSON-байтов сохраняет input стартового блока.
++                            initial_input: block
++                                .and_then(|b| b.get("input"))
++                                .cloned()
++                                .unwrap_or(Value::Null),
+                             input_json: String::new(),
+                         })
+                     }
+@@ -135,6 +147,15 @@
+                         );
+                     }
+                     self.blocks[index] = block;
++                }
++                if block_type == "text" {
++                    let text = block
++                        .and_then(|b| b.get("text"))
++                        .and_then(Value::as_str)
++                        .unwrap_or("");
++                    if !text.is_empty() {
++                        return self.append_text(index, text);
++                    }
+                 }
+                 Vec::new()
+             }
+@@ -186,20 +207,7 @@
+                             .and_then(|d| d.get("text"))
+                             .and_then(Value::as_str)
+                             .unwrap_or("");
+-                        let text = self.dsml_filter.filter(text);
+-                        if let Some(AnthropicBlock::Text { text: buf }) = self.blocks.get_mut(index)
+-                        {
+-                            buf.push_str(&text);
+-                        }
+-                        if text.is_empty() {
+-                            Vec::new()
+-                        } else {
+-                            vec![ModelStreamEvent::TextDelta {
+-                                message_id: self.message_id,
+-                                phase: None,
+-                                text,
+-                            }]
+-                        }
++                        self.append_text(index, text)
+                     }
+                     "input_json_delta" => {
+                         let partial = delta
+@@ -207,9 +215,17 @@
+                             .and_then(Value::as_str)
+                             .unwrap_or("");
+                         let call_id =
+-                            if let Some(AnthropicBlock::ToolUse { id, input_json, .. }) =
+-                                self.blocks.get_mut(index)
++                            if let Some(AnthropicBlock::ToolUse {
++                                id,
++                                initial_input,
++                                input_json,
++                                ..
++                            }) = self.blocks.get_mut(index)
+                             {
++                                if !partial.is_empty() {
++                                    // JSON-дельты заменяют input, а не дополняют его.
++                                    *initial_input = Value::Null;
++                                }
+                                 input_json.push_str(partial);
+                                 id.clone()
+                             } else {
+@@ -246,17 +262,32 @@
+                 vec![self.finalise()]
+             }
+             "error" => {
+-                let message = parsed
+-                    .get("error")
+-                    .and_then(|e| e.get("message"))
+-                    .and_then(Value::as_str)
+-                    .map(str::to_owned)
+-                    .unwrap_or_else(|| "unknown anthropic error".to_owned());
+                 vec![ModelStreamEvent::Error {
+-                    failure: ModelFailure::other(message),
++                    failure: super::errors::failure_from_error_value(
++                        parsed.get("error"),
++                        None,
++                        "unknown anthropic error",
++                    ),
+                 }]
+             }
+             _ => Vec::new(),
++        }
++    }
++
++    // Стартовый text и последующие дельты используют один фильтр и один буфер.
++    fn append_text(&mut self, index: usize, text: &str) -> Vec<ModelStreamEvent> {
++        let text = self.dsml_filter.filter(text);
++        if let Some(AnthropicBlock::Text { text: buf }) = self.blocks.get_mut(index) {
++            buf.push_str(&text);
++        }
++        if text.is_empty() {
++            Vec::new()
++        } else {
++            vec![ModelStreamEvent::TextDelta {
++                message_id: self.message_id,
++                phase: None,
++                text,
++            }]
+         }
+     }
+ 
+@@ -269,6 +300,13 @@
+                     .blocks
+                     .push(AnthropicBlock::Text { text: pending_text }),
+             }
++        }
++
++        if let Some(failure) = super::errors::context_window_stop_failure(
++            self.http_status,
++            self.stop_reason.as_deref(),
++        ) {
++            return ModelStreamEvent::Error { failure };
+         }
+ 
+         let mut parts = Vec::new();
+@@ -295,13 +333,14 @@
+                 AnthropicBlock::ToolUse {
+                     id,
+                     name,
++                    initial_input,
+                     input_json,
+                 } => {
+                     if !accept_tool_calls {
+                         continue;
+                     }
+                     let args = if input_json.is_empty() {
+-                        Value::Null
++                        initial_input
+                     } else {
+                         match serde_json::from_str(&input_json) {
+                             Ok(args) => args,
+@@ -340,3 +379,6 @@
+         ModelStreamEvent::Response { response: resp }
+     }
+ }
++
++#[cfg(test)]
++mod start_tests;
+diff --git a/model/model-pack/src/adapters/anthropic/stream/start_tests.rs b/model/model-pack/src/adapters/anthropic/stream/start_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/model/model-pack/src/adapters/anthropic/stream/start_tests.rs
+@@ -0,0 +1,175 @@
++use super::*;
++use super::super::response::from_anthropic_response;
++use serde_json::json;
++
++fn block_trace(block: Value, deltas: &[Value], stop_reason: &str) -> Vec<ModelStreamEvent> {
++    let mut state = AnthropicStreamState::default();
++    let mut events = state.translate("message_start", r#"{"message":{"usage":{}}}"#);
++    events.extend(state.translate(
++        "content_block_start",
++        &json!({"index": 0, "content_block": block}).to_string(),
++    ));
++    for delta in deltas {
++        events.extend(state.translate(
++            "content_block_delta",
++            &json!({"index": 0, "delta": delta}).to_string(),
++        ));
++    }
++    events.extend(state.translate("content_block_stop", r#"{"index":0}"#));
++    events.extend(state.translate(
++        "message_delta",
++        &json!({"delta": {"stop_reason": stop_reason}}).to_string(),
++    ));
++    events.extend(state.translate("message_stop", "{}"));
++    events
++}
++
++fn response(events: &[ModelStreamEvent]) -> &CanonicalModelResponse {
++    assert!(!events.iter().any(|event| matches!(event, ModelStreamEvent::Error { .. })));
++    let Some(ModelStreamEvent::Response { response }) = events.last() else {
++        panic!("expected final response, got {events:?}");
++    };
++    response
++}
++
++fn payloads(response: &CanonicalModelResponse) -> Vec<ContentPart> {
++    response.messages.iter().flat_map(|message| &message.parts)
++        .map(|part| part.payload.clone()).collect()
++}
++
++fn assert_text(events: &[ModelStreamEvent], expected: &str) {
++    let response = response(events);
++    let mut streamed = String::new();
++    for event in events {
++        if let ModelStreamEvent::TextDelta { message_id, phase, text } = event {
++            assert_eq!(*message_id, response.messages[0].id);
++            assert_eq!(*phase, None);
++            streamed.push_str(text);
++        }
++    }
++    assert_eq!(streamed, expected);
++    let nonstream = from_anthropic_response(json!({
++        "content": [{"type": "text", "text": expected}], "stop_reason": "end_turn"
++    })).unwrap();
++    assert_eq!(payloads(response), payloads(&nonstream));
++    assert_eq!(response.finish_reason, nonstream.finish_reason);
++}
++
++#[test]
++fn text_start_is_accumulated_and_emitted_before_optional_delta() {
++    for (initial, suffix) in [
++        ("1 + 1", None),
++        ("1 + 1", Some("")),
++        ("1 + 1", Some(" = 2")),
++        ("Привет", Some(" 🌍")),
++        ("", Some("Hello")),
++        ("", None),
++    ] {
++        let deltas = suffix.map(|text| json!({"type": "text_delta", "text": text}))
++            .into_iter().collect::<Vec<_>>();
++        let events = block_trace(json!({"type": "text", "text": initial}), &deltas, "end_turn");
++        assert_text(&events, &format!("{initial}{}", suffix.unwrap_or("")));
++        if !initial.is_empty() {
++            assert!(matches!(&events[0], ModelStreamEvent::TextDelta { text, .. } if text == initial));
++        } else if suffix.is_none() {
++            assert_eq!(events.len(), 1, "empty start emits no delta");
++        }
++    }
++}
++
++#[test]
++fn start_and_delta_share_filter_state_across_a_split_marker() {
++    for (initial, suffix) in [
++        ("before <｜｜DS", "ML｜｜tool_calls>hidden</｜｜DSML｜｜tool_calls> after"),
++        ("before <｜｜DSML｜｜tool_calls>hidden</｜｜DSML｜｜tool_calls> after", ""),
++    ] {
++        let events = block_trace(
++            json!({"type": "text", "text": initial}),
++            &[json!({"type": "text_delta", "text": suffix})],
++            "end_turn",
++        );
++        assert_text(&events, "before  after");
++    }
++}
++
++#[test]
++fn tool_start_input_survives_absent_and_empty_json_deltas() {
++    for input in [None, Some(Value::Null), Some(json!({})), Some(json!({"path": "пример.txt"}))] {
++        let mut block = json!({"type": "tool_use", "id": "call", "name": "read_file"});
++        if let Some(input) = input {
++            block["input"] = input;
++        }
++        let expected = from_anthropic_response(json!({
++            "content": [block.clone()], "stop_reason": "tool_use"
++        })).unwrap();
++        for count in 0..=2 {
++            let deltas = vec![json!({"type": "input_json_delta", "partial_json": ""}); count];
++            let events = block_trace(block.clone(), &deltas, "tool_use");
++            let actual = response(&events);
++            assert_eq!(actual.tool_calls, expected.tool_calls);
++            assert_eq!(payloads(actual), payloads(&expected));
++            assert_eq!(actual.finish_reason, FinishReason::ToolCalls);
++            assert_eq!(events.len(), 1, "fallback input belongs to the completed call, not a synthetic JSON delta");
++        }
++    }
++}
++
++#[test]
++fn nonempty_json_deltas_replace_rather_than_merge_or_append_initial_input() {
++    let events = block_trace(
++        json!({"type": "tool_use", "id": "call", "name": "read_file", "input": {"seed": true}}),
++        &[
++            json!({"type": "input_json_delta", "partial_json": ""}),
++            json!({"type": "input_json_delta", "partial_json": "{\"path\":"}),
++            json!({"type": "input_json_delta", "partial_json": "\"x.txt\"}"}),
++            json!({"type": "input_json_delta", "partial_json": ""}),
++        ],
++        "tool_use",
++    );
++    let actual = response(&events);
++    assert_eq!(actual.tool_calls[0].args, json!({"path": "x.txt"}));
++    let partials = events.iter().filter_map(|event| match event {
++        ModelStreamEvent::ToolCallDelta { call_id, args_delta, .. } => {
++            assert_eq!(call_id, "call");
++            Some(args_delta.as_str())
++        }
++        _ => None,
++    }).collect::<Vec<_>>();
++    assert_eq!(partials, vec!["{\"path\":", "\"x.txt\"}"]);
++}
++
++#[test]
++fn malformed_nonempty_delta_is_not_repaired_with_initial_input() {
++    for partial in ["{", " ", "invalid"] {
++        let events = block_trace(
++            json!({"type": "tool_use", "id": "call", "name": "read_file", "input": {}}),
++            &[json!({"type": "input_json_delta", "partial_json": partial})],
++            "tool_use",
++        );
++        assert!(!events.iter().any(|event| matches!(event, ModelStreamEvent::Response { .. })));
++        assert!(matches!(events.last(), Some(ModelStreamEvent::Error { failure })
++            if failure.kind == crate::model_standard::ModelFailureKind::Other
++                && failure.message.starts_with("invalid Anthropic tool arguments:")));
++    }
++}
++
++#[test]
++fn start_input_does_not_make_non_tool_terminal_executable() {
++    for (stop, expected) in [
++        ("max_tokens", FinishReason::Length),
++        ("end_turn", FinishReason::Stop),
++        ("future_reason", FinishReason::Unknown),
++    ] {
++        for deltas in [vec![], vec![json!({"type": "input_json_delta", "partial_json": "{"})]] {
++            let events = block_trace(
++                json!({"type": "tool_use", "id": "call", "name": "read_file", "input": {}}),
++                &deltas,
++                stop,
++            );
++            let actual = response(&events);
++            assert_eq!(actual.finish_reason, expected);
++            assert!(actual.tool_calls.is_empty());
++            assert!(!payloads(actual).iter().any(|part| matches!(part, ContentPart::ToolCall { .. })));
++        }
++    }
++}
+diff --git a/model/model-pack/src/adapters/anthropic/tests.rs b/model/model-pack/src/adapters/anthropic/tests.rs
+--- a/model/model-pack/src/adapters/anthropic/tests.rs
++++ b/model/model-pack/src/adapters/anthropic/tests.rs
+@@ -456,7 +456,7 @@
+ }
+ 
+ #[test]
+-fn context_window_stop_is_length_in_json_and_stream() {
++fn context_window_stop_is_typed_at_http_200_native_boundaries() {
+     let json_response = from_anthropic_response(json!({
+         "stop_reason": "model_context_window_exceeded",
+         "content": [{ "type": "text", "text": "partial" }]
+@@ -469,11 +469,19 @@
+         ),
+         ("message_stop", json!({})),
+     ]);
+-    let ModelStreamEvent::Response { response: streamed } = events.last().unwrap() else {
+-        panic!("expected final response");
++    let ModelStreamEvent::Error { failure: streamed } = events.last().unwrap() else {
++        panic!("expected typed context-window failure");
+     };
++    // The status-blind decoder keeps its projection; the HTTP boundary selects
++    // recovery only after decoding has succeeded and HTTP 200 is known.
+     assert_eq!(json_response.finish_reason, FinishReason::Length);
+-    assert_eq!(streamed.finish_reason, FinishReason::Length);
++    let decoded = errors::context_window_stop_failure(
++        reqwest::StatusCode::OK,
++        json_response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++    ).expect("HTTP 200 context-window stop");
++    assert_eq!(*streamed, decoded);
++    assert_eq!(streamed.kind, ModelFailureKind::ContextWindowExceeded);
++    assert!(streamed.completed_messages.is_empty());
+ }
+ 
+ #[test]
+diff --git a/model/model-pack/src/adapters/openai/image_tests.rs b/model/model-pack/src/adapters/openai/image_tests.rs
+--- a/model/model-pack/src/adapters/openai/image_tests.rs
++++ b/model/model-pack/src/adapters/openai/image_tests.rs
+@@ -1,6 +1,10 @@
+-use super::request::to_openai_request;
++use super::{
++    OpenAiPromptCacheConfig,
++    model_profile::OpenAiModelProfile,
++    request::{to_openai_request, to_openai_request_with_cache},
++};
+ use crate::{
+-    domain::{ImageRef, ModelRef},
++    domain::{ImageRef, ModelRef, ToolCall, ToolCallSurface, ToolContent, ToolResult},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -43,3 +47,120 @@
+             .contains("cannot read attached image")
+     );
+ }
++
++const TOOL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++const TOOL_GIF: &str = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
++
++fn inline_image(mime_type: &str, data: &str) -> ToolContent {
++    ToolContent::Image {
++        mime_type: mime_type.into(),
++        data: data.into(),
++    }
++}
++
++fn tool_result_body(
++    result: ToolResult,
++    surface: ToolCallSurface,
++    supports_image_input: bool,
++) -> anyhow::Result<serde_json::Value> {
++    let profile = OpenAiModelProfile::from_provider_config(&serde_json::json!({
++        "capabilities": { "supports_image_input": supports_image_input, "supports_freeform_tools": true }
++    }))?;
++    let request = CanonicalModelRequest::new(
++        ModelRef::new("openai", "vision"),
++        vec![
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("image-call", "inspect", serde_json::json!({ "input": "inspect" }))
++                        .with_surface(surface),
++                }],
++            ),
++            CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult { result }]),
++        ],
++    );
++    to_openai_request_with_cache(&request, &OpenAiPromptCacheConfig::default(), &profile)
++}
++
++#[test]
++fn function_and_custom_outputs_keep_text_and_image_order() {
++    for (surface, output_type) in [
++        (ToolCallSurface::Function, "function_call_output"),
++        (ToolCallSurface::Freeform, "custom_tool_call_output"),
++    ] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption").with_content(vec![
++            inline_image("image/png", TOOL_PNG),
++            ToolContent::Binary { mime_type: "application/pdf".into(), data: "not an image".into() },
++            inline_image("image/gif", TOOL_GIF),
++        ]);
++        let body = tool_result_body(result, surface, true).unwrap();
++        assert_eq!(body["input"].as_array().unwrap().len(), 2);
++        assert_eq!(body["input"][1], serde_json::json!({
++            "type": output_type, "call_id": "image-call",
++            "output": [
++                { "type": "input_text", "text": "Tool caption" },
++                { "type": "input_image", "image_url": format!("data:image/png;base64,{TOOL_PNG}"), "detail": "auto" },
++                { "type": "input_image", "image_url": format!("data:image/gif;base64,{TOOL_GIF}"), "detail": "auto" }
++            ]
++        }));
++    }
++}
++
++#[test]
++fn image_results_keep_error_precedence_and_content_only_fallback() {
++    for surface in [ToolCallSurface::Function, ToolCallSurface::Freeform] {
++        let mut error = ToolResult::error("image-call".into(), "Tool error");
++        error.output = "Lower-priority output".into();
++        let cases = [error, ToolResult::ok("image-call".into(), "")];
++        for (result, expected) in cases.into_iter().zip([
++            "Tool error",
++            "[image tool content: image/png]",
++        ]) {
++            let result = result.with_content(vec![inline_image("image/png", TOOL_PNG)]);
++            let body = tool_result_body(result, surface, true).unwrap();
++            let output = &body["input"][1]["output"];
++            assert_eq!(output[0], serde_json::json!({ "type": "input_text", "text": expected }));
++            assert_eq!(output[1]["image_url"], format!("data:image/png;base64,{TOOL_PNG}"));
++            assert_eq!(output.as_array().unwrap().len(), 2);
++        }
++    }
++}
++
++#[test]
++fn disabled_image_capability_rejects_both_tool_output_surfaces() {
++    for surface in [ToolCallSurface::Function, ToolCallSurface::Freeform] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption")
++            .with_content(vec![inline_image("image/png", TOOL_PNG)]);
++        let error = tool_result_body(result, surface, false).unwrap_err();
++        assert!(error.to_string().contains("image input is disabled"));
++    }
++}
++
++#[test]
++fn non_image_results_keep_string_wire_shape_without_image_capability() {
++    for (surface, output_type) in [
++        (ToolCallSurface::Function, "function_call_output"),
++        (ToolCallSurface::Freeform, "custom_tool_call_output"),
++    ] {
++        let mut error = ToolResult::error("image-call".into(), "Tool error");
++        error.output = "Lower-priority output".into();
++        let structured = ToolResult::ok("image-call".into(), "").with_content(vec![
++            ToolContent::Text { text: "Text block".into() },
++            ToolContent::Json { value: serde_json::json!({"count": 2}) },
++            ToolContent::Binary { mime_type: "image/png".into(), data: TOOL_PNG.into() },
++        ]);
++        for result in [
++            ToolResult::ok("image-call".into(), "Output"),
++            ToolResult::ok("image-call".into(), ""),
++            ToolResult::error("image-call".into(), ""),
++            error,
++            structured,
++        ] {
++            let expected = result.text_or_status();
++            let body = tool_result_body(result, surface, false).unwrap();
++            assert_eq!(body["input"][1], serde_json::json!({
++                "type": output_type, "call_id": "image-call", "output": expected,
++            }));
++        }
++    }
++}
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -8,7 +8,7 @@
+     adapters::context_render::context_text,
+     domain::{
+         FileSearchHostedToolConfig, HostedToolConfig, ResponseFormat, ToolCall, ToolCallSurface,
+-        ToolChoice, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
++        ToolChoice, ToolContent, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
+     },
+     model_standard::{
+         CanonicalMessage, CanonicalModelRequest, ContentPart, MessagePhase, MessageRole,
+@@ -47,7 +47,10 @@
+     });
+     // Replace the existing slot to preserve key order without reserializing
+     // the already-built JSON array through json!.
+-    body["input"] = Value::Array(to_openai_input(&request.messages)?);
++    body["input"] = Value::Array(to_openai_input(
++        &request.messages,
++        profile.supports_image_input,
++    )?);
+ 
+     if let Some(instructions) = joined_instructions(request) {
+         body["instructions"] = Value::String(instructions);
+@@ -335,7 +338,10 @@
+     }
+ }
+ 
+-fn to_openai_input(messages: &[CanonicalMessage]) -> Result<Vec<Value>> {
++fn to_openai_input(
++    messages: &[CanonicalMessage],
++    supports_image_input: bool,
++) -> Result<Vec<Value>> {
+     let mut input: Vec<Value> = Vec::new();
+     let mut tool_call_surfaces = HashMap::new();
+     for message in messages {
+@@ -403,24 +409,23 @@
+                         .get(&result.call_id)
+                         .copied()
+                         .unwrap_or_default();
+-                    match surface {
+-                        ToolCallSurface::Function => input.push(json!({
+-                            "type": "function_call_output",
+-                            "call_id": result.call_id,
+-                            "output": result.text_or_status(),
+-                        })),
+-                        ToolCallSurface::Freeform => input.push(json!({
+-                            "type": "custom_tool_call_output",
+-                            "call_id": result.call_id,
+-                            "output": result.text_or_status(),
+-                        })),
++                    let output_type = match surface {
++                        ToolCallSurface::Function => "function_call_output",
++                        ToolCallSurface::Freeform => "custom_tool_call_output",
+                         _ => {
+                             return Err(anyhow!(
+                                 "tool result '{}' uses unsupported surface for openai.responses",
+                                 result.call_id
+                             ));
+                         }
+-                    }
++                    };
++                    let mut item = json!({
++                        "type": output_type,
++                        "call_id": result.call_id,
++                        "output": null,
++                    });
++                    item["output"] = openai_tool_output(result, supports_image_input)?;
++                    input.push(item);
+                 }
+                 ContentPart::ReasoningSummary { text } => {
+                     input.push(openai_reasoning_item(text, None))
+@@ -460,6 +465,39 @@
+     Ok(input)
+ }
+ 
++fn openai_tool_output(
++    result: &crate::domain::ToolResult,
++    supports_image_input: bool,
++) -> Result<Value> {
++    let mut images = result
++        .content
++        .iter()
++        .filter_map(|content| match content {
++            ToolContent::Image { mime_type, data } => Some((mime_type, data)),
++            _ => None,
++        })
++        .peekable();
++    if images.peek().is_none() {
++        return Ok(Value::String(result.text_or_status()));
++    }
++    if !supports_image_input {
++        return Err(anyhow!(
++            "tool result '{}' contains images, but openai.responses image input is disabled",
++            result.call_id
++        ));
++    }
++    // Retain the existing text/error projection, then preserve inline images.
++    let mut text = json!({ "type": "input_text", "text": null });
++    text["text"] = Value::String(result.text_or_status());
++    let mut blocks = vec![text];
++    for (mime_type, data) in images {
++        let mut image = json!({ "type": "input_image", "image_url": null, "detail": "auto" });
++        image["image_url"] = Value::String(format!("data:{mime_type};base64,{data}"));
++        blocks.push(image);
++    }
++    Ok(Value::Array(blocks))
++}
++
+ fn openai_text_message(message: &CanonicalMessage, text: &str) -> Result<Value> {
+     let mut value = json!({
+         "type": "message",
+diff --git a/model/model-pack/src/adapters/openai/stream.rs b/model/model-pack/src/adapters/openai/stream.rs
+--- a/model/model-pack/src/adapters/openai/stream.rs
++++ b/model/model-pack/src/adapters/openai/stream.rs
+@@ -24,28 +24,7 @@
+             }
+             Vec::new()
+         }
+-        "response.function_call_arguments.delta" => {
+-            let call_id = parsed
+-                .get("call_id")
+-                .or_else(|| parsed.get("item_id"))
+-                .and_then(Value::as_str)
+-                .unwrap_or("")
+-                .to_owned();
+-            let args_delta = parsed
+-                .get("delta")
+-                .and_then(Value::as_str)
+-                .unwrap_or("")
+-                .to_owned();
+-            if call_id.is_empty() || args_delta.is_empty() {
+-                return Vec::new();
+-            }
+-            vec![ModelStreamEvent::ToolCallDelta {
+-                call_id,
+-                name: None,
+-                args_delta,
+-            }]
+-        }
+-        "response.custom_tool_call_input.delta" => {
++        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+             let call_id = parsed
+                 .get("call_id")
+                 .or_else(|| parsed.get("item_id"))
