@@ -1,0 +1,273 @@
+--- a/model/model-pack/src/adapters/anthropic.rs
++++ b/model/model-pack/src/adapters/anthropic.rs
+@@ -202,7 +202,14 @@
+         }
+ 
+         let response: Value = serde_json::from_str(&response_text)?;
+-        from_anthropic_response(response)
++        let response = from_anthropic_response(response)?;
++        if let Some(failure) = errors::context_window_stop_failure(
++            status,
++            response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++        ) {
++            return Err(failure.into());
++        }
++        Ok(response)
+     }
+ 
+     async fn stream_response(&self, request: CanonicalModelRequest) -> Result<ModelEventStream> {
+@@ -224,7 +231,7 @@
+         // множество content_block_delta расширяют его, content_block_stop
+         // закрывает. Для tool_use input_json_delta приходит инкрементально;
+         // собираем всё в state и на message_stop отдаём Response.
+-        let mut state = AnthropicStreamState::default();
++        let mut state = AnthropicStreamState::new(status);
+         let mut sse = response.bytes_stream().eventsource();
+         let events = async_stream::stream! {
+             let mut saw_terminal_event = false;
+--- a/model/model-pack/src/adapters/anthropic/errors.rs
++++ b/model/model-pack/src/adapters/anthropic/errors.rs
+@@ -1,6 +1,24 @@
+ use serde_json::Value;
+ 
+ use crate::model_standard::{ModelFailure, ModelFailureKind};
++
++/// A generated-but-truncated HTTP 200 response needs context recovery, not
++/// an unchanged retry. Output-token limits and unknown statuses remain unchanged.
++pub(super) fn context_window_stop_failure(
++    status: reqwest::StatusCode,
++    stop_reason: Option<&str>,
++) -> Option<ModelFailure> {
++    if status == reqwest::StatusCode::OK
++        && stop_reason == Some("model_context_window_exceeded")
++    {
++        Some(ModelFailure::new(
++            ModelFailureKind::ContextWindowExceeded,
++            "Anthropic response filled the model context window before finishing the turn",
++        ))
++    } else {
++        None
++    }
++}
+ 
+ pub(super) fn http_failure(status: reqwest::StatusCode, body: &str) -> ModelFailure {
+     let parsed = serde_json::from_str::<Value>(body).ok();
+@@ -58,6 +76,9 @@
+     };
+     ModelFailure::new(kind, message)
+ }
++
++#[cfg(test)]
++mod stop_tests;
+ 
+ #[cfg(test)]
+ mod tests {
+--- /dev/null
++++ b/model/model-pack/src/adapters/anthropic/errors/stop_tests.rs
+@@ -0,0 +1,126 @@
++use super::*;
++use super::super::{response::from_anthropic_response, stream::AnthropicStreamState};
++use crate::model_standard::{FinishReason, ModelStreamEvent};
++use serde_json::json;
++
++#[test]
++fn only_exact_http_200_context_stop_enables_recovery() {
++    for status in [101, 200, 201, 204, 302, 400, 429, 529, 598] {
++        for stop in [
++            None,
++            Some("model_context_window_exceeded"),
++            Some("model_context_window_exceeded_extra"),
++            Some("max_tokens"),
++            Some("tool_use"),
++            Some("end_turn"),
++            Some("future_stop"),
++            Some(""),
++        ] {
++            let failure = context_window_stop_failure(
++                reqwest::StatusCode::from_u16(status).unwrap(), stop,
++            );
++            assert_eq!(failure.is_some(), status == 200 && stop == Some("model_context_window_exceeded"));
++            if let Some(failure) = failure {
++                assert_eq!(failure.kind, ModelFailureKind::ContextWindowExceeded);
++                assert!(failure.completed_messages.is_empty());
++                let wrapped = anyhow::Error::new(failure.clone()).context("model callback");
++                assert_eq!(ModelFailure::from_error(&wrapped), failure);
++                let wire = serde_json::to_string(&failure).unwrap();
++                assert_eq!(serde_json::from_str::<ModelFailure>(&wire).unwrap(), failure);
++            }
++        }
++    }
++}
++
++fn trace(status: u16, stop: Option<&str>, args: &str) -> Vec<ModelStreamEvent> {
++    let mut state = AnthropicStreamState::new(reqwest::StatusCode::from_u16(status).unwrap());
++    let mut events = Vec::new();
++    for (kind, data) in [
++        ("message_start", json!({"message": {"usage": {"input_tokens": 3, "output_tokens": 1}}})),
++        ("content_block_start", json!({"index": 0, "content_block": {"type": "text", "text": ""}})),
++        ("content_block_delta", json!({"index": 0, "delta": {"type": "text_delta", "text": "partial"}})),
++        ("content_block_stop", json!({"index": 0})),
++        ("content_block_start", json!({"index": 1, "content_block": {"type": "tool_use", "id": "call", "name": "read_file", "input": {}}})),
++        ("content_block_delta", json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": args}})),
++        ("content_block_stop", json!({"index": 1})),
++        ("message_delta", json!({"delta": {"stop_reason": stop}, "usage": {"output_tokens": 4}})),
++        ("message_stop", json!({})),
++    ] {
++        events.extend(state.translate(kind, &data.to_string()));
++    }
++    events
++}
++
++#[test]
++fn context_stop_fails_without_completing_partial_text_or_tools() {
++    let events = trace(200, Some("model_context_window_exceeded"), "{");
++    assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::TextDelta { text, .. } if text == "partial")));
++    assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::ToolCallDelta { .. })));
++    assert!(!events.iter().any(|event| matches!(event,
++        ModelStreamEvent::Response { .. } | ModelStreamEvent::MessageCompleted { .. }
++        | ModelStreamEvent::ToolCallFinished { .. }
++    )));
++    assert_eq!(events.iter().filter(|event| matches!(event, ModelStreamEvent::Error { .. })).count(), 1);
++    let Some(ModelStreamEvent::Error { failure }) = events.last() else {
++        panic!("expected terminal failure");
++    };
++    assert_eq!(failure.kind, ModelFailureKind::ContextWindowExceeded);
++    assert!(failure.completed_messages.is_empty());
++}
++
++#[test]
++fn other_statuses_stops_and_successful_tool_use_keep_their_projection() {
++    for status in [101, 200, 201, 204, 302] {
++        for (stop, finish) in [
++            (Some("model_context_window_exceeded"), FinishReason::Length),
++            (Some("max_tokens"), FinishReason::Length),
++            (Some("future_stop"), FinishReason::Unknown),
++            (None, FinishReason::Unknown),
++            (Some("end_turn"), FinishReason::Stop),
++            (Some("stop_sequence"), FinishReason::Stop),
++            (Some("tool_use"), FinishReason::ToolCalls),
++        ] {
++            if status == 200 && stop == Some("model_context_window_exceeded") {
++                continue;
++            }
++            let events = trace(status, stop, r#"{"x":1}"#);
++            assert!(!events.iter().any(|event| matches!(event, ModelStreamEvent::Error { .. })));
++            let Some(ModelStreamEvent::Response { response }) = events.last() else {
++                panic!("expected original Response shape");
++            };
++            assert_eq!(response.finish_reason, finish);
++            assert_eq!(response.tool_calls.len(), usize::from(finish == FinishReason::ToolCalls));
++            let usage = response.usage.as_ref().unwrap();
++            assert_eq!((usage.input_tokens, usage.output_tokens), (3, 4));
++        }
++    }
++    let events = trace(200, Some("tool_use"), "{");
++    assert!(matches!(events.last(), Some(ModelStreamEvent::Error { failure }) if failure.kind == ModelFailureKind::Other));
++}
++
++#[test]
++fn nonstream_decoder_keeps_error_precedence_and_stop_metadata() {
++    for body in [
++        json!({"error": {"message": "provider error"}, "stop_reason": "model_context_window_exceeded", "content": []}),
++        json!({"stop_reason": "model_context_window_exceeded"}),
++    ] {
++        let error = from_anthropic_response(body).unwrap_err();
++        assert_eq!(ModelFailure::from_error(&error).kind, ModelFailureKind::Other);
++    }
++    for stop in ["model_context_window_exceeded", "max_tokens", "future_stop"] {
++        let response = from_anthropic_response(json!({
++            "content": [{"type": "text", "text": "partial"}],
++            "stop_reason": stop,
++            "usage": {"input_tokens": 3, "output_tokens": 4}
++        })).unwrap();
++        assert_eq!(response.provider_metadata["stop_reason"], stop);
++        assert_eq!(response.usage.as_ref().unwrap().output_tokens, 4);
++        for status in [200, 201, 204] {
++            let failure = context_window_stop_failure(
++                reqwest::StatusCode::from_u16(status).unwrap(),
++                response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++            );
++            assert_eq!(failure.is_some(), status == 200 && stop == "model_context_window_exceeded");
++        }
++    }
++}
+--- a/model/model-pack/src/adapters/anthropic/stream.rs
++++ b/model/model-pack/src/adapters/anthropic/stream.rs
+@@ -12,8 +12,9 @@
+ 
+ /// Stateful аккумулятор для Anthropic SSE-потока: копит text parts и
+ /// tool_use блоки по мере прихода, на `message_stop` отдаёт финальный
+-/// CanonicalModelResponse.
++/// CanonicalModelResponse или typed context-window failure.
+ pub(super) struct AnthropicStreamState {
++    http_status: reqwest::StatusCode,
+     message_id: crate::domain::MessageId,
+     blocks: Vec<AnthropicBlock>,
+     usage: AnthropicUsage,
+@@ -25,6 +26,7 @@
+ impl Default for AnthropicStreamState {
+     fn default() -> Self {
+         Self {
++            http_status: reqwest::StatusCode::OK,
+             message_id: crate::domain::new_message_id(),
+             blocks: Vec::new(),
+             usage: AnthropicUsage::default(),
+@@ -54,6 +56,10 @@
+ }
+ 
+ impl AnthropicStreamState {
++    pub(super) fn new(http_status: reqwest::StatusCode) -> Self {
++        Self { http_status, ..Self::default() }
++    }
++
+     pub(super) fn translate(&mut self, event_type: &str, data: &str) -> Vec<ModelStreamEvent> {
+         let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+             return vec![ModelStreamEvent::Error {
+@@ -269,6 +275,13 @@
+             }
+         }
+ 
++        if let Some(failure) = super::errors::context_window_stop_failure(
++            self.http_status,
++            self.stop_reason.as_deref(),
++        ) {
++            return ModelStreamEvent::Error { failure };
++        }
++
+         let mut parts = Vec::new();
+         let mut tool_calls = Vec::new();
+         let accept_tool_calls = self.stop_reason.as_deref() == Some("tool_use");
+--- a/model/model-pack/src/adapters/anthropic/tests.rs
++++ b/model/model-pack/src/adapters/anthropic/tests.rs
+@@ -456,7 +456,7 @@
+ }
+ 
+ #[test]
+-fn context_window_stop_is_length_in_json_and_stream() {
++fn context_window_stop_is_typed_at_http_200_native_boundaries() {
+     let json_response = from_anthropic_response(json!({
+         "stop_reason": "model_context_window_exceeded",
+         "content": [{ "type": "text", "text": "partial" }]
+@@ -469,11 +469,19 @@
+         ),
+         ("message_stop", json!({})),
+     ]);
+-    let ModelStreamEvent::Response { response: streamed } = events.last().unwrap() else {
+-        panic!("expected final response");
++    let ModelStreamEvent::Error { failure: streamed } = events.last().unwrap() else {
++        panic!("expected typed context-window failure");
+     };
++    // The status-blind decoder keeps its projection; the HTTP boundary selects
++    // recovery only after decoding has succeeded and HTTP 200 is known.
+     assert_eq!(json_response.finish_reason, FinishReason::Length);
+-    assert_eq!(streamed.finish_reason, FinishReason::Length);
++    let decoded = errors::context_window_stop_failure(
++        reqwest::StatusCode::OK,
++        json_response.provider_metadata.get("stop_reason").and_then(Value::as_str),
++    ).expect("HTTP 200 context-window stop");
++    assert_eq!(*streamed, decoded);
++    assert_eq!(streamed.kind, ModelFailureKind::ContextWindowExceeded);
++    assert!(streamed.completed_messages.is_empty());
+ }
+ 
+ #[test]
