@@ -1,0 +1,190 @@
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -290,6 +290,16 @@
+ 
+     /// Zed's `Развернуть всё`: every folder below `path`, within limits.
+     pub fn expand_all(&mut self, path: &str, load: &mut Loader) {
++        // The row's folded ancestors share its expansion/refresh intent.
++        // Do not list them here or spend the descendant traversal budget.
++        if let Some(head) = self.heads.get(path) {
++            self.expanded.extend(
++                paths::parents(path)
++                    .into_iter()
++                    .take_while(|parent| paths::within(parent, head))
++                    .map(str::to_owned),
++            );
++        }
+         let mut queue = VecDeque::from([(path.to_owned(), 0)]);
+         let mut listed = 0;
+         while let Some((folder, depth)) = queue.pop_front() {
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -35,6 +35,168 @@
+ }
+ 
+ #[test]
++fn folded_expand_all_refreshes_intermediate_folders_when_the_shape_changes() {
++    for full in [false, true] {
++        let before = workspace(&[
++            ("", &[("src", true), ("other", true)]),
++            ("src", &[("lib", true)]),
++            ("src/lib", &[("deep", true)]),
++            ("src/lib/deep", &[("existing.rs", false)]),
++            ("other", &[]),
++        ]);
++        let mut project = Project::default();
++        let rows = project.lines("p", &mut loader(&before)).unwrap();
++        assert!(rows.iter().any(|row| row.path == "src/lib/deep"));
++        project.expand_all("src/lib/deep", &mut loader(&before));
++        for path in ["src", "src/lib", "src/lib/deep"] {
++            assert!(project.is_expanded(path));
++        }
++        assert!(!project.is_expanded("other"));
++
++        let after = workspace(&[
++            ("", &[("src", true), ("other", true)]),
++            ("src", &[("lib", true), ("outer.rs", false)]),
++            ("src/lib", &[("deep", true), ("inner.rs", false)]),
++            ("src/lib/deep", &[("existing.rs", false)]),
++            ("other", &[]),
++        ]);
++        project.invalidate(full);
++        let mut reads = Vec::new();
++        let rows = project.lines("p", &mut |path| {
++            reads.push(path.to_owned());
++            loader(&after)(path)
++        }).unwrap();
++        for path in ["src/outer.rs", "src/lib/inner.rs", "src/lib/deep/existing.rs"] {
++            assert!(rows.iter().any(|row| row.path == path), "{path}, full={full}");
++        }
++        for path in ["src", "src/lib", "src/lib/deep"] {
++            assert_eq!(reads.iter().filter(|read| read.as_str() == path).count(), 1);
++        }
++    }
++}
++
++#[test]
++fn folded_expand_all_agrees_with_ordinary_expand_and_collapse_intent() {
++    let folders = workspace(&[
++        ("", &[("a", true)]),
++        ("a", &[("b", true)]),
++        ("a/b", &[("file.rs", false)]),
++    ]);
++    let mut one = Project::default();
++    let mut all = Project::default();
++    one.lines("p", &mut loader(&folders)).unwrap();
++    all.lines("p", &mut loader(&folders)).unwrap();
++    one.expand("a/b", &mut loader(&folders));
++    all.expand_all("a/b", &mut loader(&folders));
++    assert_eq!(one.expanded, all.expanded);
++    one.collapse("a/b");
++    all.collapse("a/b");
++    assert_eq!(one.expanded, all.expanded);
++    assert_eq!(all.expanded, HashSet::from([String::new()]));
++
++    one.expand("a/b", &mut loader(&folders));
++    all.expand_all("a/b", &mut loader(&folders));
++    one.collapse_all("a/b");
++    all.collapse_all("a/b");
++    assert_eq!(one.expanded, all.expanded);
++    assert!(all.is_expanded("a")); // Existing collapse_all scope is unchanged.
++    assert!(!all.is_expanded("a/b"));
++}
++
++#[test]
++fn expand_all_without_a_known_folded_head_does_not_reveal_other_ancestors() {
++    let folders = workspace(&[
++        ("", &[("outer", true)]),
++        ("outer", &[("target", true)]),
++        ("outer/target", &[]),
++    ]);
++    let mut plain = Project::default();
++    plain.expand_all("outer/target", &mut loader(&folders));
++    assert_eq!(plain.expanded, HashSet::from([String::new(), "outer/target".into()]));
++    let mut root = Project::default();
++    root.expand_all("", &mut loader(&folders));
++    assert_eq!(root.expanded, HashSet::from([
++        String::new(), "outer".into(), "outer/target".into(),
++    ]));
++}
++
++#[test]
++fn recorded_folded_head_needs_no_extra_reads_after_cache_invalidation() {
++    let before = workspace(&[
++        ("", &[("outer", true)]),
++        ("outer", &[("a", true), ("other.rs", false)]),
++        ("outer/a", &[("b", true)]),
++        ("outer/a/b", &[]),
++    ]);
++    let mut project = Project::default();
++    project.expand("outer", &mut loader(&before));
++    project.lines("p", &mut loader(&before)).unwrap();
++    assert_eq!(project.heads["outer/a/b"], "outer/a");
++    project.invalidate(true); // The last rendered heads are deliberately retained.
++    let mut reads = Vec::new();
++    project.expand_all("outer/a/b", &mut |path| {
++        reads.push(path.to_owned());
++        Ok(Listing::default())
++    });
++    assert_eq!(reads, ["outer/a/b"]);
++    assert!(project.is_expanded("outer/a"));
++    // Successful parent evidence, not the aged folded mapping, decides absence.
++    let gone = workspace(&[("", &[("outer", true)]), ("outer", &[("other.rs", false)])]);
++    project.invalidate(false);
++    project.lines("p", &mut loader(&gone)).unwrap();
++    assert!(!project.is_expanded("outer/a"));
++}
++
++#[test]
++fn folded_ancestors_do_not_spend_or_extend_expand_all_listing_budget() {
++    let path = "outer/a/b";
++    let mut project = Project::default();
++    project.heads.insert(path.into(), "outer/a".into());
++    let mut reads = Vec::new();
++    project.expand_all(path, &mut |folder| {
++        reads.push(folder.to_owned());
++        Ok(Listing {
++            entries: if folder == path {
++                (0..EXPAND_ALL).map(|i| Entry {
++                    name: format!("d{i}"),
++                    path: format!("{path}/d{i}"),
++                    kind: Kind::Directory,
++                }).collect()
++            } else { Vec::new() },
++            truncated: false,
++        })
++    });
++    assert_eq!(reads.len(), EXPAND_ALL);
++    assert!(reads.iter().all(|folder| paths::within(folder, path)));
++    assert!(project.is_expanded("outer/a"));
++    assert!(!project.is_expanded("outer"));
++    assert!(!project.is_expanded(&format!("{path}/d{}", EXPAND_ALL - 1)));
++}
++
++#[test]
++fn folded_ancestors_do_not_spend_or_extend_expand_all_descendant_depth() {
++    let path = "a/b";
++    let mut project = Project::default();
++    project.heads.insert(path.into(), "a".into());
++    let mut reads = Vec::new();
++    project.expand_all(path, &mut |folder| {
++        reads.push(folder.to_owned());
++        Ok(Listing {
++            entries: vec![Entry {
++                name: "child".into(),
++                path: format!("{folder}/child"),
++                kind: Kind::Directory,
++            }],
++            truncated: false,
++        })
++    });
++    assert_eq!(reads.len(), CHAIN + 1); // Root at depth zero, as before.
++    assert!(reads.iter().all(|folder| paths::within(folder, path)));
++    assert!(project.is_expanded("a"));
++    assert!(!project.is_expanded(&format!("{}/child", reads.last().unwrap())));
++}
++
++#[test]
+ fn folds_single_folder_chains_into_one_row() {
+     let folders = workspace(&[
+         ("", &[("a", true), (".git", true), ("top.rs", false)]),
