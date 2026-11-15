@@ -1,0 +1,35 @@
+diff --git a/crates/proteus-core/src/core/runtime/checkpoint.rs b/crates/proteus-core/src/core/runtime/checkpoint.rs
+--- a/crates/proteus-core/src/core/runtime/checkpoint.rs
++++ b/crates/proteus-core/src/core/runtime/checkpoint.rs
+@@ -77,11 +77,11 @@
+             return Ok(());
+         }
+         let mut history = self.history.lock().await;
+-        let previous = history.clone();
++        let mut changed = false;
+         for result in effects.drain(..) {
+-            capture.record(&mut history, &result)?;
+-        }
+-        if *history != previous {
++            changed |= capture.record(&mut history, &result)?;
++        }
++        if changed {
+             self.revision
+                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+         }
+@@ -273,13 +273,8 @@
+         if attribution == self.attribution {
+             let mut effects = self.pending_effects.lock().await;
+             let mut history = self.history.lock().await;
+-            let previous = if self.store.is_none() {
+-                Some(history.clone())
+-            } else {
+-                None
+-            };
+-            capture.record(&mut history, result)?;
+-            if previous.is_some_and(|previous| *history != previous) {
++            let changed = capture.record(&mut history, result)?;
++            if self.store.is_none() && changed {
+                 self.revision
+                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+             }
