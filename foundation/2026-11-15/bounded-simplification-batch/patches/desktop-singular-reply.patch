@@ -1,0 +1,80 @@
+--- a/src/ui/chat/replies.rs
++++ b/src/ui/chat/replies.rs
+@@ -31,7 +31,7 @@
+ }
+ 
+ impl Replies {
+-    pub(super) fn parts(
++    pub(super) fn part(
+         &mut self,
+         key: u64,
+         text: &Arc<str>,
+@@ -40,7 +40,7 @@
+         readonly: bool,
+         window: &mut Window,
+         cx: &mut Context<Chat>,
+-    ) -> Vec<Part> {
++    ) -> Part {
+         let renderer = content::format("text/markdown", cx);
+         let languages = content::languages(cx);
+         if let Some(reply) = self.0.get_mut(&key)
+@@ -56,7 +56,7 @@
+                 reply.text = text.clone();
+                 reply.languages = languages;
+             }
+-            return vec![reply.part.clone()];
++            return reply.part.clone();
+         }
+         let (part, changes, resize) = if let Some(extension) = renderer {
+             let payload = Content {
+@@ -91,7 +91,7 @@
+                 _resize: resize,
+             },
+         );
+-        vec![part]
++        part
+     }
+ 
+     pub(super) fn rehost(
+--- a/src/ui/chat/thread.rs
++++ b/src/ui/chat/thread.rs
+@@ -195,7 +195,7 @@
+                 cx,
+             ),
+             (Role::Assistant, _, _) => {
+-                let reply = self.replies.parts(
++                let reply = self.replies.part(
+                     entry.key,
+                     &entry.text,
+                     self.workspace.clone(),
+@@ -493,21 +493,19 @@
+         .into_any_element()
+ }
+ 
+-fn render_assistant(entry: &Entry, reply: Vec<super::replies::Part>, cx: &App) -> AnyElement {
++fn render_assistant(entry: &Entry, reply: super::replies::Part, cx: &App) -> AnyElement {
+     v_flex()
+         .w_full()
+         .font_family(prefs::chat_font(cx))
+         .text_size(prefs::chat_text(cx))
+-        .children(reply.into_iter().map(|part| {
+-            match part {
+-                super::replies::Part::Content(view) => view.into_any_element(),
+-                super::replies::Part::Plain(text) => gpui_kit::base::SelectableText::new(
+-                    row_id("plain-reply", entry.key),
+-                    SharedString::from(text),
+-                )
+-                .into_any_element(),
+-            }
+-        }))
++        .child(match reply {
++            super::replies::Part::Content(view) => view.into_any_element(),
++            super::replies::Part::Plain(text) => gpui_kit::base::SelectableText::new(
++                row_id("plain-reply", entry.key),
++                SharedString::from(text),
++            )
++            .into_any_element(),
++        })
+         .into_any_element()
+ }
+ 
