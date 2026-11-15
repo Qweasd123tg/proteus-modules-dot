@@ -1,0 +1,143 @@
+diff --git a/model/model-pack/src/adapters/context_render.rs b/model/model-pack/src/adapters/context_render.rs
+--- a/model/model-pack/src/adapters/context_render.rs
++++ b/model/model-pack/src/adapters/context_render.rs
+@@ -1,4 +1,7 @@
+-use crate::domain::{ContextChunk, ContextRenderMode};
++use crate::{
++    domain::{ContextChunk, ContextRenderMode},
++    model_standard::InstructionBlock,
++};
+ 
+ /// Shared model-facing formatting; provider-specific JSON shaping stays in adapters.
+ pub(super) fn context_text(chunk: &ContextChunk) -> String {
+@@ -16,3 +19,16 @@
+         ),
+     }
+ }
++
++/// Canonical instruction prefix only; legacy system messages and wire shaping
++/// remain provider-specific. Preserve equal-priority order and nonblank bytes.
++pub(super) fn instruction_text(instructions: &[InstructionBlock]) -> String {
++    let mut instructions: Vec<_> = instructions.iter().collect();
++    instructions.sort_by_key(|instruction| std::cmp::Reverse(instruction.priority));
++    instructions
++        .into_iter()
++        .map(|instruction| instruction.text.as_str())
++        .filter(|text| !text.trim().is_empty())
++        .collect::<Vec<_>>()
++        .join("\n\n")
++}
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -5,7 +5,7 @@
+ 
+ use super::{OpenAiPromptCacheConfig, model_profile::OpenAiModelProfile};
+ use crate::{
+-    adapters::context_render::context_text,
++    adapters::context_render::{context_text, instruction_text},
+     domain::{
+         FileSearchHostedToolConfig, HostedToolConfig, ResponseFormat, ToolCall, ToolCallSurface,
+         ToolChoice, ToolContent, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
+@@ -198,14 +198,7 @@
+ }
+ 
+ fn joined_instructions(request: &CanonicalModelRequest) -> Option<String> {
+-    let mut instructions: Vec<_> = request.instructions.iter().collect();
+-    instructions.sort_by_key(|instruction| std::cmp::Reverse(instruction.priority));
+-    let text = instructions
+-        .into_iter()
+-        .map(|instruction| instruction.text.as_str())
+-        .filter(|text| !text.trim().is_empty())
+-        .collect::<Vec<_>>()
+-        .join("\n\n");
++    let text = instruction_text(&request.instructions);
+     if text.is_empty() { None } else { Some(text) }
+ }
+ 
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -3,7 +3,7 @@
+ 
+ use super::AnthropicPromptCacheConfig;
+ use crate::{
+-    adapters::context_render::context_text,
++    adapters::context_render::{context_text, instruction_text},
+     domain::{ToolCallSurface, ToolChoice, ToolContent, ToolSpec, ToolSurface},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+@@ -136,14 +136,7 @@
+ }
+ 
+ fn joined_instructions(request: &CanonicalModelRequest) -> Option<String> {
+-    let mut instructions: Vec<_> = request.instructions.iter().collect();
+-    instructions.sort_by_key(|instruction| std::cmp::Reverse(instruction.priority));
+-    let text = instructions
+-        .into_iter()
+-        .map(|instruction| instruction.text.as_str())
+-        .filter(|text| !text.trim().is_empty())
+-        .collect::<Vec<_>>()
+-        .join("\n\n");
++    let text = instruction_text(&request.instructions);
+     let systems = request
+         .messages
+         .iter()
+diff --git a/model/model-pack/src/adapters/anthropic/request_tests.rs b/model/model-pack/src/adapters/anthropic/request_tests.rs
+--- a/model/model-pack/src/adapters/anthropic/request_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/request_tests.rs
+@@ -1,5 +1,54 @@
+ use super::*;
+ use crate::model_standard::{InstructionBlock, InstructionKind};
++
++#[test]
++fn canonical_prefix_preserves_legacy_system_and_cache_semantics() {
++    let cache = AnthropicPromptCacheConfig::from_provider_config(&json!({
++        "prompt_cache_ttl": "1h"
++    }));
++    for (canonical, legacy, expected) in [
++        ("", "", None),
++        (" \n\t", "", None),
++        ("", " \n\t", Some(" \n\t")),
++        (" canonical ", "", Some(" canonical ")),
++        (" canonical ", " legacy ", Some(" canonical \n\n legacy ")),
++        (" \n\t", " legacy ", Some(" legacy ")),
++    ] {
++        for cache_instructions in [false, true] {
++            let request = CanonicalModelRequest::new(
++                ModelRef::new("anthropic", "fixture"),
++                vec![
++                    CanonicalMessage::text(MessageRole::System, legacy),
++                    CanonicalMessage::text(MessageRole::User, "question"),
++                ],
++            )
++            .with_instructions(vec![InstructionBlock::new(
++                InstructionKind::System,
++                canonical,
++                100,
++            )])
++            .with_cache(crate::domain::CacheHints::new(cache_instructions, false));
++            let source = serde_json::to_value(&request).unwrap();
++            let body = to_anthropic_request_with_cache(&request, &cache).unwrap();
++            let expected_system = expected.map(|text| {
++                if cache_instructions {
++                    json!([{
++                        "type": "text",
++                        "text": text,
++                        "cache_control": { "type": "ephemeral", "ttl": "1h" },
++                    }])
++                } else {
++                    json!(text)
++                }
++            });
++            assert_eq!(body.get("system"), expected_system.as_ref());
++            assert!(body.get("cache_control").is_none());
++            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
++            assert_eq!(body["messages"][0]["content"][0]["text"], "question");
++            assert_eq!(serde_json::to_value(&request).unwrap(), source);
++        }
++    }
++}
+ 
+ #[test]
+ fn shaped_output_limits_keep_required_anthropic_max_tokens() {

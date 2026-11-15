@@ -1,0 +1,625 @@
+diff --git a/.github/workflows/check-current-core-skills.yml b/.github/workflows/check-current-core-skills.yml
+index 832e5b0..c243eb9 100644
+--- a/.github/workflows/check-current-core-skills.yml
++++ b/.github/workflows/check-current-core-skills.yml
+@@ -1,9 +1,9 @@
+ name: Current Core mixed-pin portable skills (supervised v1)
+ on:
+   push:
+-    paths: ['conformance/current-core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
++    paths: ['conformance/current-core-skills/**', 'conformance/core-skills/ci/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
+   pull_request:
+-    paths: ['conformance/current-core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
++    paths: ['conformance/current-core-skills/**', 'conformance/core-skills/ci/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
+ permissions:
+   contents: read
+ jobs:
+@@ -42,6 +42,10 @@ jobs:
+             --input ci/resource-envelope-v1/core-skills-stage.sh \
+             --input .github/workflows/check-current-core-skills.yml \
+             --input conformance/current-core-skills/ci/run.sh \
++            --input conformance/core-skills/ci/run_probe.py \
++            --input conformance/core-skills/ci/verify_results.py \
++            --input conformance/core-skills/ci/test_capture_controls.py \
++            --input conformance/core-skills/ci/test_verify_results.py \
+             -- bash "$GITHUB_WORKSPACE/ci/resource-envelope-v1/core-skills-stage.sh"
+       - name: Retain bounded invocation snapshot, never original live directory
+         if: always() && steps.destination.outcome == 'success'
+diff --git a/conformance/core-skills/CODE.sha256 b/conformance/core-skills/CODE.sha256
+index 15b0182..8c40d6a 100644
+--- a/conformance/core-skills/CODE.sha256
++++ b/conformance/core-skills/CODE.sha256
+@@ -6,7 +6,7 @@ baa96734df06a2e8e149f76462dde7671101ad273618e9c1e90c491ab0f1646b  ci/run.sh
+ 1fb0835b2ff1fd28625b7baa1dd26b4eac8e3b0f954b99b33f8acd4df4073031  ci/run_probe.py
+ 667f9b12bc6c7baa354e69fac261f3b0652ed0cb2b93c6c0856fd1f30dfbc4ed  ci/source_manifest.py
+ 10edf640510dd881853ee1dbf92f43c25b7301c843a49165ce80f66ee35b3b0d  ci/test_capture_controls.py
+-6f02c3eae8fd3891ac4cbcd121b978be978e8c02dae13b7480da480503561c7b  ci/test_verify_results.py
++999ef16a09ccc00981dfc4fbbbf4bb9736cfe96d00b4c552a3b824824eb4c907  ci/test_verify_results.py
+ 2c987d6b95a07e5813921f93b7524288759eeb29efda17979665218615baeb10  ci/verify_results.py
+ 32d99b8237d5832435d362c395422d69f52348a9fd1a154f70336d2991403064  rust-toolchain.toml
+ fa923cec34be322ed2686e7d7fee4d2083465232a84410ea2135e73f59d68c45  scenarios.json
+diff --git a/conformance/core-skills/README.md b/conformance/core-skills/README.md
+index 95721e6..aff92c6 100644
+--- a/conformance/core-skills/README.md
++++ b/conformance/core-skills/README.md
+@@ -118,3 +118,14 @@ See `VALIDATION.md` for run versus unrun status and `SOURCE_PINS.json` for exact
+ source identities. The useful next boundary after this gate is a separately
+ scoped official context-reader/full-turn integration, not weakening Core authority
+ or treating instruction hints as permissions.
++
++## Active shared-CI revision (2026-11-16)
++
++This package now owns the existing Python probe/verifier and fifteen controls
++for both skills lanes. The current-Core lane passes its own scenario pin; Rust
++inputs and both independent compatibility runs remain unchanged. See the
++[active revision notes](../current-core-skills/README.md#active-shared-ci-revision-2026-11-16)
++for shared-source freezes, repository-layout requirements and removed private
++entrypoints. `CODE.sha256` tracks this active source revision; retained
++validation snapshots and `RESOURCE-OVERLAY.json` describe their historical
++revisions and are not new runtime acceptance.
+diff --git a/conformance/core-skills/ci/test_verify_results.py b/conformance/core-skills/ci/test_verify_results.py
+index c054f2f..9861e60 100644
+--- a/conformance/core-skills/ci/test_verify_results.py
++++ b/conformance/core-skills/ci/test_verify_results.py
+@@ -9,6 +9,7 @@ import unittest
+ 
+ sys.dont_write_bytecode = True
+ HERE = Path(__file__).resolve().parent
++SCENARIOS = HERE.parent / "scenarios.json"
+ spec = importlib.util.spec_from_file_location("verifier", HERE / "verify_results.py")
+ v = importlib.util.module_from_spec(spec)
+ spec.loader.exec_module(v)
+@@ -16,7 +17,7 @@ spec.loader.exec_module(v)
+ 
+ class Controls(unittest.TestCase):
+     def setUp(self):
+-        self.expected = json.loads((HERE.parent / "scenarios.json").read_text())
++        self.expected = json.loads(SCENARIOS.read_text())
+         self.report = {"schema_version": 1, "core_commit": self.expected["core_commit"],
+                        "checks": [{"name": n, "status": "passed", "evidence": {}}
+                                   for n in self.expected["checks"]]}
+@@ -83,6 +84,10 @@ class Controls(unittest.TestCase):
+ 
+ 
+ if __name__ == "__main__":
++    if len(sys.argv) > 2:
++        raise SystemExit("usage: test_verify_results.py [SCENARIOS]")
++    if len(sys.argv) == 2:
++        SCENARIOS = Path(sys.argv[1])
+     result = unittest.TextTestRunner(verbosity=2).run(
+         unittest.defaultTestLoader.loadTestsFromTestCase(Controls))
+     raise SystemExit(0 if result.wasSuccessful() and result.testsRun == 11 and not result.skipped else 1)
+diff --git a/conformance/current-core-skills/CODE.sha256 b/conformance/current-core-skills/CODE.sha256
+index 6a4ab4b..70a3c01 100644
+--- a/conformance/current-core-skills/CODE.sha256
++++ b/conformance/current-core-skills/CODE.sha256
+@@ -1,14 +1,11 @@
+ 4b34c2accfe01e2fa31233ee11e7bc0530255f9b03aa8075aa08e5656e86a509  Cargo.lock
+ 230d1eab4e69bd9c838a82334db7e47ad8d00276564b7886a890457ef081b8ab  Cargo.toml
+-84a7be5d3386edb69084c9d58e1d9a873ecf6d07e4739855c96763d39f53fd9a  ci/check-current-core-skills.yml
+-f4017d72e48dee5501d42a0e59bb585631e76d03b3f0e452fa9bd4ce7a86847d  ci/lock_only.sh
++ae31b289a16dc22fb1da63c1abe1117797506745f6282396c818819093dd089c  ci/check-current-core-skills.yml
++91f27a8a2348f5fa1f02cc46b2e9dc69578ce4cc6fde388351f14a98a12651ff  ci/lock_only.sh
+ 3d9c1b63d826dfe437a314fb989d5d2ba87ab3210f712c0f264b5f4eba063976  ci/portable-module.sha256
+-baa96734df06a2e8e149f76462dde7671101ad273618e9c1e90c491ab0f1646b  ci/run.sh
+-1fb0835b2ff1fd28625b7baa1dd26b4eac8e3b0f954b99b33f8acd4df4073031  ci/run_probe.py
+-667f9b12bc6c7baa354e69fac261f3b0652ed0cb2b93c6c0856fd1f30dfbc4ed  ci/source_manifest.py
+-10edf640510dd881853ee1dbf92f43c25b7301c843a49165ce80f66ee35b3b0d  ci/test_capture_controls.py
+-6f02c3eae8fd3891ac4cbcd121b978be978e8c02dae13b7480da480503561c7b  ci/test_verify_results.py
+-2c987d6b95a07e5813921f93b7524288759eeb29efda17979665218615baeb10  ci/verify_results.py
++ef1b51113c9b795d71afd86feee95c9977f11e797696ab4aa4c2df130ea58510  ci/run.sh
++f15ad2bb0236dc608c14efbba33d076957f311562210b89be13a06a9d35e4053  ci/shared-ci.sha256
++3834a72fc435616a1c982141f36b64c7cdc977f44e344f5702d62d19760c496b  ci/source_manifest.py
+ 32d99b8237d5832435d362c395422d69f52348a9fd1a154f70336d2991403064  rust-toolchain.toml
+ 0239814ede34553630f4c0ea6c3108335a2529fc17f2e183c482c19cb01b60b8  scenarios.json
+ 1092e965cc5586c955b8460e675e3d49441b1067e0d2e48ddb12e628af9794f5  src/fixture.rs
+diff --git a/conformance/current-core-skills/README.md b/conformance/current-core-skills/README.md
+index 3973b14..309812d 100644
+--- a/conformance/current-core-skills/README.md
++++ b/conformance/current-core-skills/README.md
+@@ -47,3 +47,27 @@ source-reviewed capture. Portable пересобирается из неизме
+ 
+ Frozen portable сохраняет deprecated serde_yaml/unsafe-libyaml; миграции
+ парсера и полного dependency-security audit здесь нет.
++
++## Active shared-CI revision (2026-11-16)
++
++The two Core pins still run as separate compatibility lanes, with unchanged
++Rust inputs, eleven Core checks and separate run artifacts. The Python probe,
++result verifier and fifteen Python controls now have one implementation owner:
++`conformance/core-skills/ci`. The current-Core gate invokes that owner directly,
++passing its own `scenarios.json` to the verifier controls and result verifier.
++No runtime/capture/verifier algorithm is changed.
++
++Run the existing `ci/run.sh` package entrypoint from the repository layout;
++`current-core-skills` alone is no longer a self-contained copied package. Its
++four former private Python script paths are removed rather than kept as
++compatibility wrappers. Both lanes still execute all fifteen Python controls;
++this removes duplicate definitions, not required cases or CI executions.
++
++`CODE.sha256` is the active source freeze, not an old run attestation. The
++current-Core source manifest also validates `ci/shared-ci.sha256` against the
++four exact owner scripts before and after the gate. Shared changes must update
++that freeze, and the current-Core workflow now triggers on owner CI changes.
++Retained `validation/`, earlier result/source-hash snapshots, source pins and
++`VALIDATION.md` remain historical evidence for their original revisions. They
++do not attest this active shared-CI revision; no new Rust/runtime acceptance
++is implied by this refactor.
+diff --git a/conformance/current-core-skills/ci/check-current-core-skills.yml b/conformance/current-core-skills/ci/check-current-core-skills.yml
+index 832e5b0..c243eb9 100644
+--- a/conformance/current-core-skills/ci/check-current-core-skills.yml
++++ b/conformance/current-core-skills/ci/check-current-core-skills.yml
+@@ -1,9 +1,9 @@
+ name: Current Core mixed-pin portable skills (supervised v1)
+ on:
+   push:
+-    paths: ['conformance/current-core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
++    paths: ['conformance/current-core-skills/**', 'conformance/core-skills/ci/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
+   pull_request:
+-    paths: ['conformance/current-core-skills/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
++    paths: ['conformance/current-core-skills/**', 'conformance/core-skills/ci/**', 'examples/portable-skill-catalog/**', 'ci/resource-envelope-v1/**', '.github/workflows/check-current-core-skills.yml']
+ permissions:
+   contents: read
+ jobs:
+@@ -42,6 +42,10 @@ jobs:
+             --input ci/resource-envelope-v1/core-skills-stage.sh \
+             --input .github/workflows/check-current-core-skills.yml \
+             --input conformance/current-core-skills/ci/run.sh \
++            --input conformance/core-skills/ci/run_probe.py \
++            --input conformance/core-skills/ci/verify_results.py \
++            --input conformance/core-skills/ci/test_capture_controls.py \
++            --input conformance/core-skills/ci/test_verify_results.py \
+             -- bash "$GITHUB_WORKSPACE/ci/resource-envelope-v1/core-skills-stage.sh"
+       - name: Retain bounded invocation snapshot, never original live directory
+         if: always() && steps.destination.outcome == 'success'
+diff --git a/conformance/current-core-skills/ci/lock_only.sh b/conformance/current-core-skills/ci/lock_only.sh
+index 8e89a9b..8a42cd3 100644
+--- a/conformance/current-core-skills/ci/lock_only.sh
++++ b/conformance/current-core-skills/ci/lock_only.sh
+@@ -35,12 +35,14 @@ run portable-metadata cargo metadata --locked --offline --format-version 1 --man
+ python3 -B -I - "$out/source-hashes-before.json" "$module" <<'PY'
+ import hashlib, json, pathlib, sys
+ before = json.loads(pathlib.Path(sys.argv[1]).read_text())
+-for kind, root in [('harness', pathlib.Path.cwd()), ('portable_module', pathlib.Path(sys.argv[2]))]:
++for kind, root in [('harness', pathlib.Path.cwd()),
++                   ('portable_module', pathlib.Path(sys.argv[2])),
++                   ('shared_ci', pathlib.Path('../core-skills/ci'))]:
+     for name, sha in before[kind].items():
+         if kind == 'harness' and name == 'Cargo.lock':
+             continue
+         assert hashlib.sha256((root / name).read_bytes()).hexdigest() == sha, (kind, name)
+-print('Only variant Cargo.lock may differ; portable and other frozen sources unchanged')
++print('Only variant Cargo.lock may differ; portable, shared CI and other frozen sources unchanged')
+ PY
+ printf 'lock-resolution-only; no compile or runtime; review required\n' > "$out/scope.txt"
+ printf 'passed\n' > "$out/status.txt"
+diff --git a/conformance/current-core-skills/ci/run.sh b/conformance/current-core-skills/ci/run.sh
+index 80ddda4..d3e7db0 100644
+--- a/conformance/current-core-skills/ci/run.sh
++++ b/conformance/current-core-skills/ci/run.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-# Standalone package gate. Only authored probe/module executables are run.
++# Repository-layout gate with shared CI. Only authored probe/module executables are run.
+ set -euo pipefail
+ cd "$(dirname "${BASH_SOURCE[0]}")/.."
+ module="${PORTABLE_SKILLS_PACKAGE:?set absolute path to frozen portable-skill-catalog package}"
+@@ -26,8 +26,8 @@ run() {
+   if (( code != 0 )); then printf 'failed:%s:%s\n' "$name" "$code" > "$out/status.txt"; exit "$code"; fi
+ }
+ run source-freeze sha256sum -c CODE.sha256
+-run verifier-controls python3 -B -I ci/test_verify_results.py
+-run capture-controls python3 -B -I ci/test_capture_controls.py
++run verifier-controls python3 -B -I ../core-skills/ci/test_verify_results.py scenarios.json
++run capture-controls python3 -B -I ../core-skills/ci/test_capture_controls.py
+ run fmt cargo fmt --check
+ run module-fmt cargo fmt --check --manifest-path "$module/Cargo.toml"
+ run fetch timeout 300 cargo fetch --locked
+@@ -36,11 +36,11 @@ run metadata cargo metadata --locked --offline --format-version 1
+ run module-metadata cargo metadata --locked --offline --format-version 1 --manifest-path "$module/Cargo.toml"
+ run module-build timeout 600 cargo build --locked --offline -j2 --manifest-path "$module/Cargo.toml"
+ run build timeout 900 cargo build --locked --offline -j2
+-run probe python3 -B -I ci/run_probe.py \
++run probe python3 -B -I ../core-skills/ci/run_probe.py \
+   --probe "$CARGO_TARGET_DIR/debug/proteus-portable-skills-core-probe" \
+   --module "$CARGO_TARGET_DIR/debug/proteus-example-portable-skill-catalog" \
+   --output "$out/probe"
+ python3 -B -I ci/source_manifest.py "$module" > "$out/source-hashes-after.json"
+-run evidence python3 -B -I ci/verify_results.py "$out/probe/stdout.json" \
++run evidence python3 -B -I ../core-skills/ci/verify_results.py "$out/probe/stdout.json" \
+   "$out/probe/stderr.txt" scenarios.json "$out/source-hashes.json" "$out/source-hashes-after.json"
+ printf 'passed\n' > "$out/status.txt"
+diff --git a/conformance/current-core-skills/ci/run_probe.py b/conformance/current-core-skills/ci/run_probe.py
+deleted file mode 100644
+index adb9bbe..0000000
+--- a/conformance/current-core-skills/ci/run_probe.py
++++ /dev/null
+@@ -1,146 +0,0 @@
+-#!/usr/bin/env python3
+-"""Run only explicit authored binaries with an empty HOME and fresh workspace.
+-
+-This is a bounded-time trusted-process smoke, not an OS sandbox. Core launches
+-component-owned process groups; killing this controller's group on failure does
+-not prove all descendants terminated. Every timeout is a failed run.
+-"""
+-import argparse
+-import hashlib
+-import json
+-import os
+-from pathlib import Path
+-import shutil
+-import selectors
+-import signal
+-import subprocess
+-import time
+-
+-
+-def digest(path):
+-    h = hashlib.sha256()
+-    with path.open("rb") as stream:
+-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+-            h.update(chunk)
+-    return h.hexdigest()
+-
+-
+-def save(path, value):
+-    path.write_text(json.dumps(value, indent=2) + "\n")
+-
+-
+-def capture(process, timeout=90, max_bytes=2 * 1024 * 1024):
+-    """Bound each pipe independently, including descendants holding a pipe open."""
+-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+-    deadline = time.monotonic() + timeout
+-    selector = selectors.DefaultSelector()
+-    for name in buffers:
+-        stream = getattr(process, name)
+-        os.set_blocking(stream.fileno(), False)
+-        selector.register(stream, selectors.EVENT_READ, name)
+-    error = None
+-    try:
+-        while selector.get_map() or process.poll() is None:
+-            remaining = deadline - time.monotonic()
+-            if remaining <= 0:
+-                raise RuntimeError(f"{timeout}-second probe timeout")
+-            for key, _ in selector.select(min(remaining, 0.1)):
+-                data = os.read(key.fileobj.fileno(), 65536)
+-                if not data:
+-                    selector.unregister(key.fileobj)
+-                    continue
+-                buffer = buffers[key.data]
+-                available = max_bytes - len(buffer)
+-                buffer.extend(data[:available])
+-                if len(data) > available:
+-                    raise RuntimeError(f"{key.data} exceeds {max_bytes}-byte capture limit")
+-        process.wait(timeout=max(0.01, deadline - time.monotonic()))
+-    except BaseException as failure:
+-        error = repr(failure)
+-        try:
+-            os.killpg(process.pid, signal.SIGKILL)
+-        except ProcessLookupError:
+-            pass
+-        try:
+-            process.wait(timeout=5)
+-        except subprocess.TimeoutExpired:
+-            error += "; controller reap exceeded 5 seconds"
+-        error += "; controller group kill attempted; component-owned descendant cleanup unproven"
+-    finally:
+-        selector.close()
+-        process.stdout.close()
+-        process.stderr.close()
+-    decoded = []
+-    for name in ("stdout", "stderr"):
+-        try:
+-            decoded.append(bytes(buffers[name]).decode("utf-8"))
+-        except UnicodeDecodeError:
+-            error = (error + "; " if error else "") + f"{name} is not UTF-8"
+-            decoded.append(bytes(buffers[name]).decode("utf-8", errors="replace"))
+-    return decoded[0], decoded[1], error
+-
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--probe", type=Path, required=True)
+-    parser.add_argument("--module", type=Path, required=True)
+-    parser.add_argument("--output", type=Path, required=True)
+-    args = parser.parse_args()
+-    probe, module = (path.resolve(strict=True) for path in (args.probe, args.module))
+-    for executable in (probe, module):
+-        if not executable.is_file() or not os.access(executable, os.X_OK):
+-            parser.error(f"not an executable file: {executable}")
+-    if shutil.disk_usage(args.output.parent).free < 1024 ** 3:
+-        raise RuntimeError("less than 1 GiB free; no cleanup attempted")
+-    args.output.mkdir(exist_ok=False)
+-    output = args.output.resolve(strict=True)
+-    workspace, home, temp = (output / name for name in ("workspace", "home", "tmp"))
+-    for directory in (workspace, home, temp):
+-        directory.mkdir()
+-    before = {"probe": digest(probe), "portable_module": digest(module)}
+-    save(output / "inputs.json", {"binary_sha256": before, "timeout_seconds": 90, "capture_limit_bytes_per_pipe": 2097152,
+-         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+-         "launch": "trusted; cleared environment and empty HOME are not an OS sandbox"})
+-    env = {"PATH": os.defpath, "HOME": str(home), "XDG_CONFIG_HOME": str(home),
+-           "TMPDIR": str(temp), "PROTEUS_PORTABLE_SKILLS_BINARY": str(module),
+-           "PROTEUS_SKILLS_PROBE_WORKSPACE": str(workspace)}
+-    started = time.monotonic()
+-    process = None
+-    try:
+-        process = subprocess.Popen([str(probe)], cwd=workspace, env=env,
+-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                                   start_new_session=True)
+-        stdout, stderr, capture_error = capture(process)
+-        (output / "stdout.json").write_text(stdout)
+-        (output / "stderr.txt").write_text(stderr)
+-        if capture_error:
+-            raise RuntimeError(capture_error)
+-        if process.returncode:
+-            raise RuntimeError(f"probe failed with {process.returncode}")
+-        if before != {"probe": digest(probe), "portable_module": digest(module)}:
+-            raise RuntimeError("binary changed during run")
+-        if list(home.iterdir()):
+-            raise RuntimeError("probe changed the empty HOME")
+-        # Authored fixture inputs are intentionally created/changed, not an empty-workspace claim.
+-        files = sorted(path for path in workspace.rglob("*") if path.is_file())
+-        expected_paths = {"root-a/review/SKILL.md", "root-b/review/SKILL.md",
+-                          "large-body/review/SKILL.md"}
+-        expected_paths.update(f"catalog-cap/skill-{index}/SKILL.md" for index in range(16))
+-        if {str(path.relative_to(workspace)) for path in files} != expected_paths:
+-            raise RuntimeError("workspace file set differs from 19 authored fixtures")
+-        save(output / "fixture-files.json", {
+-            str(path.relative_to(workspace)): {"bytes": path.stat().st_size, "sha256": digest(path)}
+-            for path in files})
+-        save(output / "process.json", {"status": "passed", "returncode": process.returncode,
+-             "elapsed_seconds": time.monotonic() - started, "binaries_unchanged": True,
+-             "home_empty": True, "authored_fixture_files": 19})
+-    except BaseException as error:
+-        save(output / "process.json", {"status": "failed", "error": repr(error),
+-             "returncode": process.returncode if process else None,
+-             "elapsed_seconds": time.monotonic() - started})
+-        raise
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/conformance/current-core-skills/ci/shared-ci.sha256 b/conformance/current-core-skills/ci/shared-ci.sha256
+new file mode 100644
+index 0000000..d9b8705
+--- /dev/null
++++ b/conformance/current-core-skills/ci/shared-ci.sha256
+@@ -0,0 +1,4 @@
++1fb0835b2ff1fd28625b7baa1dd26b4eac8e3b0f954b99b33f8acd4df4073031  run_probe.py
++10edf640510dd881853ee1dbf92f43c25b7301c843a49165ce80f66ee35b3b0d  test_capture_controls.py
++999ef16a09ccc00981dfc4fbbbf4bb9736cfe96d00b4c552a3b824824eb4c907  test_verify_results.py
++2c987d6b95a07e5813921f93b7524288759eeb29efda17979665218615baeb10  verify_results.py
+diff --git a/conformance/current-core-skills/ci/source_manifest.py b/conformance/current-core-skills/ci/source_manifest.py
+index 33c5769..2df401b 100644
+--- a/conformance/current-core-skills/ci/source_manifest.py
++++ b/conformance/current-core-skills/ci/source_manifest.py
+@@ -6,6 +6,9 @@ from pathlib import Path
+ import sys
+ 
+ PACKAGE = Path(__file__).resolve().parent.parent
++SHARED_CI = PACKAGE.parent / "core-skills" / "ci"
++SHARED_INPUTS = ("run_probe.py", "verify_results.py",
++                 "test_capture_controls.py", "test_verify_results.py")
+ 
+ 
+ def digest(path):
+@@ -51,8 +54,11 @@ def manifest(module):
+     harness_hashes = hashes(PACKAGE, paths)
+     if harness_hashes != read_hashes(PACKAGE / "CODE.sha256"):
+         raise ValueError("frozen harness source input set or bytes changed")
++    shared_hashes = hashes(SHARED_CI, [SHARED_CI / name for name in SHARED_INPUTS])
++    if shared_hashes != read_hashes(PACKAGE / "ci/shared-ci.sha256"):
++        raise ValueError("frozen shared CI source input set or bytes changed")
+     return {"schema_version": 1, "harness": harness_hashes,
+-            "portable_module": module_hashes}
++            "portable_module": module_hashes, "shared_ci": shared_hashes}
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/conformance/current-core-skills/ci/test_capture_controls.py b/conformance/current-core-skills/ci/test_capture_controls.py
+deleted file mode 100644
+index 0ae61b4..0000000
+--- a/conformance/current-core-skills/ci/test_capture_controls.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-#!/usr/bin/env python3
+-"""Run only these tiny authored Python child strings; no Core coverage claim."""
+-import importlib.util
+-from pathlib import Path
+-import subprocess
+-import sys
+-import unittest
+-
+-sys.dont_write_bytecode = True
+-spec = importlib.util.spec_from_file_location("runner", Path(__file__).with_name("run_probe.py"))
+-runner = importlib.util.module_from_spec(spec)
+-spec.loader.exec_module(runner)
+-
+-
+-class Controls(unittest.TestCase):
+-    def child(self, code):
+-        return subprocess.Popen([sys.executable, "-I", "-B", "-c", code],
+-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                                start_new_session=True)
+-
+-    def test_complete_stdout_stderr(self):
+-        child = self.child("import sys; print('output'); print('diagnostic', file=sys.stderr)")
+-        out, err, error = runner.capture(child, timeout=5, max_bytes=64)
+-        self.assertIsNone(error)
+-        self.assertEqual((out, err, child.returncode), ("output\n", "diagnostic\n", 0))
+-
+-    def test_capture_overflow_kills_and_reaps_controller(self):
+-        child = self.child("import sys,time; sys.stdout.write('x'*1000); sys.stdout.flush(); time.sleep(10)")
+-        out, _, error = runner.capture(child, timeout=5, max_bytes=64)
+-        self.assertEqual(len(out), 64)
+-        self.assertIn("stdout exceeds 64-byte capture limit", error)
+-        self.assertIsNotNone(child.returncode)
+-
+-    def test_deadline_kills_and_reaps_controller(self):
+-        child = self.child("import time; time.sleep(10)")
+-        _, _, error = runner.capture(child, timeout=0.1, max_bytes=64)
+-        self.assertIn("0.1-second probe timeout", error)
+-        self.assertIsNotNone(child.returncode)
+-
+-    def test_non_utf8_is_not_silently_accepted(self):
+-        child = self.child("import os; os.write(1,b'\\xff')")
+-        _, _, error = runner.capture(child, timeout=5, max_bytes=64)
+-        self.assertIn("stdout is not UTF-8", error)
+-        self.assertEqual(child.returncode, 0)
+-
+-
+-if __name__ == "__main__":
+-    result = unittest.TextTestRunner(verbosity=2).run(
+-        unittest.defaultTestLoader.loadTestsFromTestCase(Controls))
+-    raise SystemExit(0 if result.wasSuccessful() and result.testsRun == 4 and not result.skipped else 1)
+diff --git a/conformance/current-core-skills/ci/test_verify_results.py b/conformance/current-core-skills/ci/test_verify_results.py
+deleted file mode 100644
+index c054f2f..0000000
+--- a/conformance/current-core-skills/ci/test_verify_results.py
++++ /dev/null
+@@ -1,88 +0,0 @@
+-#!/usr/bin/env python3
+-"""Pure authored gate controls, not evidence that Core was executed."""
+-import copy
+-import importlib.util
+-import json
+-from pathlib import Path
+-import sys
+-import unittest
+-
+-sys.dont_write_bytecode = True
+-HERE = Path(__file__).resolve().parent
+-spec = importlib.util.spec_from_file_location("verifier", HERE / "verify_results.py")
+-v = importlib.util.module_from_spec(spec)
+-spec.loader.exec_module(v)
+-
+-
+-class Controls(unittest.TestCase):
+-    def setUp(self):
+-        self.expected = json.loads((HERE.parent / "scenarios.json").read_text())
+-        self.report = {"schema_version": 1, "core_commit": self.expected["core_commit"],
+-                       "checks": [{"name": n, "status": "passed", "evidence": {}}
+-                                  for n in self.expected["checks"]]}
+-        self.stderr = "\n".join("SKILLS_CORE_CHECK " + json.dumps(
+-            {"name": n, "status": "passed"}) for n in self.expected["checks"])
+-        self.before = {"harness": {"source": "sha"}, "portable_module": {"source": "sha"}}
+-        self.after = copy.deepcopy(self.before)
+-
+-    def run_gate(self):
+-        return v.verify(self.report, self.stderr, self.expected, self.before, self.after)
+-
+-    def test_valid_complete_control(self):
+-        self.assertEqual(self.run_gate()["core_checks"], 11)
+-
+-    def test_omitted_check(self):
+-        self.report["checks"].pop()
+-        with self.assertRaisesRegex(ValueError, "exact ordered 11"):
+-            self.run_gate()
+-
+-    def test_duplicate_check(self):
+-        self.report["checks"][-1] = self.report["checks"][0]
+-        with self.assertRaisesRegex(ValueError, "exact ordered 11"):
+-            self.run_gate()
+-
+-    def test_nonpassing_check(self):
+-        self.report["checks"][0]["status"] = "skipped"
+-        with self.assertRaisesRegex(ValueError, "did not pass"):
+-            self.run_gate()
+-
+-    def test_boolean_schema_version(self):
+-        self.report["schema_version"] = True
+-        with self.assertRaisesRegex(ValueError, "report version"):
+-            self.run_gate()
+-
+-    def test_float_schema_version(self):
+-        self.report["schema_version"] = 1.0
+-        with self.assertRaisesRegex(ValueError, "report version"):
+-            self.run_gate()
+-
+-    def test_nonfinite_json(self):
+-        for constant in ("NaN", "Infinity", "-Infinity"):
+-            with self.subTest(constant=constant):
+-                with self.assertRaisesRegex(ValueError, "non-finite JSON constant"):
+-                    v.decode('{"value":' + constant + '}')
+-
+-    def test_wrong_core_pin(self):
+-        self.report["core_commit"] = "wrong"
+-        with self.assertRaisesRegex(ValueError, "Core pin"):
+-            self.run_gate()
+-
+-    def test_missing_completion_marker(self):
+-        self.stderr = "\n".join(self.stderr.splitlines()[:-1])
+-        with self.assertRaisesRegex(ValueError, "completion markers"):
+-            self.run_gate()
+-
+-    def test_changed_source(self):
+-        self.after["portable_module"]["source"] = "changed"
+-        with self.assertRaisesRegex(ValueError, "source hashes changed"):
+-            self.run_gate()
+-
+-    def test_duplicate_json_key(self):
+-        with self.assertRaisesRegex(ValueError, "duplicate JSON key: status"):
+-            v.decode('{"status":"failed","status":"passed"}')
+-
+-
+-if __name__ == "__main__":
+-    result = unittest.TextTestRunner(verbosity=2).run(
+-        unittest.defaultTestLoader.loadTestsFromTestCase(Controls))
+-    raise SystemExit(0 if result.wasSuccessful() and result.testsRun == 11 and not result.skipped else 1)
+diff --git a/conformance/current-core-skills/ci/verify_results.py b/conformance/current-core-skills/ci/verify_results.py
+deleted file mode 100644
+index 92c82cc..0000000
+--- a/conformance/current-core-skills/ci/verify_results.py
++++ /dev/null
+@@ -1,49 +0,0 @@
+-#!/usr/bin/env python3
+-"""Exact named-check gate; does not replace the Rust assertions with simulation."""
+-import json
+-from pathlib import Path
+-import sys
+-
+-
+-def unique_object(pairs):
+-    result = {}
+-    for key, value in pairs:
+-        if key in result:
+-            raise ValueError(f"duplicate JSON key: {key}")
+-        result[key] = value
+-    return result
+-
+-
+-def decode(text):
+-    return json.loads(text, object_pairs_hook=unique_object,
+-                      parse_constant=lambda value: (_ for _ in ()).throw(
+-                          ValueError(f"non-finite JSON constant: {value}")))
+-
+-
+-def verify(report, stderr, expected, before, after):
+-    if before != after or not before.get("harness") or not before.get("portable_module"):
+-        raise ValueError("input source hashes changed or missing")
+-    if (type(report.get("schema_version")) is not int or report["schema_version"] != 1
+-            or report.get("core_commit") != expected["core_commit"]):
+-        raise ValueError("wrong report version or Core pin")
+-    checks = report.get("checks", [])
+-    names = [check.get("name") for check in checks]
+-    if names != expected["checks"] or len(names) != 11 or len(set(names)) != 11:
+-        raise ValueError("required exact ordered 11 checks not present")
+-    if any(check.get("status") != "passed" or not isinstance(check.get("evidence"), dict)
+-           for check in checks):
+-        raise ValueError("check did not pass or evidence missing")
+-    markers = [decode(line.removeprefix("SKILLS_CORE_CHECK "))
+-               for line in stderr.splitlines() if line.startswith("SKILLS_CORE_CHECK ")]
+-    if markers != [{"name": name, "status": "passed"} for name in names]:
+-        raise ValueError("stderr completion markers differ from exact report")
+-    return {"status": "passed", "core_checks": 11, "input_sources_unchanged": True}
+-
+-
+-if __name__ == "__main__":
+-    if len(sys.argv) != 6:
+-        raise SystemExit("usage: verify_results.py REPORT STDERR SCENARIOS BEFORE AFTER")
+-    report, stderr, expected, before, after = [Path(name) for name in sys.argv[1:]]
+-    print(json.dumps(verify(decode(report.read_text()), stderr.read_text(),
+-                            decode(expected.read_text()), decode(before.read_text()),
+-                            decode(after.read_text())), indent=2))
