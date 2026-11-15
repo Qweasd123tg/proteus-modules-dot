@@ -1,0 +1,2646 @@
+diff --git a/components/process-module/src/config_schema.rs b/components/process-module/src/config_schema.rs
+index ecac1a0..cef43f7 100644
+--- a/components/process-module/src/config_schema.rs
++++ b/components/process-module/src/config_schema.rs
+@@ -14,6 +14,7 @@ pub(crate) fn describe(slot: &str, id: &str, config: &Value) -> Option<ModuleCon
+         "tool" | "context_provider" if id == "sqlite_memory" => sqlite_memory::config_schema(),
+         "tool" | "context_provider" if id == "rg_search" => ModuleConfigSchema::default(),
+         "tool" if id == "codex_patch" => codex_patch::config_schema(),
++        "tool" if matches!(id, "shell_tools" | "reference.tools") => shell_tool::config_schema(),
+         // These packs read no module config.
+         "tool"
+             if matches!(
+@@ -23,10 +24,8 @@ pub(crate) fn describe(slot: &str, id: &str, config: &Value) -> Option<ModuleCon
+                     | "plan_tool"
+                     | "policy_tools"
+                     | "rust_lsp"
+-                    | "shell_tools"
+                     | "skill_tool"
+                     | "direct_patch"
+-                    | "reference.tools"
+             ) =>
+         {
+             ModuleConfigSchema::default()
+@@ -35,3 +34,23 @@ pub(crate) fn describe(slot: &str, id: &str, config: &Value) -> Option<ModuleCon
+         _ => return None,
+     })
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn standalone_shell_and_aggregate_reference_advertise_one_canonical_schema() {
++        let expected = shell_tool::config_schema();
++        expected.validate().unwrap();
++        for id in ["shell_tools", "reference.tools"] {
++            assert_eq!(
++                describe("tool", id, &serde_json::json!({})),
++                Some(expected.clone())
++            );
++        }
++        assert_eq!(
++            describe("tool", "file_tools", &serde_json::json!({})),
++            Some(ModuleConfigSchema::default())
++        );
++    }
++}
+diff --git a/components/process-module/tests/independent_modules/source_capture.rs b/components/process-module/tests/independent_modules/source_capture.rs
+new file mode 100644
+index 0000000..67abfc3
+--- /dev/null
++++ b/components/process-module/tests/independent_modules/source_capture.rs
+@@ -0,0 +1,157 @@
++//! Existing runner supplies real independently packaged workers; no build/install
++//! from tests, no replacement stand-in process and no invented SDK revision.
++use super::*;
++use proteus_contracts::contracts::{ProcessToolInvokeResponse, ProcessToolListResponse};
++
++fn shell_worker(binary: &Path, workspace: &Path, id: &str, config: Value) -> ComponentBroker {
++    let export = ProcessExportBinding::new(
++        "tool",
++        id,
++        current_process_contract_authority("tool")
++            .unwrap()
++            .contract_version,
++        config,
++    )
++    .unwrap();
++    ComponentBroker::connect(
++        ProcessSpec::new(binary.to_string_lossy().into_owned()).cwd(workspace),
++        ProcessComponentBinding::new("source-capture-check", [export]).unwrap(),
++        ComponentBrokerOptions::default(),
++    )
++    .unwrap()
++}
++
++async fn call(
++    worker: &ComponentBroker,
++    target: &ProcessComponentExportRef,
++    workspace: &Path,
++    attribution: ExecutionAttribution,
++    name: &str,
++    args: Value,
++) -> ProcessToolInvokeResponse {
++    let input = ProcessToolInvokeInput {
++        call: ToolCall::new(new_call_id(), name, args),
++        cwd: workspace.into(),
++        attribution,
++        skills: Default::default(),
++    };
++    serde_json::from_value(
++        invoke(
++            worker,
++            target,
++            "invoke",
++            serde_json::to_value(input).unwrap(),
++        )
++        .await,
++    )
++    .unwrap()
++}
++
++#[tokio::test]
++async fn optin_capture_catalog_schema_and_raw_range_work_in_real_standalone_and_aggregate() {
++    let index = std::env::var_os("PROTEUS_TEST_MODULE_ARTIFACTS")
++        .expect("run python3 scripts/test.py full to prepare independent workers");
++    let index: Value = serde_json::from_slice(&std::fs::read(index).unwrap()).unwrap();
++    let standalone = Path::new(
++        index["packages"]["shell-tool"]["executable"]
++            .as_str()
++            .unwrap(),
++    );
++    let reference = Path::new(env!("CARGO_BIN_EXE_proteus-reference-module"));
++    let workspace = tempfile::tempdir().unwrap();
++    let config = json!({"source_capture":{"mode":"ephemeral_file","directory":workspace.path(),
++        "max_capture_bytes":8,"max_captures":2,"retention_seconds":300}});
++    let mut expected_catalog: Option<Value> = None;
++    let mut expected_manifest: Option<Value> = None;
++    for (binary, id) in [
++        (standalone, "shell_tools"),
++        (reference, "shell_tools"),
++        (reference, "reference.tools"),
++    ] {
++        let target = ProcessComponentExportRef {
++            slot: "tool".into(),
++            module_id: id.into(),
++        };
++        let disabled = shell_worker(binary, workspace.path(), id, json!({}));
++        let old: ProcessToolListResponse =
++            serde_json::from_value(invoke(&disabled, &target, "list", Value::Null).await).unwrap();
++        assert!(
++            !old.result
++                .iter()
++                .any(|definition| definition.spec.name == "read_exec_capture")
++        );
++        drop(disabled);
++
++        let worker = shell_worker(binary, workspace.path(), id, config.clone());
++        let catalog = invoke(&worker, &target, "list", Value::Null).await;
++        let listed: ProcessToolListResponse = serde_json::from_value(catalog.clone()).unwrap();
++        let read_spec = listed
++            .result
++            .iter()
++            .find(|definition| definition.spec.name == "read_exec_capture")
++            .unwrap();
++        assert_eq!(
++            read_spec.spec.safety,
++            proteus_contracts::domain::ToolSafety::ReadOnly
++        );
++        let manifest = serde_json::to_value(worker.manifest().unwrap()).unwrap();
++        assert_eq!(
++            manifest["exports"][0]["config_schema"]["fields"][0]["key"],
++            "source_capture"
++        );
++        if id == "shell_tools" {
++            if let Some(expected) = &expected_catalog {
++                assert_eq!(&catalog, expected);
++            } else {
++                expected_catalog = Some(catalog);
++            }
++            if let Some(expected) = &expected_manifest {
++                assert_eq!(&manifest, expected);
++            } else {
++                expected_manifest = Some(manifest);
++            }
++        }
++        let attribution = ExecutionAttribution::detached(new_execution_id());
++        let executed = call(&worker, &target, workspace.path(), attribution.clone(), "exec_command",
++            json!({"cmd":"printf 0123456789abcdef; exit 7","with_escalated_permissions":true,"yield_time_ms":1000})).await;
++        assert!(executed.result.ok);
++        assert_eq!(executed.result.metadata["exit_code"], 7);
++        assert!(executed.result.metadata["session_id"].is_null());
++        let handle = executed.result.metadata["source_capture"]["handle"]
++            .as_str()
++            .unwrap()
++            .to_owned();
++        assert!(executed.result.output.contains(&handle));
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
++        loop {
++            let result = call(
++                &worker,
++                &target,
++                workspace.path(),
++                attribution.clone(),
++                "read_exec_capture",
++                json!({"handle":handle,"format":"hex"}),
++            )
++            .await;
++            let receipt = &result.result.metadata["source_capture"];
++            let visible: Value = serde_json::from_str(&result.result.text_or_status()).unwrap();
++            assert_eq!(
++                &visible["source_capture"], receipt,
++                "model must see the same receipt"
++            );
++            if receipt["storage_state"] == "sealed" {
++                assert_eq!(visible["bytes_hex"], "3031323334353637");
++                assert_eq!(receipt["prefix_truncated"], true);
++                assert_eq!(receipt["complete_stream"], false);
++                assert_eq!(result.result.metadata["range_eof"], true);
++                break;
++            }
++            assert_ne!(receipt["storage_state"], "failed");
++            assert!(
++                tokio::time::Instant::now() < deadline,
++                "capture writer did not seal"
++            );
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    }
++}
+diff --git a/components/process-module/tests/independent_modules.rs b/components/process-module/tests/independent_modules.rs
+index 2c07994..0ffc557 100644
+--- a/components/process-module/tests/independent_modules.rs
++++ b/components/process-module/tests/independent_modules.rs
+@@ -12,6 +12,9 @@ use proteus_module_protocol::{
+ use proteus_process_host::ProcessSpec;
+ use serde_json::{Value, json};
+ 
++#[path = "independent_modules/source_capture.rs"]
++mod source_capture;
++
+ fn connect(
+     binary: &Path,
+     workspace: &Path,
+diff --git a/components/shell-tool-module/src/main.rs b/components/shell-tool-module/src/main.rs
+index 4be59ae..2400050 100644
+--- a/components/shell-tool-module/src/main.rs
++++ b/components/shell-tool-module/src/main.rs
+@@ -4,6 +4,6 @@ fn main() {
+         env!("CARGO_PKG_VERSION"),
+         include_str!("../exports.json"),
+         |registry, _binding| Ok(shell_tool::register_modules(registry)?),
+-        |_binding| Some(Default::default()),
++        |_binding| Some(shell_tool::config_schema()),
+     );
+ }
+diff --git a/docs/reference.md b/docs/reference.md
+index 2d01c7e..6189b51 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -45,6 +45,58 @@ EOF, ошибка чтения или исчерпание exit-drain grace. О
+ preview сохраняют прежнюю semantics. Этот внутренний учёт сам по себе не
+ включает capture на диск и не выдаёт artifact receipt.
+ 
++### Явный Source Capture Для Exec
++
++Опциональный объект `source_capture` в существующем module config export
++`tool/shell_tools` включает ephemeral raw-prefix storage для `exec_command` и
++`write_stdin` (pipes и PTY). One-shot `shell` / Ptyxis не меняются. Пример:
++
++```json
++{"source_capture":{"mode":"ephemeral_file","directory":"/absolute/private/capture-dir","max_capture_bytes":8388608,"max_captures":8,"retention_seconds":300}}
++```
++
++Directory заранее выбирает/создаёт оператор; вывод может содержать secrets.
++Нет content logs, uploader или отдельного network channel. Requested ranges
++возвращаются обычным tool RPC и доступны выбранному host/model pipeline.
++Отсутствующий объект не добавляет tool, files или writer threads. Неполный /
++невалидный объект отклоняется до регистрации tools. Schema одинакова в
++standalone shell package и aggregate `shell_tools` / `reference.tools` fixture.
++
++Capture admission (quota, anonymous tempfile, writer) выполняется **до** session
++pruning и command spawn; ошибка означает, что команда не запущена. После запуска
++queue overflow / storage failure прекращают только capture: обычный drain,
++bounded preview, original exit code и cancellation остаются прежними. Raw prefix
++имеет отдельный cap; exact cap ещё не доказывает truncation, следующий observed
++byte — доказывает. Все reader EOF нужны для complete_stream: exit/drain timeout,
++read error, failed storage или saturated counter не превращаются в completeness.
++
++Результат exec содержит opaque handle независимо от session_id. Только тот же
++binding generation и frozen session/thread/workspace owner могут вызвать новый
++ReadOnly tool `read_exec_capture({handle,offset,max_bytes,format})`. Read range:
++1..65536 raw bytes (default 4096), offset default 0. `format=utf8` (default)
++строго проверяет выбранный byte range: разрезанный multibyte codepoint или binary
++data дают encoding error; `format=hex` возвращает точные bytes без потерь.
++Tool output — JSON envelope с `text` либо `bytes_hex`, `range` и полным receipt;
++metadata повторяет bounded status для typed consumers. Pending/failed тоже
++видны модели, а не скрыты только в metadata. `range_eof` относится к сохранённому
++prefix, **не** к исходному потоку. Failed capture не требует rerun команды.
++
++Хранилище только в этом worker generation: anonymous files закрываются после
++последнего владельца; restart/rebind не восстанавливает handles. TTL 1..1800 s
++считается от terminal writer state, lookup отклоняет expired handle. Cleanup lazy,
++не обещание физического удаления ровно в N секунд. In-flight read, начавшийся до
++expiry, может завершиться после неё; lease сохраняет reservation до file close.
++Weak session taps не удерживают sealed file после expiry/drop binding.
++
++Лимиты **на binding**, не на весь процесс/RSS: cap 1..64 MiB, captures 1..16,
++произведение до 256 MiB. Queue 8×8192 bytes + writer-held и enqueue-candidate
++chunks (до 10 payloads); stack buffers/read buffers/hex/JSON escaping/envelope
++copies, small metadata, thread/allocator overhead и OS page cache — отдельно.
++Не более четырёх active range reads, один file cursor защищён на seek+read.
++Blocking OS I/O не имеет гарантии мгновенной отмены. Успешный seal означает
++readable immutable prefix, не fsync durability или гарантированный capture под
++любой нагрузкой. Количественный throughput/RAM benefit без измерений не заявлен.
++
+ ## Стоимость Реализаций
+ 
+ Эти правила относятся и к самостоятельному пакету, и к aggregate fixture:
+diff --git a/tool/shell-tool/src/capture_config/tests.rs b/tool/shell-tool/src/capture_config/tests.rs
+new file mode 100644
+index 0000000..8f35c46
+--- /dev/null
++++ b/tool/shell-tool/src/capture_config/tests.rs
+@@ -0,0 +1,154 @@
++use proteus_contracts::process_module::*;
++use serde_json::json;
++
++use super::*;
++
++struct Registry {
++    config: Value,
++    tools: Vec<ToolModuleObject>,
++}
++impl ModuleRegistry for Registry {
++    fn module_config(&self) -> &Value {
++        &self.config
++    }
++    fn register_tool(&mut self, tool: ToolModuleObject) -> ProcessModuleResult<()> {
++        self.tools.push(tool);
++        Ok(())
++    }
++    fn register_model(&mut self, _: String, _: ModelModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_policy(&mut self, _: String, _: PolicyModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_context_provider(
++        &mut self,
++        _: String,
++        _: ContextProviderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_context(
++        &mut self,
++        _: String,
++        _: ContextBuilderModuleObject,
++    ) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_hook(&mut self, _: String, _: HookModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++    fn register_workflow(&mut self, _: String, _: WorkflowModuleObject) -> ProcessModuleResult<()> {
++        unreachable!()
++    }
++}
++
++fn configured(directory: &std::path::Path) -> Value {
++    json!({"source_capture": {"mode":"ephemeral_file", "directory":directory,
++        "max_capture_bytes":1024, "max_captures":2, "retention_seconds":300}})
++}
++
++#[test]
++fn default_binding_has_exact_original_three_tools_and_no_retention() {
++    let mut registry = Registry {
++        config: json!({}),
++        tools: Vec::new(),
++    };
++    assert!(CaptureConfig::parse(&registry.config).unwrap().is_none());
++    crate::register_modules(&mut registry).unwrap();
++    let specs: Vec<Value> = registry
++        .tools
++        .iter()
++        .map(|tool| serde_json::from_str(&tool.spec_json()).unwrap())
++        .collect();
++    assert_eq!(
++        specs
++            .iter()
++            .map(|spec| spec["name"].as_str().unwrap())
++            .collect::<Vec<_>>(),
++        ["shell", "exec_command", "write_stdin"]
++    );
++    assert!(
++        !specs[1]["description"]
++            .as_str()
++            .unwrap()
++            .contains("retains")
++    );
++}
++
++#[test]
++fn enabled_catalog_adds_only_readonly_range_tool_with_no_new_slot() {
++    let directory = tempfile::tempdir().unwrap();
++    let mut registry = Registry {
++        config: configured(directory.path()),
++        tools: Vec::new(),
++    };
++    crate::register_modules(&mut registry).unwrap();
++    let specs: Vec<Value> = registry
++        .tools
++        .iter()
++        .map(|tool| serde_json::from_str(&tool.spec_json()).unwrap())
++        .collect();
++    assert_eq!(specs.len(), 4);
++    assert_eq!(specs[3]["name"], "read_exec_capture");
++    assert_eq!(specs[3]["safety"], "ReadOnly");
++    assert_eq!(specs[1]["safety"], "RunsCommands");
++    assert!(
++        specs[1]["description"]
++            .as_str()
++            .unwrap()
++            .contains("ephemeral")
++    );
++    // Binding alone creates neither writer nor a file; admission is per command.
++    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
++}
++
++#[test]
++fn invalid_optin_rejects_before_partial_tool_registration() {
++    let directory = tempfile::tempdir().unwrap();
++    for bad in [json!(null), json!({}), json!({"mode":"ephemeral_file"})] {
++        let mut registry = Registry {
++            config: json!({"source_capture":bad}),
++            tools: Vec::new(),
++        };
++        assert!(crate::register_modules(&mut registry).is_err());
++        assert!(registry.tools.is_empty());
++    }
++    for (key, bad) in [
++        ("max_capture_bytes", json!(0)),
++        ("max_captures", json!(17)),
++        ("retention_seconds", json!(1801)),
++        ("directory", json!("relative")),
++        ("mode", json!("durable")),
++    ] {
++        let mut config = configured(directory.path());
++        config["source_capture"][key] = bad;
++        assert!(CaptureConfig::parse(&config).is_err(), "{key}");
++    }
++    let mut config = configured(directory.path());
++    config["source_capture"]["max_capture_bytes"] = json!(64 * MIB);
++    config["source_capture"]["max_captures"] = json!(16);
++    assert!(CaptureConfig::parse(&config).is_err());
++    config["source_capture"]["max_captures"] = json!(4);
++    assert!(CaptureConfig::parse(&config).is_ok());
++}
++
++#[test]
++fn schema_describes_optional_object_without_silently_enabling_defaults() {
++    let schema = config_schema();
++    schema.validate().unwrap();
++    assert_eq!(schema.fields.len(), 1);
++    let capture = &schema.fields[0];
++    assert_eq!(capture.key, "source_capture");
++    assert!(!capture.required);
++    assert!(capture.default.is_none());
++    let ConfigValueSchema::Object { fields } = &capture.value else {
++        panic!("capture object schema")
++    };
++    assert_eq!(fields.len(), 5);
++    assert!(
++        fields
++            .iter()
++            .all(|field| field.required && field.default.is_none())
++    );
++}
+diff --git a/tool/shell-tool/src/capture_config.rs b/tool/shell-tool/src/capture_config.rs
+new file mode 100644
+index 0000000..8775cb2
+--- /dev/null
++++ b/tool/shell-tool/src/capture_config.rs
+@@ -0,0 +1,99 @@
++//! Explicit, binding-owned ephemeral output retention. Absence means no capture.
++use std::{path::PathBuf, time::Duration};
++
++use anyhow::{Context, Result, bail};
++use proteus_contracts::domain::{ConfigField, ConfigValueSchema, ModuleConfigSchema};
++use serde_json::Value;
++
++const MIB: u64 = 1024 * 1024;
++pub(crate) const MAX_PATH_BYTES: usize = 4096;
++
++pub(crate) struct CaptureConfig {
++    pub(crate) directory: PathBuf,
++    pub(crate) cap: u64,
++    pub(crate) slots: usize,
++    pub(crate) retention: Duration,
++}
++
++impl CaptureConfig {
++    pub(crate) fn parse(config: &Value) -> Result<Option<Self>> {
++        let Some(value) = config.get("source_capture") else {
++            return Ok(None);
++        };
++        let object = value
++            .as_object()
++            .context("source_capture must be an object")?;
++        const KEYS: [&str; 5] = [
++            "mode",
++            "directory",
++            "max_capture_bytes",
++            "max_captures",
++            "retention_seconds",
++        ];
++        if object.len() != KEYS.len() || object.keys().any(|key| !KEYS.contains(&key.as_str())) {
++            bail!(
++                "source_capture requires exactly mode, directory, max_capture_bytes, max_captures, retention_seconds"
++            );
++        }
++        if object["mode"].as_str() != Some("ephemeral_file") {
++            bail!("source_capture mode must be ephemeral_file");
++        }
++        let directory = object["directory"]
++            .as_str()
++            .context("capture directory must be a string")?;
++        if directory.len() > MAX_PATH_BYTES || !std::path::Path::new(directory).is_absolute() {
++            bail!("capture directory must be an absolute path of at most 4096 bytes");
++        }
++        let directory = PathBuf::from(directory)
++            .canonicalize()
++            .context("capture directory is unavailable")?;
++        if !directory.is_dir() || directory.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
++            bail!("capture directory must be an existing directory of at most 4096 encoded bytes");
++        }
++        let cap = integer(
++            &object["max_capture_bytes"],
++            1,
++            64 * MIB,
++            "max_capture_bytes",
++        )?;
++        let slots = integer(&object["max_captures"], 1, 16, "max_captures")?;
++        if cap * slots > 256 * MIB {
++            bail!("capture per-binding reservation must not exceed 256 MiB");
++        }
++        let seconds = integer(&object["retention_seconds"], 1, 1800, "retention_seconds")?;
++        Ok(Some(Self {
++            directory,
++            cap,
++            slots: slots as usize,
++            retention: Duration::from_secs(seconds),
++        }))
++    }
++}
++
++fn integer(value: &Value, min: u64, max: u64, name: &str) -> Result<u64> {
++    value
++        .as_u64()
++        .filter(|n| (min..=max).contains(n))
++        .with_context(|| format!("source_capture {name} must be an integer in {min}..={max}"))
++}
++
++pub fn config_schema() -> ModuleConfigSchema {
++    let bounded = |min, max| ConfigValueSchema::Integer {
++        minimum: Some(min),
++        maximum: Some(max),
++    };
++    ModuleConfigSchema { fields: vec![ConfigField::new(
++        "source_capture", "Временное сохранение вывода exec",
++        "Необязательный объект. Сохраняет raw prefix локально до TTL/выхода worker; вывод может содержать secrets. Не durable artifact и не срок физического удаления. Отсутствует — ничего не сохраняется.",
++        ConfigValueSchema::Object { fields: vec![
++            ConfigField::new("mode", "Режим", "Только ephemeral anonymous files.", ConfigValueSchema::choices(&[("ephemeral_file", "Временный файл")])).required(),
++            ConfigField::new("directory", "Каталог", "Существующий абсолютный private directory, выбранный оператором; до 4096 encoded bytes.", ConfigValueSchema::text()).required(),
++            ConfigField::new("max_capture_bytes", "Байт на capture", "Лимит raw prefix. Произведение на max_captures не больше 256 MiB.", bounded(1, 64 * MIB as i64)).required(),
++            ConfigField::new("max_captures", "Captures на binding", "Включает active/pending/retired handles; не process-wide quota.", bounded(1, 16)).required(),
++            ConfigField::new("retention_seconds", "Логический TTL", "После завершения writer; cleanup lazy, не deletion SLA.", bounded(1, 1800)).required(),
++        ] },
++    ).advanced()] }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/tool/shell-tool/src/lib.rs b/tool/shell-tool/src/lib.rs
+index 502b752..71f8491 100644
+--- a/tool/shell-tool/src/lib.rs
++++ b/tool/shell-tool/src/lib.rs
+@@ -29,6 +29,7 @@ use proteus_contracts::{
+ };
+ use serde_json::{Value, json};
+ 
++mod capture_config;
+ #[cfg(unix)]
+ mod child_status;
+ mod execution;
+@@ -37,6 +38,8 @@ mod result;
+ mod sandbox;
+ mod unified_exec;
+ 
++pub use capture_config::config_schema;
++
+ #[cfg(test)]
+ use execution::BoundedBuffer;
+ #[cfg(test)]
+@@ -291,14 +294,26 @@ fn spawn_shell(
+ }
+ 
+ pub fn register_modules(registry: &mut dyn ModuleRegistry) -> Result<(), ProcessModuleError> {
++    // Parse the sole existing bound config path before registering any tools.
++    let capture = capture_config::CaptureConfig::parse(registry.module_config())
++        .map_err(|error| ProcessModuleError::new(format!("{error:#}")))?
++        .map(unified_exec::CaptureStore::new);
+     let tool: ToolModuleObject = Box::new(ShellTool);
+     registry.register_tool(tool)?;
+ 
+-    let exec: ToolModuleObject = Box::new(unified_exec::ExecCommandTool);
++    let exec: ToolModuleObject = Box::new(unified_exec::ExecCommandTool {
++        capture: capture.clone(),
++    });
+     registry.register_tool(exec)?;
+ 
+-    let stdin: ToolModuleObject = Box::new(unified_exec::WriteStdinTool);
+-    registry.register_tool(stdin)
++    let stdin: ToolModuleObject = Box::new(unified_exec::WriteStdinTool {
++        capture: capture.clone(),
++    });
++    registry.register_tool(stdin)?;
++    if let Some(store) = capture {
++        registry.register_tool(Box::new(unified_exec::ReadCaptureTool(store)))?;
++    }
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+diff --git a/tool/shell-tool/src/unified_exec/capture/read.rs b/tool/shell-tool/src/unified_exec/capture/read.rs
+new file mode 100644
+index 0000000..b35b3f4
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/read.rs
+@@ -0,0 +1,194 @@
++use std::{
++    io::{Read, Seek, SeekFrom},
++    sync::{Arc, TryLockError, atomic::Ordering},
++};
++
++use anyhow::{Context, Result, bail};
++use proteus_contracts::process_module::{
++    ProcessModuleError, ToolModule, ToolModuleHostMut, ToolModuleInvocationContext,
++};
++use serde_json::{Value, json};
++
++use super::super::ensure_not_cancelled;
++use super::{CaptureStore, HANDLE_BYTES, MAX_READ_BYTES, MAX_READERS, store::QuotaState};
++
++pub(crate) struct ReadCaptureTool(pub(crate) Arc<CaptureStore>);
++
++struct ReadLease(Arc<QuotaState>);
++impl Drop for ReadLease {
++    fn drop(&mut self) {
++        self.0.readers.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++impl ReadCaptureTool {
++    fn invoke(
++        &self,
++        call_json: &str,
++        context_json: &str,
++        host: &mut ToolModuleHostMut<'_>,
++    ) -> Result<String> {
++        ensure_not_cancelled(host)?;
++        let call: Value =
++            serde_json::from_str(call_json).context("failed to parse capture ToolCall")?;
++        let context: ToolModuleInvocationContext =
++            serde_json::from_str(context_json).context("failed to parse capture context")?;
++        let args = call.get("args").context("capture args required")?;
++        let handle = args
++            .get("handle")
++            .and_then(Value::as_str)
++            .context("capture handle required")?;
++        if handle.len() != HANDLE_BYTES || !handle.is_ascii() {
++            bail!("unknown or unavailable exec capture");
++        }
++        let (generation, index) = handle
++            .split_once(':')
++            .context("unknown or unavailable exec capture")?;
++        if generation != self.0.generation.to_string() || index.len() != 16 {
++            bail!("unknown or unavailable exec capture");
++        }
++        let id = u64::from_str_radix(index, 16).context("unknown or unavailable exec capture")?;
++        let offset = args
++            .get("offset")
++            .map(|v| {
++                v.as_u64()
++                    .context("capture offset must be a nonnegative integer")
++            })
++            .transpose()?
++            .unwrap_or(0);
++        let requested = args
++            .get("max_bytes")
++            .map(|v| v.as_u64().context("max_bytes must be an integer"))
++            .transpose()?
++            .unwrap_or(4096);
++        if !(1..=MAX_READ_BYTES as u64).contains(&requested)
++            || offset.checked_add(requested).is_none()
++        {
++            bail!("capture range exceeds supported bounds");
++        }
++        let format = args
++            .get("format")
++            .map(|v| v.as_str().context("capture format must be utf8 or hex"))
++            .transpose()?
++            .unwrap_or("utf8");
++        if !matches!(format, "utf8" | "hex") {
++            bail!("capture format must be utf8 or hex");
++        }
++        let record = self
++            .0
++            .find(id)
++            .context("unknown or unavailable exec capture")?;
++        if !record.owner.matches(&context) {
++            bail!("unknown or unavailable exec capture");
++        }
++        // Owner and logical expiry are rechecked for every range, not cached as authority.
++        if self.0.expired(&record, std::time::Instant::now()) {
++            bail!("unknown or unavailable exec capture");
++        }
++        let (receipt, length) = record.snapshot();
++        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
++        let Some(length) = length else {
++            // Metadata alone is not model-visible in ToolResult::text_or_status.
++            // Copy only this bounded status snapshot into the visible envelope.
++            let output = json!({ "source_capture": &receipt, "readable": false,
++                "range": { "offset": offset, "max_bytes": requested, "format": format },
++                "retry_read": matches!(receipt["storage_state"].as_str(), Some("capturing" | "finalizing")),
++                "retry_command": false }).to_string();
++            return Ok(json!({ "call_id": call_id, "ok": true,
++                "output": output,
++                "content": [], "error": null, "metadata": { "source_capture": receipt } })
++            .to_string());
++        };
++        if offset > length {
++            bail!("capture offset exceeds readable length");
++        }
++        self.0
++            .quota
++            .readers
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
++                (n < MAX_READERS).then_some(n + 1)
++            })
++            .map_err(|_| {
++                anyhow::anyhow!("capture reader busy; retry this read, not the command")
++            })?;
++        let _lease = ReadLease(self.0.quota.clone());
++        ensure_not_cancelled(host)?;
++        let mut file = match record.file.try_lock() {
++            Ok(guard) => guard,
++            Err(TryLockError::WouldBlock) => {
++                bail!("capture reader busy; retry this read, not the command")
++            }
++            Err(TryLockError::Poisoned(_)) => bail!("capture storage unavailable"),
++        };
++        let file_ref = file.as_mut().context("capture storage unavailable")?;
++        let count = requested.min(length - offset) as usize;
++        let mut bytes = vec![0; count];
++        // Immutable contents do not imply independent cursors. The single file
++        // mutex covers seek AND the entire bounded read; no clone shares a cursor.
++        file_ref
++            .seek(SeekFrom::Start(offset))
++            .context("capture range seek failed")?;
++        file_ref
++            .read_exact(&mut bytes)
++            .context("capture range read failed")?;
++        drop(file);
++        ensure_not_cancelled(host)?;
++        let output = match format {
++            "utf8" => String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("capture byte range is not valid UTF-8 (possibly a split codepoint); request format=hex"))?,
++            "hex" => hex(&bytes),
++            _ => unreachable!(),
++        };
++        let mut metadata = json!({ "format": format, "offset": offset,
++            "bytes_returned": count, "next_offset": offset + count as u64,
++            "range_eof": offset + count as u64 == length });
++        let mut envelope = json!({ "source_capture": &receipt, "range": &metadata,
++            "readable": true, "retry_command": false });
++        envelope[if format == "utf8" {
++            "text"
++        } else {
++            "bytes_hex"
++        }] = output.into();
++        metadata["source_capture"] = receipt;
++        Ok(
++            json!({ "call_id": call_id, "ok": true, "output": envelope.to_string(),
++            "content": [], "error": null, "metadata": metadata })
++            .to_string(),
++        )
++    }
++}
++
++fn hex(bytes: &[u8]) -> String {
++    const DIGITS: &[u8; 16] = b"0123456789abcdef";
++    let mut text = String::with_capacity(bytes.len() * 2);
++    for &byte in bytes {
++        text.push(DIGITS[(byte >> 4) as usize] as char);
++        text.push(DIGITS[(byte & 15) as usize] as char);
++    }
++    text
++}
++
++impl ToolModule for ReadCaptureTool {
++    fn spec_json(&self) -> String {
++        json!({ "name": "read_exec_capture",
++            "description": "Read a bounded range of an explicitly retained exec_command raw output prefix from this same shell binding/worker generation and current runtime session/thread/workspace. Output is a JSON envelope containing the capture receipt, range facts, and exact text or bytes_hex field; status-only replies distinguish pending from failed. Captures are ephemeral, may expire, and are readable only after their writer seals. A sealed prefix can still be incomplete or truncated: inspect complete_stream and reader facts, not range_eof. UTF-8 byte ranges that split a codepoint or contain binary data fail; use format=hex for exact bytes. A failed read never means rerun the command. No arbitrary paths. Safety: ReadOnly.",
++            "input_schema": { "type": "object", "properties": {
++                "handle": { "type": "string", "minLength": HANDLE_BYTES, "maxLength": HANDLE_BYTES },
++                "offset": { "type": "integer", "minimum": 0, "description": "Byte offset, default zero." },
++                "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Raw byte range ceiling, default 4096." },
++                "format": { "type": "string", "enum": ["utf8", "hex"], "description": "Strict utf8 text (default) or exact hex bytes." }
++            }, "required": ["handle"], "additionalProperties": false },
++            "surface": { "kind": "function", "strict": false, "output_schema": null },
++            "safety": "ReadOnly", "supports_parallel_tool_calls": true, "timeout_ms": 30000,
++            "metadata": { "category": "terminal", "tags": ["capture", "output", "read"] }
++        }).to_string()
++    }
++    fn invoke_json(
++        &self,
++        call_json: String,
++        context_json: String,
++        host: &mut ToolModuleHostMut<'_>,
++    ) -> Result<String, ProcessModuleError> {
++        self.invoke(&call_json, &context_json, host)
++            .map_err(|error| ProcessModuleError::new(format!("{error:#}")))
++    }
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture/store.rs b/tool/shell-tool/src/unified_exec/capture/store.rs
+new file mode 100644
+index 0000000..0788dcd
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/store.rs
+@@ -0,0 +1,223 @@
++use std::{
++    collections::HashMap,
++    sync::{
++        Arc, Mutex, Weak,
++        atomic::{AtomicUsize, Ordering},
++        mpsc,
++    },
++    time::Instant,
++};
++
++use anyhow::{Context, Result, bail};
++use proteus_contracts::domain::{ExecutionId, new_execution_id};
++use serde_json::Value;
++
++use super::super::{
++    reader::ReaderCompletions,
++    session::{ExecSessionOwner, lock},
++};
++use super::{CaptureTap, Failure, QUEUE_CHUNKS, Record, State, StorageState, writer};
++use crate::capture_config::{CaptureConfig, MAX_PATH_BYTES};
++
++/// Budget has no map/store backreference. A resource cannot create an Arc cycle.
++pub(super) struct QuotaState {
++    pub(super) used: AtomicUsize,
++    limit: usize,
++    pub(super) readers: AtomicUsize,
++}
++
++pub(super) struct Reservation(Arc<QuotaState>);
++
++impl QuotaState {
++    pub(super) fn reserve(self: &Arc<Self>) -> Result<Reservation> {
++        self.used
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
++                (used < self.limit).then_some(used + 1)
++            })
++            .map_err(|_| anyhow::anyhow!("capture quota exhausted; command was not started"))?;
++        Ok(Reservation(self.clone()))
++    }
++}
++impl Drop for Reservation {
++    fn drop(&mut self) {
++        self.0.used.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++pub(crate) struct CaptureStore {
++    pub(super) config: CaptureConfig,
++    pub(super) generation: ExecutionId,
++    pub(super) quota: Arc<QuotaState>,
++    entries: Mutex<Entries>,
++}
++struct Entries {
++    next: u64,
++    records: HashMap<u64, Arc<Record>>,
++}
++
++impl CaptureStore {
++    pub(crate) fn new(config: CaptureConfig) -> Arc<Self> {
++        Arc::new(Self {
++            generation: new_execution_id(),
++            quota: Arc::new(QuotaState {
++                used: AtomicUsize::new(0),
++                limit: config.slots,
++                readers: AtomicUsize::new(0),
++            }),
++            config,
++            entries: Mutex::new(Entries {
++                next: 1,
++                records: HashMap::new(),
++            }),
++        })
++    }
++
++    pub(super) fn expired(&self, record: &Record, now: Instant) -> bool {
++        lock(&record.state)
++            .terminal_at
++            .is_some_and(|at| now.saturating_duration_since(at) >= self.config.retention)
++    }
++
++    fn cleanup(&self) {
++        let retired = {
++            let mut entries = lock(&self.entries);
++            let now = Instant::now();
++            let ids: Vec<_> = entries
++                .records
++                .iter()
++                .filter(|(_, r)| self.expired(r, now))
++                .map(|(id, _)| *id)
++                .collect();
++            ids.into_iter()
++                .filter_map(|id| entries.records.remove(&id))
++                .collect::<Vec<_>>()
++        };
++        // File close is outside the store mutex; actual leases may retain it.
++        drop(retired);
++    }
++
++    pub(super) fn find(&self, id: u64) -> Option<Arc<Record>> {
++        self.cleanup();
++        lock(&self.entries).records.get(&id).cloned()
++    }
++
++    pub(in crate::unified_exec) fn metadata(&self, tap: Option<&CaptureTap>) -> Option<Value> {
++        let tap = tap.filter(|tap| tap.generation == self.generation)?;
++        let record = tap.record.upgrade()?;
++        if self.expired(&record, Instant::now()) {
++            return None;
++        }
++        Some(record.receipt())
++    }
++
++    /// Must run BEFORE spawn_session/register_session: they can prune a live
++    /// command before calling their spawn closure.
++    pub(in crate::unified_exec) fn prepare(
++        self: &Arc<Self>,
++        owner: ExecSessionOwner,
++        tty: bool,
++    ) -> Result<PreparedCapture> {
++        if owner.workspace_bytes() > MAX_PATH_BYTES {
++            bail!("capture owner workspace exceeds 4096 encoded bytes");
++        }
++        self.cleanup();
++        let reservation = self.quota.reserve()?;
++        let id = {
++            let mut entries = lock(&self.entries);
++            let id = entries.next;
++            entries.next = id
++                .checked_add(1)
++                .context("capture handle counter exhausted")?;
++            id
++        };
++        // Anonymous: no path is published, no named artifact survives last close.
++        let file = tempfile::tempfile_in(&self.config.directory)
++            .context("capture storage unavailable; command was not started")?;
++        let (sender, receiver) = mpsc::sync_channel(QUEUE_CHUNKS);
++        let record = Arc::new(Record {
++            generation: self.generation,
++            id,
++            owner,
++            cap: self.config.cap,
++            state: Mutex::new(State {
++                readers: ReaderCompletions::new(tty),
++                expected: if tty { 1 } else { 2 },
++                observed: 0,
++                saturated: false,
++                queued: 0,
++                confirmed: 0,
++                unconfirmed: 0,
++                storage: StorageState::Capturing,
++                failure: None,
++                terminal_at: None,
++                process_started: false,
++                attached: false,
++            }),
++            sender,
++            file: Mutex::new(None),
++            _reservation: reservation,
++        });
++        writer::start(record.clone(), receiver, file)
++            .context("capture writer unavailable; command was not started")?;
++        lock(&self.entries).records.insert(id, record.clone());
++        Ok(PreparedCapture {
++            record,
++            store: Arc::downgrade(self),
++            attached: false,
++        })
++    }
++}
++
++impl Drop for CaptureStore {
++    fn drop(&mut self) {
++        // No writer owns Arc<Store>. Binding drop actively stops live storage;
++        // waiting for an impossible future lookup/EOF would leak its thread.
++        let entries = self.entries.get_mut().unwrap_or_else(|e| e.into_inner());
++        for record in entries.records.values() {
++            record.abort(Failure::BindingDropped);
++        }
++        entries.records.clear();
++    }
++}
++
++pub(in crate::unified_exec) struct PreparedCapture {
++    record: Arc<Record>,
++    store: Weak<CaptureStore>,
++    attached: bool,
++}
++
++impl PreparedCapture {
++    /// Immediately after successful OS spawn, before fallible backend setup.
++    pub(in crate::unified_exec) fn process_started(&mut self) {
++        lock(&self.record.state).process_started = true;
++    }
++    /// Transfer recording to ExecSession before starting either output reader.
++    pub(in crate::unified_exec) fn attach(mut self) -> CaptureTap {
++        lock(&self.record.state).attached = true;
++        self.attached = true;
++        CaptureTap {
++            generation: self.record.generation,
++            record: Arc::downgrade(&self.record),
++        }
++    }
++}
++
++impl Drop for PreparedCapture {
++    fn drop(&mut self) {
++        if self.attached {
++            return;
++        }
++        let started = lock(&self.record.state).process_started;
++        self.record.abort(if started {
++            Failure::AbortBeforeReaders
++        } else {
++            Failure::AbortBeforeSpawn
++        });
++        if let Some(store) = self.store.upgrade() {
++            let retired = lock(&store.entries).records.remove(&self.record.id);
++            drop(retired);
++        }
++        // Writer owns its file and reservation until it observes abort and closes.
++        // No reader EOF is invented; started is never rewritten to NotStarted.
++    }
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture/tests/process_paths.rs b/tool/shell-tool/src/unified_exec/capture/tests/process_paths.rs
+new file mode 100644
+index 0000000..0b407de
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/tests/process_paths.rs
+@@ -0,0 +1,88 @@
++use super::super::super::{exec_command_impl, write_stdin_impl};
++use super::*;
++
++#[test]
++fn tty_repeated_waits_keep_one_capture_and_foreign_binding_does_not_disclose_it() {
++    let (_dir, store, context) = fixture(1024, 2);
++    let _cleanup = OwnedSessionsCleanup(owner(&context));
++    let call = json!({"id":"tty_start","name":"exec_command","args":{
++        "cmd":"read -r first; printf 'one:%s\\n' \"$first\"; read -r second; printf 'two:%s\\n' \"$second\"",
++        "tty":true,"yield_time_ms":250,"with_escalated_permissions":true}});
++    let context_json = serde_json::to_string(&context).unwrap();
++    let mut host = Host { cancelled: false };
++    let result =
++        exec_command_impl(&call.to_string(), &context_json, Some(&store), &mut host).unwrap();
++    let result: Value = serde_json::from_str(&result).unwrap();
++    let id = result["metadata"]["session_id"].as_i64().unwrap();
++    let handle = result["metadata"]["source_capture"]["handle"]
++        .as_str()
++        .unwrap()
++        .to_owned();
++    let first = json!({"id":"tty_one","name":"write_stdin","args":{"session_id":id,"chars":"alpha\n","yield_time_ms":250}});
++    let first: Value = serde_json::from_str(
++        &write_stdin_impl(&first.to_string(), &context_json, Some(&store), &mut host).unwrap(),
++    )
++    .unwrap();
++    assert_eq!(first["metadata"]["session_id"], id);
++    assert_eq!(first["metadata"]["source_capture"]["handle"], handle);
++    let other = CaptureStore::new(CaptureConfig {
++        directory: context.cwd.clone(),
++        cap: 1024,
++        slots: 2,
++        retention: Duration::from_secs(300),
++    });
++    let second = json!({"id":"tty_two","name":"write_stdin","args":{"session_id":id,"chars":"beta\n","yield_time_ms":1000}});
++    let second: Value = serde_json::from_str(
++        &write_stdin_impl(&second.to_string(), &context_json, Some(&other), &mut host).unwrap(),
++    )
++    .unwrap();
++    assert!(second["metadata"]["session_id"].is_null());
++    assert!(second["metadata"].get("source_capture").is_none());
++    assert_eq!(
++        other.quota.used.load(Ordering::Acquire),
++        0,
++        "write must not replace capture"
++    );
++    let record = store.find(1).unwrap();
++    sealed(&record);
++    let bytes = read(&store, &context, json!({"handle":handle})).unwrap();
++    let text = bytes["envelope"]["text"].as_str().unwrap();
++    assert!(text.contains("one:alpha"), "{text}");
++    assert!(text.contains("two:beta"), "{text}");
++    assert_eq!(
++        bytes["metadata"]["source_capture"]["readers"]["expected"],
++        1
++    );
++}
++
++#[test]
++fn cancellation_after_spawn_preserves_started_fact_and_does_not_rerun_command() {
++    use std::sync::atomic::AtomicUsize;
++    struct CancelAfterLaunch(AtomicUsize);
++    impl ToolModuleHost for CancelAfterLaunch {
++        fn is_cancelled(&self) -> Result<bool, ProcessModuleError> {
++            // Entry/execute/admission/interaction checks precede wait checks.
++            Ok(self.0.fetch_add(1, Ordering::AcqRel) >= 5)
++        }
++    }
++    let (_dir, store, context) = fixture(100, 1);
++    let _cleanup = OwnedSessionsCleanup(owner(&context));
++    let call = json!({"id":"cancel_capture","name":"exec_command","args":{
++        "cmd":"printf started; sleep 5","with_escalated_permissions":true,"yield_time_ms":1000}});
++    let error = exec_command_impl(
++        &call.to_string(),
++        &serde_json::to_string(&context).unwrap(),
++        Some(&store),
++        &mut CancelAfterLaunch(AtomicUsize::new(0)),
++    )
++    .unwrap_err();
++    assert!(error.to_string().contains("canceled"));
++    let record = store.find(1).expect("capture admitted before launch");
++    assert!(lock(&record.state).process_started);
++    assert!(lock(&record.state).attached);
++    wait_for(|| lock(&record.state).terminal_at.is_some());
++    assert_ne!(lock(&record.state).failure, Some(Failure::AbortBeforeSpawn));
++    // EOF after cancellation is a source fact, not a claim of command success.
++    // No assertion turns cancellation request into a confirmed exit code.
++    assert_eq!(store.quota.used.load(Ordering::Acquire), 1);
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs b/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs
+new file mode 100644
+index 0000000..cea72cc
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs
+@@ -0,0 +1,178 @@
++use super::*;
++
++#[test]
++fn actual_model_text_exposes_failed_pending_and_truncated_receipts() {
++    let (_dir, store, context) = fixture(3, 2);
++    let (session, record) = attached(&store, &context, true);
++    let pending = read(&store, &context, json!({"handle":record.handle()})).unwrap();
++    assert_eq!(pending["envelope"]["retry_read"], true);
++    assert_eq!(pending["envelope"]["readable"], false);
++    session.push_output(b"abcdef");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let view = read(&store, &context, json!({"handle":record.handle()})).unwrap();
++    assert_eq!(view["envelope"]["text"], "abc");
++    assert_eq!(view["envelope"]["source_capture"]["complete_stream"], false);
++    assert_eq!(view["envelope"]["source_capture"]["prefix_truncated"], true);
++    assert_eq!(
++        view["envelope"]["source_capture"],
++        view["metadata"]["source_capture"]
++    );
++    let mut prepared = store.prepare(owner(&context), true).unwrap();
++    let failed = store.find(2).unwrap();
++    prepared.process_started();
++    let _tap = prepared.attach();
++    failed.abort(Failure::Io);
++    wait_for(|| lock(&failed.state).terminal_at.is_some());
++    let view = read(&store, &context, json!({"handle":failed.handle()})).unwrap();
++    assert_eq!(
++        view["envelope"]["source_capture"]["storage_state"],
++        "failed"
++    );
++    assert_eq!(
++        view["envelope"]["source_capture"]["storage_failure"],
++        "storage_io"
++    );
++    assert_eq!(view["envelope"]["retry_read"], false);
++    assert_eq!(view["envelope"]["retry_command"], false);
++    assert_eq!(view["envelope"]["readable"], false);
++}
++
++#[test]
++fn raw_binary_and_mid_codepoint_ranges_have_explicit_utf8_or_hex_behavior() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(&[0xc3, 0xa9, 0xff]);
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let handle = record.handle();
++    assert_eq!(
++        read(&store, &context, json!({"handle":handle,"max_bytes":2})).unwrap()["envelope"]["text"],
++        "é"
++    );
++    assert!(
++        read(
++            &store,
++            &context,
++            json!({"handle":handle,"offset":1,"max_bytes":1})
++        )
++        .unwrap_err()
++        .message
++        .contains("UTF-8")
++    );
++    let result = read(&store, &context, json!({"handle":handle,"format":"hex"})).unwrap();
++    assert_eq!(result["envelope"]["bytes_hex"], "c3a9ff");
++    assert_eq!(result["metadata"]["bytes_returned"], 3);
++    assert_eq!(result["metadata"]["range_eof"], true);
++}
++
++#[test]
++fn owner_workspace_binding_and_restart_handle_checks_are_fresh() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(b"private");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let handle = record.handle();
++    let other_owner = super::context(&context.cwd);
++    assert!(
++        read(&store, &other_owner, json!({"handle":handle}))
++            .unwrap_err()
++            .message
++            .contains("unknown or unavailable")
++    );
++    let elsewhere = tempfile::tempdir().unwrap();
++    let mut other_workspace = context.clone();
++    other_workspace.cwd = elsewhere.path().to_path_buf();
++    assert!(read(&store, &other_workspace, json!({"handle":handle})).is_err());
++    let restarted = CaptureStore::new(CaptureConfig {
++        directory: context.cwd.clone(),
++        cap: 100,
++        slots: 1,
++        retention: Duration::from_secs(300),
++    });
++    assert!(read(&restarted, &context, json!({"handle":handle})).is_err());
++    assert!(restarted.metadata(session.capture.as_ref()).is_none());
++    assert_eq!(
++        read(&store, &context, json!({"handle":handle})).unwrap()["envelope"]["text"],
++        "private"
++    );
++}
++
++#[test]
++fn byte_ranges_are_bounded_and_sequential_reads_have_independent_positions() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(b"0123456789");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let handle = record.handle();
++    for (offset, expected) in [(6, "67"), (0, "01"), (8, "89")] {
++        assert_eq!(
++            read(
++                &store,
++                &context,
++                json!({"handle":handle,"offset":offset,"max_bytes":2})
++            )
++            .unwrap()["envelope"]["text"],
++            expected
++        );
++    }
++    assert!(read(&store, &context, json!({"handle":handle,"offset":11})).is_err());
++    assert!(read(&store, &context, json!({"handle":handle,"offset":u64::MAX})).is_err());
++    assert!(read(&store, &context, json!({"handle":handle,"max_bytes":65537})).is_err());
++    let at_end = read(&store, &context, json!({"handle":handle,"offset":10})).unwrap();
++    assert_eq!(at_end["envelope"]["text"], "");
++    assert_eq!(at_end["metadata"]["range_eof"], true);
++}
++
++#[test]
++fn busy_file_cursor_and_read_slot_cap_do_not_wait_or_allocate_a_range() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let file_guard = record.file.lock().unwrap();
++    assert!(
++        read(&store, &context, json!({"handle":record.handle()}))
++            .unwrap_err()
++            .message
++            .contains("busy")
++    );
++    assert_eq!(store.quota.readers.load(Ordering::Acquire), 0);
++    drop(file_guard);
++    store.quota.readers.store(MAX_READERS, Ordering::Release);
++    assert!(
++        read(&store, &context, json!({"handle":record.handle()}))
++            .unwrap_err()
++            .message
++            .contains("busy")
++    );
++    store.quota.readers.store(0, Ordering::Release);
++    assert!(read(&store, &context, json!({"handle":record.handle()})).is_ok());
++}
++
++#[test]
++fn cancelled_range_read_is_not_a_command_retry_or_storage_mutation() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(b"bytes");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let tool = ReadCaptureTool(store.clone());
++    let call =
++        json!({"id":"cancel_read","name":"read_exec_capture","args":{"handle":record.handle()}});
++    let error = tool
++        .invoke_json(
++            call.to_string(),
++            serde_json::to_string(&context).unwrap(),
++            &mut Host { cancelled: true },
++        )
++        .unwrap_err();
++    assert!(error.message.contains("canceled"));
++    assert_eq!(
++        read(&store, &context, json!({"handle":record.handle()})).unwrap()["envelope"]["text"],
++        "bytes"
++    );
++    assert_eq!(store.quota.readers.load(Ordering::Acquire), 0);
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture/tests.rs b/tool/shell-tool/src/unified_exec/capture/tests.rs
+new file mode 100644
+index 0000000..b9693ee
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/tests.rs
+@@ -0,0 +1,439 @@
++use std::{
++    cell::Cell,
++    io,
++    sync::{Arc, atomic::Ordering, mpsc},
++    time::{Duration, Instant},
++};
++
++use proteus_contracts::{
++    contracts::ExecutionAttribution,
++    domain::{new_execution_id, new_session_id, new_thread_id, new_turn_id},
++    process_module::{ProcessModuleError, ToolModule, ToolModuleHost, ToolModuleInvocationContext},
++};
++
++use super::super::session::{ExecSession, ProcessControl};
++use super::*;
++use crate::capture_config::CaptureConfig;
++
++mod process_paths;
++mod read_ranges;
++
++struct Host {
++    cancelled: bool,
++}
++impl ToolModuleHost for Host {
++    fn is_cancelled(&self) -> Result<bool, ProcessModuleError> {
++        Ok(self.cancelled)
++    }
++}
++struct NoopControl;
++impl ProcessControl for NoopControl {
++    fn write(&self, _: &[u8]) -> io::Result<()> {
++        Ok(())
++    }
++    fn interrupt(&self) -> io::Result<()> {
++        Ok(())
++    }
++    fn kill(&self) {}
++}
++
++// Process fixtures clean up their unique owner even if an assertion panics.
++// Do not depend on the production 30-minute janitor to settle a failed test.
++struct OwnedSessionsCleanup(ExecSessionOwner);
++impl Drop for OwnedSessionsCleanup {
++    fn drop(&mut self) {
++        let victims = {
++            let mut sessions = lock(super::super::session::sessions());
++            let ids: Vec<_> = sessions
++                .iter()
++                .filter(|(_, session)| session.owner == self.0)
++                .map(|(id, _)| *id)
++                .collect();
++            ids.into_iter()
++                .filter_map(|id| sessions.remove(&id))
++                .collect::<Vec<_>>()
++        };
++        for victim in victims {
++            victim.kill();
++        }
++    }
++}
++
++fn context(path: &std::path::Path) -> ToolModuleInvocationContext {
++    ToolModuleInvocationContext {
++        cwd: path.to_path_buf(),
++        skills: Default::default(),
++        config: json!({}),
++        attribution: ExecutionAttribution::for_turn(
++            new_execution_id(),
++            new_session_id(),
++            new_thread_id(),
++            new_turn_id(),
++        ),
++    }
++}
++fn owner(context: &ToolModuleInvocationContext) -> ExecSessionOwner {
++    ExecSessionOwner::from_context(
++        context,
++        context.cwd.canonicalize().unwrap().to_str().unwrap(),
++    )
++}
++fn fixture(
++    cap: u64,
++    slots: usize,
++) -> (
++    tempfile::TempDir,
++    Arc<CaptureStore>,
++    ToolModuleInvocationContext,
++) {
++    let directory = tempfile::tempdir().unwrap();
++    let context = context(directory.path());
++    let store = CaptureStore::new(CaptureConfig {
++        directory: directory.path().to_path_buf(),
++        cap,
++        slots,
++        retention: Duration::from_secs(300),
++    });
++    (directory, store, context)
++}
++fn attached(
++    store: &Arc<CaptureStore>,
++    context: &ToolModuleInvocationContext,
++    tty: bool,
++) -> (ExecSession, Arc<Record>) {
++    let mut prepared = store.prepare(owner(context), tty).unwrap();
++    let record = store.find(1).unwrap();
++    prepared.process_started();
++    let session = ExecSession::new(Box::new(NoopControl), tty, None, owner(context))
++        .with_capture(Some(prepared));
++    (session, record)
++}
++fn wait_for(mut predicate: impl FnMut() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(3);
++    while !predicate() {
++        assert!(Instant::now() < deadline, "capture worker did not settle");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++fn sealed(record: &Record) {
++    wait_for(|| lock(&record.state).terminal_at.is_some());
++    assert_eq!(lock(&record.state).storage, StorageState::Sealed);
++}
++fn read(
++    store: &Arc<CaptureStore>,
++    context: &ToolModuleInvocationContext,
++    args: Value,
++) -> Result<Value, ProcessModuleError> {
++    let tool = ReadCaptureTool(store.clone());
++    let call = json!({ "id": "capture_read", "name": "read_exec_capture", "args": args });
++    tool.invoke_json(
++        call.to_string(),
++        serde_json::to_string(context).unwrap(),
++        &mut Host { cancelled: false },
++    )
++    .map(|result| {
++        let typed: proteus_contracts::domain::ToolResult = serde_json::from_str(&result).unwrap();
++        let envelope: Value = serde_json::from_str(&typed.text_or_status()).unwrap();
++        let mut result = serde_json::to_value(typed).unwrap();
++        result["envelope"] = envelope;
++        result
++    })
++}
++
++#[test]
++fn cap_minus_one_exact_cap_and_cap_plus_one_have_distinct_receipts() {
++    for length in [3, 4, 5] {
++        let (_dir, store, context) = fixture(4, 1);
++        let (session, record) = attached(&store, &context, true);
++        session.push_output(&vec![b'x'; length]);
++        session.mark_reader_ended(ReaderEnd::Eof);
++        sealed(&record);
++        let receipt = record.receipt();
++        assert_eq!(receipt["observed_bytes"], length);
++        assert_eq!(receipt["confirmed_bytes"], length.min(4));
++        assert_eq!(receipt["cap_reached"], length >= 4);
++        assert_eq!(receipt["prefix_truncated"], length > 4);
++        assert_eq!(receipt["complete_stream"], length <= 4);
++        let result = read(&store, &context, json!({"handle": record.handle()})).unwrap();
++        assert_eq!(result["envelope"]["text"], "x".repeat(length.min(4)));
++        assert_eq!(result["metadata"]["range_eof"], true);
++        assert_eq!(lock(&session.output).buffer.len(), length);
++    }
++}
++
++#[test]
++fn cap_and_read_failure_are_both_preserved_not_prioritized_away() {
++    let (_dir, store, context) = fixture(3, 1);
++    let (session, record) = attached(&store, &context, false);
++    session.push_output(b"abcdef");
++    session.mark_reader_ended(ReaderEnd::ReadFailed);
++    assert_eq!(record.receipt()["readers"]["pending"], 1);
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let receipt = record.receipt();
++    assert_eq!(receipt["prefix_truncated"], true);
++    assert_eq!(receipt["readers"]["read_failed"], 1);
++    assert_eq!(receipt["readers"]["eof"], 1);
++    assert_eq!(receipt["complete_stream"], false);
++    assert_eq!(
++        read(&store, &context, json!({"handle": record.handle()})).unwrap()["envelope"]["text"],
++        "abc"
++    );
++}
++
++#[test]
++fn process_exit_and_drain_expiry_are_not_eof_or_early_sealing() {
++    let (_dir, store, context) = fixture(100, 1);
++    let (session, record) = attached(&store, &context, false);
++    session.push_output(b"tail");
++    session.mark_exited(Some(7));
++    assert_eq!(record.receipt()["complete_stream"], false);
++    assert!(record.receipt()["readable_bytes"].is_null());
++    session.mark_reader_ended(ReaderEnd::Eof);
++    assert_eq!(record.receipt()["readers"]["pending"], 1);
++    session.mark_reader_ended(ReaderEnd::DrainExpired);
++    sealed(&record);
++    assert_eq!(record.receipt()["complete_stream"], false);
++    assert_eq!(record.receipt()["readers"]["drain_expired"], 1);
++    assert_eq!(lock(&session.output).exit_code, Some(7));
++}
++
++#[test]
++fn saturated_observation_count_never_yields_complete() {
++    let (_dir, store, context) = fixture(16, 1);
++    let (session, record) = attached(&store, &context, true);
++    lock(&record.state).observed = u64::MAX;
++    session.push_output(b"x");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    assert_eq!(record.receipt()["count_saturated"], true);
++    assert_eq!(record.receipt()["complete_stream"], false);
++}
++
++#[test]
++fn queue_full_is_irreversible_but_preview_and_source_drain_continue() {
++    let (_dir, store, context) = fixture(1024 * 1024, 1);
++    let (sender, _undrained) = mpsc::sync_channel(QUEUE_CHUNKS);
++    let record = Arc::new(Record {
++        generation: store.generation,
++        id: 1,
++        owner: owner(&context),
++        cap: 1024 * 1024,
++        state: Mutex::new(State {
++            readers: ReaderCompletions::new(true),
++            expected: 1,
++            observed: 0,
++            saturated: false,
++            queued: 0,
++            confirmed: 0,
++            unconfirmed: 0,
++            storage: StorageState::Capturing,
++            failure: None,
++            terminal_at: None,
++            process_started: true,
++            attached: true,
++        }),
++        sender,
++        file: Mutex::new(None),
++        _reservation: store.quota.reserve().unwrap(),
++    });
++    let mut session = ExecSession::new(Box::new(NoopControl), true, None, owner(&context));
++    session.capture = Some(CaptureTap {
++        generation: store.generation,
++        record: Arc::downgrade(&record),
++    });
++    for _ in 0..QUEUE_CHUNKS + 2 {
++        session.push_output(&[255; CHUNK_BYTES]);
++    }
++    session.mark_reader_ended(ReaderEnd::Eof);
++    let receipt = record.receipt();
++    assert_eq!(receipt["storage_failure"], "queue_full");
++    assert_eq!(receipt["complete_stream"], false);
++    assert!(receipt["readable_bytes"].is_null());
++    assert_eq!(receipt["observed_bytes"], (QUEUE_CHUNKS + 2) * CHUNK_BYTES);
++    assert_eq!(
++        lock(&session.output).buffer.len(),
++        (QUEUE_CHUNKS + 2) * CHUNK_BYTES
++    );
++    assert_eq!(
++        lock(&record.state).queued,
++        (QUEUE_CHUNKS * CHUNK_BYTES) as u64
++    );
++}
++
++#[test]
++fn failed_append_receipt_preserves_uncertainty_and_exposes_no_readable_file() {
++    use std::io::Write;
++    struct FailAfterPrefix(usize);
++    impl Write for FailAfterPrefix {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.0 += 1;
++            if self.0 == 1 {
++                Ok(bytes.len().min(2))
++            } else {
++                Err(io::Error::other("fault"))
++            }
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            panic!("must not publish failed storage")
++        }
++    }
++    let (_dir, store, context) = fixture(16, 1);
++    let (sender, _receiver) = mpsc::sync_channel(QUEUE_CHUNKS);
++    let record = Record {
++        generation: store.generation,
++        id: 1,
++        owner: owner(&context),
++        cap: 16,
++        state: Mutex::new(State {
++            readers: ReaderCompletions::new(true),
++            expected: 1,
++            observed: 0,
++            saturated: false,
++            queued: 0,
++            confirmed: 0,
++            unconfirmed: 0,
++            storage: StorageState::Capturing,
++            failure: None,
++            terminal_at: None,
++            process_started: true,
++            attached: true,
++        }),
++        sender,
++        file: Mutex::new(None),
++        _reservation: store.quota.reserve().unwrap(),
++    };
++    record.observe(b"abcdef");
++    let mut sink = FailAfterPrefix(0);
++    record.append_result(6, writer::append(&mut sink, b"abcdef"));
++    record.ended(ReaderEnd::Eof);
++    let receipt = record.receipt();
++    assert_eq!(sink.0, 2, "no retry after failing write");
++    assert_eq!(receipt["confirmed_bytes"], 2);
++    assert_eq!(receipt["unconfirmed_append_bytes"], 4);
++    assert_eq!(receipt["storage_state"], "failed");
++    assert_eq!(receipt["storage_failure"], "storage_io");
++    assert_eq!(receipt["complete_stream"], false);
++    assert!(receipt["readable_bytes"].is_null());
++}
++
++#[test]
++fn failed_capture_admission_never_enters_session_prune_or_spawn_closure() {
++    let (_dir, store, context) = fixture(16, 1);
++    let _first = store.prepare(owner(&context), true).unwrap();
++    let entered = Cell::new(false);
++    let result = admit(Some(&store), owner(&context), true, |_, _| {
++        entered.set(true);
++        Ok(())
++    });
++    assert!(result.unwrap_err().to_string().contains("quota"));
++    assert!(
++        !entered.get(),
++        "prune/spawn must be after capture admission"
++    );
++}
++
++#[test]
++fn pre_spawn_and_post_spawn_pre_attach_abort_do_not_invent_eof() {
++    for started in [false, true] {
++        let (_dir, store, context) = fixture(16, 1);
++        let mut prepared = store.prepare(owner(&context), false).unwrap();
++        let record = store.find(1).unwrap();
++        if started {
++            prepared.process_started();
++        }
++        drop(prepared); // models failure/cancellation before any reader exists
++        wait_for(|| lock(&record.state).terminal_at.is_some());
++        let state = lock(&record.state);
++        assert_eq!(state.process_started, started);
++        assert_eq!(
++            state.failure,
++            Some(if started {
++                Failure::AbortBeforeReaders
++            } else {
++                Failure::AbortBeforeSpawn
++            })
++        );
++        assert_eq!(state.readers.eof, 0);
++        assert_eq!(state.readers.read_failed + state.readers.drain_expired, 0);
++        drop(state);
++        assert!(store.find(1).is_none());
++        assert!(record.file.lock().unwrap().is_none());
++        drop(record);
++        wait_for(|| store.quota.used.load(Ordering::Acquire) == 0);
++    }
++}
++
++#[test]
++fn expired_map_entry_does_not_refund_an_outstanding_resource_lease() {
++    let (_dir, store, context) = fixture(16, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(b"abc");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    lock(&record.state).terminal_at = Some(Instant::now() - Duration::from_secs(301));
++    assert!(store.find(1).is_none());
++    assert_eq!(store.quota.used.load(Ordering::Acquire), 1);
++    assert!(store.prepare(owner(&context), true).is_err());
++    drop(record); // sole actual read/resource lease; session tap is weak
++    wait_for(|| store.quota.used.load(Ordering::Acquire) == 0);
++    assert!(store.prepare(owner(&context), true).is_ok());
++    assert!(store.metadata(session.capture.as_ref()).is_none());
++}
++
++#[test]
++fn binding_drop_stops_writer_without_future_lookup_or_reader_eof() {
++    let (_dir, store, context) = fixture(16, 1);
++    let (session, record) = attached(&store, &context, true);
++    let weak = Arc::downgrade(&record);
++    let quota = store.quota.clone();
++    drop(record);
++    drop(store);
++    wait_for(|| weak.upgrade().is_none());
++    assert_eq!(quota.used.load(Ordering::Acquire), 0);
++    session.push_output(b"preview still works");
++    assert_eq!(lock(&session.output).buffer, b"preview still works");
++}
++
++#[test]
++fn sealed_capture_does_not_depend_on_exec_session_lifetime() {
++    let (_dir, store, context) = fixture(16, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(b"kept");
++    session.mark_reader_ended(ReaderEnd::Eof);
++    drop(session);
++    sealed(&record);
++    assert_eq!(
++        read(&store, &context, json!({"handle": record.handle()})).unwrap()["envelope"]["text"],
++        "kept"
++    );
++}
++
++#[test]
++fn actual_exec_code_seven_keeps_original_success_and_exit_semantics() {
++    let (_dir, store, context) = fixture(128, 1);
++    let _cleanup = OwnedSessionsCleanup(owner(&context));
++    let call = json!({"id":"exec_capture_7", "name":"exec_command", "args": {
++        "cmd":"printf capture-seven; exit 7", "with_escalated_permissions":true, "yield_time_ms":1000 }});
++    let result = super::super::exec_command_impl(
++        &call.to_string(),
++        &serde_json::to_string(&context).unwrap(),
++        Some(&store),
++        &mut Host { cancelled: false },
++    )
++    .unwrap();
++    let result: Value = serde_json::from_str(&result).unwrap();
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["metadata"]["exit_code"], 7);
++    assert!(result["metadata"]["session_id"].is_null());
++    let handle = result["metadata"]["source_capture"]["handle"]
++        .as_str()
++        .unwrap();
++    assert!(result["output"].as_str().unwrap().contains(handle));
++    let record = store.find(1).unwrap();
++    sealed(&record);
++    assert_eq!(
++        read(&store, &context, json!({"handle":handle})).unwrap()["envelope"]["text"],
++        "capture-seven"
++    );
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture/writer.rs b/tool/shell-tool/src/unified_exec/capture/writer.rs
+new file mode 100644
+index 0000000..bf290df
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture/writer.rs
+@@ -0,0 +1,169 @@
++use std::{
++    fs::File,
++    io::{self, Write},
++    sync::{
++        Arc,
++        mpsc::{Receiver, RecvTimeoutError, TryRecvError},
++    },
++    time::{Duration, Instant},
++};
++
++use super::super::session::lock;
++use super::{Failure, Record, StorageState};
++
++// Field drop order is important even on panic/thread spawn failure: File closes
++// before the final Arc<Record> can return its reservation.
++struct Writer {
++    file: Option<File>,
++    record: Arc<Record>,
++}
++
++pub(super) fn start(
++    record: Arc<Record>,
++    receiver: Receiver<Box<[u8]>>,
++    file: File,
++) -> io::Result<()> {
++    let writer = Writer {
++        file: Some(file),
++        record,
++    };
++    std::thread::Builder::new()
++        .name("exec-source-capture".into())
++        .spawn(move || writer.run(receiver))
++        .map(|_| ())
++}
++
++pub(super) struct AppendFailure {
++    pub(super) confirmed: usize,
++    pub(super) uncertain: usize,
++}
++
++/// No retry after an error (including Interrupted), no seal after uncertainty.
++pub(super) fn append(writer: &mut impl Write, bytes: &[u8]) -> Result<(), AppendFailure> {
++    let mut confirmed = 0;
++    while confirmed < bytes.len() {
++        match writer.write(&bytes[confirmed..]) {
++            Ok(0) => {
++                return Err(AppendFailure {
++                    confirmed,
++                    uncertain: 0,
++                });
++            }
++            Ok(n) if n <= bytes.len() - confirmed => confirmed += n,
++            Ok(_) => {
++                return Err(AppendFailure {
++                    confirmed,
++                    uncertain: bytes.len() - confirmed,
++                });
++            }
++            Err(_) => {
++                return Err(AppendFailure {
++                    confirmed,
++                    uncertain: bytes.len() - confirmed,
++                });
++            }
++        }
++    }
++    Ok(())
++}
++
++impl Writer {
++    fn chunk(&mut self, bytes: &[u8]) {
++        if lock(&self.record.state).failure.is_some() {
++            return;
++        }
++        let result = append(self.file.as_mut().expect("writer file"), bytes);
++        self.record.append_result(bytes.len(), result);
++    }
++
++    fn fail(&mut self) {
++        drop(self.file.take());
++        let mut state = lock(&self.record.state);
++        state.storage = StorageState::Failed;
++        state.terminal_at = Some(Instant::now());
++    }
++
++    fn run(mut self, receiver: Receiver<Box<[u8]>>) {
++        loop {
++            if lock(&self.record.state).failure.is_some() {
++                self.fail();
++                return;
++            }
++            match receiver.recv_timeout(Duration::from_millis(20)) {
++                Ok(chunk) => self.chunk(&chunk),
++                Err(RecvTimeoutError::Disconnected) => self.record.abort(Failure::WriterLost),
++                Err(RecvTimeoutError::Timeout) => {
++                    if !lock(&self.record.state).readers.is_closed() {
++                        continue;
++                    }
++                    // Terminal facts are ordered AFTER all sends. Recheck queue
++                    // after observing closure, not before, to avoid a final-chunk race.
++                    loop {
++                        match receiver.try_recv() {
++                            Ok(chunk) => self.chunk(&chunk),
++                            Err(TryRecvError::Empty) => break,
++                            Err(TryRecvError::Disconnected) => {
++                                self.record.abort(Failure::WriterLost);
++                                break;
++                            }
++                        }
++                    }
++                    let mut state = lock(&self.record.state);
++                    if state.failure.is_some() {
++                        drop(state);
++                        self.fail();
++                        return;
++                    }
++                    if state.confirmed != state.queued {
++                        state.failure = Some(Failure::Protocol);
++                        drop(state);
++                        self.fail();
++                        return;
++                    }
++                    // No I/O under locks: move sole File into immutable sealed
++                    // state. This promises readable bytes, NOT fsync durability.
++                    *lock(&self.record.file) = self.file.take();
++                    state.storage = StorageState::Sealed;
++                    state.terminal_at = Some(Instant::now());
++                    return;
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    struct Faulty {
++        calls: usize,
++    }
++    impl Write for Faulty {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.calls += 1;
++            if self.calls == 1 {
++                Ok(bytes.len().min(2))
++            } else {
++                Err(io::Error::other("disk failure"))
++            }
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            panic!("no durability promise")
++        }
++    }
++    #[test]
++    fn partial_write_failure_has_no_retry_or_false_confirmation() {
++        let mut sink = Faulty { calls: 0 };
++        let failure = append(&mut sink, b"abcdef").err().unwrap();
++        assert_eq!(
++            (failure.confirmed, failure.uncertain, sink.calls),
++            (2, 4, 2)
++        );
++    }
++    #[test]
++    fn raw_bytes_are_written_without_text_conversion() {
++        let mut sink = Vec::new();
++        assert!(append(&mut sink, &[0, 255, 128, 13, 10]).is_ok());
++        assert_eq!(sink, [0, 255, 128, 13, 10]);
++    }
++}
+diff --git a/tool/shell-tool/src/unified_exec/capture.rs b/tool/shell-tool/src/unified_exec/capture.rs
+new file mode 100644
+index 0000000..dac40e9
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/capture.rs
+@@ -0,0 +1,245 @@
++//! Optional source-side capture owned by one bound shell_tools generation.
++//! No command strings, paths from tool arguments, output logs, or network I/O.
++use std::{
++    fs::File,
++    sync::{
++        Mutex, Weak,
++        mpsc::{SyncSender, TrySendError},
++    },
++    time::Instant,
++};
++
++use proteus_contracts::domain::ExecutionId;
++use serde_json::{Value, json};
++
++use super::{
++    reader::{ReaderCompletions, ReaderEnd},
++    session::{ExecSessionOwner, lock},
++};
++
++mod read;
++mod store;
++mod writer;
++pub(crate) use read::ReadCaptureTool;
++pub(crate) use store::CaptureStore;
++pub(super) use store::PreparedCapture;
++
++const CHUNK_BYTES: usize = 8192;
++const QUEUE_CHUNKS: usize = 8;
++const MAX_READ_BYTES: usize = 65536;
++const MAX_READERS: usize = 4;
++const HANDLE_BYTES: usize = 53;
++
++/// The closure includes session pruning and spawn. Capture rejection must not
++/// enter either; this also gives regression sources the exact admission seam.
++pub(super) fn admit<T>(
++    store: Option<&std::sync::Arc<CaptureStore>>,
++    owner: ExecSessionOwner,
++    tty: bool,
++    spawn: impl FnOnce(ExecSessionOwner, Option<PreparedCapture>) -> anyhow::Result<T>,
++) -> anyhow::Result<T> {
++    if store.is_some() && owner.workspace_bytes() > crate::capture_config::MAX_PATH_BYTES {
++        anyhow::bail!("capture owner workspace exceeds 4096 encoded bytes");
++    }
++    let prepared = store
++        .map(|store| store.prepare(owner.clone(), tty))
++        .transpose()?;
++    spawn(owner, prepared)
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum StorageState {
++    Capturing,
++    Finalizing,
++    Sealed,
++    Failed,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Failure {
++    QueueFull,
++    WriterLost,
++    Io,
++    Protocol,
++    AbortBeforeSpawn,
++    AbortBeforeReaders,
++    BindingDropped,
++}
++
++impl Failure {
++    fn label(self) -> &'static str {
++        match self {
++            Self::QueueFull => "queue_full",
++            Self::WriterLost => "writer_lost",
++            Self::Io => "storage_io",
++            Self::Protocol => "capture_protocol",
++            Self::AbortBeforeSpawn => "abort_before_spawn",
++            Self::AbortBeforeReaders => "abort_before_readers",
++            Self::BindingDropped => "binding_dropped",
++        }
++    }
++}
++
++struct State {
++    readers: ReaderCompletions,
++    expected: u8,
++    observed: u64,
++    saturated: bool,
++    queued: u64,
++    confirmed: u64,
++    unconfirmed: u64,
++    storage: StorageState,
++    failure: Option<Failure>,
++    terminal_at: Option<Instant>,
++    process_started: bool,
++    attached: bool,
++}
++
++struct Record {
++    generation: ExecutionId,
++    id: u64,
++    owner: ExecSessionOwner,
++    cap: u64,
++    state: Mutex<State>,
++    sender: SyncSender<Box<[u8]>>,
++    // One actual File. Writer owns it until seal; reads serialize seek+read here.
++    file: Mutex<Option<File>>,
++    // Field order plus explicit Drop guarantee close-before-reservation-release.
++    _reservation: store::Reservation,
++}
++
++impl Drop for Record {
++    fn drop(&mut self) {
++        let file = self
++            .file
++            .get_mut()
++            .unwrap_or_else(|e| e.into_inner())
++            .take();
++        drop(file);
++        // Reservation field is dropped only after this method returns.
++    }
++}
++
++impl Record {
++    fn append_result(&self, attempted: usize, result: Result<(), writer::AppendFailure>) {
++        let mut state = lock(&self.state);
++        match result {
++            Ok(()) => state.confirmed += attempted as u64,
++            Err(failure) => {
++                state.confirmed += failure.confirmed as u64;
++                state.unconfirmed = failure.uncertain as u64;
++                state.failure.get_or_insert(Failure::Io);
++                state.storage = StorageState::Failed;
++            }
++        }
++    }
++    fn handle(&self) -> String {
++        format!("{}:{:016x}", self.generation, self.id)
++    }
++
++    fn observe(&self, chunk: &[u8]) {
++        let mut state = lock(&self.state);
++        match state.observed.checked_add(chunk.len() as u64) {
++            Some(total) => state.observed = total,
++            None => {
++                state.observed = u64::MAX;
++                state.saturated = true;
++            }
++        }
++        if state.failure.is_some() {
++            return;
++        }
++        if chunk.len() > CHUNK_BYTES || !state.attached || state.readers.is_closed() {
++            state.failure = Some(Failure::Protocol);
++            state.storage = StorageState::Failed;
++            return;
++        }
++        let offered = chunk
++            .len()
++            .min(self.cap.saturating_sub(state.queued) as usize);
++        if offered == 0 {
++            return;
++        }
++        // Called under the existing output mutex: only one enqueue allocation
++        // per capture can coexist with 8 queued + 1 writer-held payloads.
++        match self.sender.try_send(chunk[..offered].into()) {
++            Ok(()) => state.queued += offered as u64,
++            Err(error) => {
++                state.failure = Some(match error {
++                    TrySendError::Full(_) => Failure::QueueFull,
++                    TrySendError::Disconnected(_) => Failure::WriterLost,
++                });
++                state.storage = StorageState::Failed;
++            }
++        }
++    }
++
++    fn ended(&self, end: ReaderEnd) {
++        let mut state = lock(&self.state);
++        state.readers.record(end);
++        if state.readers.is_closed() && state.failure.is_none() {
++            state.storage = StorageState::Finalizing;
++        }
++    }
++
++    fn abort(&self, reason: Failure) {
++        let mut state = lock(&self.state);
++        state.failure.get_or_insert(reason);
++        state.storage = StorageState::Failed;
++    }
++
++    fn receipt(&self) -> Value {
++        self.snapshot().0
++    }
++
++    /// Range readiness and its visible receipt must describe one state, even
++    /// when the writer seals between two successive tool-side instructions.
++    fn snapshot(&self) -> (Value, Option<u64>) {
++        let state = lock(&self.state);
++        let sealed = state.storage == StorageState::Sealed && state.failure.is_none();
++        let complete = sealed
++            && state.readers.eof == state.expected
++            && !state.saturated
++            && state.observed == state.confirmed;
++        let receipt = json!({
++            "version": 1, "handle": self.handle(), "stream": "merged_host_order",
++            "storage_state": match state.storage {
++                StorageState::Capturing => "capturing", StorageState::Finalizing => "finalizing",
++                StorageState::Sealed => "sealed", StorageState::Failed => "failed",
++            },
++            "observed_bytes": state.observed, "count_saturated": state.saturated,
++            "confirmed_bytes": state.confirmed, "unconfirmed_append_bytes": state.unconfirmed,
++            "cap_bytes": self.cap, "cap_reached": state.confirmed == self.cap,
++            "prefix_truncated": state.observed > self.cap,
++            "readable_bytes": if sealed { Some(state.confirmed) } else { None },
++            "readers": { "expected": state.expected, "eof": state.readers.eof,
++                "read_failed": state.readers.read_failed, "drain_expired": state.readers.drain_expired,
++                "pending": state.expected - state.readers.eof - state.readers.read_failed - state.readers.drain_expired },
++            "storage_failure": state.failure.map(Failure::label),
++            "complete_stream": complete,
++        });
++        (receipt, sealed.then_some(state.confirmed))
++    }
++}
++
++/// Session taps are weak: a finished session must not defeat TTL or binding drop.
++pub(super) struct CaptureTap {
++    generation: ExecutionId,
++    record: Weak<Record>,
++}
++
++impl CaptureTap {
++    pub(super) fn observe(&self, chunk: &[u8]) {
++        if let Some(record) = self.record.upgrade() {
++            record.observe(chunk);
++        }
++    }
++    pub(super) fn ended(&self, end: ReaderEnd) {
++        if let Some(record) = self.record.upgrade() {
++            record.ended(end);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/tool/shell-tool/src/unified_exec/output.rs b/tool/shell-tool/src/unified_exec/output.rs
+index de722ed..093c05e 100644
+--- a/tool/shell-tool/src/unified_exec/output.rs
++++ b/tool/shell-tool/src/unified_exec/output.rs
+@@ -107,6 +107,12 @@ pub(super) fn render_result(
+             collected.dropped_bytes
+         ));
+     }
++    if let Some(capture) = metadata.get("source_capture") {
++        sections.push(format!("Source capture: {} (state={}, complete_stream={}); use read_exec_capture to inspect status or read a sealed retained prefix. This is independent of the command exit code.",
++            capture["handle"].as_str().unwrap_or("unavailable"),
++            capture["storage_state"].as_str().unwrap_or("unknown"),
++            capture["complete_stream"].as_bool().unwrap_or(false)));
++    }
+     sections.push(format!("Output:\n{text}"));
+ 
+     if let Some(map) = metadata.as_object_mut() {
+diff --git a/tool/shell-tool/src/unified_exec/process.rs b/tool/shell-tool/src/unified_exec/process.rs
+index 5554865..9ee9b76 100644
+--- a/tool/shell-tool/src/unified_exec/process.rs
++++ b/tool/shell-tool/src/unified_exec/process.rs
+@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
+ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+ use proteus_contracts::domain::EXEC_SHELL;
+ 
++use super::capture::PreparedCapture;
+ use super::pty_lifetime::PtyLifetime;
+ use super::session::{
+     ExecSession, ExecSessionOwner, ProcessControl, ensure_session_janitor, lock, register_session,
+@@ -24,6 +25,7 @@ pub(super) fn spawn_session(
+     workdir: &str,
+     sandbox: Option<SandboxKind>,
+     owner: ExecSessionOwner,
++    capture: Option<PreparedCapture>,
+ ) -> Result<(i64, Arc<ExecSession>)> {
+     ensure_session_janitor()?;
+     let (program, args) = match sandbox.as_ref() {
+@@ -36,9 +38,9 @@ pub(super) fn spawn_session(
+     let mut sessions = lock(sessions());
+     register_session(&mut sessions, || {
+         if tty {
+-            spawn_pty(&program, args, workdir, sandbox, owner)
++            spawn_pty(&program, args, workdir, sandbox, owner, capture)
+         } else {
+-            spawn_pipes(&program, args, workdir, sandbox, owner)
++            spawn_pipes(&program, args, workdir, sandbox, owner, capture)
+         }
+     })
+ }
+@@ -72,6 +74,7 @@ fn spawn_pty(
+     workdir: &str,
+     sandbox: Option<SandboxKind>,
+     owner: ExecSessionOwner,
++    mut capture: Option<PreparedCapture>,
+ ) -> Result<Arc<ExecSession>> {
+     let pair = native_pty_system()
+         .openpty(PtySize {
+@@ -100,6 +103,9 @@ fn spawn_pty(
+         .slave
+         .spawn_command(builder)
+         .map_err(|error| anyhow!("failed to spawn command in PTY: {error}"))?;
++    if let Some(capture) = &mut capture {
++        capture.process_started();
++    }
+     let lifetime = Arc::new(PtyLifetime::new(child));
+     let control = PtyControl {
+         writer: Mutex::new(writer),
+@@ -107,7 +113,8 @@ fn spawn_pty(
+         _master: Mutex::new(pair.master),
+     };
+     drop(pair.slave);
+-    let session = Arc::new(ExecSession::new(Box::new(control), true, sandbox, owner));
++    let session =
++        Arc::new(ExecSession::new(Box::new(control), true, sandbox, owner).with_capture(capture));
+     read_output(reader, session.clone());
+     let wait_session = session.clone();
+     std::thread::spawn(move || {
+@@ -200,6 +207,7 @@ fn spawn_pipes(
+     workdir: &str,
+     sandbox: Option<SandboxKind>,
+     owner: ExecSessionOwner,
++    mut capture: Option<PreparedCapture>,
+ ) -> Result<Arc<ExecSession>> {
+     let mut command = Command::new(program);
+     command
+@@ -219,6 +227,9 @@ fn spawn_pipes(
+     let mut child = command
+         .spawn()
+         .context("failed to spawn command with pipes")?;
++    if let Some(capture) = &mut capture {
++        capture.process_started();
++    }
+     let stdout = child.stdout.take().expect("piped stdout");
+     let stderr = child.stderr.take().expect("piped stderr");
+     #[cfg(unix)]
+@@ -234,7 +245,8 @@ fn spawn_pipes(
+     let control = PipeControl {
+         child: child.clone(),
+     };
+-    let session = Arc::new(ExecSession::new(Box::new(control), false, sandbox, owner));
++    let session =
++        Arc::new(ExecSession::new(Box::new(control), false, sandbox, owner).with_capture(capture));
+     read_output(stdout, session.clone());
+     read_output(stderr, session.clone());
+     let wait_session = session.clone();
+diff --git a/tool/shell-tool/src/unified_exec/session.rs b/tool/shell-tool/src/unified_exec/session.rs
+index 3b1e130..ba12bab 100644
+--- a/tool/shell-tool/src/unified_exec/session.rs
++++ b/tool/shell-tool/src/unified_exec/session.rs
+@@ -1,4 +1,5 @@
+ //! Session ownership, storage and lifetime.
++use super::capture::{CaptureTap, PreparedCapture};
+ use super::reader::{ReaderCompletions, ReaderEnd};
+ use super::{
+     CANCELLATION_POLL_INTERVAL, EXIT_DRAIN_GRACE, MAX_SESSIONS, SESSION_BUFFER_LIMIT,
+@@ -37,6 +38,7 @@ pub(super) struct ExecSession {
+     pub(super) tty: bool,
+     pub(super) sandbox: Option<SandboxKind>,
+     pub(super) owner: ExecSessionOwner,
++    pub(super) capture: Option<CaptureTap>,
+     /// Для LRU-prune: обновляется при каждом обращении к сессии.
+     pub(super) last_used: Mutex<Instant>,
+ }
+@@ -57,6 +59,9 @@ enum ExecSessionPrincipal {
+ }
+ 
+ impl ExecSessionOwner {
++    pub(super) fn workspace_bytes(&self) -> usize {
++        self.workspace.as_os_str().as_encoded_bytes().len()
++    }
+     pub(super) fn from_context(
+         context: &ToolModuleInvocationContext,
+         canonical_workspace: &str,
+@@ -116,6 +121,7 @@ impl ExecSession {
+             tty,
+             sandbox,
+             owner,
++            capture: None,
+             last_used: Mutex::new(Instant::now()),
+         }
+     }
+@@ -124,6 +130,11 @@ impl ExecSession {
+         *lock(&self.last_used) = Instant::now();
+     }
+ 
++    pub(super) fn with_capture(mut self, capture: Option<PreparedCapture>) -> Self {
++        self.capture = capture.map(PreparedCapture::attach);
++        self
++    }
++
+     pub(super) fn lock_interaction(
+         &self,
+         host: &mut ToolModuleHostMut<'_>,
+@@ -149,6 +160,9 @@ impl ExecSession {
+ 
+     pub(super) fn push_output(&self, chunk: &[u8]) {
+         let mut output = lock(&self.output);
++        if let Some(capture) = &self.capture {
++            capture.observe(chunk);
++        }
+         output.buffer.extend_from_slice(chunk);
+         if output.buffer.len() > SESSION_BUFFER_LIMIT {
+             let excess = output.buffer.len() - SESSION_BUFFER_LIMIT;
+@@ -163,6 +177,9 @@ impl ExecSession {
+     pub(super) fn mark_reader_ended(&self, end: ReaderEnd) {
+         let mut output = lock(&self.output);
+         output.readers.record(end);
++        if let Some(capture) = &self.capture {
++            capture.ended(end);
++        }
+         drop(output);
+         self.output_cond.notify_all();
+     }
+diff --git a/tool/shell-tool/src/unified_exec/spec.rs b/tool/shell-tool/src/unified_exec/spec.rs
+index cbe50d3..93c9d4f 100644
+--- a/tool/shell-tool/src/unified_exec/spec.rs
++++ b/tool/shell-tool/src/unified_exec/spec.rs
+@@ -1,13 +1,17 @@
+ //! Model-visible terminal specifications and process tool entrypoints.
++use super::CaptureStore;
+ use super::{EXEC_SPEC_TIMEOUT_MS, WRITE_SPEC_TIMEOUT_MS, exec_command_impl, write_stdin_impl};
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::json;
++use std::sync::Arc;
+ 
+-pub(crate) struct ExecCommandTool;
++pub(crate) struct ExecCommandTool {
++    pub(crate) capture: Option<Arc<CaptureStore>>,
++}
+ 
+ impl ToolModule for ExecCommandTool {
+     fn spec_json(&self) -> String {
+-        let spec = json!({
++        let mut spec = json!({
+             "name": "exec_command",
+             "description": "Runs a shell command (sh -lc) with closed stdin and stdout/stderr pipes by default. Set `tty: true` for a PTY with interactive stdin. Waits up to `yield_time_ms` for output; if the process is still running, returns a Session ID for follow-up interaction via `write_stdin`. Non-escalated commands require bwrap and run with no network access, a private PID namespace, and a read-only filesystem outside the workspace; execution fails closed when bwrap is unavailable or disabled. The sandbox network is isolated per session: a localhost server started in a sandboxed session is unreachable from other tool calls and from the user's machine; start servers that must stay reachable with `with_escalated_permissions: true`. Set `with_escalated_permissions: true` with a short `justification` to request an unsandboxed run (requires user approval). Non-escalated workdirs must stay inside the workspace. Live sessions belong to the current runtime session/thread/workspace, expire after 30 minutes idle, and are killed when the invocation is cancelled. At most 16 live sessions: the least recently used one is killed to make room, so close finished sessions via write_stdin (Ctrl-C/Ctrl-D). Safety: RunsCommands.",
+             "input_schema": {
+@@ -48,6 +52,10 @@ impl ToolModule for ExecCommandTool {
+                 "aliases": ["interactive shell", "repl", "long-running command"]
+             }
+         });
++        if self.capture.is_some() {
++            let description = spec["description"].as_str().unwrap().to_owned();
++            spec["description"] = format!("{description} This binding explicitly retains a bounded raw output prefix in ephemeral local storage. Capture admission failure prevents command launch. After launch, capture overflow or storage failure does not change the command's outcome. Results include a source capture handle for read_exec_capture; incomplete streams are never declared complete.").into();
++        }
+         spec.to_string()
+     }
+ 
+@@ -57,14 +65,21 @@ impl ToolModule for ExecCommandTool {
+         context_json: String,
+         host: &mut ToolModuleHostMut<'_>,
+     ) -> Result<String, ProcessModuleError> {
+-        match exec_command_impl(call_json.as_str(), context_json.as_str(), host) {
++        match exec_command_impl(
++            call_json.as_str(),
++            context_json.as_str(),
++            self.capture.as_ref(),
++            host,
++        ) {
+             Ok(result_json) => Ok(result_json),
+             Err(error) => Err(ProcessModuleError::new(format!("{error:#}"))),
+         }
+     }
+ }
+ 
+-pub(crate) struct WriteStdinTool;
++pub(crate) struct WriteStdinTool {
++    pub(crate) capture: Option<Arc<CaptureStore>>,
++}
+ 
+ impl ToolModule for WriteStdinTool {
+     fn spec_json(&self) -> String {
+@@ -112,7 +127,12 @@ impl ToolModule for WriteStdinTool {
+         context_json: String,
+         host: &mut ToolModuleHostMut<'_>,
+     ) -> Result<String, ProcessModuleError> {
+-        match write_stdin_impl(call_json.as_str(), context_json.as_str(), host) {
++        match write_stdin_impl(
++            call_json.as_str(),
++            context_json.as_str(),
++            self.capture.as_ref(),
++            host,
++        ) {
+             Ok(result_json) => Ok(result_json),
+             Err(error) => Err(ProcessModuleError::new(format!("{error:#}"))),
+         }
+diff --git a/tool/shell-tool/src/unified_exec/tests/pipe_exec.rs b/tool/shell-tool/src/unified_exec/tests/pipe_exec.rs
+index 0d6e9cc..ed01889 100644
+--- a/tool/shell-tool/src/unified_exec/tests/pipe_exec.rs
++++ b/tool/shell-tool/src/unified_exec/tests/pipe_exec.rs
+@@ -160,7 +160,7 @@ fn long_empty_poll_returns_final_stdout_and_stderr_once() {
+                     let call = json!({"id": "poll", "name": "write_stdin", "args": {
+                         "session_id": id, "yield_time_ms": 300000
+                     }});
+-                    write_stdin_impl(&call.to_string(), &context_json, &mut host)
++                    write_stdin_impl(&call.to_string(), &context_json, None, &mut host)
+                 })
+             })
+             .collect::<Vec<_>>();
+@@ -308,6 +308,7 @@ fn cancel_poll_kills_process_group(tty: bool) {
+         write_stdin_impl(
+             &call.to_string(),
+             &serde_json::to_string(&context).unwrap(),
++            None,
+             host,
+         )
+     })
+diff --git a/tool/shell-tool/src/unified_exec/tests.rs b/tool/shell-tool/src/unified_exec/tests.rs
+index 7553b7e..8d31426 100644
+--- a/tool/shell-tool/src/unified_exec/tests.rs
++++ b/tool/shell-tool/src/unified_exec/tests.rs
+@@ -52,7 +52,7 @@ fn exec_command_with_context(context: &ToolModuleInvocationContext, mut args: Va
+     let call = json!({ "id": "call_exec", "name": "exec_command", "args": args });
+     let context_json = serde_json::to_string(context).expect("context json");
+     let result = with_host(Arc::new(AtomicBool::new(false)), |host| {
+-        exec_command_impl(&call.to_string(), &context_json, host)
++        exec_command_impl(&call.to_string(), &context_json, None, host)
+     })
+     .expect("invoke");
+     serde_json::from_str(&result).expect("tool result")
+@@ -66,7 +66,7 @@ fn write_stdin_result(context: &ToolModuleInvocationContext, args: Value) -> Res
+     let call = json!({ "id": "call_stdin", "name": "write_stdin", "args": args });
+     let context_json = serde_json::to_string(context).expect("context json");
+     with_host(Arc::new(AtomicBool::new(false)), |host| {
+-        write_stdin_impl(&call.to_string(), &context_json, host)
++        write_stdin_impl(&call.to_string(), &context_json, None, host)
+     })
+ }
+ 
+@@ -312,7 +312,7 @@ fn cancellation_kills_and_removes_interactive_session() {
+ 
+     let started = Instant::now();
+     let error = with_host(cancelled, |host| {
+-        exec_command_impl(&call.to_string(), &context_json, host)
++        exec_command_impl(&call.to_string(), &context_json, None, host)
+     })
+     .expect_err("cancelled invocation must fail");
+     canceller.join().expect("canceller");
+@@ -362,7 +362,7 @@ fn exec_command_requires_cmd_arg() {
+         serde_json::to_string(&invocation_context(dir.path())).expect("context json");
+ 
+     let error = with_host(Arc::new(AtomicBool::new(false)), |host| {
+-        exec_command_impl(&call.to_string(), &context_json, host)
++        exec_command_impl(&call.to_string(), &context_json, None, host)
+     })
+     .expect_err("missing cmd must error");
+ 
+@@ -384,6 +384,7 @@ fn exec_command_fails_closed_without_bwrap() {
+             &context,
+             false,
+             SandboxPolicy::unavailable_for_test(),
++            None,
+             host,
+         )
+     })
+@@ -406,7 +407,7 @@ fn exec_command_rejects_external_workdir_without_escalation() {
+         serde_json::to_string(&invocation_context(workspace.path())).expect("context json");
+ 
+     let error = with_host(Arc::new(AtomicBool::new(false)), |host| {
+-        exec_command_impl(&call.to_string(), &context_json, host)
++        exec_command_impl(&call.to_string(), &context_json, None, host)
+     })
+     .expect_err("external workdir must require escalation");
+ 
+diff --git a/tool/shell-tool/src/unified_exec.rs b/tool/shell-tool/src/unified_exec.rs
+index 24ceaa1..de7e70f 100644
+--- a/tool/shell-tool/src/unified_exec.rs
++++ b/tool/shell-tool/src/unified_exec.rs
+@@ -5,6 +5,7 @@ use crate::sandbox::{SandboxKind, SandboxPolicy, resolve_workdir};
+ use anyhow::{Context, Result, anyhow};
+ use proteus_contracts::process_module::{ToolModuleHostMut, ToolModuleInvocationContext};
+ use serde_json::{Value, json};
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ const DEFAULT_EXEC_YIELD_MS: u64 = 10_000;
+@@ -29,6 +30,7 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+ /// После выхода процесса даём reader'у дочитать хвост из PTY.
+ const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(50);
+ 
++mod capture;
+ mod output;
+ mod process;
+ mod pty_lifetime;
+@@ -36,6 +38,7 @@ mod reader;
+ mod session;
+ mod spec;
+ 
++pub(crate) use capture::{CaptureStore, ReadCaptureTool};
+ use output::*;
+ use process::spawn_session;
+ use session::*;
+@@ -44,6 +47,7 @@ pub(crate) use spec::{ExecCommandTool, WriteStdinTool};
+ fn exec_command_impl(
+     call_json: &str,
+     context_json: &str,
++    capture: Option<&Arc<CaptureStore>>,
+     host: &mut ToolModuleHostMut<'_>,
+ ) -> Result<String> {
+     ensure_not_cancelled(host)?;
+@@ -77,6 +81,7 @@ fn exec_command_impl(
+         &context,
+         escalated,
+         sandbox_policy,
++        capture,
+         host,
+     )
+ }
+@@ -88,6 +93,7 @@ fn execute_command(
+     context: &ToolModuleInvocationContext,
+     escalated: bool,
+     sandbox_policy: SandboxPolicy,
++    capture: Option<&Arc<CaptureStore>>,
+     host: &mut ToolModuleHostMut<'_>,
+ ) -> Result<String> {
+     ensure_not_cancelled(host)?;
+@@ -110,15 +116,23 @@ fn execute_command(
+         .unwrap_or(false);
+     let sandbox = sandbox_policy.select(escalated, false)?;
+ 
++    let owner = ExecSessionOwner::from_context(context, &resolved.workspace);
++    // Capture admission must precede session pruning as well as OS spawn.
+     let started = Instant::now();
+-    let (session_id, session) = spawn_session(
+-        cmd,
+-        tty,
+-        &resolved.workspace,
+-        &resolved.workdir,
+-        sandbox,
+-        ExecSessionOwner::from_context(context, &resolved.workspace),
+-    )?;
++    let (session_id, session) = capture::admit(capture, owner, tty, |owner, prepared| {
++        if prepared.is_some() {
++            ensure_not_cancelled(host)?;
++        }
++        spawn_session(
++            cmd,
++            tty,
++            &resolved.workspace,
++            &resolved.workdir,
++            sandbox,
++            owner,
++            prepared,
++        )
++    })?;
+     let _interaction = match session.lock_interaction(host) {
+         Ok(guard) => guard,
+         Err(error) => {
+@@ -139,13 +153,16 @@ fn execute_command(
+         lock(sessions()).remove(&session_id);
+     }
+ 
+-    let metadata = json!({
++    let mut metadata = json!({
+         "yield_time_ms": yield_time_ms,
+         "workdir": resolved.workdir,
+         "sandbox": session.sandbox.as_ref().map(SandboxKind::label),
+         "escalated": escalated,
+         "tty": tty,
+     });
++    if let Some(receipt) = capture.and_then(|store| store.metadata(session.capture.as_ref())) {
++        metadata["source_capture"] = receipt;
++    }
+     Ok(render_result(
+         &call_id,
+         session_id,
+@@ -159,6 +176,7 @@ fn execute_command(
+ fn write_stdin_impl(
+     call_json: &str,
+     context_json: &str,
++    capture: Option<&Arc<CaptureStore>>,
+     host: &mut ToolModuleHostMut<'_>,
+ ) -> Result<String> {
+     ensure_not_cancelled(host)?;
+@@ -226,12 +244,17 @@ fn write_stdin_impl(
+         lock(sessions()).remove(&session_id);
+     }
+ 
+-    let metadata = json!({
++    let mut metadata = json!({
+         "yield_time_ms": yield_time_ms,
+         "stdin_bytes": chars.len(),
+         "tty": session.tty,
+         "sandbox": session.sandbox.as_ref().map(SandboxKind::label),
+     });
++    // Legacy cross-binding interaction remains valid, but cannot disclose the
++    // capture handle of another bound store or start a replacement capture.
++    if let Some(receipt) = capture.and_then(|store| store.metadata(session.capture.as_ref())) {
++        metadata["source_capture"] = receipt;
++    }
+     Ok(render_result(
+         &call_id,
+         session_id,
