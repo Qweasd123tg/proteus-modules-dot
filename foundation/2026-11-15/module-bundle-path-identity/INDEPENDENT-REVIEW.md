@@ -1,0 +1,13 @@
+# Independent final source/evidence review
+
+Verdict: no blocker in this known caller-path identity correction. No rerun was performed. The result is a synthetic command-boundary qualification, not actual packaging or installation coverage.
+
+Independently verified patch SHA256 `4b69a3375a45496e4d199c52c8ccd783516ad8ffbd815adda65affd7c16d287d`, driver `1035583a0bfff713b46f52190e7389a3860f83d960d2c7d1992d84e05d77d215`, test `b1703378d482fa997a725f2903017e779e0a343dfac3b377541c1020026f093e`, and REPORT.md `44237bc6d53a22934e610f2e9083746a82f8bf829ebc28095a34c0a41f0d4101`. Rehashed runtime production copies: baseline `e07d8a96fb17af1eb4e145f5511bf4374acf67fea23484666372f7c618082265`, candidate `ba53a9b8ac80bc05fcb0133777bab9afddd25a367772acf23e5abeff091009e6`; both test copies match the reviewed source.
+
+Read logs and exit files: baseline exit 1 with one assertion failure at argv element 5, relative delivered runtime instead of caller-absolute destination; the same logged command already has absolute target-dir. Candidate exit 0 with all five intended tests passing. Both runs have zero errors/skips. This is six executions consisting of one expected red and five greens. TEST-RESULTS records Python 3.12.14, -I -B -S. The reviewed driver's completed summaries follow exact-path and before/after hash checks; logs point to the correct copies. Log digests agree with TEST-RESULTS.
+
+APPLY-CHECK records strict check/apply and both file-byte matches. The production change remains only destination resolution plus its docstring; no change to child cwd, artifact return or error forwarding. The report correctly distinguishes source-inferred downstream meaning from actual consumer execution and ordinary absolute paths from general resolve normalization/symlink behavior. The no-bundle control preserves the existing JSON-artifact path.
+
+No packager subprocess or source resolver was run by these tests: actual build_packages executed with check_output and resolver mocked. No real bundle destination was written, and no real builder, CLI, API or installation result is established. Known PR85 dedup and distinction from PR141/142 are appropriate. Report counts and boundaries require no correction; PRE-RUN-REVIEW remains the detailed source/coverage record.
+
+Report prose revision: verified current REPORT.md SHA256 `dc1c36159ab340b7aaafa38ecb9ed7a5cf8799f2d32dcbc2a154f632355a76f1`, superseding the earlier report hash. The limitations now state only that upstream and production were not changed, without asserting an authorization boundary. This is consistent with the evidence; verdict unchanged, no rerun.
