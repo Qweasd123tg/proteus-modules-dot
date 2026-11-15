@@ -1,0 +1,46 @@
+--- a/ci/strict-fullturn/test_envelope.py
++++ b/ci/strict-fullturn/test_envelope.py
+@@ -123,18 +123,31 @@
+         self.assertTrue((self.root/'out/result.json').is_file())
+ 
+     def test_success_has_fresh_marker_and_bounded_archive(self):
+-        def supervised(process, artifact_root, output, timeout):
+-            artifact_root.mkdir(); (artifact_root/'status.txt').write_text('passed\n')
+-            return {'status': 'passed', 'returncode': 0, 'all_descendant_termination': 'unproven'}
+-        with patch.object(e.shutil, 'disk_usage', return_value=SimpleNamespace(free=e.INITIAL_FREE)), patch.object(e.subprocess, 'Popen', return_value=Mock()), patch.object(e, 'supervise', side_effect=supervised):
+-            result=e.execute('core-skills',self.root,self.root/'out',self.root/'child',[],['authored-mock'])
+-        import json
+-        marker=json.loads((self.root/'out/invocation.json').read_text())
+-        self.assertEqual(marker['invocation_id'],result['invocation_id'])
+-        self.assertEqual(result['status'],'passed')
+-        self.assertEqual(set(result['snapshot_files']),{'status.txt'})
+-        with tarfile.open(self.root/'out/artifacts.tar') as archive:
+-            self.assertEqual(archive.extractfile('status.txt').read(),b'passed\n')
++        expected = {'core-skills': 1800, 'evidence-spans': 1500, 'strict-fullturn': 2700}
++        self.assertEqual(e.DEADLINES, expected)
++        for profile, deadline in expected.items():
++            with self.subTest(profile=profile):
++                output = self.root / ('out-' + profile)
++                child = self.root / ('child-' + profile)
++                def supervised(process, artifact_root, output, timeout):
++                    self.assertEqual(timeout, deadline)
++                    artifact_root.mkdir(); (artifact_root/'status.txt').write_text('passed\n')
++                    return {'status': 'passed', 'returncode': 0, 'all_descendant_termination': 'unproven'}
++                with patch.object(e.shutil, 'disk_usage', return_value=SimpleNamespace(free=e.INITIAL_FREE)), patch.object(e.subprocess, 'Popen', return_value=Mock()), patch.object(e, 'supervise', side_effect=supervised):
++                    result=e.execute(profile,self.root,output,child,[],['authored-mock'])
++                import json
++                marker=json.loads((output/'invocation.json').read_text())
++                receipt=json.loads((output/'result.json').read_text())
++                self.assertEqual(marker['invocation_id'],result['invocation_id'])
++                self.assertEqual(marker['profile'],profile)
++                self.assertEqual(result['profile'],profile)
++                self.assertEqual(receipt['profile'],profile)
++                self.assertEqual(result['deadline_seconds'],deadline)
++                self.assertEqual(receipt['deadline_seconds'],deadline)
++                self.assertEqual(result['status'],'passed')
++                self.assertEqual(set(result['snapshot_files']),{'status.txt'})
++                with tarfile.open(output/'artifacts.tar') as archive:
++                    self.assertEqual(archive.extractfile('status.txt').read(),b'passed\n')
+ 
+     def test_changed_input_keeps_command_success_separate(self):
+         def supervised(process, artifact_root, output, timeout):

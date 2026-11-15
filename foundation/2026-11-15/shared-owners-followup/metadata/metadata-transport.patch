@@ -1,0 +1,272 @@
+diff --git a/model/model-pack/src/adapters/openai/codex_catalog.rs b/model/model-pack/src/adapters/openai/codex_catalog.rs
+--- a/model/model-pack/src/adapters/openai/codex_catalog.rs
++++ b/model/model-pack/src/adapters/openai/codex_catalog.rs
+@@ -68,54 +68,38 @@
+                     return Ok(Some(catalog.clone()));
+                 }
+             }
+-            let mut access = auth.access(None).await?;
+-            let version = self.catalog_client_version();
+-            for attempt in 0..2 {
+-                let response = self
+-                    .http
++            let response = super::transport::send_metadata_request(auth, "model catalog", || {
++                self.http
+                     .get(format!("{}/models", self.base_url))
+-                    .query(&[("client_version", version)])
+-                    .headers(access.headers.clone())
+-                    .send()
+-                    .await
+-                    .map_err(|error| {
+-                        super::transport::metadata_request_error("model catalog", error)
+-                    })?;
+-                if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+-                    access = auth.access(Some(access.token)).await?;
+-                    continue;
+-                }
+-                if !response.status().is_success() {
+-                    bail!("ChatGPT model catalog returned HTTP {}", response.status());
+-                }
+-                let mut response: ModelsResponse = response
+-                    .json()
+-                    .await
+-                    .context("invalid ChatGPT model catalog response")?;
+-                response.models.sort_by_key(|model| model.priority);
+-                let catalog = ModelCatalog {
+-                    models: response
+-                        .models
+-                        .into_iter()
+-                        .map(|model| ModelCatalogEntry {
+-                            id: model.slug,
+-                            display_name: model.display_name,
+-                            description: model.description,
+-                            hidden: model.visibility != "list",
+-                            reasoning_efforts: model
+-                                .supported_reasoning_levels
+-                                .into_iter()
+-                                .map(|level| level.effort)
+-                                .collect(),
+-                            default_reasoning_effort: model.default_reasoning_level,
+-                        })
+-                        .collect(),
+-                };
+-                catalog.validate().map_err(anyhow::Error::msg)?;
+-                *cache = Some((Instant::now(), catalog.clone()));
+-                return Ok(Some(catalog));
+-            }
+-            unreachable!()
++                    .query(&[("client_version", self.catalog_client_version())])
++            })
++            .await?;
++            let mut response: ModelsResponse = response
++                .json()
++                .await
++                .context("invalid ChatGPT model catalog response")?;
++            response.models.sort_by_key(|model| model.priority);
++            let catalog = ModelCatalog {
++                models: response
++                    .models
++                    .into_iter()
++                    .map(|model| ModelCatalogEntry {
++                        id: model.slug,
++                        display_name: model.display_name,
++                        description: model.description,
++                        hidden: model.visibility != "list",
++                        reasoning_efforts: model
++                            .supported_reasoning_levels
++                            .into_iter()
++                            .map(|level| level.effort)
++                            .collect(),
++                        default_reasoning_effort: model.default_reasoning_level,
++                    })
++                    .collect(),
++            };
++            catalog.validate().map_err(anyhow::Error::msg)?;
++            *cache = Some((Instant::now(), catalog.clone()));
++            Ok(Some(catalog))
+         })
+         .await
+         .context("ChatGPT model catalog timed out")?
+diff --git a/model/model-pack/src/adapters/openai/codex_quota.rs b/model/model-pack/src/adapters/openai/codex_quota.rs
+--- a/model/model-pack/src/adapters/openai/codex_quota.rs
++++ b/model/model-pack/src/adapters/openai/codex_quota.rs
+@@ -1,7 +1,7 @@
+ //! ChatGPT quota HTTP/DTO details stay inside the provider implementation.
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+-use anyhow::{Context, Result, bail};
++use anyhow::{Context, Result};
+ use proteus_contracts::contracts::{
+     ModelQuotaBucket, ModelQuotaCredits, ModelQuotaSnapshot, ModelQuotaWindow,
+ };
+@@ -132,31 +132,16 @@
+                     return Ok(Some(snapshot.clone()));
+                 }
+             }
+-            let mut access = auth.access(None).await?;
+-            for attempt in 0..2 {
+-                let response = self
+-                    .http
+-                    .get(url)
+-                    .headers(access.headers.clone())
+-                    .send()
+-                    .await
+-                    .map_err(|error| super::transport::metadata_request_error("quota", error))?;
+-                if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+-                    access = auth.access(Some(access.token)).await?;
+-                    continue;
+-                }
+-                if !response.status().is_success() {
+-                    bail!("ChatGPT quota returned HTTP {}", response.status());
+-                }
+-                let response: QuotaResponse = response
+-                    .json()
+-                    .await
+-                    .map_err(|_| anyhow::anyhow!("invalid ChatGPT quota response"))?;
+-                let snapshot = response.into_snapshot()?;
+-                *cache = Some((Instant::now(), snapshot.clone()));
+-                return Ok(Some(snapshot));
+-            }
+-            unreachable!()
++            let response =
++                super::transport::send_metadata_request(auth, "quota", || self.http.get(url))
++                    .await?;
++            let response: QuotaResponse = response
++                .json()
++                .await
++                .map_err(|_| anyhow::anyhow!("invalid ChatGPT quota response"))?;
++            let snapshot = response.into_snapshot()?;
++            *cache = Some((Instant::now(), snapshot.clone()));
++            Ok(Some(snapshot))
+         })
+         .await
+         .context("ChatGPT quota timed out")?
+diff --git a/model/model-pack/src/adapters/openai/transport.rs b/model/model-pack/src/adapters/openai/transport.rs
+--- a/model/model-pack/src/adapters/openai/transport.rs
++++ b/model/model-pack/src/adapters/openai/transport.rs
+@@ -18,7 +18,36 @@
+     },
+ };
+ 
+-pub(super) fn metadata_request_error(operation: &str, error: reqwest::Error) -> anyhow::Error {
++/// Metadata reads refresh once after 401, but never use inference retries.
++/// Callers own their deadline, cache lock, response decoding and publication.
++pub(super) async fn send_metadata_request<F>(
++    auth: &CodexAuth,
++    operation: &str,
++    mut build: F,
++) -> Result<reqwest::Response>
++where
++    F: FnMut() -> reqwest::RequestBuilder,
++{
++    let mut access = auth.access(None).await?;
++    for attempt in 0..2 {
++        let response = build()
++            .headers(access.headers.clone())
++            .send()
++            .await
++            .map_err(|error| metadata_request_error(operation, error))?;
++        if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
++            access = auth.access(Some(access.token)).await?;
++            continue;
++        }
++        if !response.status().is_success() {
++            bail!("ChatGPT {operation} returned HTTP {}", response.status());
++        }
++        return Ok(response);
++    }
++    unreachable!()
++}
++
++fn metadata_request_error(operation: &str, error: reqwest::Error) -> anyhow::Error {
+     // Metadata failures cross the worker boundary as a message, not an error
+     // chain. Keep the transport cause, but never its URL or response payload.
+     let cause = anyhow::Error::new(error.without_url());
+diff --git a/model/model-pack/src/adapters/openai/transport_tests.rs b/model/model-pack/src/adapters/openai/transport_tests.rs
+--- a/model/model-pack/src/adapters/openai/transport_tests.rs
++++ b/model/model-pack/src/adapters/openai/transport_tests.rs
+@@ -276,3 +276,84 @@
+     );
+     assert!(!missing_auth.exists());
+ }
++
++#[tokio::test]
++async fn metadata_reads_refresh_once_and_never_use_inference_retries() {
++    tokio::time::timeout(Duration::from_secs(10), async {
++        for catalog in [false, true] {
++            for status in [401, 429, 500] {
++                let root = tempfile::tempdir().unwrap();
++                let auth_file = super::super::codex_tests::auth_file(root.path());
++                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++                let url = format!("http://{}", listener.local_addr().unwrap());
++                let mut client = OpenAiResponsesClient::from_codex_config(json!({
++                    "base_url": url, "quota_url": format!("{url}/usage"),
++                    "oauth_issuer": url, "auth_file": auth_file,
++                    "request_max_retries": 4, "client_version": "0.170.2",
++                }))
++                .unwrap();
++                client.http = reqwest::Client::builder()
++                    .no_proxy()
++                    .redirect(reqwest::redirect::Policy::none())
++                    .build()
++                    .unwrap();
++                let mut replies = Vec::new();
++                if status == 401 {
++                    replies.push((401, "not-for-errors".to_owned()));
++                    replies.push((
++                        200,
++                        json!({"access_token":"rotated", "refresh_token":"next", "expires_in":3600})
++                            .to_string(),
++                    ));
++                }
++                replies.push((status, "not-for-errors".to_owned()));
++                // Joined futures stay inside the deadline. The listener closes
++                // after the last allowed response, so an extra request cannot
++                // produce the expected final HTTP-status diagnostic.
++                let server = async move {
++                    let mut requests = Vec::new();
++                    for (status, body) in replies {
++                        let (mut socket, _) = listener.accept().await.unwrap();
++                        requests.push(test_http::read(&mut socket).await);
++                        test_http::reply(&mut socket, status, "application/json", &body).await;
++                    }
++                    requests
++                };
++                let lookup = async {
++                    if catalog {
++                        client.catalog().await.unwrap_err()
++                    } else {
++                        client.quota().await.unwrap_err()
++                    }
++                };
++                let (requests, error) = tokio::join!(server, lookup);
++                let operation = if catalog { "model catalog" } else { "quota" };
++                assert_eq!(
++                    format!("{error:#}"),
++                    format!(
++                        "ChatGPT {operation} returned HTTP {}",
++                        StatusCode::from_u16(status).unwrap(),
++                    ),
++                );
++                assert_eq!(requests.len(), if status == 401 { 3 } else { 1 });
++                let target = if catalog {
++                    "GET /models?client_version=0.170.2 HTTP/1.1"
++                } else {
++                    "GET /usage HTTP/1.1"
++                };
++                assert_eq!(requests[0].target, target);
++                assert_eq!(requests[0].headers["authorization"], "Bearer fixture-access");
++                if status == 401 {
++                    assert_eq!(requests[1].target, "POST /oauth/token HTTP/1.1");
++                    assert_eq!(requests[2].target, target);
++                    assert_eq!(requests[2].headers["authorization"], "Bearer rotated");
++                    assert_eq!(requests[2].headers["chatgpt-account-id"], "fixture-account");
++                }
++                assert!(client.catalog_cache.lock().await.is_none());
++                assert!(client.quota_cache.lock().await.is_none());
++            }
++        }
++    })
++    .await
++    .expect("metadata retry-boundary fixture timed out");
++}
