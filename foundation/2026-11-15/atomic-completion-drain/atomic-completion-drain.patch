@@ -1,0 +1,103 @@
+--- a/crates/proteus-core/src/core/agent_control/collaboration/control.rs
++++ b/crates/proteus-core/src/core/agent_control/collaboration/control.rs
+@@ -284,14 +284,6 @@
+         Ok(records.into_iter().map(|(_, view)| view).collect())
+     }
+ 
+-    pub(super) fn has_completions(&self, session_id: SessionId) -> Result<bool> {
+-        let state = self.lock()?;
+-        Ok(state
+-            .sessions
+-            .get(&session_id)
+-            .is_some_and(|session| !session.completions.is_empty()))
+-    }
+-
+     pub(super) fn drain_completions(
+         &self,
+         session_id: SessionId,
+--- a/crates/proteus-core/src/core/agent_control/collaboration/mod.rs
++++ b/crates/proteus-core/src/core/agent_control/collaboration/mod.rs
+@@ -274,10 +274,9 @@
+             ));
+         }
+         let notify = self.control.session_notify(session_id)?;
+-        let completed = if self.control.has_completions(session_id)? {
+-            self.control.drain_completions(session_id)?
+-        } else if timeout_ms == 0 {
+-            Vec::new()
++        let completed = self.control.drain_completions(session_id)?;
++        let completed = if !completed.is_empty() || timeout_ms == 0 {
++            completed
+         } else {
+             let control = self.control.clone();
+             tokio::time::timeout(Duration::from_millis(timeout_ms), async move {
+@@ -285,8 +284,9 @@
+                     let notified = notify.notified();
+                     tokio::pin!(notified);
+                     notified.as_mut().enable();
+-                    if control.has_completions(session_id)? {
+-                        return control.drain_completions(session_id);
++                    let completed = control.drain_completions(session_id)?;
++                    if !completed.is_empty() {
++                        return Ok::<_, anyhow::Error>(completed);
+                     }
+                     notified.as_mut().await;
+                     // Another concurrent waiter can drain the queue after the
+--- a/crates/proteus-core/src/core/agent_control/collaboration/tests.rs
++++ b/crates/proteus-core/src/core/agent_control/collaboration/tests.rs
+@@ -6,6 +6,7 @@
+ use super::control::{FollowupRequest, MAX_OUTSTANDING_COMPLETIONS};
+ use super::spec::{followup_spec, send_message_spec};
+ use super::*;
++mod wait;
+ use crate::{
+     contracts::{
+         AgentControlHandle, AgentControlMessage, AgentControlRequest, AgentControlResult,
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/collaboration/tests/wait.rs
+@@ -0,0 +1,45 @@
++use super::*;
++
++fn queue_completion(control: &CollaborationControl, host: Arc<TestHost>, task: &str) {
++    let reservation = control.reserve(host.session_id, task, "explore").unwrap();
++    let handle = AgentControlHandle::new(new_call_id(), "explore", new_thread_id());
++    control.attach(
++        host.session_id, &reservation.path, reservation.generation, handle, host.clone(),
++    ).unwrap();
++    control.complete(
++        host.session_id,
++        &reservation.path,
++        reservation.generation,
++        Ok(AgentControlResult::new(task, AgentLifecycleStatus::Completed)),
++    );
++}
++
++#[tokio::test]
++async fn competing_waiter_keeps_waiting_after_another_consumer_takes_the_update() {
++    let control = CollaborationControl::default();
++    let host = Arc::new(TestHost::new(new_session_id()));
++    let wait = WaitAgentTool::new(30_000, control.clone());
++    let ctx = context(host.clone());
++    let first_call = call("wait_agent", json!({"timeout_ms":30_000}));
++    let second_call = call("wait_agent", json!({"timeout_ms":30_000}));
++    let mut first = Box::pin(wait.invoke(&first_call, ctx.clone()));
++    let mut second = Box::pin(wait.invoke(&second_call, ctx.clone()));
++    assert!(futures_util::poll!(first.as_mut()).is_pending());
++    assert!(futures_util::poll!(second.as_mut()).is_pending());
++
++    queue_completion(&control, host.clone(), "first");
++    let first_result = output(&first.await.unwrap());
++    assert_eq!(first_result["timed_out"], false);
++    assert_eq!(first_result["agents"].as_array().unwrap().len(), 1);
++    assert_eq!(first_result["agents"][0]["path"], "/root/first");
++    // Both waiters received the broadcast; the second no longer owns a record.
++    assert!(futures_util::poll!(second.as_mut()).is_pending());
++
++    queue_completion(&control, host, "second");
++    let second_result = output(&second.await.unwrap());
++    assert_eq!(second_result["timed_out"], false);
++    assert_eq!(second_result["agents"].as_array().unwrap().len(), 1);
++    assert_eq!(second_result["agents"][0]["path"], "/root/second");
++    let empty = wait.invoke(&call("wait_agent", json!({"timeout_ms":0})), ctx).await.unwrap();
++    assert_eq!(output(&empty)["timed_out"], true);
++}
