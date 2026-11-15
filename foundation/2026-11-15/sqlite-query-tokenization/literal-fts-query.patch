@@ -1,0 +1,179 @@
+--- a/context_provider/sqlite-memory/src/lib.rs
++++ b/context_provider/sqlite-memory/src/lib.rs
+@@ -173,16 +173,21 @@
+ }
+ 
+ fn fts_match_expression(text: &str) -> String {
++    // Keep whitespace-delimited spans as literal phrases. SQLite owns their
++    // punctuation/diacritic tokenization; deleting separators would join words.
+     let tokens: Vec<String> = text
+         .split_whitespace()
+-        .map(|token| {
++        .filter(|token| {
+             token
+                 .chars()
+-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+-                .collect::<String>()
++                .any(|c| c.is_alphanumeric() || c == '_' || c == '-')
+         })
+-        .filter(|token| !token.is_empty())
+-        .map(|token| format!("\"{token}\"*"))
++        .map(|token| {
++            // MATCH expressions are NUL-terminated. Keep NUL as a separator,
++            // and double quotes inside the FTS literal instead of dropping them.
++            let literal = token.replace('\0', " ").replace('"', "\"\"");
++            format!("\"{literal}\"*")
++        })
+         .collect();
+     tokens.join(" AND ")
+ }
+@@ -224,6 +229,8 @@
+ mod tests {
+     use super::*;
+ 
++    mod recall;
++
+     fn fresh_conn() -> Mutex<Connection> {
+         let conn = Connection::open_in_memory().expect("in-memory sqlite");
+         conn.execute_batch(SCHEMA).expect("schema");
+@@ -307,10 +314,10 @@
+     }
+ 
+     #[test]
+-    fn fts_match_expression_sanitizes_tokens() {
++    fn fts_match_expression_keeps_literal_spans() {
+         assert_eq!(
+             fts_match_expression("React Router!!! v6"),
+-            "\"React\"* AND \"Router\"* AND \"v6\"*"
++            "\"React\"* AND \"Router!!!\"* AND \"v6\"*"
+         );
+     }
+ }
+--- /dev/null
++++ b/context_provider/sqlite-memory/src/tests/recall.rs
+@@ -0,0 +1,98 @@
++use super::*;
++
++fn remember_text(conn: &Mutex<Connection>, content: &str) {
++    remember_impl(
++        conn,
++        &serde_json::json!({"kind": "fact", "content": content, "metadata": null}).to_string(),
++    )
++    .expect("remember");
++}
++
++fn recall_texts(conn: &Mutex<Connection>, text: &str) -> Vec<String> {
++    let body = recall_impl(
++        conn,
++        &serde_json::json!({"text": text, "limit": 20}).to_string(),
++    )
++    .expect("recall");
++    let items: Vec<MemoryItem> = serde_json::from_str(&body).expect("memory items");
++    items.into_iter().map(|item| item.content).collect()
++}
++
++#[test]
++fn punctuation_separates_indexed_words_instead_of_joining_them() {
++    for (literal, joined) in [
++        ("src/config.rs", "srcconfigrs"),
++        ("Config::load", "Configload"),
++        ("v1.2.3", "v123"),
++        ("alpha\"beta", "alphabeta"),
++        ("alpha+beta", "alphabeta"),
++    ] {
++        let conn = fresh_conn();
++        remember_text(&conn, literal);
++        remember_text(&conn, joined);
++        assert_eq!(recall_texts(&conn, literal), vec![literal], "{literal}");
++        assert_eq!(recall_texts(&conn, joined), vec![joined], "{joined}");
++    }
++}
++
++#[test]
++fn phrase_prefix_applies_only_to_last_token_and_preserves_adjacency() {
++    let conn = fresh_conn();
++    for content in [
++        "src/config.rs",
++        "src/config.rst",
++        "src/configuration.rs",
++        "src/extra/config.rs",
++    ] {
++        remember_text(&conn, content);
++    }
++    let mut actual = recall_texts(&conn, "src/config.r");
++    actual.sort();
++    assert_eq!(actual, vec!["src/config.rs", "src/config.rst"]);
++}
++
++#[test]
++fn whitespace_and_and_existing_compound_phrases_keep_their_meaning() {
++    let conn = fresh_conn();
++    remember_text(&conn, "dark mode");
++    assert_eq!(recall_texts(&conn, "mod dark"), vec!["dark mode"]);
++    for literal in ["some_name", "some-name"] {
++        let conn = fresh_conn();
++        remember_text(&conn, literal);
++        remember_text(&conn, "some other name");
++        assert_eq!(recall_texts(&conn, literal), vec![literal]);
++    }
++}
++
++#[test]
++fn sqlite_owns_combining_mark_tokenization() {
++    let conn = fresh_conn();
++    let literal = "co\u{301}de";
++    remember_text(&conn, literal);
++    assert_eq!(recall_texts(&conn, literal), vec![literal]);
++    assert_eq!(fts_match_expression(literal), format!("\"{literal}\"*"));
++}
++
++#[test]
++fn nul_becomes_a_phrase_separator_not_a_merged_token_or_parse_error() {
++    let conn = fresh_conn();
++    remember_text(&conn, "alpha beta");
++    remember_text(&conn, "alphabeta");
++    assert_eq!(recall_texts(&conn, "alpha\0beta"), vec!["alpha beta"]);
++    assert_eq!(fts_match_expression("alpha\0beta"), "\"alpha beta\"*");
++}
++
++#[test]
++fn empty_span_gate_preserves_recent_fallback_and_legacy_empty_phrases() {
++    let conn = fresh_conn();
++    remember_text(&conn, "first");
++    remember_text(&conn, "second");
++    for query in ["", " \t\n", "!!!", "\"", "\0", "... / ::"] {
++        assert_eq!(fts_match_expression(query), "");
++        assert_eq!(recall_texts(&conn, query), vec!["second", "first"]);
++    }
++    for query in ["-", "_"] {
++        assert_eq!(fts_match_expression(query), format!("\"{query}\"*"));
++        assert!(recall_texts(&conn, query).is_empty());
++    }
++}
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -59,6 +59,24 @@
+ остальные fidelity gates. Native CLI `0.167.0` по умолчанию предоставляет
+ programmatic `exec` через отдельный code-mode-host; local summary compactor
+ и protocol/tool/session orchestration этой сборки проверяются отдельно.
++
++## SQLite Memory: Запрос Recall
++
++`sqlite_memory` использует одну нормализацию запроса для `recall_memory` и
++`context_provider/sqlite_memory`. Части запроса, разделённые пробелами,
++соединяются через `AND`; каждая часть передаётся как буквальная FTS5-фраза.
++Пунктуацию и диакритику внутри фразы обрабатывает tokenizer SQLite, как при
++индексировании: `src/config.rs` не превращается в `srcconfigrs`.
++Порядок и соседство слов внутри части сохраняются; prefix применяется только
++к последнему токену каждой фразы, а не ко всем её словам. Это не сравнение
++строк или точное совпадение пунктуации.
++
++Вложенные кавычки передаются буквально. NUL внутри части заменяется пробелом,
++так как parser MATCH использует NUL как конец выражения. Части без букв/цифр,
++`_` или `-` по-прежнему пропускаются. Если частей не осталось, возвращаются
++последние записи; части из одних `_`/`-` сохраняют прежнюю FTS-семантику пустой
++фразы. `limit=0` по-прежнему возвращает пустой список. Схема базы, формат
++записей, ранжирование и лимиты не меняются.
+ 
+ ## CodeMode
+ 
