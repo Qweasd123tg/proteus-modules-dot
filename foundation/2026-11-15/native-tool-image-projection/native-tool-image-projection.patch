@@ -1,0 +1,412 @@
+--- a/model/model-pack/src/adapters/anthropic/image_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/image_tests.rs
+@@ -1,6 +1,6 @@
+ use super::request::to_anthropic_request;
+ use crate::{
+-    domain::{ImageRef, ModelRef},
++    domain::{ImageRef, ModelRef, ToolCall, ToolContent, ToolResult},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -37,3 +37,102 @@
+     );
+     assert_eq!(body["messages"][0]["content"][1]["text"], "Describe");
+ }
++
++const TOOL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++const TOOL_GIF: &str = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
++
++fn inline_image(mime_type: &str, data: &str) -> ToolContent {
++    ToolContent::Image {
++        mime_type: mime_type.into(),
++        data: data.into(),
++    }
++}
++
++fn tool_result_request(result: ToolResult, role: MessageRole) -> CanonicalModelRequest {
++    CanonicalModelRequest::new(
++        ModelRef::new("anthropic", "vision"),
++        vec![
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("image-call", "inspect", serde_json::json!({})),
++                }],
++            ),
++            CanonicalMessage::new(role, vec![ContentPart::ToolResult { result }]),
++            CanonicalMessage::new(
++                MessageRole::User,
++                vec![ContentPart::Text { text: "Continue".into() }],
++            ),
++        ],
++    )
++}
++
++#[test]
++fn tool_images_preserve_text_order_and_result_grouping_in_both_message_paths() {
++    for role in [MessageRole::Tool, MessageRole::User] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption").with_content(vec![
++            inline_image("image/png", TOOL_PNG),
++            ToolContent::Binary { mime_type: "application/pdf".into(), data: "not an image".into() },
++            inline_image("image/gif", TOOL_GIF),
++        ]);
++        let body = to_anthropic_request(&tool_result_request(result, role)).unwrap();
++        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
++        assert_eq!(body["messages"][1]["role"], "user");
++        assert_eq!(body["messages"][1]["content"], serde_json::json!([
++            {
++                "type": "tool_result", "tool_use_id": "image-call", "is_error": false,
++                "content": [
++                    { "type": "text", "text": "Tool caption" },
++                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": TOOL_PNG } },
++                    { "type": "image", "source": { "type": "base64", "media_type": "image/gif", "data": TOOL_GIF } }
++                ]
++            },
++            { "type": "text", "text": "Continue" }
++        ]));
++    }
++}
++
++#[test]
++fn image_results_keep_error_precedence_and_content_only_fallback() {
++    let mut error = ToolResult::error("image-call".into(), "Tool error");
++    error.output = "Lower-priority output".into();
++    let cases = [error, ToolResult::ok("image-call".into(), "")];
++    for (result, expected) in cases.into_iter().zip([
++        "Tool error",
++        "[image tool content: image/png]",
++    ]) {
++        let is_error = !result.ok;
++        let result = result.with_content(vec![inline_image("image/png", TOOL_PNG)]);
++        let body = to_anthropic_request(&tool_result_request(result, MessageRole::Tool)).unwrap();
++        let block = &body["messages"][1]["content"][0];
++        assert_eq!(block["is_error"], is_error);
++        assert_eq!(block["content"][0], serde_json::json!({ "type": "text", "text": expected }));
++        assert_eq!(block["content"][1]["source"]["data"], TOOL_PNG);
++        assert_eq!(block["content"].as_array().unwrap().len(), 2);
++    }
++}
++
++#[test]
++fn non_image_results_keep_string_wire_shape_and_text_semantics() {
++    let mut error = ToolResult::error("image-call".into(), "Tool error");
++    error.output = "Lower-priority output".into();
++    let structured = ToolResult::ok("image-call".into(), "").with_content(vec![
++        ToolContent::Text { text: "Text block".into() },
++        ToolContent::Json { value: serde_json::json!({"count": 2}) },
++        ToolContent::Binary { mime_type: "image/png".into(), data: TOOL_PNG.into() },
++    ]);
++    for result in [
++        ToolResult::ok("image-call".into(), "Output"),
++        ToolResult::ok("image-call".into(), ""),
++        ToolResult::error("image-call".into(), ""),
++        error,
++        structured,
++    ] {
++        let expected = result.text_or_status();
++        let is_error = !result.ok;
++        let body = to_anthropic_request(&tool_result_request(result, MessageRole::Tool)).unwrap();
++        assert_eq!(body["messages"][1]["content"][0], serde_json::json!({
++            "type": "tool_result", "tool_use_id": "image-call", "content": expected, "is_error": is_error,
++        }));
++    }
++}
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -4,7 +4,7 @@
+ use super::AnthropicPromptCacheConfig;
+ use crate::{
+     adapters::context_render::context_text,
+-    domain::{ToolCallSurface, ToolChoice, ToolSpec, ToolSurface},
++    domain::{ToolCallSurface, ToolChoice, ToolContent, ToolSpec, ToolSurface},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -317,12 +317,37 @@
+ }
+ 
+ fn tool_result_block(result: &crate::domain::ToolResult) -> Value {
+-    json!({
++    let mut images = result
++        .content
++        .iter()
++        .filter_map(|content| match content {
++            ToolContent::Image { mime_type, data } => Some((mime_type, data)),
++            _ => None,
++        })
++        .peekable();
++    let content = if images.peek().is_some() {
++        // Retain the existing text/error projection, then preserve inline images.
++        let mut text = json!({ "type": "text", "text": null });
++        text["text"] = Value::String(result.text_or_status());
++        let mut blocks = vec![text];
++        for (mime_type, data) in images {
++            blocks.push(json!({
++                "type": "image",
++                "source": { "type": "base64", "media_type": mime_type, "data": data },
++            }));
++        }
++        Value::Array(blocks)
++    } else {
++        Value::String(result.text_or_status())
++    };
++    let mut block = json!({
+         "type": "tool_result",
+         "tool_use_id": result.call_id,
+-        "content": result.text_or_status(),
++        "content": null,
+         "is_error": !result.ok,
+-    })
++    });
++    block["content"] = content;
++    block
+ }
+ 
+ fn push_message(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+--- a/model/model-pack/src/adapters/openai/image_tests.rs
++++ b/model/model-pack/src/adapters/openai/image_tests.rs
+@@ -1,6 +1,10 @@
+-use super::request::to_openai_request;
++use super::{
++    OpenAiPromptCacheConfig,
++    model_profile::OpenAiModelProfile,
++    request::{to_openai_request, to_openai_request_with_cache},
++};
+ use crate::{
+-    domain::{ImageRef, ModelRef},
++    domain::{ImageRef, ModelRef, ToolCall, ToolCallSurface, ToolContent, ToolResult},
+     model_standard::{CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole},
+ };
+ 
+@@ -43,3 +47,120 @@
+             .contains("cannot read attached image")
+     );
+ }
++
++const TOOL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
++const TOOL_GIF: &str = "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
++
++fn inline_image(mime_type: &str, data: &str) -> ToolContent {
++    ToolContent::Image {
++        mime_type: mime_type.into(),
++        data: data.into(),
++    }
++}
++
++fn tool_result_body(
++    result: ToolResult,
++    surface: ToolCallSurface,
++    supports_image_input: bool,
++) -> anyhow::Result<serde_json::Value> {
++    let profile = OpenAiModelProfile::from_provider_config(&serde_json::json!({
++        "capabilities": { "supports_image_input": supports_image_input, "supports_freeform_tools": true }
++    }))?;
++    let request = CanonicalModelRequest::new(
++        ModelRef::new("openai", "vision"),
++        vec![
++            CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("image-call", "inspect", serde_json::json!({ "input": "inspect" }))
++                        .with_surface(surface),
++                }],
++            ),
++            CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult { result }]),
++        ],
++    );
++    to_openai_request_with_cache(&request, &OpenAiPromptCacheConfig::default(), &profile)
++}
++
++#[test]
++fn function_and_custom_outputs_keep_text_and_image_order() {
++    for (surface, output_type) in [
++        (ToolCallSurface::Function, "function_call_output"),
++        (ToolCallSurface::Freeform, "custom_tool_call_output"),
++    ] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption").with_content(vec![
++            inline_image("image/png", TOOL_PNG),
++            ToolContent::Binary { mime_type: "application/pdf".into(), data: "not an image".into() },
++            inline_image("image/gif", TOOL_GIF),
++        ]);
++        let body = tool_result_body(result, surface, true).unwrap();
++        assert_eq!(body["input"].as_array().unwrap().len(), 2);
++        assert_eq!(body["input"][1], serde_json::json!({
++            "type": output_type, "call_id": "image-call",
++            "output": [
++                { "type": "input_text", "text": "Tool caption" },
++                { "type": "input_image", "image_url": format!("data:image/png;base64,{TOOL_PNG}"), "detail": "auto" },
++                { "type": "input_image", "image_url": format!("data:image/gif;base64,{TOOL_GIF}"), "detail": "auto" }
++            ]
++        }));
++    }
++}
++
++#[test]
++fn image_results_keep_error_precedence_and_content_only_fallback() {
++    for surface in [ToolCallSurface::Function, ToolCallSurface::Freeform] {
++        let mut error = ToolResult::error("image-call".into(), "Tool error");
++        error.output = "Lower-priority output".into();
++        let cases = [error, ToolResult::ok("image-call".into(), "")];
++        for (result, expected) in cases.into_iter().zip([
++            "Tool error",
++            "[image tool content: image/png]",
++        ]) {
++            let result = result.with_content(vec![inline_image("image/png", TOOL_PNG)]);
++            let body = tool_result_body(result, surface, true).unwrap();
++            let output = &body["input"][1]["output"];
++            assert_eq!(output[0], serde_json::json!({ "type": "input_text", "text": expected }));
++            assert_eq!(output[1]["image_url"], format!("data:image/png;base64,{TOOL_PNG}"));
++            assert_eq!(output.as_array().unwrap().len(), 2);
++        }
++    }
++}
++
++#[test]
++fn disabled_image_capability_rejects_both_tool_output_surfaces() {
++    for surface in [ToolCallSurface::Function, ToolCallSurface::Freeform] {
++        let result = ToolResult::ok("image-call".into(), "Tool caption")
++            .with_content(vec![inline_image("image/png", TOOL_PNG)]);
++        let error = tool_result_body(result, surface, false).unwrap_err();
++        assert!(error.to_string().contains("image input is disabled"));
++    }
++}
++
++#[test]
++fn non_image_results_keep_string_wire_shape_without_image_capability() {
++    for (surface, output_type) in [
++        (ToolCallSurface::Function, "function_call_output"),
++        (ToolCallSurface::Freeform, "custom_tool_call_output"),
++    ] {
++        let mut error = ToolResult::error("image-call".into(), "Tool error");
++        error.output = "Lower-priority output".into();
++        let structured = ToolResult::ok("image-call".into(), "").with_content(vec![
++            ToolContent::Text { text: "Text block".into() },
++            ToolContent::Json { value: serde_json::json!({"count": 2}) },
++            ToolContent::Binary { mime_type: "image/png".into(), data: TOOL_PNG.into() },
++        ]);
++        for result in [
++            ToolResult::ok("image-call".into(), "Output"),
++            ToolResult::ok("image-call".into(), ""),
++            ToolResult::error("image-call".into(), ""),
++            error,
++            structured,
++        ] {
++            let expected = result.text_or_status();
++            let body = tool_result_body(result, surface, false).unwrap();
++            assert_eq!(body["input"][1], serde_json::json!({
++                "type": output_type, "call_id": "image-call", "output": expected,
++            }));
++        }
++    }
++}
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -8,7 +8,7 @@
+     adapters::context_render::context_text,
+     domain::{
+         FileSearchHostedToolConfig, HostedToolConfig, ResponseFormat, ToolCall, ToolCallSurface,
+-        ToolChoice, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
++        ToolChoice, ToolContent, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
+     },
+     model_standard::{
+         CanonicalMessage, CanonicalModelRequest, ContentPart, MessagePhase, MessageRole,
+@@ -47,7 +47,10 @@
+     });
+     // Replace the existing slot to preserve key order without reserializing
+     // the already-built JSON array through json!.
+-    body["input"] = Value::Array(to_openai_input(&request.messages)?);
++    body["input"] = Value::Array(to_openai_input(
++        &request.messages,
++        profile.supports_image_input,
++    )?);
+ 
+     if let Some(instructions) = joined_instructions(request) {
+         body["instructions"] = Value::String(instructions);
+@@ -335,7 +338,10 @@
+     }
+ }
+ 
+-fn to_openai_input(messages: &[CanonicalMessage]) -> Result<Vec<Value>> {
++fn to_openai_input(
++    messages: &[CanonicalMessage],
++    supports_image_input: bool,
++) -> Result<Vec<Value>> {
+     let mut input: Vec<Value> = Vec::new();
+     let mut tool_call_surfaces = HashMap::new();
+     for message in messages {
+@@ -403,24 +409,23 @@
+                         .get(&result.call_id)
+                         .copied()
+                         .unwrap_or_default();
+-                    match surface {
+-                        ToolCallSurface::Function => input.push(json!({
+-                            "type": "function_call_output",
+-                            "call_id": result.call_id,
+-                            "output": result.text_or_status(),
+-                        })),
+-                        ToolCallSurface::Freeform => input.push(json!({
+-                            "type": "custom_tool_call_output",
+-                            "call_id": result.call_id,
+-                            "output": result.text_or_status(),
+-                        })),
++                    let output_type = match surface {
++                        ToolCallSurface::Function => "function_call_output",
++                        ToolCallSurface::Freeform => "custom_tool_call_output",
+                         _ => {
+                             return Err(anyhow!(
+                                 "tool result '{}' uses unsupported surface for openai.responses",
+                                 result.call_id
+                             ));
+                         }
+-                    }
++                    };
++                    let mut item = json!({
++                        "type": output_type,
++                        "call_id": result.call_id,
++                        "output": null,
++                    });
++                    item["output"] = openai_tool_output(result, supports_image_input)?;
++                    input.push(item);
+                 }
+                 ContentPart::ReasoningSummary { text } => {
+                     input.push(openai_reasoning_item(text, None))
+@@ -460,6 +465,39 @@
+     Ok(input)
+ }
+ 
++fn openai_tool_output(
++    result: &crate::domain::ToolResult,
++    supports_image_input: bool,
++) -> Result<Value> {
++    let mut images = result
++        .content
++        .iter()
++        .filter_map(|content| match content {
++            ToolContent::Image { mime_type, data } => Some((mime_type, data)),
++            _ => None,
++        })
++        .peekable();
++    if images.peek().is_none() {
++        return Ok(Value::String(result.text_or_status()));
++    }
++    if !supports_image_input {
++        return Err(anyhow!(
++            "tool result '{}' contains images, but openai.responses image input is disabled",
++            result.call_id
++        ));
++    }
++    // Retain the existing text/error projection, then preserve inline images.
++    let mut text = json!({ "type": "input_text", "text": null });
++    text["text"] = Value::String(result.text_or_status());
++    let mut blocks = vec![text];
++    for (mime_type, data) in images {
++        let mut image = json!({ "type": "input_image", "image_url": null, "detail": "auto" });
++        image["image_url"] = Value::String(format!("data:{mime_type};base64,{data}"));
++        blocks.push(image);
++    }
++    Ok(Value::Array(blocks))
++}
++
+ fn openai_text_message(message: &CanonicalMessage, text: &str) -> Result<Value> {
+     let mut value = json!({
+         "type": "message",
