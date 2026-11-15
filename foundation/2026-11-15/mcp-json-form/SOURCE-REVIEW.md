@@ -1,0 +1,27 @@
+# Independent source review: MCP JSON prototype
+
+Reviewed exact patch SHA256 `0f39ff4bcf7ee4aa3f570964d0e898216127fe11fa68eee2765b319d95332ab5`, including all seven changed paths, typed Draft/change projection, existing editor error retention, test module declaration and relevant DESIGN/AGENTS requirements. Verdict: coherent source proposal for the selected JSON contract; no blocking parser or assignment defect found. Not production-ready or compile/runtime qualified. No code, compiler, formatter, tests or behavioral substitute executed.
+
+## Correctness
+
+Args `from_str::<Vec<String>>` rejects blank/null/wrong shapes/non-string items/trailing input and preserves ordering, duplicate items and exact decoded string values. Env's dedicated Visitor reads decoded String keys and String values before collection, rejects empty/whitespace-only keys and repeated decoded keys, and calls decoder.end to reject trailing non-whitespace input. Thus escaped `\u0041` and literal `A` are correctly duplicate keys. Spaced nonblank keys are now preserved and distinct, an explicit validation/normalization change rather than a neutral cleanup.
+
+Both setters assign only after successful complete parsing. Env's temporary map may have been overwritten immediately before duplicate detection, but it is discarded on error and never reaches the draft. Existing native subscriptions retain invalid raw input and record field errors; this patch does not replace entities, focus handlers or remapping. Pretty serialization of typed string collections is appropriate and does not alter their decoded values. Generic TextFormat behavior and the allowlist remain unchanged. No dependency or shared framework is introduced.
+
+The source-level round-trip claim covers Args and Env with accepted nonblank keys. An already loaded typed Env containing an empty/whitespace-only key can be displayed but cannot pass the new parser; the proposal intentionally retains that validation exclusion. Do not claim a total inverse over every mathematically possible BTreeMap<String,String>, or imply accepted string contents are qualified for process launch.
+
+## Tests and compatibility
+
+Ten new test functions are plausibly wired through `settings/tests.rs -> tests/mcp_json.rs`; Draft has the needed Clone/PartialEq and existing save projection clones typed addons. Tests cover string details, duplicate decoded keys, malformed/trailing input with unchanged draft, explicit empty collections, neighboring edits, undo/dirty-state and save DTO serialization. Two existing connection-test bodies are migrated rather than left exercising obsolete line syntax. This is source plausibility, not ten passing tests. Native buffer/cursor/focus, save blocking, reset/remapping and persisted profile integration still need applicable real gates.
+
+The form syntax deliberately changes: old newline argv / KEY=VALUE paste is rejected, blank/null is invalid, empty collections require []/{}. Profile DTO format is unchanged. README and placeholder/help edits disclose the migration. Before final UI acceptance, clarify DESIGN's generic string-list wording with the Args exception if it would otherwise suggest the generic line-list presentation applies here. Existing textarea reuse is consistent with the current multiline MCP surface; the reviewed Zed reference supplies native layout precedent, not a lossless Args parser (its own join/split is unsuitable).
+
+No new finding is asserted: this is a bounded prototype for the previously known text-roundtrip family. Source acceptance does not authorize production integration/publication or replace the remaining Rust/native UI and profile round-trip verification gates.
+
+## Final documentation and source-boundary addendum
+
+Read the final REPORT.md (SHA256 `7ac8dd3bdcf156242c12be7e78397324ff4f6ea35c150dd0869c12ee1c67c2ca`) and final README/DESIGN deltas. Independently checked final patch SHA256 `d53bbf0d84002cb6c986cbbcb12d792c1bdd892351f6b67a712c624c8320f66a`. Model implementation and new test module retain the reviewed hashes `66616d5fa1b558b180bde186c22024518131248cb8acada66a6d9bda52f95a27` and `5f4419c2cd00dc45e414a14117d2440ff56fd09f72d69efaa80184da94bd405f`; this revision changes documentation, not their semantics.
+
+DESIGN now explicitly separates exact JSON Args/Env from generic normalized line lists. README discloses nonblank-key validation, preserving other key/value whitespace, old-paste incompatibility and correction of unsupported existing keys on field editing. These address the prior documentation notes. The additional supplied settings/mod.rs source confirms dirty state includes editor errors and can_save requires !has_errors; this supports the report's save-gating source statement, not an observed native interaction.
+
+Final scope is eight changed paths and a coordinator-verified 17-source catalog, superseding the initial seven-path stage. The report correctly distinguishes selected JSON semantics, supported typed values, unchanged profile representation, no recovery of previously lost values, mixed-client risks, proposed tests and remaining compilation/native UI/profile-readback gates. Inert application/byte comparison and toolchain absence are coordinator-recorded checks, not tests executed by this reviewer. No factual blocker or production-readiness overclaim found. Source-only prototype verdict remains unchanged; nothing was run or published here.
