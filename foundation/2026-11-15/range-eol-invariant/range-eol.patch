@@ -1,0 +1,268 @@
+--- a/tool/file-tools/src/read.rs
++++ b/tool/file-tools/src/read.rs
+@@ -24,7 +24,7 @@
+     fn spec_json(&self) -> String {
+         let spec = json!({
+             "name": "read_file",
+-            "description": "Read a UTF-8 file inside the current workspace, optionally by line range. Output and each line are limited to 2 MiB; ranged reads scan at most 16 MiB. Truncated ranges report total_lines as unknown.",
++            "description": "Read a UTF-8 file inside the current workspace, optionally by line range. Unnumbered ranges preserve separators between returned lines but omit the last selected line ending; numbered output uses LF separators. Output and each line are limited to 2 MiB; ranged reads scan at most 16 MiB. Truncated ranges report total_lines as unknown.",
+             "input_schema": {
+                 "type": "object",
+                 "properties": {
+@@ -208,6 +208,7 @@
+     let mut scanned_bytes = 0u64;
+     let mut returned = 0usize;
+     let mut output = String::new();
++    let mut separator = "";
+     let mut line = Vec::new();
+     let mut eof = false;
+     let mut reason = None;
+@@ -237,12 +238,17 @@
+         }
+         scanned_lines += 1;
+         let complete = line.ends_with(b"\n") || read < allowance as usize;
+-        if line.ends_with(b"\n") {
++        let line_ending = if line.ends_with(b"\n") {
+             line.pop();
+             if line.ends_with(b"\r") {
+                 line.pop();
+-            }
+-        }
++                "\r\n"
++            } else {
++                "\n"
++            }
++        } else {
++            ""
++        };
+         if scanned_lines < start_line {
+             if !complete {
+                 reason = Some("line_budget");
+@@ -255,9 +261,8 @@
+         } else {
+             String::new()
+         };
+-        let separator = usize::from(returned != 0);
+-        let available =
+-            (MAX_READ_FILE_BYTES as usize).saturating_sub(output.len() + prefix.len() + separator);
++        let available = (MAX_READ_FILE_BYTES as usize)
++            .saturating_sub(output.len() + prefix.len() + separator.len());
+         if available == 0 {
+             reason = Some("output_budget");
+             break;
+@@ -271,12 +276,13 @@
+             }
+             Err(error) => return Err(format!("invalid UTF-8 in {}: {error}", path.display())),
+         };
+-        if separator != 0 {
+-            output.push('\n');
+-        }
++        output.push_str(separator);
+         output.push_str(&prefix);
+         output.push_str(text);
+         returned += 1;
++        // Keep the previous selected line's delimiter, not the current one's.
++        // Delaying it preserves the existing omission of the final delimiter.
++        separator = if options.line_numbers { "\n" } else { line_ending };
+         if end < line.len() || !complete {
+             reason = Some("output_budget");
+             break;
+@@ -312,3 +318,7 @@
+ #[cfg(test)]
+ #[path = "read_budget_tests.rs"]
+ mod budget_tests;
++
++#[cfg(test)]
++#[path = "read_eol_tests.rs"]
++mod eol_tests;
+--- /dev/null
++++ b/tool/file-tools/src/read_eol_tests.rs
+@@ -0,0 +1,121 @@
++use super::*;
++use std::io::Cursor;
++
++#[test]
++fn unnumbered_ranges_preserve_selected_inter_line_endings() {
++    for (source, start_line, limit, expected) in [
++        ("one\r\ntwo\r\nthree\r\n", 1, Some(2), "one\r\ntwo"),
++        ("one\r\ntwo\r\nthree\r\n", 2, None, "two\r\nthree"),
++        (
++            "skip\none\r\ntwo\nthree\r\nlast",
++            2,
++            Some(3),
++            "one\r\ntwo\nthree",
++        ),
++        ("skip\r\n\r\n\r\nlast\r", 2, None, "\r\n\r\nlast\r"),
++        ("one\r\r\ntwo\r\n", 1, None, "one\r\r\ntwo"),
++        ("one\rtwo\r", 1, None, "one\rtwo\r"),
++        ("one\ntwo\n", 1, None, "one\ntwo"),
++        ("one\r\n", 1, Some(1), "one"),
++        ("\r\n\r\n", 1, None, "\r\n"),
++        ("", 1, None, ""),
++        ("one\r\n", 2, None, ""),
++    ] {
++        let (output, _) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("eol-fixture"),
++            ReadOptions {
++                start_line: Some(start_line),
++                limit,
++                line_numbers: false,
++            },
++        )
++        .unwrap();
++        assert_eq!(output, expected, "source={source:?}, start={start_line}");
++        assert!(source.contains(output.as_str()), "{source:?}: {output:?}");
++    }
++}
++
++#[test]
++fn numbered_ranges_keep_the_existing_lf_display_projection() {
++    for source in [
++        "skip\none\ntwo\nthree\n",
++        "skip\r\none\r\ntwo\r\nthree\r\n",
++        "skip\none\r\ntwo\nthree\r\n",
++    ] {
++        let (output, metadata) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("numbered-eol-fixture"),
++            ReadOptions {
++                start_line: Some(2),
++                limit: Some(2),
++                line_numbers: true,
++            },
++        )
++        .unwrap();
++        assert_eq!(output, "2\tone\n3\ttwo");
++        assert_eq!(metadata["returned_lines"], 2);
++        assert_eq!(metadata["truncation_reason"], "line_limit");
++        assert!(metadata["total_lines"].is_null());
++    }
++}
++
++#[test]
++fn unnumbered_range_counts_whole_crlf_separator_against_output_budget() {
++    let limit = MAX_READ_FILE_BYTES as usize;
++    let first = "x".repeat(limit - 4);
++    let source = format!("{first}\r\néZ\n");
++    let (output, metadata) = render_range(
++        Cursor::new(source.as_bytes()),
++        Path::new("budget-eol-fixture"),
++        ReadOptions {
++            start_line: Some(1),
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(output, format!("{first}\r\né"));
++    assert_eq!(output.len(), limit);
++    assert!(source.starts_with(output.as_str()));
++    assert_eq!(metadata["returned_lines"], 2);
++    assert_eq!(metadata["truncation_reason"], "output_budget");
++    assert!(metadata["total_lines"].is_null());
++
++    for spare in [1, 2] {
++        let first = "x".repeat(limit - spare);
++        let source = format!("{first}\r\ny\n");
++        let (output, metadata) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("separator-does-not-fit"),
++            ReadOptions {
++                start_line: Some(1),
++                ..Default::default()
++            },
++        )
++        .unwrap();
++        assert_eq!(output, first, "spare={spare}");
++        assert_eq!(metadata["returned_lines"], 1);
++        assert_eq!(metadata["truncation_reason"], "output_budget");
++    }
++}
++
++#[test]
++fn range_metadata_keeps_raw_scan_counts_and_existing_final_eol_policy() {
++    let source = "skip\r\nold\r\nkeep\r\n";
++    let (output, metadata) = render_range(
++        Cursor::new(source.as_bytes()),
++        Path::new("metadata-eol-fixture"),
++        ReadOptions {
++            start_line: Some(2),
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(output, "old\r\nkeep");
++    assert_eq!(metadata["scanned_bytes"], source.len());
++    assert_eq!(metadata["total_lines"], 3);
++    assert_eq!(metadata["start_line"], 2);
++    assert_eq!(metadata["end_line"], 3);
++    assert_eq!(metadata["returned_lines"], 2);
++    assert_eq!(metadata["truncated"], false);
++}
+--- /dev/null
++++ b/tool/file-tools/src/tests/read_eol.rs
+@@ -0,0 +1,53 @@
++use super::*;
++
++#[test]
++fn unnumbered_range_can_supply_an_exact_multiline_edit_preimage() {
++    for source in [
++        "before\nold\nkeep\nafter\n",
++        "before\r\nold\r\nkeep\r\nafter\r\n",
++        "before\nold\r\nkeep\nafter\r\n",
++    ] {
++        let directory = tempfile::tempdir().expect("workspace");
++        let path = directory.path().join("sample.txt");
++        std::fs::write(&path, source).expect("source fixture");
++
++        let full = invoke(&ReadFileTool, directory.path(), json!({"path": "sample.txt"}));
++        assert_eq!(full["ok"], true);
++        assert_eq!(full["output"], source);
++        let batch = invoke(
++            &ReadManyFilesTool,
++            directory.path(),
++            json!({"paths": ["sample.txt"]}),
++        );
++        assert_eq!(batch["ok"], true);
++        assert_eq!(batch["output"], format!("== sample.txt ==\n{source}"));
++
++        let ranged = invoke(
++            &ReadFileTool,
++            directory.path(),
++            json!({"path": "sample.txt", "start_line": 2, "limit": 2}),
++        );
++        assert_eq!(ranged["ok"], true);
++        let old = ranged["output"].as_str().unwrap();
++        let expected = if source.contains("old\r\n") { "old\r\nkeep" } else { "old\nkeep" };
++        assert_eq!(old, expected);
++
++        if source.contains("old\r\n") {
++            let normalized = invoke(
++                &EditFileTool,
++                directory.path(),
++                json!({"path": "sample.txt", "old_string": "old\nkeep", "new_string": "new\nkeep"}),
++            );
++            assert_eq!(normalized["ok"], false);
++            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
++        }
++        let edited = invoke(
++            &EditFileTool,
++            directory.path(),
++            json!({"path": "sample.txt", "old_string": old, "new_string": old.replacen("old", "new", 1)}),
++        );
++        assert_eq!(edited["ok"], true, "{edited}");
++        assert_eq!(edited["metadata"]["replacements"], 1);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), source.replacen("old", "new", 1));
++    }
++}
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -7,6 +7,8 @@
+ 
+ use super::*;
+ use crate::{find::FindFilesTool, read_many::ReadManyFilesTool, search::GrepTool};
++
++mod read_eol;
+ 
+ struct TestToolHost;
+ 
