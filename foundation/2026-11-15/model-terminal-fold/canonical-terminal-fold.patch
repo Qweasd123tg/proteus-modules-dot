@@ -1,0 +1,302 @@
+diff --git a/crates/proteus-contracts/src/contracts/model/tests.rs b/crates/proteus-contracts/src/contracts/model/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-contracts/src/contracts/model/tests.rs
+@@ -0,0 +1,138 @@
++use super::*;
++use std::sync::Mutex;
++
++use crate::model_standard::{
++    CanonicalMessage, FinishReason, MessageRole, ModelFailure, ModelFailureKind, TokenUsage,
++};
++use futures_util::stream;
++
++struct StreamOnlyModel {
++    next_stream: Mutex<Option<Result<ModelEventStream>>>,
++}
++
++impl StreamOnlyModel {
++    fn events(events: Vec<Result<ModelStreamEvent>>) -> Self {
++        Self {
++            next_stream: Mutex::new(Some(Ok(Box::pin(stream::iter(events))))),
++        }
++    }
++
++    fn start_failure(failure: ModelFailure) -> Self {
++        Self {
++            next_stream: Mutex::new(Some(Err(anyhow::Error::new(failure)))),
++        }
++    }
++}
++
++#[async_trait]
++impl Model for StreamOnlyModel {
++    fn id(&self) -> Cow<'static, str> {
++        "stream-only".into()
++    }
++
++    fn capabilities(&self, _model: &ModelRef) -> Result<ModelCapabilities> {
++        Ok(ModelCapabilities::empty())
++    }
++
++    async fn stream(&self, _request: CanonicalModelRequest) -> Result<ModelEventStream> {
++        self.next_stream
++            .lock()
++            .unwrap()
++            .take()
++            .expect("one invocation")
++    }
++}
++
++fn request() -> CanonicalModelRequest {
++    CanonicalModelRequest::new(ModelRef::new("test", "model"), Vec::new())
++}
++
++fn failure(kind: ModelFailureKind) -> ModelFailure {
++    ModelFailure::new(kind, "typed terminal diagnosis").with_completed_messages(vec![
++        CanonicalMessage::text(MessageRole::Assistant, "completed item"),
++    ])
++}
++
++#[tokio::test]
++async fn inherited_complete_preserves_the_entire_canonical_failure() {
++    for kind in [
++        ModelFailureKind::ContextWindowExceeded,
++        ModelFailureKind::StreamDisconnected,
++        ModelFailureKind::Retryable {
++            retry_delay_ms: Some(17),
++        },
++        ModelFailureKind::Interrupted,
++        ModelFailureKind::SessionBudgetExceeded,
++        ModelFailureKind::Other,
++    ] {
++        let expected = failure(kind);
++        let model = StreamOnlyModel::events(vec![
++            Ok(ModelStreamEvent::MessageCompleted {
++                message: expected.completed_messages[0].clone(),
++            }),
++            Ok(ModelStreamEvent::Error {
++                failure: expected.clone(),
++            }),
++        ]);
++
++        let error = model.complete(request()).await.unwrap_err();
++
++        assert_eq!(error.downcast_ref::<ModelFailure>(), Some(&expected));
++        assert_eq!(ModelFailure::from_error(&error), expected);
++    }
++}
++
++#[tokio::test]
++async fn inherited_complete_returns_the_terminal_response_unchanged() {
++    let expected = CanonicalModelResponse::new(
++        CanonicalMessage::text(MessageRole::Assistant, "final answer"),
++        Vec::new(),
++        FinishReason::Stop,
++    )
++    .with_usage(TokenUsage::new(12, 3));
++    let model = StreamOnlyModel::events(vec![
++        Ok(ModelStreamEvent::TextDelta {
++            message_id: expected.messages[0].id,
++            phase: None,
++            text: "final ".into(),
++        }),
++        Ok(ModelStreamEvent::Response {
++            response: expected.clone(),
++        }),
++    ]);
++
++    assert_eq!(model.complete(request()).await.unwrap(), expected);
++}
++
++#[tokio::test]
++async fn inherited_complete_keeps_start_and_stream_item_errors_typed() {
++    let expected = failure(ModelFailureKind::Interrupted);
++    let start = StreamOnlyModel::start_failure(expected.clone());
++    let item = StreamOnlyModel::events(vec![Err(
++        anyhow::Error::new(expected.clone()).context("stream item context"),
++    )]);
++    for model in [start, item] {
++        let error = model.complete(request()).await.unwrap_err();
++        assert_eq!(ModelFailure::from_error(&error), expected);
++    }
++}
++
++#[tokio::test]
++async fn inherited_complete_retains_the_true_eof_error() {
++    for events in [
++        Vec::new(),
++        vec![Ok(ModelStreamEvent::MessageCompleted {
++            message: CanonicalMessage::text(MessageRole::Assistant, "not a terminal response"),
++        })],
++    ] {
++        let error = StreamOnlyModel::events(events)
++            .complete(request())
++            .await
++            .unwrap_err();
++        assert_eq!(
++            error.to_string(),
++            "model stream ended without a complete response"
++        );
++        assert!(error.downcast_ref::<ModelFailure>().is_none());
++    }
++}
+diff --git a/crates/proteus-contracts/src/contracts/model.rs b/crates/proteus-contracts/src/contracts/model.rs
+--- a/crates/proteus-contracts/src/contracts/model.rs
++++ b/crates/proteus-contracts/src/contracts/model.rs
+@@ -46,13 +46,20 @@
+     /// emit that response; consumers do not reconstruct it from deltas.
+     async fn stream(&self, request: CanonicalModelRequest) -> Result<ModelEventStream>;
+ 
++    /// Собирает terminal outcome из выбранного stream, не реконструируя deltas.
++    /// Canonical Error возвращается как исходный typed ModelFailure.
+     async fn complete(&self, request: CanonicalModelRequest) -> Result<CanonicalModelResponse> {
+         let mut stream = self.stream(request).await?;
+         while let Some(event) = stream.next().await {
+-            if let ModelStreamEvent::Response { response } = event? {
+-                return Ok(response);
++            match event? {
++                ModelStreamEvent::Response { response } => return Ok(response),
++                ModelStreamEvent::Error { failure } => return Err(anyhow::Error::new(failure)),
++                _ => {}
+             }
+         }
+         anyhow::bail!("model stream ended without a complete response")
+     }
+ }
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/core/bound_model.rs b/crates/proteus-core/src/core/bound_model.rs
+--- a/crates/proteus-core/src/core/bound_model.rs
++++ b/crates/proteus-core/src/core/bound_model.rs
+@@ -24,7 +24,7 @@
+         new_exchange_id,
+     },
+     model_standard::{
+-        CanonicalModelRequest, CanonicalModelResponse, ModelCapabilities, ModelStreamEvent,
++        CanonicalModelRequest, ModelCapabilities, ModelStreamEvent,
+     },
+ };
+ 
+@@ -360,18 +360,6 @@
+             deadline,
+             crate::core::model_call_scope::operation_cancellation(&self.binding.scope.cancellation),
+         ))
+-    }
+-
+-    async fn complete(&self, request: CanonicalModelRequest) -> Result<CanonicalModelResponse> {
+-        let mut stream = self.stream(request).await?;
+-        while let Some(event) = stream.next().await {
+-            match event? {
+-                ModelStreamEvent::Response { response } => return Ok(response),
+-                ModelStreamEvent::Error { failure } => return Err(failure.into()),
+-                _ => {}
+-            }
+-        }
+-        Err(anyhow!("model stream ended without Response event"))
+     }
+ }
+ 
+diff --git a/crates/proteus-core/src/core/bound_model_tests/failure_progress.rs b/crates/proteus-core/src/core/bound_model_tests/failure_progress.rs
+--- a/crates/proteus-core/src/core/bound_model_tests/failure_progress.rs
++++ b/crates/proteus-core/src/core/bound_model_tests/failure_progress.rs
+@@ -190,7 +190,10 @@
+         part.part_id = new_part_id();
+     }
+     let second = completed("second", MessagePhase::FinalAnswer);
+-    let failure = ModelFailure::other("provider stopped")
++    let kind = crate::model_standard::ModelFailureKind::Retryable {
++        retry_delay_ms: Some(17),
++    };
++    let failure = ModelFailure::new(kind, "provider stopped")
+         .with_completed_messages(vec![duplicate, second.clone()]);
+     let (model, recorder) = recording_model(vec![
+         ModelStreamEvent::MessageCompleted {
+@@ -204,6 +207,8 @@
+         .await
+         .unwrap_err();
+     let failure = ModelFailure::from_error(&error);
++    assert_eq!(failure.kind, kind);
++    assert_eq!(failure.message, "provider stopped");
+     assert_eq!(failure.completed_messages, [first.clone(), second.clone()]);
+     assert_eq!(recorder.facts.lock().await.errors[0].2, [first, second]);
+ }
+diff --git a/crates/proteus-core/src/core/bound_model_tests.rs b/crates/proteus-core/src/core/bound_model_tests.rs
+--- a/crates/proteus-core/src/core/bound_model_tests.rs
++++ b/crates/proteus-core/src/core/bound_model_tests.rs
+@@ -13,7 +13,9 @@
+     },
+     core::{JournalEntry, SessionExecutionRecorder, SessionStore, TurnOpened},
+     domain::{AgentTask, EventEnvelope, new_session_id, new_thread_id, new_turn_id},
+-    model_standard::{CanonicalMessage, ContentPart, FinishReason, MessageRole},
++    model_standard::{
++        CanonicalMessage, CanonicalModelResponse, ContentPart, FinishReason, MessageRole,
++    },
+ };
+ 
+ #[path = "bound_model_tests/deadline.rs"]
+diff --git a/crates/proteus-core/src/core/model_service.rs b/crates/proteus-core/src/core/model_service.rs
+--- a/crates/proteus-core/src/core/model_service.rs
++++ b/crates/proteus-core/src/core/model_service.rs
+@@ -8,8 +8,8 @@
+     contracts::{Model, ModelEventStream},
+     domain::{ModelRef, ToolSpec},
+     model_standard::{
+-        CanonicalModelRequest, CanonicalModelResponse, ModelCapabilities, ModelStreamEvent,
+-        RequestShaper, validate_model_response_against_request,
++        CanonicalModelRequest, ModelCapabilities, ModelStreamEvent, RequestShaper,
++        validate_model_response_against_request,
+     },
+ };
+ 
+@@ -73,24 +73,6 @@
+         let validation_request = request.clone();
+         let stream = self.start_prepared(request).await?;
+         Ok(validating_stream(stream, validation_request))
+-    }
+-
+-    async fn complete(&self, request: CanonicalModelRequest) -> Result<CanonicalModelResponse> {
+-        let mut stream = self.stream(request).await?;
+-
+-        while let Some(event) = stream.next().await {
+-            let event = event?;
+-            match event {
+-                ModelStreamEvent::Response { response } => {
+-                    return Ok(response);
+-                }
+-                ModelStreamEvent::Error { failure } => {
+-                    return Err(anyhow::Error::new(failure));
+-                }
+-                _ => {}
+-            }
+-        }
+-        Err(anyhow!("model stream ended without Response event"))
+     }
+ }
+ 
+@@ -502,12 +484,22 @@
+ 
+     #[tokio::test]
+     async fn stream_error_propagates_as_anyhow() {
++        let failure = crate::model_standard::ModelFailure::new(
++            crate::model_standard::ModelFailureKind::Retryable {
++                retry_delay_ms: Some(17),
++            },
++            "provider exploded",
++        )
++        .with_completed_messages(vec![CanonicalMessage::text(
++            MessageRole::Assistant,
++            "completed before failure",
++        )]);
+         let adapter = Arc::new(ScriptedAdapter::new(vec![ModelStreamEvent::Error {
+-            failure: crate::model_standard::ModelFailure::other("provider exploded"),
++            failure: failure.clone(),
+         }]));
+         let service = ModelService::new(adapter);
+         let err = service.complete(sample_request()).await.unwrap_err();
+-        assert!(err.to_string().contains("provider exploded"), "{err}");
++        assert_eq!(crate::model_standard::ModelFailure::from_error(&err), failure);
+     }
+ 
+     #[tokio::test]
