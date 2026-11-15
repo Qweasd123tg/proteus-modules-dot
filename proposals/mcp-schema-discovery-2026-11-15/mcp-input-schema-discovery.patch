@@ -1,0 +1,200 @@
+--- a/crates/proteus-core/src/tools/mcp/discovery.rs
++++ b/crates/proteus-core/src/tools/mcp/discovery.rs
+@@ -3,7 +3,7 @@
+ 
+ use crate::{
+     core::ConfiguredMcpServerConfig,
+-    domain::{ToolSafety, ToolSpec, ToolSurface},
++    domain::{ToolSafety, ToolSpec, ToolSurface, tool_validation::validate_tool_input_schema},
+ };
+ 
+ #[derive(Debug)]
+@@ -58,6 +58,7 @@
+             } else {
+                 spec
+             };
++            validate_tool_input_schema(&spec).map_err(anyhow::Error::msg)?;
+             Ok(DiscoveredMcpTool { remote_tool, spec })
+         })
+         .collect()
+--- a/crates/proteus-core/tests/mcp_client.rs
++++ b/crates/proteus-core/tests/mcp_client.rs
+@@ -19,6 +19,8 @@
+ mod sandbox;
+ #[path = "support/model.rs"]
+ mod test_model;
++#[path = "mcp_client/discovery.rs"]
++mod discovery;
+ 
+ struct Fixture {
+     dir: tempfile::TempDir,
+--- /dev/null
++++ b/crates/proteus-core/tests/mcp_client/discovery.rs
+@@ -0,0 +1,120 @@
++use super::*;
++
++fn fixture_with_list_mode(mode: &str) -> Fixture {
++    let mut fixture = Fixture::new(1_000, None);
++    fixture.config.tools.mcp_servers[0]
++        .environment
++        .env
++        .insert("MCP_FIXTURE_LIST_MODE".into(), mode.into());
++    fixture
++}
++
++#[tokio::test]
++async fn input_schema_discovery_errors_are_isolated_without_registering_a_prefix() {
++    for (mode, enabled) in [
++        ("invalid_first", true),
++        ("invalid_last", true),
++        ("empty", true),
++        ("invalid_last", false),
++    ] {
++        let fixture = fixture_with_list_mode(mode);
++        let healthy = Fixture::new(1_000, None);
++        let mut config = fixture.config.clone();
++        config.active_provider = None;
++        config.providers.clear();
++        config.tools.mcp_servers[0].enabled = enabled;
++        let mut healthy_config = healthy.config.tools.mcp_servers[0].clone();
++        healthy_config.name = "healthy".into();
++        config.tools.mcp_servers.push(healthy_config);
++        let server = proteus_core::app_server::AgentAppServer::launch(
++            config,
++            fixture.dir.path().to_owned(),
++            None,
++        )
++        .await
++        .expect("one invalid discovery must not prevent independent server assembly");
++        let snapshot = server.addons_snapshot().await;
++        let state = snapshot
++            .mcp_servers
++            .iter()
++            .find(|state| state.name == "fixture")
++            .unwrap();
++        assert_eq!(state.enabled, enabled);
++        assert!(state.tools.is_empty(), "no prefix from {mode}");
++        if enabled && mode != "empty" {
++            let error = state.error.as_ref().expect("schema error must be visible");
++            assert!(error.contains("fixture__invalid"), "{error}");
++            assert!(error.contains("invalid input schema"), "{error}");
++        } else {
++            assert!(state.error.is_none());
++        }
++        let healthy_state = snapshot
++            .mcp_servers
++            .iter()
++            .find(|state| state.name == "healthy")
++            .unwrap();
++        assert!(healthy_state.error.is_none());
++        assert!(healthy_state.tools.contains(&"healthy__echo".to_owned()));
++        let tools = server.config_builder_snapshot().await.tools;
++        assert!(!tools.iter().any(|tool| tool.name.starts_with("fixture__")));
++        assert!(
++            tools
++                .iter()
++                .any(|tool| tool.name == "healthy__echo" && tool.registered)
++        );
++        server.shutdown().await;
++    }
++}
++
++#[test]
++fn valid_discovered_batches_keep_name_collisions_fatal() {
++    let fixture = fixture_with_list_mode("collision");
++    let error = fixture.registry().err().expect("duplicate discovered name");
++    assert!(format!("{error:#}").contains("duplicate tool registration"));
++
++    let mut first = Fixture::new(1_000, None);
++    let second = Fixture::new(1_000, None);
++    first.config.tools.mcp_servers[0].name = "same name".into();
++    let mut second_config = second.config.tools.mcp_servers[0].clone();
++    second_config.name = "same.name".into();
++    first.config.tools.mcp_servers.push(second_config);
++    let error = first
++        .registry()
++        .err()
++        .expect("sanitized cross-server name collision");
++    assert!(format!("{error:#}").contains("duplicate tool registration"));
++}
++
++#[tokio::test]
++async fn invalid_schema_batch_is_rejected_before_potential_name_collisions() {
++    let fixture = fixture_with_list_mode("invalid_collision");
++    let mut config = fixture.config.clone();
++    config.active_provider = None;
++    config.providers.clear();
++    let server = proteus_core::app_server::AgentAppServer::launch(
++        config,
++        fixture.dir.path().to_owned(),
++        None,
++    )
++    .await
++    .expect("invalid batch is a server-local discovery error");
++    let snapshot = server.addons_snapshot().await;
++    let state = snapshot
++        .mcp_servers
++        .iter()
++        .find(|state| state.name == "fixture")
++        .unwrap();
++    assert!(state.tools.is_empty());
++    let error = state.error.as_ref().expect("invalid input schema");
++    assert!(error.contains("invalid input schema"), "{error}");
++    assert!(!error.contains("duplicate tool registration"), "{error}");
++    assert!(
++        !server
++            .config_builder_snapshot()
++            .await
++            .tools
++            .iter()
++            .any(|tool| tool.name.starts_with("fixture__"))
++    );
++    server.shutdown().await;
++}
+--- a/crates/proteus-core/tests/mcp_client/server.py
++++ b/crates/proteus-core/tests/mcp_client/server.py
+@@ -13,6 +13,7 @@
+ EVENT_LOG = os.environ["MCP_FIXTURE_EVENT_LOG"]
+ GENERATION_FILE = os.environ["MCP_FIXTURE_GENERATION_FILE"]
+ INIT_MODE = os.environ.get("MCP_FIXTURE_INIT_MODE", "ok")
++LIST_MODE = os.environ.get("MCP_FIXTURE_LIST_MODE", "ok")
+ WRITE_LOCK = threading.Lock()
+ CANCEL_LOCK = threading.Lock()
+ CANCELLED = {}
+@@ -204,6 +205,20 @@
+     elif method == "tools/list":
+         cursor = params.get("cursor")
+         event(f"list:{cursor or 'first'}")
++        if LIST_MODE != "ok":
++            valid = tool("echo", "valid discovery tool")
++            invalid = tool("invalid", "invalid nested input schema", {
++                "message": {"type": "invalid-type"},
++            })
++            tools = {
++                "empty": [],
++                "invalid_first": [invalid, valid],
++                "invalid_last": [valid, invalid],
++                "collision": [valid, valid],
++                "invalid_collision": [valid, valid, invalid],
++            }[LIST_MODE]
++            result(request_id, {"tools": tools})
++            continue
+         if cursor is None:
+             result(request_id, {
+                 "tools": [tool("echo", "echo a label", {
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -1213,7 +1213,12 @@
+ задаёт рабочий каталог процесса; относительный путь отсчитывается от workspace.
+ Неудачный start/handshake/list изолируется на этом сервере: его tools не
+ регистрируются, остальные подключения работают, ошибка видна в `/addons`.
+-Name collision остаётся блокирующей ошибкой сборки. Список `tools` в MCP status
++Весь discovered list сначала проверяется, включая input schemas; ошибка любого
++элемента отклоняет весь список до регистрации, без сохранения valid prefix.
++Только успешно подготовленный список участвует в общей регистрации, где name
++collision остаётся блокирующей ошибкой сборки. Если список содержит и invalid
++schema, и потенциальную collision, сначала отклоняется discovery этого сервера:
++collision из уже отклонённого списка не проверяется. Список `tools` в MCP status
+ отражает discovery при подготовке epoch, а не непрерывную проверку live health.
+ 
+ Текущий MCP scope — stdio tool discovery/invocation. HTTP, OAuth, resources,
