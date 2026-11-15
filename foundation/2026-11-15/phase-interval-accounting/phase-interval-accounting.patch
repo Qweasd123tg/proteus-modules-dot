@@ -1,0 +1,482 @@
+--- a/examples/performance/common/README.md
++++ b/examples/performance/common/README.md
+@@ -70,6 +70,25 @@
+ показатель одного интервала. Накопительные counters сохраняют последнее
+ успешное наблюдение при временных ошибках чтения.
+ 
++### Атрибуция целого интервала фазе
++
++`interval_start_monotonic_ns` хранит предыдущую точку времени самого `Tree`,
++соответствующую `interval_seconds`; у первой выборки это `null`. `Recorder`
++добавляет `phase_interval_eligible`, используя общий `PhaseIntervals`:
++интервал допустим для фазовой CPU/IO сводки только при известном положительном
++интервале, совпадающем имени фазы и начале не раньше последней метки этой фазы.
++Каждая новая метка, даже с прежним именем, начинает новую эпоху. Интервал,
++пересекающий метку, не делится пропорционально и не приписывается новой фазе.
++
++Это контракт упорядоченного потока одного `Tree` и одного монотонного clock,
++а не общий валидатор произвольной telemetry. Метка отражает момент наблюдения
++launcher, не точное время более раннего driver event; последовательное чтение
++`/proc` по-прежнему не атомарно. Проверка границ не устраняет missing baselines
++отдельных процессов/counters и не делает lifetime accounting полным.
++Сами raw counters, lifetime totals и точечные измерения памяти не меняются.
++Старые samples без interval-start provenance не доказывают пригодность для
++этого способа фазовой атрибуции.
++
+ `read_bytes`/`write_bytes` — kernel storage IO, а `rchar`/`wchar` учитывают и
+ кэшированные операции. **Финальные CPU/IO между последней выборкой и выходом,
+ а также дети, целиком родившиеся и завершившиеся между выборками, не
+--- a/examples/performance/common/proc_sampler.py
++++ b/examples/performance/common/proc_sampler.py
+@@ -7,6 +7,7 @@
+ 
+ import argparse
+ import json
++import math
+ import os
+ from pathlib import Path
+ import time
+@@ -17,6 +18,7 @@
+ IO_KEYS = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes")
+ COUNTERS = ("cpu_ticks", "minor_faults", "major_faults") + IO_KEYS
+ GROUPS = ("gui", "backend", "modules", "extensions", "other")
++PHASE_INTERVAL_POLICY = "whole-observed-interval/v1"
+ 
+ 
+ def read_stat(path: Path) -> dict:
+@@ -200,6 +202,7 @@
+             "root_pid": self.root, "root_start_ticks": self.root_start,
+             "processes": processes, "groups": groups,
+             **self._memory_totals(processes), "process_count": len(processes),
++            "interval_start_monotonic_ns": self.previous_ns,
+             "interval_seconds": elapsed, "interval_cpu_percent_one_core": cpu_percent,
+             "interval_counters": deltas if elapsed is not None else None,
+             "cpu_missing_baseline_pids": cpu_missing_baselines,
+@@ -244,14 +247,40 @@
+         }
+ 
+ 
++class PhaseIntervals:
++    """Attribute only intervals wholly after the latest observed phase marker."""
++    def __init__(self):
++        self.phase = None
++        self.started_ns = None
++
++    def observe(self, event):
++        if event.get("type") == "phase":
++            self.phase = event.get("phase")
++            self.started_ns = event.get("monotonic_ns")
++            return False
++        if event.get("type") != "sample":
++            return False
++        start = event.get("interval_start_monotonic_ns")
++        end = event.get("monotonic_ns")
++        elapsed = event.get("interval_seconds")
++        return (self.phase is not None and event.get("phase") == self.phase
++                and type(self.started_ns) is int and type(start) is int and type(end) is int
++                and self.started_ns <= start < end
++                and type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed > 0)
++
++
+ class Recorder:
+     """Flush each JSONL event so a failed benchmark retains its partial evidence."""
+     def __init__(self, tree: Tree, path: Path | str):
+         self.tree = tree
+         self.file = open(path, "w", encoding="utf-8")
+         self.phase: str | None = None
++        self.phase_intervals = PhaseIntervals()
+ 
+     def write(self, event: dict) -> dict:
++        eligible = self.phase_intervals.observe(event)
++        if event.get("type") == "sample":
++            event["phase_interval_eligible"] = eligible
+         self.file.write(json.dumps(event, ensure_ascii=False) + "\n")
+         self.file.flush()
+         return event
+--- a/examples/performance/history-scale/README.md
++++ b/examples/performance/history-scale/README.md
+@@ -193,6 +193,26 @@
+ sampled peaks, resident medians и CPU weighted mean по длительности интервалов
+ (100% — одно ядро). `VmHWM` разных процессов не складывается в пик дерева.
+ 
++CPU median/peak, weighted mean и phase interval counters включают только
++интервалы, целиком начинающиеся не раньше последней наблюдённой метки фазы
++(`whole-observed-interval/v1`). Общая проверка используется и при записи subject
++сводки, и при чтении raw full-tree samples в `../summarize.py`. Память и её пики
++сохраняются по всем выборкам. Нет пригодных интервалов: CPU равен `null`/`н/д`,
++а не измеренному нулю. Суммы counters по пустому множеству остаются нулевыми,
++поэтому читать их нужно вместе с `eligible_interval_samples` и
++`observed_interval_seconds`, не как стоимость всей фазы.
++
++`excluded_interval_samples`, `excluded_interval_seconds` и
++`excluded_interval_counters` явно показывают исключённые наблюдения. Сумма
++исключённых секунд не включает неизвестную длительность первой выборки и не
++измеряет все ненаблюдённые промежутки. Raw samples и lifetime totals не
++перезаписываются, работа из пересекающего интервала не теряется из них.
++`phase_interval_policy` отмечает новую семантику. При сравнении старых данных
++сохранённые subject phase aggregates показываются без перерасчёта с legacy
++предупреждением; full-tree CPU из raw samples без точного начала интервала
++показывается как `н/д`, при сохранении памяти. Это явная новая read-time
++проекция, а не исправление опубликованных исторических результатов.
++
+ Первые запуски используют свежие копии canonical inputs, но кэш ОС не
+ очищается: это не cold boot и не измерение allocation count. Restart сохраняет
+ derived files именно своего случая. Sequential `/proc` scan не атомарен;
+--- a/examples/performance/history-scale/measurement.py
++++ b/examples/performance/history-scale/measurement.py
+@@ -9,7 +9,7 @@
+ import time
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+-from proc_sampler import Recorder, Tree, table
++from proc_sampler import PHASE_INTERVAL_POLICY, Recorder, Tree, table
+ 
+ 
+ def classifier(args):
+@@ -44,7 +44,8 @@
+         event["subject"] = subject
+         self.log.write(event)
+         self.small.append(dict(phase=event["phase"], monotonic_ns=event["monotonic_ns"],
+-                               interval_seconds=event["interval_seconds"], **subject))
++                               interval_seconds=event["interval_seconds"],
++                               phase_interval_eligible=event["phase_interval_eligible"], **subject))
+         if subject["pss_swap_kib"] > self.args.max_pss_mib * 1024:
+             raise MemoryError(f"subject PSS+SwapPss exceeded {self.args.max_pss_mib} MiB")
+         if subject["memory_incomplete_pids"]:
+@@ -66,11 +67,22 @@
+         for phase in sorted({sample["phase"] for sample in self.small}):
+             samples = [sample for sample in self.small if sample["phase"] == phase]
+             phases[phase] = dict(samples=len(samples))
+-            for key in ("rss_kib", "pss_kib", "pss_swap_kib", "swap_pss_kib", "private_kib", "cpu_percent_one_core"):
++            for key in ("rss_kib", "pss_kib", "pss_swap_kib", "swap_pss_kib", "private_kib"):
+                 values = [sample[key] for sample in samples]
+                 phases[phase][key] = dict(median=statistics.median(values), peak=max(values))
+-            elapsed = sum(sample["interval_seconds"] or 0 for sample in samples)
+-            phase_counters = {field: sum(sample["interval_counters"][field] for sample in samples)
++            intervals = [sample for sample in samples if sample.get("phase_interval_eligible") is True]
++            excluded = [sample for sample in samples if sample.get("phase_interval_eligible") is not True]
++            cpu = [sample["cpu_percent_one_core"] for sample in intervals]
++            phases[phase]["cpu_percent_one_core"] = dict(median=statistics.median(cpu) if cpu else None,
++                                                        peak=max(cpu) if cpu else None)
++            phases[phase]["eligible_interval_samples"] = len(intervals)
++            phases[phase]["excluded_interval_samples"] = len(excluded)
++            phases[phase]["excluded_interval_seconds"] = sum(sample["interval_seconds"] or 0 for sample in excluded)
++            phases[phase]["excluded_interval_counters"] = {
++                field: sum(sample["interval_counters"][field] for sample in excluded)
++                for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar")}
++            elapsed = sum(sample["interval_seconds"] for sample in intervals)
++            phase_counters = {field: sum(sample["interval_counters"][field] for sample in intervals)
+                               for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar")}
+             phases[phase]["observed_interval_counters"] = phase_counters
+             phases[phase]["observed_interval_seconds"] = elapsed
+@@ -80,7 +92,7 @@
+         counters = {field: sum(row.get(field, 0) for row in observed)
+                     for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar", "minor_faults", "major_faults")}
+         counters["cpu_seconds"] = counters["cpu_ticks"] / self.tree.clock_ticks
+-        return dict(phases=phases, subject_observed_counters=counters,
++        return dict(phases=phases, phase_interval_policy=PHASE_INTERVAL_POLICY, subject_observed_counters=counters,
+                     sampled_peak_pss_swap_kib=max((sample["pss_swap_kib"] for sample in self.small), default=0),
+                     sampled_peak_rss_kib=max((sample["rss_kib"] for sample in self.small), default=0),
+                     sampling_scope="actual Core backends + reference modules; Python/driver control overhead separately grouped",
+--- a/examples/performance/history-scale/test_harness.py
++++ b/examples/performance/history-scale/test_harness.py
+@@ -203,7 +203,7 @@
+         metrics.tree = SimpleNamespace(last={}, clock_ticks=100, totals=lambda: {})
+         metrics.small = []
+         for elapsed, ticks in ((0.1, 10), (0.9, 0)):
+-            metrics.small.append(dict(phase="idle", interval_seconds=elapsed, rss_kib=10, pss_kib=8,
++            metrics.small.append(dict(phase="idle", interval_seconds=elapsed, phase_interval_eligible=True, rss_kib=10, pss_kib=8,
+                 pss_swap_kib=9, swap_pss_kib=1, private_kib=4, cpu_percent_one_core=100 * ticks / 100 / elapsed,
+                 interval_counters=dict(cpu_ticks=ticks, read_bytes=0, write_bytes=0, rchar=0, wchar=0)))
+         phase = metrics.summary()["phases"]["idle"]
+--- /dev/null
++++ b/examples/performance/history-scale/test_phase_intervals.py
+@@ -0,0 +1,209 @@
++"""Deterministic phase attribution using a private fake proc tree; no child processes."""
++from contextlib import redirect_stdout
++import io
++import json
++from pathlib import Path
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from measurement import Metrics, Tree
++import proc_sampler
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import summarize
++
++
++class PhaseIntervalTests(unittest.TestCase):
++    def process(self, proc, cpu=0, rss=100):
++        path = proc/'100'
++        path.mkdir(parents=True, exist_ok=True)
++        fields = ['0'] * 22
++        fields[0], fields[1], fields[11], fields[12], fields[19] = 'S', '1', str(cpu), '0', '100'
++        (path/'stat').write_text('100 (synthetic) '+' '.join(fields))
++        (path/'smaps_rollup').write_text(f'Rss: {rss} kB\nPss: 80 kB\nSwapPss: 2 kB\nPrivate_Clean: 3 kB\nPrivate_Dirty: 4 kB\n')
++        (path/'io').write_text(f'read_bytes: {cpu*10}\nwrite_bytes: {cpu*20}\nrchar: {cpu*30}\nwchar: {cpu*40}\n')
++        (path/'status').write_text('VmHWM: 10000 kB\nThreads: 1\n')
++        (path/'cmdline').write_bytes(b'/synthetic/backend\0')
++        (proc/'uptime').write_text('1000 0\n')
++
++    def scenario(self, root, *, boundary_sample=False, finish=True, boundary_rss=100):
++        proc = root/'proc'
++        case = root/'case'
++        case.mkdir()
++        self.process(proc)
++        tree = Tree(100, root_group='backend', proc=proc)
++        tree.clock_ticks = 100
++        clock = SimpleNamespace(ns=1_000_000_000)
++        args = SimpleNamespace(max_pss_mib=1024, timeout=60, interval=0.1)
++        with patch.object(proc_sampler.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
++             patch.object(proc_sampler.time, 'monotonic', side_effect=lambda: clock.ns/1e9):
++            metrics = Metrics(tree, case, args)
++            try:
++                metrics.mark('first_launch')
++                metrics.sample()
++                clock.ns = 2_000_000_000
++                self.process(proc, cpu=100, rss=boundary_rss)
++                if boundary_sample:
++                    metrics.sample()
++                metrics.mark('resident_idle')
++                if not boundary_sample:
++                    metrics.sample()
++                if finish:
++                    clock.ns = 3_000_000_000
++                    self.process(proc, cpu=100)
++                    metrics.sample()
++                measurement = metrics.summary()
++            finally:
++                metrics.close()
++        events = [json.loads(line) for line in (case/'samples.jsonl').read_text().splitlines()]
++        return case, measurement, events
++
++    def render(self, root, case, measurement):
++        source = root/'report.json'
++        output = root/'comparison.md'
++        source.write_text(json.dumps({'status': 'complete', 'mode': 'agent-control', 'runs': [
++            {'status': 'passed', 'mode': 'agent-control', 'messages_per_session': 1,
++             'peers': 1, 'path': str(case), 'measurement': measurement}]}))
++        original = {path: path.read_bytes() for path in [source, case/'samples.jsonl']}
++        with patch.object(sys, 'argv', ['summarize.py', '--active-before', str(source), '--output', str(output)]), \
++             redirect_stdout(io.StringIO()):
++            summarize.main()
++        self.assertEqual(original, {path: path.read_bytes() for path in original})
++        return output.read_text()
++
++    def full_tree_row(self, text):
++        return next(line for line in text.splitlines() if line.startswith('|') and '+ управляющий процесс' in line)
++
++    def test_phase_summary_does_not_charge_launch_work_to_idle(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, events = self.scenario(Path(directory), boundary_rss=400)
++            idle = measurement['phases']['resident_idle']
++            # Behavioral red assertion occurs before access to new evidence fields.
++            self.assertEqual(idle['cpu_percent_one_core_weighted_mean'], 0)
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': 0, 'peak': 0})
++            self.assertEqual(idle['observed_interval_counters']['cpu_ticks'], 0)
++            self.assertEqual(idle['excluded_interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(idle['excluded_interval_counters']['read_bytes'], 1000)
++            self.assertEqual(idle['observed_interval_seconds'], 1)
++            self.assertEqual(idle['excluded_interval_seconds'], 1)
++            self.assertEqual(idle['eligible_interval_samples'], 1)
++            self.assertEqual(idle['excluded_interval_samples'], 1)
++            self.assertEqual(idle['samples'], 2)
++            self.assertEqual(idle['rss_kib'], {'median': 250, 'peak': 400})
++            self.assertEqual(measurement['subject_observed_counters']['cpu_ticks'], 100)
++            self.assertEqual(measurement['full_tree']['cpu_ticks'], 100)
++            samples = [event for event in events if event.get('type') == 'sample' and event['phase'] == 'resident_idle']
++            self.assertEqual(samples[0]['interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(samples[0]['interval_start_monotonic_ns'], 1_000_000_000)
++            self.assertFalse(samples[0]['phase_interval_eligible'])
++            self.assertTrue(samples[1]['phase_interval_eligible'])
++
++    def test_full_tree_comparison_does_not_charge_launch_work_to_idle(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            case, measurement, _ = self.scenario(root)
++            text = self.render(root, case, measurement)
++            self.assertEqual(self.full_tree_row(text).split('|')[-2].strip(), '0.00')
++            self.assertIn('1/2', text)
++
++    def test_explicit_old_phase_boundary_sample_preserves_attribution(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, _ = self.scenario(Path(directory), boundary_sample=True)
++            launch = measurement['phases']['first_launch']
++            idle = measurement['phases']['resident_idle']
++            self.assertEqual(launch['observed_interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(launch['cpu_percent_one_core_weighted_mean'], 100)
++            self.assertEqual(idle['cpu_percent_one_core_weighted_mean'], 0)
++            self.assertEqual(idle['eligible_interval_samples'], 1)
++            self.assertEqual(idle['excluded_interval_samples'], 0)
++
++    def test_every_marker_starts_an_epoch_even_when_label_returns_or_repeats(self):
++        tracker = proc_sampler.PhaseIntervals()
++        def mark(phase, time):
++            tracker.observe({'type': 'phase', 'phase': phase, 'monotonic_ns': time})
++        def sample(start, end, phase='A'):
++            return tracker.observe({'type': 'sample', 'phase': phase, 'interval_start_monotonic_ns': start,
++                                    'monotonic_ns': end, 'interval_seconds': (end-start)/1e9})
++        mark('A', 0)
++        self.assertTrue(sample(0, 10))
++        mark('B', 12)
++        mark('A', 15)
++        self.assertFalse(sample(10, 20))
++        self.assertTrue(sample(20, 30))
++        mark('A', 35)
++        self.assertFalse(sample(30, 40))
++        self.assertTrue(sample(40, 50))
++
++    def test_unknown_or_empty_interval_coverage_is_not_zero_cpu(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, _ = self.scenario(Path(directory), finish=False)
++            idle = measurement['phases']['resident_idle']
++            self.assertIsNone(idle['cpu_percent_one_core_weighted_mean'])
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': None, 'peak': None})
++            self.assertEqual(idle['rss_kib']['median'], 100)
++            self.assertEqual(idle['excluded_interval_counters']['cpu_ticks'], 100)
++        tracker = proc_sampler.PhaseIntervals()
++        sample = {'type': 'sample', 'phase': 'idle', 'interval_start_monotonic_ns': 10,
++                  'monotonic_ns': 20, 'interval_seconds': 1e-8}
++        self.assertFalse(tracker.observe(sample))
++        tracker.observe({'type': 'phase', 'phase': 'idle', 'monotonic_ns': 10})
++        for changes in [{'interval_start_monotonic_ns': None}, {'interval_start_monotonic_ns': True},
++                        {'interval_seconds': None}, {'interval_seconds': 0}, {'interval_seconds': -1},
++                        {'interval_seconds': float('nan')}, {'monotonic_ns': 10}, {'phase': 'different'}]:
++            with self.subTest(changes=changes):
++                self.assertFalse(tracker.observe({**sample, **changes}))
++
++    def test_legacy_raw_samples_keep_memory_but_not_unproven_full_tree_cpu(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            case, measurement, events = self.scenario(root)
++            for event in events:
++                event.pop('interval_start_monotonic_ns', None)
++                event.pop('phase_interval_eligible', None)
++            (case/'samples.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++            measurement.pop('phase_interval_policy')
++            measurement['phases']['resident_idle']['cpu_percent_one_core_weighted_mean'] = 50
++            text = self.render(root, case, measurement)
++            full = self.full_tree_row(text)
++            self.assertEqual(full.split('|')[-2].strip(), 'н/д')
++            self.assertIn('0.10', full)
++            subject = next(line for line in text.splitlines() if line.startswith('|')
++                           and ': resident_idle ' in line and '+ управляющий процесс' not in line)
++            self.assertEqual(subject.split('|')[-2].strip(), '50.00')
++            self.assertIn('без ретроактивного пересчёта', text)
++
++    def test_same_phase_weighted_cpu_and_all_memory_samples_are_retained(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.process(root/'proc')
++            tree = Tree(100, root_group='backend', proc=root/'proc')
++            tree.clock_ticks = 100
++            clock = SimpleNamespace(ns=1_000_000_000)
++            args = SimpleNamespace(max_pss_mib=1024, timeout=60)
++            with patch.object(proc_sampler.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
++                 patch.object(proc_sampler.time, 'monotonic', side_effect=lambda: clock.ns/1e9):
++                metrics = Metrics(tree, root, args)
++                try:
++                    metrics.mark('idle')
++                    metrics.sample()
++                    clock.ns = 1_100_000_000
++                    self.process(root/'proc', cpu=10, rss=200)
++                    metrics.sample()
++                    clock.ns = 2_000_000_000
++                    self.process(root/'proc', cpu=10, rss=300)
++                    metrics.sample()
++                    idle = metrics.summary()['phases']['idle']
++                finally:
++                    metrics.close()
++            self.assertAlmostEqual(idle['cpu_percent_one_core_weighted_mean'], 10)
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': 50, 'peak': 100})
++            self.assertEqual(idle['rss_kib'], {'median': 200, 'peak': 300})
++            self.assertEqual(idle['eligible_interval_samples'], 2)
++            self.assertEqual(idle['excluded_interval_samples'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/summarize.py
++++ b/examples/performance/summarize.py
+@@ -6,6 +6,8 @@
+ import math
+ from pathlib import Path
+ import statistics
++
++from common.proc_sampler import PHASE_INTERVAL_POLICY, PhaseIntervals
+ 
+ 
+ def get(value, *keys):
+@@ -110,6 +112,9 @@
+                 readiness[(scenario, 'внешнее наблюдение готовности, мс')][side].append(external * 1000 if number(external) else None)
+             else:
+                 phases = measurement.get('phases', {})
++                if phases and measurement.get('phase_interval_policy') != PHASE_INTERVAL_POLICY:
++                    notices.append(f'{path}: сохранённые subject phase CPU aggregates не подтверждают whole-interval policy; '
++                                   'они показаны как записаны, без ретроактивного пересчёта.')
+                 memory[scenario + ': пик всего кейса'][side].append(dict(
+                     peak_rss=measurement.get('sampled_peak_rss_kib'),
+                     peak_pss_swap=measurement.get('sampled_peak_pss_swap_kib')))
+@@ -123,6 +128,10 @@
+                     values.update(peak_rss=get(data, 'rss_kib', 'peak'), peak_pss_swap=get(data, 'pss_swap_kib', 'peak'),
+                                   cpu=data.get('cpu_percent_one_core_weighted_mean'))
+                     memory[scenario + ': ' + phase][side].append(values)
++                    if data.get('excluded_interval_seconds', 0) > 0:
++                        notices.append(f'{path}, {phase}: из phase CPU/IO исключено '
++                                       f'{data["excluded_interval_seconds"]:.6g} с смешанных/неподтверждённых интервалов; '
++                                       f'учтено {data.get("observed_interval_seconds", 0):.6g} с.')
+                 if kind == 'idle':
+                     for cache in ('first', 'restart'):
+                         for key in ('all_http_bound_ms', 'all_snapshots_ready_ms'):
+@@ -131,18 +140,27 @@
+                     events = measurement.get('events', [])
+                     samples_path = Path(row.get('path', path.parent)) / 'samples.jsonl'
+                     if samples_path.is_file():
+-                        samples = [item for line in samples_path.read_text().splitlines()
+-                                   if (item := json.loads(line)).get('type') == 'sample'
+-                                   and item.get('phase') == 'resident_idle']
++                        phase_intervals = PhaseIntervals()
++                        samples = []
++                        for line in samples_path.read_text().splitlines():
++                            item = json.loads(line)
++                            eligible = phase_intervals.observe(item)
++                            if item.get('type') == 'sample' and item.get('phase') == 'resident_idle':
++                                item['phase_interval_eligible'] = eligible
++                                samples.append(item)
+                         if samples:
+                             values = {key: statistics.median(item[key] for item in samples)
+                                       for key in ('rss_kib','pss_kib','swap_pss_kib','pss_swap_kib')}
+-                            intervals = [item for item in samples if item.get('interval_seconds')]
++                            intervals = [item for item in samples if item['phase_interval_eligible']]
+                             values.update(peak_rss=max(item['rss_kib'] for item in samples),
+                                           peak_pss_swap=max(item['pss_swap_kib'] for item in samples),
+                                           cpu=sum((item.get('interval_cpu_percent_one_core') or 0)*item['interval_seconds'] for item in intervals)
+                                           / sum(item['interval_seconds'] for item in intervals) if intervals else None)
+                             memory[scenario+': resident_idle + управляющий процесс'][side].append(values)
++                            if len(intervals) != len(samples):
++                                notices.append(f'{samples_path}: full-tree idle CPU использует '
++                                               f'{len(intervals)}/{len(samples)} сэмплов с подтверждённым целым интервалом; '
++                                               'границы и legacy samples без interval-start provenance исключены, память сохранена.')
+                     for phase in ('parent_ready', 'all_models_entered', 'round_settled'):
+                         elapsed = [event.get('elapsed_ms') for event in events if event.get('phase') == phase]
+                         readiness[(scenario, phase + ' (первое событие), мс')][side].append(elapsed[0] if elapsed else None)
+@@ -155,11 +173,13 @@
+              'и read_file; Python/driver overhead исключён из измеряемой памяти. Число сообщений задано в каждой сессии.', '',
+              'Дополнительные строки «+ управляющий процесс» включают Rust AgentControl driver и всё его дерево; внешний Python измеритель в них не входит.', '',
+              'CPU — среднее с весом по времени внутри фазы (100% = одно ядро), затем медиана повторов. '
++             'Новая history-scale policy учитывает лишь интервалы целиком после наблюдавшегося phase marker; '
++             'coverage и исключения приведены отдельно. Сохранённые legacy aggregates не переоцениваются. '
+              'RSS суммирует разделяемые страницы; PSS распределяет их. PSS+SwapPss учитывает вытеснение в swap. '
+              'Пики — максимумы одновременных сэмплов внутри каждого кейса/фазы, затем медиана повторов; '
+              'короткие пики между сэмплами могут быть пропущены. OS cache не сбрасывается; first — пустой кэш приложения, restart — повторный процесс.', '']
+     if notices:
+-        lines += ['## Незавершённые прогоны', ''] + [f'- {escape(item)}' for item in notices] + ['']
++        lines += ['## Ограничения и неполные данные', ''] + [f'- {escape(item)}' for item in notices] + ['']
+     lines += ['## Память и CPU', '']
+     memory_rows = []
+     for scenario, sides in sorted(memory.items()):
