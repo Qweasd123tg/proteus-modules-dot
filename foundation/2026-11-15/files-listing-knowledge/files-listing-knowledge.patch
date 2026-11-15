@@ -1,0 +1,209 @@
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -96,7 +96,7 @@
+ pub type Loader<'a> = dyn FnMut(&str) -> Result<Listing> + 'a;
+ 
+ pub struct Project {
+-    /// Listed folders until the next refresh; `None` — the folder is gone.
++    /// Listings until refresh; `None` memoizes a failed attempt, not absence.
+     listings: HashMap<String, Option<Listing>>,
+     pub expanded: HashSet<String>,
+     /// First folder of each folded row by its deepest folder.
+@@ -118,13 +118,14 @@
+ impl Project {
+     /// Forgets listings; the next render lists the visible folders again.
+     /// A partial refresh keeps listings of collapsed folders, which only
+-    /// decide how rows fold.
++    /// decide how rows fold. Failed attempts expire even for collapsed folders.
+     pub fn invalidate(&mut self, full: bool) {
+         if full {
+             self.listings.clear();
+         } else {
+             let expanded = &self.expanded;
+-            self.listings.retain(|path, _| !expanded.contains(path));
++            self.listings
++                .retain(|path, listing| listing.is_some() && !expanded.contains(path));
+         }
+     }
+ 
+@@ -185,7 +186,6 @@
+         lines: &mut Vec<Line>,
+     ) {
+         let Some(listing) = self.listing(folder, load).cloned() else {
+-            self.expanded.remove(folder);
+             return;
+         };
+         self.truncated |= listing.truncated;
+@@ -339,7 +339,6 @@
+         self.expanded.retain(|open| {
+             open.is_empty()
+                 || match listings.get(paths::parent(open)) {
+-                    Some(None) => false,
+                     Some(Some(listing)) if !listing.truncated => listing
+                         .entries
+                         .iter()
+@@ -353,7 +352,6 @@
+     pub fn exists(&self, path: &str) -> bool {
+         path.is_empty()
+             || match self.listings.get(paths::parent(path)) {
+-                Some(None) => false,
+                 Some(Some(listing)) if !listing.truncated => {
+                     listing.entries.iter().any(|entry| entry.path == path)
+                 }
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -135,3 +135,154 @@
+             .is_err()
+     );
+ }
++
++#[test]
++fn failed_expanded_listing_keeps_intent_and_retries_on_partial_refresh() {
++    let folders = workspace(&[
++        ("", &[("a", true)]),
++        ("a", &[("b", true), ("visible.rs", false)]),
++        ("a/b", &[("nested.rs", false)]),
++    ]);
++    let mut project = Project::default();
++    project.expanded.extend(["a".into(), "a/b".into()]);
++    project.lines("p", &mut loader(&folders)).unwrap();
++    project.invalidate(false);
++
++    let attempts = std::cell::Cell::new(0);
++    let mut unavailable = |path: &str| {
++        if path == "a" {
++            attempts.set(attempts.get() + 1);
++            Err(proteus_extension::anyhow!("temporarily unavailable"))
++        } else {
++            loader(&folders)(path)
++        }
++    };
++    project.lines("p", &mut unavailable).unwrap();
++    assert_eq!(attempts.get(), 1, "fold and visit share one failed attempt");
++    assert!(project.is_expanded("a") && project.is_expanded("a/b"));
++    assert!(project.exists("a/visible.rs") && project.exists("a/b"));
++    // Another render before refresh does not busy-retry the failed listing.
++    project.lines("p", &mut unavailable).unwrap();
++    assert_eq!(attempts.get(), 1);
++
++    project.invalidate(false);
++    let lines = project.lines("p", &mut loader(&folders)).unwrap();
++    assert!(project.is_expanded("a") && project.is_expanded("a/b"));
++    assert!(lines.iter().any(|line| line.path == "a/visible.rs"));
++    assert!(lines.iter().any(|line| line.path == "a/b/nested.rs"));
++}
++
++#[test]
++fn collapsed_failure_expires_but_successful_lookahead_stays_cached() {
++    let folders = workspace(&[
++        ("", &[("a", true), ("z", true)]),
++        ("a", &[("b", true)]),
++        ("a/b", &[("file.rs", false)]),
++        ("z", &[("file.rs", false)]),
++    ]);
++    let calls = std::cell::RefCell::new(HashMap::<String, usize>::new());
++    let fail = std::cell::Cell::new(true);
++    let mut load = |path: &str| {
++        *calls.borrow_mut().entry(path.to_owned()).or_default() += 1;
++        if path == "a" && fail.get() {
++            Err(proteus_extension::anyhow!("temporarily unavailable"))
++        } else {
++            loader(&folders)(path)
++        }
++    };
++    let mut project = Project::default();
++    project.lines("p", &mut load).unwrap();
++    fail.set(false);
++    project.lines("p", &mut load).unwrap();
++    assert_eq!(calls.borrow().get("a"), Some(&1));
++    assert_eq!(calls.borrow().get("z"), Some(&1));
++
++    project.invalidate(false);
++    let lines = project.lines("p", &mut load).unwrap();
++    assert_eq!(calls.borrow().get("a"), Some(&2));
++    assert_eq!(calls.borrow().get("z"), Some(&1));
++    assert!(lines.iter().any(|line| line.path == "a/b" && line.expanded == Some(false)));
++    assert_eq!(project.expanded, HashSet::from([String::new()]));
++}
++
++#[test]
++fn only_complete_parent_absence_prunes_unknown_descendants() {
++    let folders = workspace(&[("", &[("a", true)]), ("a", &[("b", true)]), ("a/b", &[])]);
++    let mut project = Project::default();
++    project.expanded.extend(["a".into(), "a/b".into()]);
++    project.listings.insert(String::new(), Some(folders[""].clone()));
++    project.listings.insert("a".into(), None);
++    project.prune();
++    assert!(project.is_expanded("a/b") && project.exists("a/b"));
++
++    project.listings.insert("a".into(), Some(Listing {
++        entries: Vec::new(), truncated: true,
++    }));
++    project.prune();
++    assert!(project.is_expanded("a/b") && project.exists("a/b"));
++
++    project.listings.insert("a".into(), Some(Listing::default()));
++    project.prune();
++    assert!(!project.is_expanded("a/b") && !project.exists("a/b"));
++    assert!(project.is_expanded("a") && project.exists("a"));
++}
++
++#[test]
++fn recovered_listing_does_not_reverse_explicit_collapse() {
++    let folders = workspace(&[("", &[("a", true)]), ("a", &[("file.rs", false)])]);
++    let mut project = Project::default();
++    project.expanded.insert("a".into());
++    project.lines("p", &mut loader(&folders)).unwrap();
++    project.invalidate(false);
++    let mut unavailable = |path: &str| {
++        if path == "a" { Err(proteus_extension::anyhow!("unavailable")) }
++        else { loader(&folders)(path) }
++    };
++    project.lines("p", &mut unavailable).unwrap();
++    project.collapse("a");
++    project.invalidate(false);
++    let lines = project.lines("p", &mut loader(&folders)).unwrap();
++    assert!(!project.is_expanded("a"));
++    assert!(lines.iter().any(|line| line.path == "a" && line.expanded == Some(false)));
++    assert!(!lines.iter().any(|line| line.path == "a/file.rs"));
++}
++
++#[test]
++fn failed_collapsed_lookahead_still_obeys_per_render_budget() {
++    let root = Listing {
++        entries: (0..LOOKAHEAD + 8).map(|index| Entry {
++            name: format!("folder-{index}"), path: format!("folder-{index}"), kind: Kind::Directory,
++        }).collect(),
++        truncated: false,
++    };
++    let attempts = std::cell::Cell::new(0);
++    let mut load = |path: &str| {
++        if path.is_empty() { return Ok(root.clone()); }
++        attempts.set(attempts.get() + 1);
++        Err(proteus_extension::anyhow!("unavailable"))
++    };
++    let mut project = Project::default();
++    project.lines("p", &mut load).unwrap();
++    assert_eq!(attempts.get(), LOOKAHEAD);
++    project.invalidate(false);
++    project.lines("p", &mut load).unwrap();
++    assert_eq!(attempts.get(), LOOKAHEAD * 2);
++    assert_eq!(project.expanded, HashSet::from([String::new()]));
++}
++
++#[test]
++fn failed_full_refresh_also_preserves_expanded_intent() {
++    let folders = workspace(&[("", &[("a", true)]), ("a", &[("file.rs", false)])]);
++    let mut project = Project::default();
++    project.expanded.insert("a".into());
++    project.lines("p", &mut loader(&folders)).unwrap();
++    project.invalidate(true);
++    let mut unavailable = |path: &str| {
++        if path == "a" { Err(proteus_extension::anyhow!("unavailable")) }
++        else { loader(&folders)(path) }
++    };
++    project.lines("p", &mut unavailable).unwrap();
++    assert!(project.is_expanded("a") && project.exists("a/file.rs"));
++    project.invalidate(false);
++    assert!(project.lines("p", &mut loader(&folders)).unwrap().iter().any(|line| line.path == "a/file.rs"));
++}
