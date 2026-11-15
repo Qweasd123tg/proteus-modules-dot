@@ -1,0 +1,928 @@
+diff --git a/docs/reference.md b/docs/reference.md
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -59,6 +59,16 @@
+ остальные fidelity gates. Native CLI `0.167.0` по умолчанию предоставляет
+ programmatic `exec` через отдельный code-mode-host; local summary compactor
+ и protocol/tool/session orchestration этой сборки проверяются отдельно.
++
++## Окончания Строк В Direct Patch
++
++`direct_patch` сохраняет CRLF при update, если все имеющиеся newline исходного
++файла используют CRLF. LF/CRLF самого patch не выбирает EOL результата.
++Отсутствие final newline сохраняется; `*** End of File` убирает final newline.
++Файл без newline и `Add File` используют прежний LF формат. Bare CR остаётся
++данными. Mixed LF/CRLF source сохраняет прежний exact LF-based путь без общей
++нормализации: CRLF строки mixed-файла по-прежнему могут не совпасть с hunk.
++Это не меняет newline representation в `file-tools` ranged reads/edits.
+ 
+ ## CodeMode
+ 
+@@ -230,6 +240,14 @@
+ будит их через общий wake fd, без периодического опроса. Потомок, ушедший через `setsid` и
+ сохранивший эти fd, не может бесконечно продлить ожидание EOF; это не обещание
+ остановить процесс, который покинул принадлежащую вызову process group.
++
++Текстовый preview `exec_command` / `write_stdin` сохраняет до трёх trailing bytes
++незавершённого UTF-8 символа между незавершающими polls. Они выдаются вместе с
++продолжением символа, а `output_bytes` считает только bytes текущей выдачи.
++Заведомо невалидный/binary вывод по-прежнему отображается с replacement characters.
++При terminal выдаче или закрытии всех readers оставшийся incomplete suffix
++выдаётся через тот же lossy decoder; terminal status не доказывает полный EOF.
++Head/tail truncation и исходный raw capture не меняются.
+ 
+ ### Явный Source Capture Для Exec
+ 
+diff --git a/tool/direct-patch/src/transaction.rs b/tool/direct-patch/src/transaction.rs
+--- a/tool/direct-patch/src/transaction.rs
++++ b/tool/direct-patch/src/transaction.rs
+@@ -63,7 +63,7 @@
+                 self.set_current(
+                     target,
+                     Some(FileVersion {
+-                        content: render_text(&lines, true),
++                        content: render_text(&lines, true, "\n"),
+                         permissions: None,
+                     }),
+                 );
+@@ -244,7 +244,18 @@
+ }
+ 
+ fn apply_hunks(original: &str, hunks: &[Hunk], no_newline_at_eof: bool) -> Result<String, String> {
+-    let (mut lines, mut trailing_newline) = split_lines(original);
++    // Use CRLF only when every source newline is CRLF. Mixed files keep the
++    // existing LF representation rather than silently normalizing their bytes.
++    let line_ending = if original.contains("\r\n")
++        && original
++            .split_inclusive('\n')
++            .all(|line| !line.ends_with('\n') || line.ends_with("\r\n"))
++    {
++        "\r\n"
++    } else {
++        "\n"
++    };
++    let (mut lines, mut trailing_newline) = split_lines(original, line_ending);
+     let mut cursor = 0;
+     for hunk in hunks {
+         let mut old_lines = Vec::new();
+@@ -272,15 +283,15 @@
+     if no_newline_at_eof {
+         trailing_newline = false;
+     }
+-    Ok(render_text(&lines, trailing_newline))
+-}
+-
+-fn split_lines(text: &str) -> (Vec<String>, bool) {
+-    let trailing_newline = text.ends_with('\n');
++    Ok(render_text(&lines, trailing_newline, line_ending))
++}
++
++fn split_lines(text: &str, line_ending: &str) -> (Vec<String>, bool) {
++    let trailing_newline = text.ends_with(line_ending);
+     let lines = if text.is_empty() {
+         Vec::new()
+     } else {
+-        text.split_terminator('\n').map(str::to_owned).collect()
++        text.split_terminator(line_ending).map(str::to_owned).collect()
+     };
+     (lines, trailing_newline)
+ }
+@@ -296,13 +307,16 @@
+     (start..=last_start).find(|&index| lines[index..index + needle.len()] == needle[..])
+ }
+ 
+-fn render_text(lines: &[String], trailing_newline: bool) -> String {
++fn render_text(lines: &[String], trailing_newline: bool, line_ending: &str) -> String {
+     if lines.is_empty() {
+         return String::new();
+     }
+-    let mut text = lines.join("\n");
++    let mut text = lines.join(line_ending);
+     if trailing_newline {
+-        text.push('\n');
++        text.push_str(line_ending);
+     }
+     text
+ }
++
++#[cfg(test)]
++mod eol_tests;
+diff --git a/tool/direct-patch/src/transaction/eol_tests.rs b/tool/direct-patch/src/transaction/eol_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/direct-patch/src/transaction/eol_tests.rs
+@@ -0,0 +1,83 @@
++use super::*;
++
++fn update(original: &str, patch: &str) -> Result<String, String> {
++    let operations = crate::parse_patch(patch)?;
++    let [PatchOperation::Update { hunks, no_newline_at_eof, .. }] = operations.as_slice() else {
++        panic!("fixture must contain one update");
++    };
++    apply_hunks(original, hunks, *no_newline_at_eof)
++}
++
++const REPLACE_FIRST: &str = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n keep\n*** End Patch";
++
++#[test]
++fn source_eol_not_patch_eol_controls_uniform_updates() {
++    for source_eol in ["\n", "\r\n"] {
++        for patch_eol in ["\n", "\r\n"] {
++            let original = format!("old{source_eol}keep{source_eol}");
++            let patch = REPLACE_FIRST.replace('\n', patch_eol);
++            assert_eq!(
++                update(&original, &patch).unwrap(),
++                format!("new{source_eol}keep{source_eol}")
++            );
++        }
++    }
++}
++
++#[test]
++fn crlf_insert_remove_and_multiple_hunks_keep_the_source_delimiter() {
++    let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n old\n+inserted\n keep\n@@\n-remove\n+replacement\n tail\n*** End Patch";
++    assert_eq!(
++        update("old\r\nkeep\r\nremove\r\ntail\r\n", patch).unwrap(),
++        "old\r\ninserted\r\nkeep\r\nreplacement\r\ntail\r\n"
++    );
++}
++
++#[test]
++fn unterminated_and_explicit_eof_updates_do_not_leave_a_stray_carriage_return() {
++    assert_eq!(update("old\r\nkeep", REPLACE_FIRST).unwrap(), "new\r\nkeep");
++    let patch = REPLACE_FIRST.replace("*** End Patch", "*** End of File\n*** End Patch");
++    assert_eq!(update("old\r\nkeep\r\n", &patch).unwrap(), "new\r\nkeep");
++
++    let append = "*** Begin Patch\n*** Update File: file.txt\n@@\n-drop\n last\n+added\n*** End Patch";
++    assert_eq!(update("drop\r\nlast", append).unwrap(), "last\r\nadded");
++}
++
++#[test]
++fn empty_blank_and_no_hunk_roundtrips_keep_existing_newline_semantics() {
++    for source in ["", "plain", "bare\r", "\r\n", "a\r\n\r\n", "a\n", "a\nother\r\n"] {
++        assert_eq!(apply_hunks(source, &[], false).unwrap(), source);
++    }
++    let remove = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n*** End Patch";
++    assert_eq!(update("old\r\n", remove).unwrap(), "");
++    let blank = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n \n keep\n*** End Patch";
++    assert_eq!(update("old\r\n\r\nkeep\r\n", blank).unwrap(), "new\r\n\r\nkeep\r\n");
++}
++
++#[test]
++fn bare_carriage_returns_remain_data_and_no_eol_source_uses_lf() {
++    let first_only = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch";
++    assert_eq!(update("old\r\nliteral\r", first_only).unwrap(), "new\r\nliteral\r");
++    assert!(update("old\r", first_only).is_err());
++    let internal = "*** Begin Patch\n*** Update File: file.txt\n@@\n-left\rmid\n+right\rmid\n*** End Patch";
++    assert_eq!(update("left\rmid\r\n", internal).unwrap(), "right\rmid\r\n");
++    let insert = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n+second\n*** End Patch";
++    assert_eq!(update("old", insert).unwrap(), "new\nsecond");
++}
++
++#[test]
++fn mixed_eol_keeps_legacy_matching_and_untouched_bytes() {
++    let first_only = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch";
++    assert_eq!(update("old\nkeep\r\n", first_only).unwrap(), "new\nkeep\r\n");
++    assert!(update("old\r\nkeep\n", first_only).is_err());
++    assert!(update("old\nkeep\r\n", REPLACE_FIRST).is_err());
++}
++
++#[test]
++fn add_file_content_still_uses_lf_even_when_patch_text_is_crlf() {
++    let operations = crate::parse_patch("*** Begin Patch\r\n*** Add File: new.txt\r\n+one\r\n+two\r\n*** End Patch").unwrap();
++    let [PatchOperation::Add { lines, .. }] = operations.as_slice() else {
++        panic!("fixture must contain one add");
++    };
++    assert_eq!(render_text(lines, true, "\n"), "one\ntwo\n");
++}
+diff --git a/tool/file-tools/src/lib.rs b/tool/file-tools/src/lib.rs
+--- a/tool/file-tools/src/lib.rs
++++ b/tool/file-tools/src/lib.rs
+@@ -26,6 +26,7 @@
+ mod list;
+ mod read;
+ mod read_many;
++mod read_text;
+ mod search;
+ mod util;
+ mod write;
+diff --git a/tool/file-tools/src/read.rs b/tool/file-tools/src/read.rs
+--- a/tool/file-tools/src/read.rs
++++ b/tool/file-tools/src/read.rs
+@@ -9,6 +9,7 @@
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::json;
+ 
++use crate::read_text::decode_read_bytes;
+ use crate::util::{
+     err_result, module_error, ok_result, optional_positive_usize, parse_call,
+     parse_invocation_context, required_string, workspace_path,
+@@ -24,7 +25,7 @@
+     fn spec_json(&self) -> String {
+         let spec = json!({
+             "name": "read_file",
+-            "description": "Read a UTF-8 file inside the current workspace, optionally by line range. Output and each line are limited to 2 MiB; ranged reads scan at most 16 MiB. Truncated ranges report total_lines as unknown.",
++            "description": "Read a UTF-8 file inside the current workspace, optionally by line range. Unnumbered ranges preserve separators between returned lines but omit the last selected line ending; numbered output uses LF separators. Output and each line are limited to 2 MiB; ranged reads scan at most 16 MiB. Truncated ranges report total_lines as unknown.",
+             "input_schema": {
+                 "type": "object",
+                 "properties": {
+@@ -208,6 +209,7 @@
+     let mut scanned_bytes = 0u64;
+     let mut returned = 0usize;
+     let mut output = String::new();
++    let mut separator = "";
+     let mut line = Vec::new();
+     let mut eof = false;
+     let mut reason = None;
+@@ -237,12 +239,17 @@
+         }
+         scanned_lines += 1;
+         let complete = line.ends_with(b"\n") || read < allowance as usize;
+-        if line.ends_with(b"\n") {
++        let line_ending = if line.ends_with(b"\n") {
+             line.pop();
+             if line.ends_with(b"\r") {
+                 line.pop();
+-            }
+-        }
++                "\r\n"
++            } else {
++                "\n"
++            }
++        } else {
++            ""
++        };
+         if scanned_lines < start_line {
+             if !complete {
+                 reason = Some("line_budget");
+@@ -255,28 +262,23 @@
+         } else {
+             String::new()
+         };
+-        let separator = usize::from(returned != 0);
+-        let available =
+-            (MAX_READ_FILE_BYTES as usize).saturating_sub(output.len() + prefix.len() + separator);
++        let available = (MAX_READ_FILE_BYTES as usize)
++            .saturating_sub(output.len() + prefix.len() + separator.len());
+         if available == 0 {
+             reason = Some("output_budget");
+             break;
+         }
+-        let mut end = line.len().min(available);
+-        let text = match std::str::from_utf8(&line[..end]) {
+-            Ok(text) => text,
+-            Err(error) if error.error_len().is_none() && (end < line.len() || !complete) => {
+-                end = error.valid_up_to();
+-                std::str::from_utf8(&line[..end]).expect("validated UTF-8 prefix")
+-            }
+-            Err(error) => return Err(format!("invalid UTF-8 in {}: {error}", path.display())),
+-        };
+-        if separator != 0 {
+-            output.push('\n');
+-        }
++        let end = line.len().min(available);
++        let text = decode_read_bytes(&line[..end], end < line.len() || !complete)
++            .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
++        let end = text.len();
++        output.push_str(separator);
+         output.push_str(&prefix);
+         output.push_str(text);
+         returned += 1;
++        // Keep the previous selected line's delimiter, not the current one's.
++        // Delaying it preserves the existing omission of the final delimiter.
++        separator = if options.line_numbers { "\n" } else { line_ending };
+         if end < line.len() || !complete {
+             reason = Some("output_budget");
+             break;
+@@ -312,3 +314,7 @@
+ #[cfg(test)]
+ #[path = "read_budget_tests.rs"]
+ mod budget_tests;
++
++#[cfg(test)]
++#[path = "read_eol_tests.rs"]
++mod eol_tests;
+diff --git a/tool/file-tools/src/read_eol_tests.rs b/tool/file-tools/src/read_eol_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/file-tools/src/read_eol_tests.rs
+@@ -0,0 +1,121 @@
++use super::*;
++use std::io::Cursor;
++
++#[test]
++fn unnumbered_ranges_preserve_selected_inter_line_endings() {
++    for (source, start_line, limit, expected) in [
++        ("one\r\ntwo\r\nthree\r\n", 1, Some(2), "one\r\ntwo"),
++        ("one\r\ntwo\r\nthree\r\n", 2, None, "two\r\nthree"),
++        (
++            "skip\none\r\ntwo\nthree\r\nlast",
++            2,
++            Some(3),
++            "one\r\ntwo\nthree",
++        ),
++        ("skip\r\n\r\n\r\nlast\r", 2, None, "\r\n\r\nlast\r"),
++        ("one\r\r\ntwo\r\n", 1, None, "one\r\r\ntwo"),
++        ("one\rtwo\r", 1, None, "one\rtwo\r"),
++        ("one\ntwo\n", 1, None, "one\ntwo"),
++        ("one\r\n", 1, Some(1), "one"),
++        ("\r\n\r\n", 1, None, "\r\n"),
++        ("", 1, None, ""),
++        ("one\r\n", 2, None, ""),
++    ] {
++        let (output, _) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("eol-fixture"),
++            ReadOptions {
++                start_line: Some(start_line),
++                limit,
++                line_numbers: false,
++            },
++        )
++        .unwrap();
++        assert_eq!(output, expected, "source={source:?}, start={start_line}");
++        assert!(source.contains(output.as_str()), "{source:?}: {output:?}");
++    }
++}
++
++#[test]
++fn numbered_ranges_keep_the_existing_lf_display_projection() {
++    for source in [
++        "skip\none\ntwo\nthree\n",
++        "skip\r\none\r\ntwo\r\nthree\r\n",
++        "skip\none\r\ntwo\nthree\r\n",
++    ] {
++        let (output, metadata) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("numbered-eol-fixture"),
++            ReadOptions {
++                start_line: Some(2),
++                limit: Some(2),
++                line_numbers: true,
++            },
++        )
++        .unwrap();
++        assert_eq!(output, "2\tone\n3\ttwo");
++        assert_eq!(metadata["returned_lines"], 2);
++        assert_eq!(metadata["truncation_reason"], "line_limit");
++        assert!(metadata["total_lines"].is_null());
++    }
++}
++
++#[test]
++fn unnumbered_range_counts_whole_crlf_separator_against_output_budget() {
++    let limit = MAX_READ_FILE_BYTES as usize;
++    let first = "x".repeat(limit - 4);
++    let source = format!("{first}\r\néZ\n");
++    let (output, metadata) = render_range(
++        Cursor::new(source.as_bytes()),
++        Path::new("budget-eol-fixture"),
++        ReadOptions {
++            start_line: Some(1),
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(output, format!("{first}\r\né"));
++    assert_eq!(output.len(), limit);
++    assert!(source.starts_with(output.as_str()));
++    assert_eq!(metadata["returned_lines"], 2);
++    assert_eq!(metadata["truncation_reason"], "output_budget");
++    assert!(metadata["total_lines"].is_null());
++
++    for spare in [1, 2] {
++        let first = "x".repeat(limit - spare);
++        let source = format!("{first}\r\ny\n");
++        let (output, metadata) = render_range(
++            Cursor::new(source.as_bytes()),
++            Path::new("separator-does-not-fit"),
++            ReadOptions {
++                start_line: Some(1),
++                ..Default::default()
++            },
++        )
++        .unwrap();
++        assert_eq!(output, first, "spare={spare}");
++        assert_eq!(metadata["returned_lines"], 1);
++        assert_eq!(metadata["truncation_reason"], "output_budget");
++    }
++}
++
++#[test]
++fn range_metadata_keeps_raw_scan_counts_and_existing_final_eol_policy() {
++    let source = "skip\r\nold\r\nkeep\r\n";
++    let (output, metadata) = render_range(
++        Cursor::new(source.as_bytes()),
++        Path::new("metadata-eol-fixture"),
++        ReadOptions {
++            start_line: Some(2),
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(output, "old\r\nkeep");
++    assert_eq!(metadata["scanned_bytes"], source.len());
++    assert_eq!(metadata["total_lines"], 3);
++    assert_eq!(metadata["start_line"], 2);
++    assert_eq!(metadata["end_line"], 3);
++    assert_eq!(metadata["returned_lines"], 2);
++    assert_eq!(metadata["truncated"], false);
++}
+diff --git a/tool/file-tools/src/read_many.rs b/tool/file-tools/src/read_many.rs
+--- a/tool/file-tools/src/read_many.rs
++++ b/tool/file-tools/src/read_many.rs
+@@ -5,6 +5,7 @@
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::{Value, json};
+ 
++use crate::read_text::decode_read_bytes;
+ use crate::util::{
+     err_result, module_error, ok_result, optional_positive_usize, parse_call,
+     parse_invocation_context, workspace_path,
+@@ -165,19 +166,11 @@
+             };
+             let rendered_truncated_by_budget = rendered.len() > content_budget;
+             if rendered_truncated_by_budget {
+-                rendered = match utf8_prefix(rendered.as_bytes(), content_budget) {
+-                    Ok(prefix) => prefix,
+-                    Err(e) => {
+-                        return err_result(
+-                            &call.id,
+-                            &call.name,
+-                            format!(
+-                                "failed to truncate rendered output for {} as UTF-8: {e}",
+-                                absolute.display()
+-                            ),
+-                        );
+-                    }
+-                };
++                let mut end = content_budget;
++                while !rendered.is_char_boundary(end) {
++                    end -= 1;
++                }
++                rendered.truncate(end);
+             }
+             let returned_bytes = rendered.len();
+             let file_truncated = file_read.truncated || rendered_truncated_by_budget;
+@@ -256,30 +249,19 @@
+         .take(limit.saturating_add(1) as u64)
+         .read_to_end(&mut bytes)
+         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+-    let truncated = bytes.len() > limit || original_bytes > bytes.len();
+-    if truncated {
++    let at_budget_boundary = bytes.len() > limit;
++    let truncated = at_budget_boundary || original_bytes > bytes.len();
++    if at_budget_boundary {
+         bytes.truncate(limit);
+     }
+-    let text = utf8_prefix(&bytes, bytes.len())
+-        .map_err(|e| format!("failed to decode {} as UTF-8: {e}", path.display()))?;
++    let text = decode_read_bytes(&bytes, at_budget_boundary)
++        .map_err(|e| format!("failed to decode {} as UTF-8: {e}", path.display()))?
++        .to_owned();
+     Ok(FileRead {
+         text,
+         original_bytes,
+         truncated,
+     })
+-}
+-
+-fn utf8_prefix(bytes: &[u8], max_bytes: usize) -> Result<String, std::str::Utf8Error> {
+-    let mut end = bytes.len().min(max_bytes);
+-    loop {
+-        match std::str::from_utf8(&bytes[..end]) {
+-            Ok(text) => return Ok(text.to_owned()),
+-            Err(error) if error.error_len().is_none() && end > 0 => {
+-                end = error.valid_up_to();
+-            }
+-            Err(error) => return Err(error),
+-        }
+-    }
+ }
+ 
+ fn add_line_numbers(text: &str) -> String {
+@@ -289,3 +271,6 @@
+         .collect::<Vec<_>>()
+         .join("\n")
+ }
++
++#[cfg(test)]
++mod utf8_tests;
+diff --git a/tool/file-tools/src/read_many/utf8_tests.rs b/tool/file-tools/src/read_many/utf8_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/file-tools/src/read_many/utf8_tests.rs
+@@ -0,0 +1,34 @@
++use super::*;
++
++#[test]
++fn observed_eof_is_strict_even_when_old_metadata_claims_more_bytes() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("tail.txt");
++    std::fs::write(&path, b"valid\xc3").unwrap();
++    for original_bytes in [6, 100] {
++        for limit in [6, 10] {
++            let error = read_text_prefix(&path, limit, original_bytes).unwrap_err();
++            assert!(error.contains("failed to decode"));
++        }
++    }
++}
++
++#[test]
++fn byte_cut_allows_only_incomplete_tail_and_preserves_conservative_metadata() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("text.txt");
++    std::fs::write(&path, "valid😀tail").unwrap();
++    for limit in 6..9 {
++        let read = read_text_prefix(&path, limit, 13).unwrap();
++        assert_eq!(read.text, "valid");
++        assert!(read.truncated);
++        assert_eq!(read.original_bytes, 13);
++    }
++    std::fs::write(&path, b"valid\xfftail").unwrap();
++    assert!(read_text_prefix(&path, 7, 10).is_err());
++    std::fs::write(&path, "short").unwrap();
++    let read = read_text_prefix(&path, 10, 100).unwrap();
++    assert_eq!(read.text, "short");
++    assert_eq!(read.original_bytes, 100);
++    assert!(read.truncated, "retain the existing conservative metadata claim");
++}
+diff --git a/tool/file-tools/src/read_text.rs b/tool/file-tools/src/read_text.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/file-tools/src/read_text.rs
+@@ -0,0 +1,52 @@
++//! UTF-8 policy for bounded raw-byte reads. A real EOF is not a budget cut.
++
++/// Only a read stopped by a byte budget may omit an unfinished trailing scalar.
++/// Invalid interior bytes are errors at either boundary. File metadata is not
++/// evidence that the actual read stopped before EOF.
++pub(crate) fn decode_read_bytes(
++    bytes: &[u8],
++    at_budget_boundary: bool,
++) -> Result<&str, std::str::Utf8Error> {
++    match std::str::from_utf8(bytes) {
++        Err(error) if at_budget_boundary && error.error_len().is_none() => {
++            std::str::from_utf8(&bytes[..error.valid_up_to()])
++        }
++        result => result,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_a_budget_boundary_can_omit_an_incomplete_scalar() {
++        for text in ["я", "€", "😀"] {
++            let bytes = text.as_bytes();
++            for end in 1..bytes.len() {
++                assert!(decode_read_bytes(&bytes[..end], false).is_err());
++                assert_eq!(decode_read_bytes(&bytes[..end], true).unwrap(), "");
++                let mut prefixed = b"valid".to_vec();
++                prefixed.extend_from_slice(&bytes[..end]);
++                assert!(decode_read_bytes(&prefixed, false).is_err());
++                assert_eq!(decode_read_bytes(&prefixed, true).unwrap(), "valid");
++            }
++        }
++    }
++
++    #[test]
++    fn invalid_bytes_are_never_repaired_and_valid_text_is_borrowed() {
++        for bytes in [&b"valid\xfftail"[..], &b"\xc0\xaf"[..], &b"\xed\xa0\x80"[..]] {
++            for boundary in [false, true] {
++                assert!(decode_read_bytes(bytes, boundary).is_err());
++            }
++        }
++        for boundary in [false, true] {
++            assert_eq!(decode_read_bytes(b"", boundary).unwrap(), "");
++            let bytes = "a😀z".as_bytes();
++            let text = decode_read_bytes(bytes, boundary).unwrap();
++            assert_eq!(text, "a😀z");
++            assert_eq!(text.as_ptr(), bytes.as_ptr());
++        }
++    }
++}
+diff --git a/tool/file-tools/src/tests.rs b/tool/file-tools/src/tests.rs
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -7,6 +7,9 @@
+ 
+ use super::*;
+ use crate::{find::FindFilesTool, read_many::ReadManyFilesTool, search::GrepTool};
++
++mod read_eol;
++mod read_utf8;
+ 
+ struct TestToolHost;
+ 
+diff --git a/tool/file-tools/src/tests/read_eol.rs b/tool/file-tools/src/tests/read_eol.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/file-tools/src/tests/read_eol.rs
+@@ -0,0 +1,53 @@
++use super::*;
++
++#[test]
++fn unnumbered_range_can_supply_an_exact_multiline_edit_preimage() {
++    for source in [
++        "before\nold\nkeep\nafter\n",
++        "before\r\nold\r\nkeep\r\nafter\r\n",
++        "before\nold\r\nkeep\nafter\r\n",
++    ] {
++        let directory = tempfile::tempdir().expect("workspace");
++        let path = directory.path().join("sample.txt");
++        std::fs::write(&path, source).expect("source fixture");
++
++        let full = invoke(&ReadFileTool, directory.path(), json!({"path": "sample.txt"}));
++        assert_eq!(full["ok"], true);
++        assert_eq!(full["output"], source);
++        let batch = invoke(
++            &ReadManyFilesTool,
++            directory.path(),
++            json!({"paths": ["sample.txt"]}),
++        );
++        assert_eq!(batch["ok"], true);
++        assert_eq!(batch["output"], format!("== sample.txt ==\n{source}"));
++
++        let ranged = invoke(
++            &ReadFileTool,
++            directory.path(),
++            json!({"path": "sample.txt", "start_line": 2, "limit": 2}),
++        );
++        assert_eq!(ranged["ok"], true);
++        let old = ranged["output"].as_str().unwrap();
++        let expected = if source.contains("old\r\n") { "old\r\nkeep" } else { "old\nkeep" };
++        assert_eq!(old, expected);
++
++        if source.contains("old\r\n") {
++            let normalized = invoke(
++                &EditFileTool,
++                directory.path(),
++                json!({"path": "sample.txt", "old_string": "old\nkeep", "new_string": "new\nkeep"}),
++            );
++            assert_eq!(normalized["ok"], false);
++            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
++        }
++        let edited = invoke(
++            &EditFileTool,
++            directory.path(),
++            json!({"path": "sample.txt", "old_string": old, "new_string": old.replacen("old", "new", 1)}),
++        );
++        assert_eq!(edited["ok"], true, "{edited}");
++        assert_eq!(edited["metadata"]["replacements"], 1);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), source.replacen("old", "new", 1));
++    }
++}
+diff --git a/tool/file-tools/src/tests/read_utf8.rs b/tool/file-tools/src/tests/read_utf8.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/file-tools/src/tests/read_utf8.rs
+@@ -0,0 +1,50 @@
++use super::*;
++
++#[test]
++fn file_read_modes_reject_invalid_utf8_at_observed_eof() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("text.txt");
++    for bytes in [&b"valid\xc3"[..], &b"valid\xf0\x9f\x98"[..], &b"valid\xff"[..]] {
++        std::fs::write(&path, bytes).unwrap();
++        let results = [
++            invoke(&ReadFileTool, dir.path(), json!({"path":"text.txt"})),
++            invoke(&ReadFileTool, dir.path(), json!({"path":"text.txt", "start_line":1})),
++            invoke(&ReadManyFilesTool, dir.path(), json!({"paths":["text.txt"]})),
++            invoke(&ReadManyFilesTool, dir.path(), json!({"paths":["text.txt"], "line_numbers":true})),
++        ];
++        for result in results {
++            assert_eq!(result["ok"], false);
++            assert!(result["error"].as_str().unwrap().to_ascii_lowercase().contains("utf-8"));
++        }
++    }
++}
++
++#[test]
++fn batch_read_reports_an_intentional_scalar_cut_as_truncated() {
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::write(dir.path().join("text.txt"), "valid😀tail").unwrap();
++    let result = invoke(&ReadManyFilesTool, dir.path(), json!({
++        "paths":["text.txt"], "max_bytes_per_file":7, "max_bytes_total":100
++    }));
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["output"], "== text.txt ==\nvalid");
++    assert_eq!(result["metadata"]["files"][0]["original_bytes"], 13);
++    assert_eq!(result["metadata"]["files"][0]["returned_bytes"], 5);
++    assert_eq!(result["metadata"]["files"][0]["truncated"], true);
++    assert_eq!(result["metadata"]["truncated"], true);
++}
++
++#[test]
++fn numbered_rendering_truncates_valid_string_at_a_scalar_boundary() {
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::write(dir.path().join("text.txt"), "я").unwrap();
++    let budget = "== text.txt ==\n".len() + 3;
++    let result = invoke(&ReadManyFilesTool, dir.path(), json!({
++        "paths":["text.txt"], "line_numbers":true, "max_bytes_total":budget
++    }));
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["output"], "== text.txt ==\n1\t");
++    assert!(result["output"].as_str().unwrap().len() <= budget);
++    assert_eq!(result["metadata"]["files"][0]["returned_bytes"], 2);
++    assert_eq!(result["metadata"]["files"][0]["truncated"], true);
++}
+diff --git a/tool/shell-tool/src/unified_exec/output.rs b/tool/shell-tool/src/unified_exec/output.rs
+--- a/tool/shell-tool/src/unified_exec/output.rs
++++ b/tool/shell-tool/src/unified_exec/output.rs
+@@ -57,12 +57,41 @@
+             .unwrap_or_else(|poisoned| poisoned.into_inner());
+         output = guard;
+     }
++    let final_output = output.exited || output.readers.is_closed();
+     Ok(Collected {
+-        bytes: std::mem::take(&mut output.buffer),
++        bytes: take_ready_bytes(&mut output.buffer, final_output),
+         dropped_bytes: std::mem::take(&mut output.dropped_bytes),
+         exited: output.exited,
+         exit_code: output.exit_code,
+     })
++}
++
++/// Keep only an incomplete trailing UTF-8 scalar for the next live poll.
++/// Invalid bytes and final output still use the existing lossy rendering.
++fn take_ready_bytes(buffer: &mut Vec<u8>, final_output: bool) -> Vec<u8> {
++    let mut bytes = std::mem::take(buffer);
++    if final_output {
++        return bytes;
++    }
++    // An incomplete scalar has at most three bytes. Starting inside an earlier
++    // complete scalar is harmless: its continuation bytes are skipped below.
++    let mut offset = bytes.len().saturating_sub(3);
++    while offset < bytes.len() {
++        match std::str::from_utf8(&bytes[offset..]) {
++            Ok(_) => break,
++            Err(error) => {
++                offset += error.valid_up_to();
++                match error.error_len() {
++                    Some(len) => offset += len,
++                    None => {
++                        *buffer = bytes.split_off(offset);
++                        break;
++                    }
++                }
++            }
++        }
++    }
++    bytes
+ }
+ 
+ pub(super) fn render_result(
+@@ -188,3 +217,6 @@
+     }
+     index
+ }
++
++#[cfg(test)]
++mod tests;
+diff --git a/tool/shell-tool/src/unified_exec/output/tests.rs b/tool/shell-tool/src/unified_exec/output/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/tool/shell-tool/src/unified_exec/output/tests.rs
+@@ -0,0 +1,138 @@
++use super::*;
++
++#[test]
++fn every_pair_of_poll_boundaries_preserves_valid_utf8() {
++    for text in ["", "ASCII", "é", "中", "😀", "aé中😀z"] {
++        let input = text.as_bytes();
++        for first in 0..=input.len() {
++            for second in first..=input.len() {
++                let mut buffer = input[..first].to_vec();
++                let a = take_ready_bytes(&mut buffer, false);
++                assert!(buffer.len() <= 3);
++                buffer.extend_from_slice(&input[first..second]);
++                let b = take_ready_bytes(&mut buffer, false);
++                assert!(buffer.len() <= 3);
++                buffer.extend_from_slice(&input[second..]);
++                let c = take_ready_bytes(&mut buffer, true);
++                assert!(buffer.is_empty());
++                assert_eq!(
++                    format!(
++                        "{}{}{}",
++                        String::from_utf8_lossy(&a),
++                        String::from_utf8_lossy(&b),
++                        String::from_utf8_lossy(&c)
++                    ),
++                    text,
++                    "poll boundaries {first}, {second}"
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn one_byte_and_empty_polls_do_not_consume_an_incomplete_scalar() {
++    let text = "é中😀";
++    let mut buffer = Vec::new();
++    let mut rendered = String::new();
++    for byte in text.bytes() {
++        buffer.push(byte);
++        let ready = take_ready_bytes(&mut buffer, false);
++        rendered.push_str(&String::from_utf8_lossy(&ready));
++        let pending = buffer.clone();
++        assert!(take_ready_bytes(&mut buffer, false).is_empty());
++        assert_eq!(buffer, pending);
++        assert!(buffer.len() <= 3);
++    }
++    assert!(take_ready_bytes(&mut buffer, true).is_empty());
++    assert_eq!(rendered, text);
++}
++
++#[test]
++fn definite_invalid_binary_bytes_are_not_held_for_future_polls() {
++    let cases: &[&[u8]] = &[
++        &[0xff],
++        &[0x80, 0x81],
++        &[0xc0, 0xaf],
++        &[0xe0, 0x80],
++        &[0xed, 0xa0],
++        &[0xf4, 0x90],
++        &[0xf5],
++        &[0xe2, b'x'],
++    ];
++    for input in cases {
++        let mut buffer = input.to_vec();
++        assert_eq!(take_ready_bytes(&mut buffer, false), *input);
++        assert!(buffer.is_empty());
++    }
++
++    let mut buffer = vec![0xff, b'x', 0xf0, 0x9f];
++    let ready = take_ready_bytes(&mut buffer, false);
++    assert_eq!(ready, [0xff, b'x']);
++    assert_eq!(String::from_utf8_lossy(&ready), "�x");
++    assert_eq!(buffer, [0xf0, 0x9f]);
++    buffer.extend_from_slice(&[0x98, 0x80]);
++    assert_eq!(String::from_utf8_lossy(&take_ready_bytes(&mut buffer, false)), "😀");
++    assert!(buffer.is_empty());
++}
++
++#[test]
++fn final_collection_flushes_incomplete_bytes_with_existing_lossy_semantics() {
++    for input in [&[0xc3][..], &[0xe4, 0xb8][..], &[0xf0, 0x9f, 0x98][..]] {
++        let mut buffer = input.to_vec();
++        assert!(take_ready_bytes(&mut buffer, false).is_empty());
++        assert_eq!(buffer, input);
++        let ready = take_ready_bytes(&mut buffer, true);
++        assert_eq!(ready, input);
++        assert_eq!(String::from_utf8_lossy(&ready), String::from_utf8_lossy(input));
++        assert!(buffer.is_empty());
++    }
++}
++
++fn rendered(bytes: Vec<u8>, dropped_bytes: usize, exited: bool) -> Value {
++    serde_json::from_str(&render_result(
++        "utf8-call",
++        42,
++        Collected {
++            bytes,
++            dropped_bytes,
++            exited,
++            exit_code: exited.then_some(0),
++        },
++        Duration::ZERO,
++        SESSION_BUFFER_LIMIT * 2,
++        json!({}),
++    ))
++    .unwrap()
++}
++
++#[test]
++fn split_scalar_renders_once_and_output_bytes_count_delivered_bytes() {
++    let mut buffer = vec![0xf0, 0x9f];
++    let first = rendered(take_ready_bytes(&mut buffer, false), 0, false);
++    assert_eq!(first["metadata"]["output_bytes"], 0);
++    assert_eq!(first["metadata"]["truncated"], false);
++    assert!(first["output"].as_str().unwrap().ends_with("Output:\n"));
++    buffer.extend_from_slice(&[0x98, 0x80]);
++    let second = rendered(take_ready_bytes(&mut buffer, true), 0, true);
++    assert_eq!(second["metadata"]["output_bytes"], 4);
++    assert_eq!(second["metadata"]["truncated"], false);
++    assert_eq!(second["metadata"]["session_id"], Value::Null);
++    assert!(second["output"].as_str().unwrap().ends_with("Output:\n😀"));
++    assert!(buffer.is_empty());
++}
++
++#[test]
++fn retained_suffix_does_not_break_existing_dropped_middle_rendering() {
++    let mut buffer = vec![b'x'; SESSION_BUFFER_LIMIT];
++    buffer[SESSION_BUFFER_LIMIT - 2..].copy_from_slice(&[0xf0, 0x9f]);
++    let first = rendered(take_ready_bytes(&mut buffer, false), 17, false);
++    assert_eq!(first["metadata"]["output_bytes"], SESSION_BUFFER_LIMIT - 2);
++    assert_eq!(first["metadata"]["dropped_bytes"], 17);
++    assert_eq!(first["metadata"]["truncated"], true);
++    assert!(!first["output"].as_str().unwrap().contains('�'));
++    assert_eq!(buffer, [0xf0, 0x9f]);
++    buffer.extend_from_slice(&[0x98, 0x80]);
++    let second = rendered(take_ready_bytes(&mut buffer, true), 0, true);
++    assert!(second["output"].as_str().unwrap().ends_with("Output:\n😀"));
++}
