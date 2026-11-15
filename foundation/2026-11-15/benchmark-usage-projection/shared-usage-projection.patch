@@ -1,0 +1,427 @@
+--- a/examples/performance/coding-harness/README.md
++++ b/examples/performance/coding-harness/README.md
+@@ -129,6 +129,17 @@
+ возвращает ненулевой exit при любом FAIL. Повтор учитывается отдельно от шести
+ первых попыток. `report.py` проверяет одинаковые prompt/repository hashes.
+ 
++Короткий и длинный отчёты используют одну политику полноты usage. Числовой
++subtotal сам по себе не подтверждает завершение generation: для незавершённого
++запуска полные `tokens` и итоговые `input`/`cached`/`output` остаются unknown.
++Исходные числа сохраняются в `reported_usage`, наблюдаемые нижние границы —
++в `observed_partial_usage`. Сводка первичных попыток отдельно содержит
++`known_token_runs` и `observed_token_sums`; повторы не входят в эти суммы.
++Нулевой observed sum без known runs не доказывает нулевой полный расход.
++Флаг `usage_complete` описывает завершение по существующей policy и не означает,
++что провайдер сообщил каждую token category. Метрики grader/pipeline, правила
++отбора и сохранённые результаты прогонов этим представлением не меняются.
++
+ `proteus-codex` можно добавить как самостоятельную конфигурацию. Для Flash она
+ использует Pi model transport и JSON surface настоящего patch engine. Native
+ Codex с этим endpoint сейчас помечается unavailable после HTTP 403 на Responses
+--- a/examples/performance/coding-harness/long_report.py
++++ b/examples/performance/coding-harness/long_report.py
+@@ -7,6 +7,8 @@
+ from pathlib import Path
+ import re
+ from statistics import median
++
++from usage_report import TOKENS, json_lines, known_sum, project_usage, read_json, summarize_usage
+ 
+ HERE = Path(__file__).resolve().parent
+ CORE = HERE.parents[2]
+@@ -23,27 +25,6 @@
+     'ledger-recovery': 'Многофайловое хранилище с crash recovery, миграцией и concurrent writers',
+     'go-review': 'Три последовательных запроса на SGF parser, territory counting и интеграцию',
+ }
+-TOKENS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')
+-
+-
+-def read_json(path):
+-    return json.loads(path.read_text()) if path.is_file() else None
+-
+-
+-def json_lines(path):
+-    if path.is_file():
+-        with path.open(errors='replace') as stream:
+-            for line in stream:
+-                try:
+-                    value = json.loads(line)
+-                except json.JSONDecodeError:
+-                    continue
+-                if isinstance(value, dict):
+-                    yield value
+-
+-
+-def known_sum(values):
+-    return sum(values) if values and all(type(value) is int for value in values) else None
+ 
+ 
+ def midpoint(values):
+@@ -208,40 +189,6 @@
+             'review_flags': flags}
+ 
+ 
+-def usage_completion(path, result, metrics):
+-    if result.get('pipeline_ok') and not result.get('timed_out'):
+-        return True, 'The complete task pipeline settled and exported its reported usage.'
+-    agent = result.get('agent')
+-    if agent == 'proteus':
+-        failures = metrics.get('failures', [])
+-        all_answered = (type(metrics.get('model_requests')) is int
+-                        and metrics.get('model_requests') == metrics.get('model_responses'))
+-        settled = metrics.get('settlements') or []
+-        if all_answered and settled and all(item.get('status') == 'success' for item in settled) and not any(
+-            isinstance(item, dict) and item.get('kind') == 'model' for item in failures
+-        ):
+-            return True, 'Every canonical model exchange and task settlement completed before the CLI teardown error.'
+-    elif agent == 'pi':
+-        completed = 0
+-        failed = False
+-        for event in json_lines(path/'stdout.jsonl'):
+-            if event.get('type') == 'agent_end' and not event.get('willRetry'):
+-                completed += 1
+-            message = event.get('message', {})
+-            if event.get('type') == 'message_end' and message.get('role') == 'assistant':
+-                failed |= message.get('stopReason') in ('error', 'aborted', 'pending')
+-        if completed >= result.get('expected_turns', 1) and not failed:
+-            return True, 'Each requested Pi turn emitted a final agent_end before the CLI error.'
+-    elif agent == 'opencode':
+-        native = read_json(path/'runtime/native/usage.json') or {}
+-        primary = native.get('assistant_messages', [])
+-        if (metrics.get('settled') and primary and primary[-1].get('finish') == 'stop'
+-                and sum(msg.get('finish') == 'stop' for msg in primary) >= result.get('expected_turns', 1)
+-                and not metrics.get('errors')):
+-            return True, 'The native session succeeded and its final assistant stopped before the CLI teardown error.'
+-    return False, 'The generation or task did not settle; recorded usage is a lower bound and can omit the active request.'
+-
+-
+ def failure_taxonomy(result, grade, failures):
+     classes = []
+     text = json.dumps(failures, ensure_ascii=False)
+@@ -308,8 +255,6 @@
+                               sum(item.get('origin') == 'direct' for item in metrics['requests'])
+                               if metrics.get('requests') else metrics.get('model_requests')),
+            'usage_includes_auxiliary': metrics.get('usage_includes_auxiliary_requests', False),
+-           'tokens': metrics.get('provider_usage', {}),
+-           'observed_partial_usage': metrics.get('partial_reported_usage_sums', {}),
+            'failures_by_kind': dict(kinds), 'failure_count': len(failures), 'tools': metrics.get('tool_names', {}),
+            'compactions': metrics.get('compactions'), 'model_verified': result.get('model_verified', False),
+            'reasoning_verified': result.get('reasoning_verified', False),
+@@ -339,13 +284,7 @@
+                 'last_assistant_age_seconds': round((stamp-max(created))/1000, 3),
+                 'last_completed_before_error_age_seconds': round((stamp-max(before_error))/1000, 3) if before_error else None,
+                 'outer_timed_out': result.get('timed_out', False)}
+-    row['usage_complete'], row['usage_completeness_reason'] = usage_completion(path, result, metrics)
+-    row['reported_usage'] = dict(row['tokens'])
+-    row['observed_partial_usage'] = {key: value if type(value) is int else
+-                                   row['observed_partial_usage'].get(key)
+-                                   for key, value in {**{key: None for key in TOKENS}, **row['reported_usage']}.items()}
+-    if not row['usage_complete']:
+-        row['tokens'] = {key: None for key in row['tokens']}
++    row.update(project_usage(path, result, metrics))
+     row['failure_taxonomy'] = failure_taxonomy(result, grade, failures)
+     row['length_limit_failures'] = sum(isinstance(item, dict) and 'length limit' in json.dumps(item) for item in failures)
+     try:
+@@ -368,18 +307,14 @@
+         selected = [row for row in rows if row['arm'] == arm and row['attempt'] == 1]
+         done = [row for row in selected if row['state'] == 'graded']
+         observed = [row for row in selected if 'tokens' in row]
+-        values = {key: [row['tokens'].get(key) for row in observed] for key in TOKENS}
++        usage = summarize_usage(observed)
+         stats.append({'arm': arm, 'expected_tasks': len(expected_cases), 'graded': len(done),
+                       'passed': sum(row['pass'] for row in done),
+                       'grade_passed': sum(row['grade'] is True for row in done),
+                       'pipeline_failed_with_task_pass': sum(row['grade'] is True and not row['pipeline_ok'] for row in done), 'failed': sum(not row['pass'] for row in done),
+                       'timed_out': sum(row.get('timed_out', False) for row in done),
+                       'observed_runs': len(observed),
+-                      'tokens': {key: known_sum(items) for key, items in values.items()},
+-                      'known_token_runs': {key: sum(value is not None for value in items) for key, items in values.items()},
+-                      'observed_token_sums': {key: sum(
+-                          row['tokens'][key] if type(row['tokens'].get(key)) is int else
+-                          row.get('observed_partial_usage', {}).get(key) or 0 for row in observed) for key in TOKENS},
++                      **usage,
+                       'median_seconds': midpoint([row.get('seconds') for row in done]),
+                       'median_actions': midpoint([row.get('actions') for row in done]),
+                       'median_requests': midpoint([row.get('requests') for row in done]),
+--- a/examples/performance/coding-harness/report.py
++++ b/examples/performance/coding-harness/report.py
+@@ -5,6 +5,8 @@
+ import json
+ from pathlib import Path
+ from statistics import median
++
++from usage_report import project_usage, summarize_usage
+ 
+ 
+ def read_rows(directories, excluded):
+@@ -25,15 +27,18 @@
+             identities.add(key)
+             grade = json.loads((file.parent/'grading.json').read_text())
+             metrics = result['metrics']
+-            rows.append({'model':result['model'], 'effort':result['reasoning'], 'case':case,
++            row = {'model':result['model'], 'effort':result['reasoning'], 'case':case,
+                          'attempt':int(repeat), 'arm':arm, 'source':str(file.resolve()),
+                          'prompt_sha256':result['prompt_sha256'],
+                          'repo_sha256':hashlib.sha256(json.dumps(result['fixture_files_sha256'],sort_keys=True).encode()).hexdigest(),
+                          'pipeline_ok':result['pipeline_ok'], 'grade':grade['passed'],
+                          'pass':result['pipeline_ok'] and grade['passed'], 'seconds':result['wall_seconds'],
++                         'returncode':result.get('returncode'), 'timed_out':result.get('timed_out', False),
+                          'failures':metrics.get('failures', metrics.get('errors', [])),
+                          'actions':metrics.get('all_tool_calls'), 'tools':metrics.get('tool_names', {}),
+-                         'requests':metrics.get('model_requests'), 'tokens':metrics.get('provider_usage', {})})
++                         'requests':metrics.get('model_requests')}
++            row.update(project_usage(file.parent, result, metrics))
++            rows.append(row)
+     return rows
+ 
+ 
+@@ -52,15 +57,18 @@
+     stats = []
+     for (model,effort,arm),runs in sorted(by_config.items()):
+         primary = [r for r in runs if r['attempt']==1]
++        usage = summarize_usage(primary)
+         tools = Counter()
+         for r in primary:
+             tools.update(r['tools'])
+         stats.append({'model':model,'effort':effort,'arm':arm,
+                       'primary_attempts':len(primary),'primary_passed':sum(r['pass'] for r in primary),
+                       'repeat_attempts':len(runs)-len(primary),'repeat_passed':sum(r['pass'] for r in runs if r['attempt']>1),
+-                      'input':complete_sum([r['tokens'].get('input_tokens') for r in primary]),
+-                      'cached':complete_sum([r['tokens'].get('cached_input_tokens') for r in primary]),
+-                      'output':complete_sum([r['tokens'].get('output_tokens') for r in primary]),
++                      'input':usage['tokens']['input_tokens'],
++                      'cached':usage['tokens']['cached_input_tokens'],
++                      'output':usage['tokens']['output_tokens'],
++                      'known_token_runs':usage['known_token_runs'],
++                      'observed_token_sums':usage['observed_token_sums'],
+                       'requests':complete_sum([r['requests'] for r in primary]),
+                       'actions':complete_sum([r['actions'] for r in primary]),'tools':dict(tools),
+                       'median_wall_seconds':round(median(r['seconds'] for r in primary),2)})
+--- /dev/null
++++ b/examples/performance/coding-harness/usage_report.py
+@@ -0,0 +1,82 @@
++"""Shared usage evidence projection for short and long harness reports."""
++import json
++
++TOKENS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')
++
++
++def read_json(path):
++    return json.loads(path.read_text()) if path.is_file() else None
++
++
++def json_lines(path):
++    if path.is_file():
++        with path.open(errors='replace') as stream:
++            for line in stream:
++                try:
++                    value = json.loads(line)
++                except json.JSONDecodeError:
++                    continue
++                if isinstance(value, dict):
++                    yield value
++
++
++def known_sum(values):
++    return sum(values) if values and all(type(value) is int for value in values) else None
++
++
++def usage_completion(path, result, metrics):
++    if result.get('pipeline_ok') and not result.get('timed_out'):
++        return True, 'The complete task pipeline settled and exported its reported usage.'
++    agent = result.get('agent')
++    if agent == 'proteus':
++        failures = metrics.get('failures', [])
++        all_answered = (type(metrics.get('model_requests')) is int
++                        and metrics.get('model_requests') == metrics.get('model_responses'))
++        settled = metrics.get('settlements') or []
++        if all_answered and settled and all(item.get('status') == 'success' for item in settled) and not any(
++            isinstance(item, dict) and item.get('kind') == 'model' for item in failures
++        ):
++            return True, 'Every canonical model exchange and task settlement completed before the CLI teardown error.'
++    elif agent == 'pi':
++        completed = 0
++        failed = False
++        for event in json_lines(path/'stdout.jsonl'):
++            if event.get('type') == 'agent_end' and not event.get('willRetry'):
++                completed += 1
++            message = event.get('message', {})
++            if event.get('type') == 'message_end' and message.get('role') == 'assistant':
++                failed |= message.get('stopReason') in ('error', 'aborted', 'pending')
++        if completed >= result.get('expected_turns', 1) and not failed:
++            return True, 'Each requested Pi turn emitted a final agent_end before the CLI error.'
++    elif agent == 'opencode':
++        native = read_json(path/'runtime/native/usage.json') or {}
++        primary = native.get('assistant_messages', [])
++        if (metrics.get('settled') and primary and primary[-1].get('finish') == 'stop'
++                and sum(msg.get('finish') == 'stop' for msg in primary) >= result.get('expected_turns', 1)
++                and not metrics.get('errors')):
++            return True, 'The native session succeeded and its final assistant stopped before the CLI teardown error.'
++    return False, 'The generation or task did not settle; recorded usage is a lower bound and can omit the active request.'
++
++
++def project_usage(path, result, metrics):
++    """Retain reported lower bounds separately from lifecycle-complete totals."""
++    complete, reason = usage_completion(path, result, metrics)
++    reported = dict(metrics.get('provider_usage', {}))
++    partial = metrics.get('partial_reported_usage_sums', {})
++    observed = {key: value if type(value) is int else partial.get(key)
++                for key, value in {**{key: None for key in TOKENS}, **reported}.items()}
++    return {'usage_complete': complete, 'usage_completeness_reason': reason,
++            'reported_usage': reported, 'observed_partial_usage': observed,
++            'tokens': dict(reported) if complete else {key: None for key in reported}}
++
++
++def summarize_usage(rows):
++    """Aggregate the selected runs without promoting partial evidence to totals."""
++    values = {key: [row['tokens'].get(key) for row in rows] for key in TOKENS}
++    return {'tokens': {key: known_sum(items) for key, items in values.items()},
++            'known_token_runs': {key: sum(value is not None for value in items)
++                                 for key, items in values.items()},
++            'observed_token_sums': {key: sum(
++                row['tokens'][key] if type(row['tokens'].get(key)) is int else
++                row.get('observed_partial_usage', {}).get(key) or 0 for row in rows)
++                for key in TOKENS}}
+--- /dev/null
++++ b/examples/performance/coding-harness/usage_report_test.py
+@@ -0,0 +1,140 @@
++"""Synthetic artifact controls for shared short/long usage projection."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++import long_report
++import report
++import usage_report
++
++
++class UsageReportChecks(unittest.TestCase):
++    def trial(self, root, case, attempt=1, *, pipeline=True, grade=True,
++              timed_out=False, tokens=None, partial=None, events=()):
++        path = root/f'fixture_{case}_{attempt}_pi'
++        path.mkdir()
++        metrics = {'provider_usage': tokens or {}, 'model_requests': 1,
++                   'all_tool_calls': 2, 'tool_names': {'read_file': 2}, 'errors': []}
++        if partial is not None:
++            metrics['partial_reported_usage_sums'] = partial
++        result = {'agent': 'pi', 'model': 'fixture', 'reasoning': 'high',
++                  'pipeline_ok': pipeline, 'timed_out': timed_out,
++                  'returncode': 124 if timed_out else 0, 'expected_turns': 1,
++                  'wall_seconds': 1.0, 'prompt_sha256': 'prompt',
++                  'fixture_files_sha256': {'fixture.txt': 'contents'}, 'metrics': metrics}
++        (path/'result.json').write_text(json.dumps(result))
++        (path/'grading.json').write_text(json.dumps({'passed': grade}))
++        (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++        return path, result
++
++    def test_short_and_long_keep_same_complete_and_partial_row_evidence(self):
++        tokens = {'input_tokens': 10, 'cached_input_tokens': 2, 'output_tokens': 3}
++        for complete in [True, False]:
++            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                path, _ = self.trial(root, 'case', pipeline=complete, timed_out=not complete,
++                                     tokens=tokens)
++                original = {file.name: file.read_bytes() for file in path.iterdir()}
++                short = report.read_rows([root], [])[0]
++                long = long_report.read_trial(path, 'case', 'pi', 1)
++                for key in ['tokens', 'reported_usage', 'observed_partial_usage',
++                            'usage_complete', 'usage_completeness_reason', 'timed_out']:
++                    self.assertEqual(short[key], long[key], key)
++                self.assertEqual(short['usage_complete'], complete)
++                self.assertEqual(short['tokens']['input_tokens'], 10 if complete else None)
++                self.assertEqual(short['reported_usage']['input_tokens'], 10)
++                self.assertEqual(short['observed_partial_usage']['input_tokens'], 10)
++                self.assertEqual(original, {file.name: file.read_bytes() for file in path.iterdir()})
++
++    def test_partial_primary_is_not_promoted_and_repeat_does_not_enter_totals(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            first, _ = self.trial(root, 'first', grade=False,
++                                  tokens={'input_tokens': 10, 'cached_input_tokens': 2, 'output_tokens': 3})
++            second, _ = self.trial(root, 'second', pipeline=False, timed_out=True,
++                                   tokens={'input_tokens': 20, 'cached_input_tokens': 4, 'output_tokens': 6})
++            repeat, _ = self.trial(root, 'second', 2,
++                                   tokens={'input_tokens': 1000, 'cached_input_tokens': 200, 'output_tokens': 300})
++            short_rows = report.read_rows([root], [])
++            short = report.summarize(short_rows)[0]
++            long_rows = [long_report.read_trial(first, 'first', 'pi', 1),
++                         long_report.read_trial(second, 'second', 'pi', 1),
++                         long_report.read_trial(repeat, 'second', 'pi', 2)]
++            long = long_report.summarize(long_rows, ['pi'], ['first', 'second'])[0]
++            self.assertEqual(short['primary_attempts'], 2)
++            self.assertEqual(short['primary_passed'], 0)
++            self.assertEqual(short['repeat_attempts'], 1)
++            self.assertEqual(short['repeat_passed'], 1)
++            self.assertEqual(short['requests'], 2)
++            self.assertEqual(short['actions'], 4)
++            for field in ['input', 'cached', 'output']:
++                self.assertIsNone(short[field])
++            self.assertEqual(short['known_token_runs'], long['known_token_runs'])
++            self.assertEqual(short['observed_token_sums'], long['observed_token_sums'])
++            self.assertEqual(short['known_token_runs']['input_tokens'], 1)
++            self.assertEqual(short['observed_token_sums']['input_tokens'], 30)
++            self.assertEqual(short['observed_token_sums']['output_tokens'], 9)
++            self.assertIsNone(long['tokens']['input_tokens'])
++
++    def test_complete_run_with_missing_category_keeps_observed_partial_evidence(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.trial(root, 'case', tokens={'input_tokens': None, 'output_tokens': 3},
++                       partial={'input_tokens': 7})
++            row = report.read_rows([root], [])[0]
++            summary = report.summarize([row])[0]
++            self.assertTrue(row['usage_complete'])
++            self.assertIsNone(summary['input'])
++            self.assertEqual(summary['output'], 3)
++            self.assertEqual(summary['known_token_runs']['input_tokens'], 0)
++            self.assertEqual(summary['observed_token_sums']['input_tokens'], 7)
++            self.assertEqual(row['reported_usage']['input_tokens'], None)
++
++    def test_explicit_zero_and_no_observation_have_distinct_coverage(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            zero = usage_report.project_usage(path, {'pipeline_ok': True},
++                                               {'provider_usage': {'input_tokens': 0}})
++            empty = usage_report.project_usage(path, {'pipeline_ok': True}, {})
++            zeros = usage_report.summarize_usage([zero])
++            absent = usage_report.summarize_usage([empty])
++            self.assertEqual(zeros['tokens']['input_tokens'], 0)
++            self.assertEqual(zeros['known_token_runs']['input_tokens'], 1)
++            self.assertIsNone(absent['tokens']['input_tokens'])
++            self.assertEqual(absent['known_token_runs']['input_tokens'], 0)
++            self.assertEqual(zeros['observed_token_sums']['input_tokens'], 0)
++            self.assertEqual(absent['observed_token_sums']['input_tokens'], 0)
++            zero['tokens']['input_tokens'] = 9
++            self.assertEqual(zero['reported_usage']['input_tokens'], 0)
++
++    def test_existing_teardown_completion_policy_is_not_replaced_by_pipeline_boolean(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            (path/'stdout.jsonl').write_text(json.dumps({'type': 'agent_end', 'willRetry': False})+'\n')
++            complete = usage_report.project_usage(path,
++                {'agent': 'pi', 'pipeline_ok': False, 'expected_turns': 1},
++                {'provider_usage': {'input_tokens': 10}})
++            self.assertTrue(complete['usage_complete'])
++            self.assertEqual(complete['tokens']['input_tokens'], 10)
++            canonical = usage_report.project_usage(path,
++                {'agent': 'proteus', 'pipeline_ok': False},
++                {'model_requests': 1, 'model_responses': 1,
++                 'settlements': [{'status': 'success'}], 'failures': [],
++                 'provider_usage': {'input_tokens': 12}})
++            self.assertTrue(canonical['usage_complete'])
++            self.assertEqual(canonical['tokens']['input_tokens'], 12)
++
++    def test_pair_identity_guard_still_rejects_different_inputs(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.trial(root, 'case', tokens={'input_tokens': 1})
++            second, result = self.trial(root, 'case', 2, tokens={'input_tokens': 1})
++            result['prompt_sha256'] = 'different'
++            (second/'result.json').write_text(json.dumps(result))
++            with self.assertRaisesRegex(ValueError, 'fixture or prompt differs'):
++                report.summarize(report.read_rows([root], []))
++
++
++if __name__ == '__main__':
++    unittest.main()
