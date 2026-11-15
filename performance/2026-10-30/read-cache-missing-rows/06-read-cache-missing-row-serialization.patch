@@ -1,0 +1,226 @@
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite/update/tests.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite/update/tests.rs
+@@ -1,4 +1,159 @@
+ use super::*;
++
++struct Counted<'a> {
++    value: &'a str,
++    calls: std::cell::Cell<usize>,
++}
++
++impl<'a> Counted<'a> {
++    fn new(value: &'a str) -> Self {
++        Self {
++            value,
++            calls: std::cell::Cell::new(0),
++        }
++    }
++}
++
++impl Serialize for Counted<'_> {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.calls.set(self.calls.get() + 1);
++        serializer.serialize_str(self.value)
++    }
++}
++
++struct Failing(std::cell::Cell<usize>);
++
++impl Serialize for Failing {
++    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
++        self.0.set(self.0.get() + 1);
++        Err(serde::ser::Error::custom(
++            "deliberate serialization failure",
++        ))
++    }
++}
++
++#[test]
++fn failed_serialization_is_not_retried_as_a_row_mismatch() {
++    let dir = source();
++    let source = SourceFingerprint::read(dir.path(), MAX_BLOBS).unwrap();
++    let writer = Writer::new(dir.path(), "test", &source).unwrap();
++    writer.row("data", 0, &"before").unwrap();
++    writer.finish().unwrap();
++    for position in [0, 1] {
++        let writer = Updater::new(dir.path(), "test", &source).unwrap();
++        let data = Failing(std::cell::Cell::new(0));
++        assert_eq!(writer.row("data", position, &data), None);
++        assert_eq!(data.0.get(), 1);
++        drop(writer);
++        assert_eq!(
++            Reader::open(dir.path(), "test")
++                .unwrap()
++                .one::<String>("data")
++                .unwrap(),
++            "before"
++        );
++    }
++}
++
++#[test]
++fn failed_lookup_does_not_invoke_the_expected_hash_supplier() {
++    let conn = Connection::open_in_memory().unwrap();
++    let calls = std::cell::Cell::new(0);
++    assert_eq!(
++        row_matches_with(&conn, "data", 0, || {
++            calls.set(calls.get() + 1);
++            Some([0u8; 32])
++        }),
++        None
++    );
++    assert_eq!(calls.get(), 0);
++}
++
++#[test]
++fn missing_keys_serialize_once_including_a_hole_between_existing_rows() {
++    let dir = source();
++    let source = SourceFingerprint::read(dir.path(), MAX_BLOBS).unwrap();
++    let writer = Writer::new(dir.path(), "test", &source).unwrap();
++    writer.row("data", 0, &"zero").unwrap();
++    writer.row("data", 2, &"two").unwrap();
++    writer.finish().unwrap();
++
++    let writer = Updater::new(dir.path(), "test", &source).unwrap();
++    for (position, value) in [(1, "hole"), (3, "tail")] {
++        let data = Counted::new(value);
++        assert_eq!(writer.row("data", position, &data), Some(false));
++        assert_eq!(data.calls.get(), 1);
++    }
++    writer.finish().unwrap();
++    assert_eq!(
++        Reader::open(dir.path(), "test")
++            .unwrap()
++            .page::<String>("data", 0, 4)
++            .unwrap(),
++        ["zero", "hole", "two", "tail"]
++    );
++}
++
++#[test]
++fn existing_keys_keep_streaming_comparison_and_repair_serialization_counts() {
++    let dir = source();
++    let source = SourceFingerprint::read(dir.path(), MAX_BLOBS).unwrap();
++    let writer = Writer::new(dir.path(), "test", &source).unwrap();
++    for position in 0..3 {
++        writer.row("data", position, &"before").unwrap();
++    }
++    writer.finish().unwrap();
++    let connection = Connection::open(cache_path(dir.path(), "test").unwrap()).unwrap();
++    connection
++        .execute(
++            "UPDATE records SET payload=x'00' WHERE section='data' AND position=2",
++            [],
++        )
++        .unwrap();
++    drop(connection);
++
++    let writer = Updater::new(dir.path(), "test", &source).unwrap();
++    for (position, value, unchanged, calls) in [
++        (0, "before", true, 1),
++        (1, "after", false, 2),
++        (2, "before", false, 2),
++    ] {
++        let data = Counted::new(value);
++        assert_eq!(writer.row("data", position, &data), Some(unchanged));
++        assert_eq!(data.calls.get(), calls);
++    }
++    writer.finish().unwrap();
++    assert_eq!(
++        Reader::open(dir.path(), "test")
++            .unwrap()
++            .page::<String>("data", 0, 3)
++            .unwrap(),
++        ["before", "after", "before"]
++    );
++}
++
++#[test]
++fn oversized_missing_or_existing_row_fails_once_and_rolls_back() {
++    let dir = source();
++    let source = SourceFingerprint::read(dir.path(), MAX_BLOBS).unwrap();
++    let writer = Writer::new(dir.path(), "test", &source).unwrap();
++    writer.row("data", 0, &"before").unwrap();
++    writer.finish().unwrap();
++    // JSON quotes alone take this beyond the per-row bounded writer limit.
++    let oversized = "x".repeat(MAX_BYTES);
++    for position in [0, 2] {
++        let writer = Updater::new(dir.path(), "test", &source).unwrap();
++        assert_eq!(writer.row("data", 1, &"uncommitted"), Some(false));
++        let data = Counted::new(&oversized);
++        assert_eq!(writer.row("data", position, &data), None);
++        assert_eq!(data.calls.get(), 1);
++        drop(writer);
++        let reader = Reader::open(dir.path(), "test").unwrap();
++        assert_eq!(reader.one::<String>("data").unwrap(), "before");
++        assert!(reader.page::<String>("data", 1, 2).is_none());
++        assert!(reader.page::<String>("data", 2, 3).is_none());
++    }
++}
+ 
+ fn source() -> tempfile::TempDir {
+     let dir = tempfile::tempdir().unwrap();
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite/update.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite/update.rs
+@@ -68,15 +68,15 @@
+ 
+     /// Returns true only when the existing payload and checksum both match.
+     /// Unchanged rows avoid a full serialized payload allocation and SQL write.
++    /// Missing keys skip comparison serialization and encode only for insertion.
+     pub(in crate::core::session_store) fn row<T: Serialize>(
+         &self,
+         section: &str,
+         position: usize,
+         data: &T,
+     ) -> Option<bool> {
+-        let expected = hash_serialized(data)?;
+         let conn = self.conn.as_ref()?;
+-        if row_matches(conn, section, position, &expected)? {
++        if row_matches_with(conn, section, position, || hash_serialized(data))? {
+             return Some(true);
+         }
+         let bytes = serialize_bounded(data)?;
+--- a/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
++++ b/crates/proteus-core/src/core/session_store/read_cache/sqlite.rs
+@@ -310,22 +310,37 @@
+ }
+ 
+ fn row_matches(conn: &Connection, section: &str, position: usize, expected: &[u8]) -> Option<bool> {
++    row_matches_with(conn, section, position, || Some(expected))
++}
++
++// Delay serialization until the lookup finds a key. Missing rows have no
++// previous payload to compare and can be serialized once for insertion.
++fn row_matches_with<H: AsRef<[u8]>>(
++    conn: &Connection,
++    section: &str,
++    position: usize,
++    expected: impl FnOnce() -> Option<H>,
++) -> Option<bool> {
+     let mut statement = conn
+         .prepare_cached("SELECT payload,checksum FROM records WHERE section=?1 AND position=?2")
+         .ok()?;
+     match statement.query_row(params![section, i64::try_from(position).ok()?], |row| {
++        // Preserve serialization failure as None, not a mismatch/retry.
++        let Some(expected) = expected() else {
++            return Ok(None);
++        };
+         let bytes = row.get_ref(0)?;
+         let checksum = row.get_ref(1)?;
+-        Ok(match (bytes.as_blob(), checksum.as_blob()) {
++        Ok(Some(match (bytes.as_blob(), checksum.as_blob()) {
+             (Ok(bytes), Ok(checksum)) => {
+                 bytes.len() <= MAX_BYTES
+-                    && checksum == expected
++                    && checksum == expected.as_ref()
+                     && digest(&SHA256, bytes).as_ref() == checksum
+             }
+             _ => false,
+-        })
++        }))
+     }) {
+-        Ok(matches) => Some(matches),
++        Ok(matches) => matches,
+         Err(rusqlite::Error::QueryReturnedNoRows) => Some(false),
+         Err(_) => None,
+     }
