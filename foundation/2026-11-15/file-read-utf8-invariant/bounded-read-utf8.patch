@@ -1,0 +1,275 @@
+--- a/tool/file-tools/src/lib.rs
++++ b/tool/file-tools/src/lib.rs
+@@ -26,6 +26,7 @@
+ mod list;
+ mod read;
+ mod read_many;
++mod read_text;
+ mod search;
+ mod util;
+ mod write;
+--- a/tool/file-tools/src/read.rs
++++ b/tool/file-tools/src/read.rs
+@@ -9,6 +9,7 @@
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::json;
+ 
++use crate::read_text::decode_read_bytes;
+ use crate::util::{
+     err_result, module_error, ok_result, optional_positive_usize, parse_call,
+     parse_invocation_context, required_string, workspace_path,
+@@ -262,15 +263,10 @@
+             reason = Some("output_budget");
+             break;
+         }
+-        let mut end = line.len().min(available);
+-        let text = match std::str::from_utf8(&line[..end]) {
+-            Ok(text) => text,
+-            Err(error) if error.error_len().is_none() && (end < line.len() || !complete) => {
+-                end = error.valid_up_to();
+-                std::str::from_utf8(&line[..end]).expect("validated UTF-8 prefix")
+-            }
+-            Err(error) => return Err(format!("invalid UTF-8 in {}: {error}", path.display())),
+-        };
++        let end = line.len().min(available);
++        let text = decode_read_bytes(&line[..end], end < line.len() || !complete)
++            .map_err(|error| format!("invalid UTF-8 in {}: {error}", path.display()))?;
++        let end = text.len();
+         if separator != 0 {
+             output.push('\n');
+         }
+--- a/tool/file-tools/src/read_many.rs
++++ b/tool/file-tools/src/read_many.rs
+@@ -5,6 +5,7 @@
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::{Value, json};
+ 
++use crate::read_text::decode_read_bytes;
+ use crate::util::{
+     err_result, module_error, ok_result, optional_positive_usize, parse_call,
+     parse_invocation_context, workspace_path,
+@@ -165,19 +166,11 @@
+             };
+             let rendered_truncated_by_budget = rendered.len() > content_budget;
+             if rendered_truncated_by_budget {
+-                rendered = match utf8_prefix(rendered.as_bytes(), content_budget) {
+-                    Ok(prefix) => prefix,
+-                    Err(e) => {
+-                        return err_result(
+-                            &call.id,
+-                            &call.name,
+-                            format!(
+-                                "failed to truncate rendered output for {} as UTF-8: {e}",
+-                                absolute.display()
+-                            ),
+-                        );
+-                    }
+-                };
++                let mut end = content_budget;
++                while !rendered.is_char_boundary(end) {
++                    end -= 1;
++                }
++                rendered.truncate(end);
+             }
+             let returned_bytes = rendered.len();
+             let file_truncated = file_read.truncated || rendered_truncated_by_budget;
+@@ -256,30 +249,19 @@
+         .take(limit.saturating_add(1) as u64)
+         .read_to_end(&mut bytes)
+         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+-    let truncated = bytes.len() > limit || original_bytes > bytes.len();
+-    if truncated {
++    let at_budget_boundary = bytes.len() > limit;
++    let truncated = at_budget_boundary || original_bytes > bytes.len();
++    if at_budget_boundary {
+         bytes.truncate(limit);
+     }
+-    let text = utf8_prefix(&bytes, bytes.len())
+-        .map_err(|e| format!("failed to decode {} as UTF-8: {e}", path.display()))?;
++    let text = decode_read_bytes(&bytes, at_budget_boundary)
++        .map_err(|e| format!("failed to decode {} as UTF-8: {e}", path.display()))?
++        .to_owned();
+     Ok(FileRead {
+         text,
+         original_bytes,
+         truncated,
+     })
+-}
+-
+-fn utf8_prefix(bytes: &[u8], max_bytes: usize) -> Result<String, std::str::Utf8Error> {
+-    let mut end = bytes.len().min(max_bytes);
+-    loop {
+-        match std::str::from_utf8(&bytes[..end]) {
+-            Ok(text) => return Ok(text.to_owned()),
+-            Err(error) if error.error_len().is_none() && end > 0 => {
+-                end = error.valid_up_to();
+-            }
+-            Err(error) => return Err(error),
+-        }
+-    }
+ }
+ 
+ fn add_line_numbers(text: &str) -> String {
+@@ -289,3 +271,6 @@
+         .collect::<Vec<_>>()
+         .join("\n")
+ }
++
++#[cfg(test)]
++mod utf8_tests;
+--- /dev/null
++++ b/tool/file-tools/src/read_many/utf8_tests.rs
+@@ -0,0 +1,34 @@
++use super::*;
++
++#[test]
++fn observed_eof_is_strict_even_when_old_metadata_claims_more_bytes() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("tail.txt");
++    std::fs::write(&path, b"valid\xc3").unwrap();
++    for original_bytes in [6, 100] {
++        for limit in [6, 10] {
++            let error = read_text_prefix(&path, limit, original_bytes).unwrap_err();
++            assert!(error.contains("failed to decode"));
++        }
++    }
++}
++
++#[test]
++fn byte_cut_allows_only_incomplete_tail_and_preserves_conservative_metadata() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("text.txt");
++    std::fs::write(&path, "valid😀tail").unwrap();
++    for limit in 6..9 {
++        let read = read_text_prefix(&path, limit, 13).unwrap();
++        assert_eq!(read.text, "valid");
++        assert!(read.truncated);
++        assert_eq!(read.original_bytes, 13);
++    }
++    std::fs::write(&path, b"valid\xfftail").unwrap();
++    assert!(read_text_prefix(&path, 7, 10).is_err());
++    std::fs::write(&path, "short").unwrap();
++    let read = read_text_prefix(&path, 10, 100).unwrap();
++    assert_eq!(read.text, "short");
++    assert_eq!(read.original_bytes, 100);
++    assert!(read.truncated, "retain the existing conservative metadata claim");
++}
+--- /dev/null
++++ b/tool/file-tools/src/read_text.rs
+@@ -0,0 +1,52 @@
++//! UTF-8 policy for bounded raw-byte reads. A real EOF is not a budget cut.
++
++/// Only a read stopped by a byte budget may omit an unfinished trailing scalar.
++/// Invalid interior bytes are errors at either boundary. File metadata is not
++/// evidence that the actual read stopped before EOF.
++pub(crate) fn decode_read_bytes(
++    bytes: &[u8],
++    at_budget_boundary: bool,
++) -> Result<&str, std::str::Utf8Error> {
++    match std::str::from_utf8(bytes) {
++        Err(error) if at_budget_boundary && error.error_len().is_none() => {
++            std::str::from_utf8(&bytes[..error.valid_up_to()])
++        }
++        result => result,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_a_budget_boundary_can_omit_an_incomplete_scalar() {
++        for text in ["я", "€", "😀"] {
++            let bytes = text.as_bytes();
++            for end in 1..bytes.len() {
++                assert!(decode_read_bytes(&bytes[..end], false).is_err());
++                assert_eq!(decode_read_bytes(&bytes[..end], true).unwrap(), "");
++                let mut prefixed = b"valid".to_vec();
++                prefixed.extend_from_slice(&bytes[..end]);
++                assert!(decode_read_bytes(&prefixed, false).is_err());
++                assert_eq!(decode_read_bytes(&prefixed, true).unwrap(), "valid");
++            }
++        }
++    }
++
++    #[test]
++    fn invalid_bytes_are_never_repaired_and_valid_text_is_borrowed() {
++        for bytes in [&b"valid\xfftail"[..], &b"\xc0\xaf"[..], &b"\xed\xa0\x80"[..]] {
++            for boundary in [false, true] {
++                assert!(decode_read_bytes(bytes, boundary).is_err());
++            }
++        }
++        for boundary in [false, true] {
++            assert_eq!(decode_read_bytes(b"", boundary).unwrap(), "");
++            let bytes = "a😀z".as_bytes();
++            let text = decode_read_bytes(bytes, boundary).unwrap();
++            assert_eq!(text, "a😀z");
++            assert_eq!(text.as_ptr(), bytes.as_ptr());
++        }
++    }
++}
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -7,6 +7,8 @@
+ 
+ use super::*;
+ use crate::{find::FindFilesTool, read_many::ReadManyFilesTool, search::GrepTool};
++
++mod read_utf8;
+ 
+ struct TestToolHost;
+ 
+--- /dev/null
++++ b/tool/file-tools/src/tests/read_utf8.rs
+@@ -0,0 +1,50 @@
++use super::*;
++
++#[test]
++fn file_read_modes_reject_invalid_utf8_at_observed_eof() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("text.txt");
++    for bytes in [&b"valid\xc3"[..], &b"valid\xf0\x9f\x98"[..], &b"valid\xff"[..]] {
++        std::fs::write(&path, bytes).unwrap();
++        let results = [
++            invoke(&ReadFileTool, dir.path(), json!({"path":"text.txt"})),
++            invoke(&ReadFileTool, dir.path(), json!({"path":"text.txt", "start_line":1})),
++            invoke(&ReadManyFilesTool, dir.path(), json!({"paths":["text.txt"]})),
++            invoke(&ReadManyFilesTool, dir.path(), json!({"paths":["text.txt"], "line_numbers":true})),
++        ];
++        for result in results {
++            assert_eq!(result["ok"], false);
++            assert!(result["error"].as_str().unwrap().to_ascii_lowercase().contains("utf-8"));
++        }
++    }
++}
++
++#[test]
++fn batch_read_reports_an_intentional_scalar_cut_as_truncated() {
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::write(dir.path().join("text.txt"), "valid😀tail").unwrap();
++    let result = invoke(&ReadManyFilesTool, dir.path(), json!({
++        "paths":["text.txt"], "max_bytes_per_file":7, "max_bytes_total":100
++    }));
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["output"], "== text.txt ==\nvalid");
++    assert_eq!(result["metadata"]["files"][0]["original_bytes"], 13);
++    assert_eq!(result["metadata"]["files"][0]["returned_bytes"], 5);
++    assert_eq!(result["metadata"]["files"][0]["truncated"], true);
++    assert_eq!(result["metadata"]["truncated"], true);
++}
++
++#[test]
++fn numbered_rendering_truncates_valid_string_at_a_scalar_boundary() {
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::write(dir.path().join("text.txt"), "я").unwrap();
++    let budget = "== text.txt ==\n".len() + 3;
++    let result = invoke(&ReadManyFilesTool, dir.path(), json!({
++        "paths":["text.txt"], "line_numbers":true, "max_bytes_total":budget
++    }));
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["output"], "== text.txt ==\n1\t");
++    assert!(result["output"].as_str().unwrap().len() <= budget);
++    assert_eq!(result["metadata"]["files"][0]["returned_bytes"], 2);
++    assert_eq!(result["metadata"]["files"][0]["truncated"], true);
++}
