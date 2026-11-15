@@ -1,0 +1,1056 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -21,7 +21,7 @@
+ use crate::{
+     core::{
+         AppConfig, ModuleCatalogEntrySummary, ModuleSourceTopology, ModuleTopology, ModulesConfig,
+-        ProviderProfileConfig, TopologyBuildInput, TopologySnapshot, build_topology_snapshot,
++        TopologyBuildInput, TopologySnapshot, build_topology_snapshot,
+         core_slots::{CoreSlotSelection, core_slot_descriptor_by_id},
+     },
+     domain::PermissionMode,
+@@ -186,13 +186,9 @@
+             next_config.addons = update.addons;
+             next_config.tools.mcp_servers = update.mcp_servers;
+         }
+-        if let Some(active_provider) = &active_provider {
+-            validate_config_builder_provider(active_provider, &next_config)?;
+-        }
+         if let Some(hooks) = hooks {
+             next_config.modules.hooks = hooks;
+         }
+-        next_config.modules.validate_hooks()?;
+         for (slot, module_id) in modules {
+             set_module_slot(&mut next_config.modules, &slot, module_id)?;
+         }
+@@ -208,6 +204,7 @@
+         if let Some(mode) = permission_mode {
+             next_config.permissions.mode = mode;
+         }
++        next_config.validate_semantics()?;
+         let target = config_builder_target_path(Some(config_path))
+             .context("config target is not available")?;
+         if !target
+@@ -386,16 +383,6 @@
+         .collect()
+ }
+ 
+-pub(super) fn validate_config_builder_provider(
+-    active_provider: &str,
+-    config: &AppConfig,
+-) -> Result<()> {
+-    if !config.providers.contains_key(active_provider) {
+-        anyhow::bail!("active_provider is not defined in [providers]: {active_provider}");
+-    }
+-    Ok(())
+-}
+-
+ pub(super) fn validate_config_builder_modules(
+     modules: &BTreeMap<String, String>,
+     catalog_entries: &[ModuleCatalogEntrySummary],
+diff --git a/crates/proteus-core/src/app_server/config_builder/persistence.rs b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -44,11 +44,6 @@
+     module_config: &'a BTreeMap<String, BTreeMap<String, Value>>,
+ }
+ 
+-#[derive(serde::Serialize)]
+-struct ProvidersToml<'a> {
+-    providers: &'a BTreeMap<String, ProviderProfileConfig>,
+-}
+-
+ pub(super) fn validate_module_config_toml(
+     module_config: &BTreeMap<String, BTreeMap<String, Value>>,
+ ) -> Result<()> {
+@@ -64,6 +59,17 @@
+         .context("serialized module_config TOML could not be parsed")
+ }
+ 
++/// Initial source must retain file references, not their resolved runtime text.
++fn initial_profile_source(config: &AppConfig) -> AppConfig {
++    let mut source = config.clone();
++    for entry in &mut source.instructions {
++        if entry.file.is_some() {
++            entry.text = None;
++        }
++    }
++    source
++}
++
+ #[cfg(test)]
+ pub(super) async fn persist_config_builder(path: &Path, config: &AppConfig) -> Result<()> {
+     persist_config_builder_with_components(path, config, &BTreeSet::new()).await
+@@ -89,7 +95,7 @@
+         && path.file_name().and_then(|name| name.to_str())
+             != Some(crate::core::CONFIG_BUILDER_OVERLAY)
+     {
+-        toml::to_string_pretty(config)
++        toml::to_string_pretty(&initial_profile_source(config))
+             .context("cannot serialize initial profile")?
+             .parse::<toml_edit::DocumentMut>()?
+     } else {
+@@ -101,17 +107,6 @@
+     } else {
+         doc.remove("active_provider");
+     }
+-    if doc.get("providers").is_none() {
+-        let text = toml::to_string_pretty(&ProvidersToml {
+-            providers: &config.providers,
+-        })
+-        .context("providers cannot be represented as TOML")?;
+-        let providers_doc = text
+-            .parse::<toml_edit::DocumentMut>()
+-            .context("serialized providers TOML could not be parsed")?;
+-        doc["providers"] = providers_doc["providers"].clone();
+-    }
+-
+     if doc
+         .get("permissions")
+         .is_none_or(|item| !item.is_table_like())
+@@ -229,7 +224,9 @@
+     let mut document: Value = match tokio::fs::read(path).await {
+         Ok(bytes) => serde_json::from_slice(&bytes)
+             .with_context(|| format!("failed to parse config JSON at {}", path.display()))?,
+-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => next.clone(),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            serde_json::to_value(initial_profile_source(config))?
++        }
+         Err(error) => return Err(error.into()),
+     };
+     let root = document
+@@ -240,8 +237,6 @@
+     } else {
+         root.remove("active_provider");
+     }
+-    root.entry("providers")
+-        .or_insert_with(|| next["providers"].clone());
+     for key in ["modules", "module_config", "addons"] {
+         root.insert(key.into(), next[key].clone());
+     }
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -1,3 +1,5 @@
++mod validation;
++
+ use super::super::AgentAppServer;
+ use super::*;
+ 
+@@ -5,7 +7,9 @@
+ async fn directory_save_has_explicit_precedence_over_late_fragments() {
+     let dir = tempfile::tempdir().unwrap();
+     tokio::fs::write(dir.path().join("z-settings.toml"), "[permissions]\nmode='normal'\n[modules]\nworkflow='old'\n[module_config.workflow.old]\nvalue=1\n[tools]\nenabled=['old']\n").await.unwrap();
+-    let mut config = AppConfig::default();
++    let mut config = AppConfig::load(Some(dir.path())).await.unwrap();
++    config.modules.workflow = None;
++    config.module_config.clear();
+     config.permissions.mode = PermissionMode::Plan;
+     config.tools.enabled = vec!["new".into()];
+     let target = config_builder_target_path(Some(dir.path())).unwrap();
+@@ -83,7 +87,7 @@
+         .await
+         .unwrap();
+     std::os::unix::fs::symlink(&source, &alias).unwrap();
+-    let mut config = AppConfig::default();
++    let mut config = AppConfig::load(Some(&alias)).await.unwrap();
+     config.permissions.mode = PermissionMode::Plan;
+     let target = config_builder_target_path(Some(&alias)).unwrap();
+     persist_config_builder(&target, &config).await.unwrap();
+@@ -166,6 +170,8 @@
+     assert_eq!(saved["agent_control"]["max_depth"], 3);
+ }
+ 
++mod instruction_bootstrap;
++
+ #[tokio::test]
+ async fn json_profile_save_does_not_apply_toml_value_restrictions() {
+     let dir = tempfile::tempdir().unwrap();
+@@ -201,3 +207,5 @@
+     );
+     server.shutdown().await;
+ }
++
++mod provider_inheritance;
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs b/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
+@@ -0,0 +1,107 @@
++use super::*;
++
++async fn write_profile(path: &Path, source: &Value) {
++    let text = if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::to_string_pretty(source).unwrap()
++    } else {
++        toml::to_string_pretty(source).unwrap()
++    };
++    tokio::fs::write(path, text).await.unwrap();
++}
++
++async fn read_profile(path: &Path) -> Value {
++    let text = tokio::fs::read_to_string(path).await.unwrap();
++    if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::from_str(&text).unwrap()
++    } else {
++        let value: toml::Value = toml::from_str(&text).unwrap();
++        serde_json::to_value(value).unwrap()
++    }
++}
++
++#[tokio::test]
++async fn missing_standalone_profile_preserves_instruction_sources() {
++    for extension in ["toml", "json"] {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(format!("profile.{extension}"));
++        let relative = dir.path().join("relative.md");
++        let absolute = dir.path().join("absolute.md");
++        tokio::fs::write(&relative, "relative v1").await.unwrap();
++        tokio::fs::write(&absolute, "absolute v1").await.unwrap();
++        let instructions = serde_json::json!([
++            {"kind": "System", "file": "relative.md", "priority": 100},
++            {"kind": "Developer", "text": "inline text", "priority": 90},
++            {"kind": "System", "file": absolute, "priority": 80}
++        ]);
++        write_profile(&path, &serde_json::json!({"instructions": instructions})).await;
++        let mut config = AppConfig::load(Some(&path)).await.unwrap();
++        let runtime_instructions = serde_json::to_value(&config.instructions).unwrap();
++        assert_eq!(config.instructions[0].text.as_deref(), Some("relative v1"));
++        assert_eq!(config.instructions[2].text.as_deref(), Some("absolute v1"));
++
++        config.tools.enabled = vec!["managed-change".into()];
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], instructions);
++
++        tokio::fs::remove_file(&path).await.unwrap();
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], instructions);
++        assert_eq!(serde_json::to_value(&config.instructions).unwrap(), runtime_instructions);
++        let loaded = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(serde_json::to_value(&loaded.instructions).unwrap(), runtime_instructions);
++        assert_eq!(loaded.tools.enabled, config.tools.enabled);
++
++        tokio::fs::write(&relative, "relative v2").await.unwrap();
++        tokio::fs::write(&absolute, "absolute v2").await.unwrap();
++        let loaded = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(loaded.instructions[0].text.as_deref(), Some("relative v2"));
++        assert_eq!(loaded.instructions[1].text.as_deref(), Some("inline text"));
++        assert_eq!(loaded.instructions[2].text.as_deref(), Some("absolute v2"));
++    }
++}
++
++#[tokio::test]
++async fn bootstrap_does_not_substitute_cached_text_for_missing_instruction_assets() {
++    for extension in ["toml", "json"] {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(format!("profile.{extension}"));
++        let asset = dir.path().join("rules.md");
++        tokio::fs::write(&asset, "cached text").await.unwrap();
++        let source = serde_json::json!({"instructions": [
++            {"kind": "System", "file": "rules.md", "priority": 100}
++        ]});
++        write_profile(&path, &source).await;
++        let config = AppConfig::load(Some(&path)).await.unwrap();
++        tokio::fs::remove_file(&path).await.unwrap();
++        tokio::fs::remove_file(&asset).await.unwrap();
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], source["instructions"]);
++        let error = AppConfig::load(Some(&path)).await.unwrap_err();
++        assert!(format!("{error:#}").contains("failed to read instructions file"));
++        assert_eq!(config.instructions[0].text.as_deref(), Some("cached text"));
++    }
++}
++
++#[tokio::test]
++async fn directory_overlay_does_not_materialize_resolved_instructions() {
++    let dir = tempfile::tempdir().unwrap();
++    let source = dir.path().join("base.toml");
++    let asset = dir.path().join("rules.md");
++    let instructions = serde_json::json!([
++        {"kind": "System", "file": "rules.md", "priority": 100}
++    ]);
++    write_profile(&source, &serde_json::json!({"instructions": instructions})).await;
++    tokio::fs::write(&asset, "v1").await.unwrap();
++    let target = config_builder_target_path(Some(dir.path())).unwrap();
++    for text in ["v2", "v3"] {
++        let mut config = AppConfig::load(Some(dir.path())).await.unwrap();
++        config.tools.enabled = vec![text.into()];
++        persist_config_builder(&target, &config).await.unwrap();
++        assert!(read_profile(&target).await.get("instructions").is_none());
++        assert_eq!(read_profile(&source).await["instructions"], instructions);
++        tokio::fs::write(&asset, text).await.unwrap();
++        let loaded = AppConfig::load(Some(dir.path())).await.unwrap();
++        assert_eq!(loaded.instructions[0].text.as_deref(), Some(text));
++        assert_eq!(loaded.tools.enabled, config.tools.enabled);
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs b/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs
+@@ -0,0 +1,108 @@
++//! Persistence/load boundaries only; these fixtures do not launch a model.
++
++use super::*;
++use serde_json::json;
++
++async fn write_document(path: &Path, value: &Value) {
++    let text = if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::to_string_pretty(value).unwrap()
++    } else {
++        toml::to_string_pretty(value).unwrap()
++    };
++    tokio::fs::write(path, text).await.unwrap();
++}
++
++async fn read_document(path: &Path) -> Value {
++    let text = tokio::fs::read_to_string(path).await.unwrap();
++    if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::from_str(&text).unwrap()
++    } else {
++        serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap()
++    }
++}
++
++fn provider_fragment(model: &str) -> Value {
++    json!({"providers": {"demo": {"provider": "synthetic", "model": model}}})
++}
++
++#[tokio::test]
++async fn existing_include_profiles_preserve_provider_absence_and_explicit_overrides() {
++    for extension in ["toml", "json"] {
++        for local_override in [false, true] {
++            let dir = tempfile::tempdir().unwrap();
++            let fragment_name = format!("providers.{extension}");
++            let fragment = dir.path().join(&fragment_name);
++            let profile = dir.path().join(format!("profile.{extension}"));
++            write_document(&fragment, &provider_fragment("inherited-v1")).await;
++            let mut initial = json!({
++                "include": fragment_name,
++                "active_provider": "demo",
++                "runtime": {"model_timeout_ms": 98765}
++            });
++            if local_override {
++                initial["providers"] = json!({"demo": {"model": "local-v1"}});
++            }
++            write_document(&profile, &initial).await;
++            let mut config = AppConfig::load(Some(&profile)).await.unwrap();
++            assert_eq!(config.providers["demo"].model, if local_override { "local-v1" } else { "inherited-v1" });
++            config.tools.enabled = vec!["managed-fixture-tool".into()];
++
++            persist_config_builder(&profile, &config).await.unwrap();
++
++            let saved = read_document(&profile).await;
++            assert_eq!(saved.get("providers"), initial.get("providers"));
++            assert_eq!(saved["include"], initial["include"]);
++            assert_eq!(saved["runtime"], initial["runtime"]);
++            write_document(&fragment, &provider_fragment("inherited-v2")).await;
++            let reloaded = AppConfig::load(Some(&profile)).await.unwrap();
++            assert_eq!(reloaded.providers["demo"].model, if local_override { "local-v1" } else { "inherited-v2" });
++            assert_eq!(reloaded.active_provider.as_deref(), Some("demo"));
++            assert_eq!(reloaded.tools.enabled, config.tools.enabled);
++        }
++    }
++}
++
++#[tokio::test]
++async fn directory_first_and_repeated_overlay_saves_do_not_freeze_providers() {
++    let dir = tempfile::tempdir().unwrap();
++    let fragment = dir.path().join("base.toml");
++    let mut initial = provider_fragment("inherited-v1");
++    initial["active_provider"] = json!("demo");
++    write_document(&fragment, &initial).await;
++    let target = config_builder_target_path(Some(dir.path())).unwrap();
++    assert!(!target.exists());
++    for next_model in ["inherited-v2", "inherited-v3"] {
++        let mut config = AppConfig::load(Some(dir.path())).await.unwrap();
++        config.tools.enabled = vec!["managed-fixture-tool".into()];
++
++        persist_config_builder(&target, &config).await.unwrap();
++
++        assert!(read_document(&target).await.get("providers").is_none());
++        initial["providers"]["demo"]["model"] = json!(next_model);
++        write_document(&fragment, &initial).await;
++        let reloaded = AppConfig::load(Some(dir.path())).await.unwrap();
++        assert_eq!(reloaded.providers["demo"].model, next_model);
++        assert_eq!(reloaded.active_provider.as_deref(), Some("demo"));
++        assert_eq!(reloaded.tools.enabled, config.tools.enabled);
++    }
++}
++
++#[tokio::test]
++async fn absent_standalone_profiles_still_seed_the_selected_provider() {
++    for extension in ["toml", "json"] {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(format!("fresh.{extension}"));
++        let mut config = AppConfig::default();
++        let active = config.active_provider.clone().unwrap();
++        config.providers.get_mut(&active).unwrap().model = "standalone-fixture".into();
++        assert!(!path.exists());
++
++        persist_config_builder(&path, &config).await.unwrap();
++
++        assert!(read_document(&path).await.get("providers").is_some());
++        let reloaded = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(reloaded.active_provider, config.active_provider);
++        assert_eq!(serde_json::to_value(&reloaded.providers).unwrap(), serde_json::to_value(&config.providers).unwrap());
++        assert_eq!(reloaded.providers[&active].model, "standalone-fixture");
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/validation.rs b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+@@ -0,0 +1,309 @@
++use super::*;
++use crate::app_server::AppServerEvent;
++use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
++
++fn fixture_config() -> AppConfig {
++    let mut config = AppConfig::default();
++    config.active_provider = None;
++    config.providers.clear();
++    config.agent_control.surface = crate::core::AgentControlSurface::None;
++    config.tools.enabled = vec!["probe_command".into()];
++    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process_commands.py");
++    config.components.insert(
++        "probe".into(),
++        serde_json::from_value(serde_json::json!({
++            "command": "python3", "args": [fixture],
++            "exports": {"tool": {"probe.commands": {}}}
++        }))
++        .unwrap(),
++    );
++    config
++}
++
++fn write_config(path: &Path, config: &AppConfig) {
++    let bytes = if path
++        .extension()
++        .is_some_and(|extension| extension == "json")
++    {
++        serde_json::to_vec_pretty(config).unwrap()
++    } else {
++        toml::to_string_pretty(config).unwrap().into_bytes()
++    };
++    std::fs::write(path, bytes).unwrap();
++}
++
++async fn launch(
++    root: &Path,
++    format: &str,
++    config: AppConfig,
++) -> (PathBuf, PathBuf, AppServerHandle) {
++    let source = root.join(format!("config.{format}"));
++    let target = if format == "directory" {
++        std::fs::create_dir(&source).unwrap();
++        write_config(&source.join("base.toml"), &config);
++        config_builder_target_path(Some(&source)).unwrap()
++    } else {
++        if !format.starts_with("missing.") {
++            write_config(&source, &config);
++        }
++        source.clone()
++    };
++    let config = if source.exists() {
++        AppConfig::load(Some(&source)).await.unwrap()
++    } else {
++        config
++    };
++    let cwd = root.join("workspace");
++    std::fs::create_dir(&cwd).unwrap();
++    let server = AgentAppServer::launch(config, cwd, Some(&source))
++        .await
++        .unwrap();
++    (source, target, server)
++}
++
++#[tokio::test]
++async fn invalid_save_preserves_disk_live_epoch_and_history_then_valid_save_succeeds() {
++    for format in ["toml", "json", "directory", "missing.toml", "missing.json"] {
++        let root = tempfile::tempdir().unwrap();
++        let (source, target, server) = launch(root.path(), format, fixture_config()).await;
++        let disk = std::fs::read(&target).ok();
++        let live = serde_json::to_value(&*server.config.read().await).unwrap();
++        let epoch = server.runtime.module_epoch().await;
++        let history = serde_json::to_value(server.config_history().await.unwrap()).unwrap();
++        for (request, message) in [
++            (
++                serde_json::json!({"module_config":{"unknown_slot":{"unused":{"value":1}}}}),
++                "unknown module_config slot",
++            ),
++            (
++                serde_json::json!({"hooks":["same", "same"]}),
++                "duplicate id",
++            ),
++            (serde_json::json!({"hooks":[" "]}), "blank id"),
++            (
++                serde_json::json!({"active_provider":"missing"}),
++                "not defined",
++            ),
++            (
++                serde_json::json!({"active_provider":" "}),
++                "must not be empty",
++            ),
++        ] {
++            let request: SetConfigBuilderRequest = serde_json::from_value(request).unwrap();
++            let error = server.set_profile_config(request).await.unwrap_err();
++            assert!(
++                format!("{error:#}").contains(message),
++                "{format}: {error:#}"
++            );
++            assert_eq!(std::fs::read(&target).ok(), disk, "{format}: disk changed");
++            assert_eq!(
++                serde_json::to_value(&*server.config.read().await).unwrap(),
++                live
++            );
++            assert_eq!(server.runtime.module_epoch().await, epoch);
++            assert_eq!(
++                serde_json::to_value(server.config_history().await.unwrap()).unwrap(),
++                history
++            );
++        }
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            AppConfig::load(Some(&source))
++                .await
++                .unwrap()
++                .permissions
++                .mode,
++            PermissionMode::Plan
++        );
++        assert_eq!(server.permission_mode().await, PermissionMode::Plan);
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn empty_profile_save_remains_model_free_and_cold_loadable() {
++    for format in ["toml", "json", "directory"] {
++        let root = tempfile::tempdir().unwrap();
++        let source = root.path().join(format!("empty.{format}"));
++        match format {
++            "directory" => std::fs::create_dir(&source).unwrap(),
++            "json" => std::fs::write(&source, "{}").unwrap(),
++            _ => std::fs::write(&source, "").unwrap(),
++        }
++        let config = AppConfig::load(Some(&source)).await.unwrap();
++        assert!(config.active_provider.is_none());
++        assert!(config.components.is_empty());
++        let initial = serde_json::to_value(&config).unwrap();
++        let server = AgentAppServer::launch(config, root.path().into(), Some(&source))
++            .await
++            .unwrap();
++        server
++            .set_profile_config(serde_json::from_value(serde_json::json!({})).unwrap())
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert_eq!(serde_json::to_value(cold).unwrap(), initial, "{format}");
++        assert_eq!(
++            serde_json::to_value(&*server.config.read().await).unwrap(),
++            initial
++        );
++        assert!(server.config_history().await.unwrap().revisions.is_empty());
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert!(cold.active_provider.is_none());
++        assert!(cold.components.is_empty());
++        assert_eq!(cold.permissions.mode, PermissionMode::Plan);
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn supported_slot_save_preserves_resolved_file_instructions_and_cold_load() {
++    for (format, relative) in ["toml", "json", "directory"]
++        .into_iter()
++        .flat_map(|format| [(format, false), (format, true)])
++    {
++        let root = tempfile::tempdir().unwrap();
++        let mut config = serde_json::to_value(fixture_config()).unwrap();
++        let prompt = root.path().join("instructions.md");
++        std::fs::write(&prompt, "File instructions.").unwrap();
++        let instruction_path = if relative {
++            PathBuf::from(if format == "directory" {
++                "../instructions.md"
++            } else {
++                "instructions.md"
++            })
++        } else {
++            prompt
++        };
++        config["instructions"] = serde_json::json!([
++            {"kind":"System", "file":instruction_path, "priority":100},
++            {"kind":"Developer", "text":"Inline instructions.", "priority":90}
++        ]);
++        let (source, _, server) =
++            launch(root.path(), format, serde_json::from_value(config).unwrap()).await;
++        let instructions = server.config.read().await.instructions.clone();
++        assert_eq!(instructions[0].file.as_ref(), Some(&instruction_path));
++        assert_eq!(instructions[0].text.as_deref(), Some("File instructions."));
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::from([(
++                    "tool".into(),
++                    BTreeMap::from([("unused".into(), serde_json::json!({"value":1}))]),
++                )]),
++                None,
++                None,
++                None,
++            )
++            .await
++            .unwrap();
++        let cold = AppConfig::load(Some(&source)).await.unwrap();
++        assert_eq!(cold.module_config["tool"]["unused"]["value"], 1);
++        assert_eq!(
++            serde_json::to_value(cold.instructions).unwrap(),
++            serde_json::to_value(&instructions).unwrap()
++        );
++        server
++            .set_config_builder(
++                BTreeMap::new(),
++                None,
++                BTreeMap::new(),
++                None,
++                None,
++                Some(PermissionMode::Plan),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            AppConfig::load(Some(&source))
++                .await
++                .unwrap()
++                .permissions
++                .mode,
++            PermissionMode::Plan
++        );
++        server.shutdown().await;
++    }
++}
++
++#[tokio::test]
++async fn watcher_rejects_same_invalid_slot_and_recovers_without_replacing_valid_runtime() {
++    for format in ["toml", "json"] {
++        let root = tempfile::tempdir().unwrap();
++        let config = fixture_config();
++        let (source, _, server) = launch(root.path(), format, config.clone()).await;
++        let epoch = server.runtime.module_epoch().await;
++        let mut events = server.subscribe();
++        let mut invalid = config.clone();
++        invalid
++            .module_config
++            .insert("unknown_slot".into(), BTreeMap::new());
++        write_config(&source, &invalid);
++        let expected_error = AppConfig::load(Some(&source))
++            .await
++            .unwrap_err()
++            .to_string();
++        tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            loop {
++                if let AppServerEvent::ProfileReloadStatus { error: Some(error) } =
++                    events.recv().await.unwrap()
++                {
++                    assert_eq!(error, expected_error);
++                    break;
++                }
++            }
++        })
++        .await
++        .unwrap();
++        assert_eq!(server.runtime.module_epoch().await, epoch);
++        assert!(
++            !server
++                .config
++                .read()
++                .await
++                .module_config
++                .contains_key("unknown_slot")
++        );
++        assert!(server.config_history().await.unwrap().revisions.is_empty());
++        let mut recovered = config;
++        recovered.permissions.mode = PermissionMode::Plan;
++        write_config(&source, &recovered);
++        tokio::time::timeout(std::time::Duration::from_secs(5), async {
++            loop {
++                if matches!(
++                    events.recv().await.unwrap(),
++                    AppServerEvent::ModulesReloaded { .. }
++                ) {
++                    break;
++                }
++            }
++        })
++        .await
++        .unwrap();
++        assert_eq!(server.permission_mode().await, PermissionMode::Plan);
++        assert!(server.addons_snapshot().await.reload_error.is_none());
++        server.shutdown().await;
++    }
++}
+diff --git a/crates/proteus-core/src/core/config.rs b/crates/proteus-core/src/core/config.rs
+--- a/crates/proteus-core/src/core/config.rs
++++ b/crates/proteus-core/src/core/config.rs
+@@ -17,6 +17,7 @@
+ mod files;
+ mod inputs;
+ mod loading;
++mod validation;
+ pub use commands::PromptCommandConfig;
+ pub(crate) use files::config_files;
+ pub(crate) use inputs::ConfigInputs;
+diff --git a/crates/proteus-core/src/core/config/loading.rs b/crates/proteus-core/src/core/config/loading.rs
+--- a/crates/proteus-core/src/core/config/loading.rs
++++ b/crates/proteus-core/src/core/config/loading.rs
+@@ -6,8 +6,6 @@
+ 
+ use anyhow::{Context, Result, bail};
+ use serde_json::{Map, Value};
+-
+-use crate::core::core_slots::{CoreSlotSelection, core_slot_descriptor_by_id};
+ 
+ use super::{AppConfig, ConfigInputs};
+ 
+@@ -76,28 +74,8 @@
+                 path.display()
+             )
+         })?;
+-        config.selected_model_config()?;
+-        config.validate_module_config_slots()?;
+-        config.modules.validate_hooks()?;
+-        config.validate_commands()?;
++        config.validate_semantics()?;
+         Ok(config)
+-    }
+-
+-    fn validate_module_config_slots(&self) -> Result<()> {
+-        for slot in self.module_config.keys() {
+-            if matches!(
+-                slot.as_str(),
+-                "tool" | "context_provider" | "model" | "hook"
+-            ) {
+-                continue;
+-            }
+-            match core_slot_descriptor_by_id(slot) {
+-                Some(descriptor) if descriptor.selection == CoreSlotSelection::ModulesConfig => {}
+-                Some(_) => bail!("module_config is not supported for slot {slot:?}"),
+-                None => bail!("unknown module_config slot {slot:?}"),
+-            }
+-        }
+-        Ok(())
+     }
+ 
+     pub fn default_user_config_path() -> Option<PathBuf> {
+diff --git a/crates/proteus-core/src/core/config/validation.rs b/crates/proteus-core/src/core/config/validation.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/src/core/config/validation.rs
+@@ -0,0 +1,36 @@
++//! Source-independent profile rules shared by loading and edited configs.
++use anyhow::{Result, bail};
++
++use crate::core::core_slots::{CoreSlotSelection, core_slot_descriptor_by_id};
++
++use super::AppConfig;
++
++impl AppConfig {
++    /// Validate typed profile semantics without rereading sources or resolving
++    /// instructions. Loaded file instructions already carry both file and text;
++    /// their source-shape checks belong to the loader, not this shared pass.
++    pub(crate) fn validate_semantics(&self) -> Result<()> {
++        self.selected_model_config()?;
++        self.validate_module_config_slots()?;
++        self.modules.validate_hooks()?;
++        self.validate_commands()?;
++        Ok(())
++    }
++
++    fn validate_module_config_slots(&self) -> Result<()> {
++        for slot in self.module_config.keys() {
++            if matches!(
++                slot.as_str(),
++                "tool" | "context_provider" | "model" | "hook"
++            ) {
++                continue;
++            }
++            match core_slot_descriptor_by_id(slot) {
++                Some(descriptor) if descriptor.selection == CoreSlotSelection::ModulesConfig => {}
++                Some(_) => bail!("module_config is not supported for slot {slot:?}"),
++                None => bail!("unknown module_config slot {slot:?}"),
++            }
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/proteus-core/src/tools/mcp/discovery.rs b/crates/proteus-core/src/tools/mcp/discovery.rs
+--- a/crates/proteus-core/src/tools/mcp/discovery.rs
++++ b/crates/proteus-core/src/tools/mcp/discovery.rs
+@@ -3,7 +3,7 @@
+ 
+ use crate::{
+     core::ConfiguredMcpServerConfig,
+-    domain::{ToolSafety, ToolSpec, ToolSurface},
++    domain::{ToolSafety, ToolSpec, ToolSurface, tool_validation::validate_tool_input_schema},
+ };
+ 
+ #[derive(Debug)]
+@@ -58,6 +58,7 @@
+             } else {
+                 spec
+             };
++            validate_tool_input_schema(&spec).map_err(anyhow::Error::msg)?;
+             Ok(DiscoveredMcpTool { remote_tool, spec })
+         })
+         .collect()
+diff --git a/crates/proteus-core/tests/mcp_client.rs b/crates/proteus-core/tests/mcp_client.rs
+--- a/crates/proteus-core/tests/mcp_client.rs
++++ b/crates/proteus-core/tests/mcp_client.rs
+@@ -19,6 +19,8 @@
+ mod sandbox;
+ #[path = "support/model.rs"]
+ mod test_model;
++#[path = "mcp_client/discovery.rs"]
++mod discovery;
+ 
+ struct Fixture {
+     dir: tempfile::TempDir,
+diff --git a/crates/proteus-core/tests/mcp_client/discovery.rs b/crates/proteus-core/tests/mcp_client/discovery.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/proteus-core/tests/mcp_client/discovery.rs
+@@ -0,0 +1,120 @@
++use super::*;
++
++fn fixture_with_list_mode(mode: &str) -> Fixture {
++    let mut fixture = Fixture::new(1_000, None);
++    fixture.config.tools.mcp_servers[0]
++        .environment
++        .env
++        .insert("MCP_FIXTURE_LIST_MODE".into(), mode.into());
++    fixture
++}
++
++#[tokio::test]
++async fn input_schema_discovery_errors_are_isolated_without_registering_a_prefix() {
++    for (mode, enabled) in [
++        ("invalid_first", true),
++        ("invalid_last", true),
++        ("empty", true),
++        ("invalid_last", false),
++    ] {
++        let fixture = fixture_with_list_mode(mode);
++        let healthy = Fixture::new(1_000, None);
++        let mut config = fixture.config.clone();
++        config.active_provider = None;
++        config.providers.clear();
++        config.tools.mcp_servers[0].enabled = enabled;
++        let mut healthy_config = healthy.config.tools.mcp_servers[0].clone();
++        healthy_config.name = "healthy".into();
++        config.tools.mcp_servers.push(healthy_config);
++        let server = proteus_core::app_server::AgentAppServer::launch(
++            config,
++            fixture.dir.path().to_owned(),
++            None,
++        )
++        .await
++        .expect("one invalid discovery must not prevent independent server assembly");
++        let snapshot = server.addons_snapshot().await;
++        let state = snapshot
++            .mcp_servers
++            .iter()
++            .find(|state| state.name == "fixture")
++            .unwrap();
++        assert_eq!(state.enabled, enabled);
++        assert!(state.tools.is_empty(), "no prefix from {mode}");
++        if enabled && mode != "empty" {
++            let error = state.error.as_ref().expect("schema error must be visible");
++            assert!(error.contains("fixture__invalid"), "{error}");
++            assert!(error.contains("invalid input schema"), "{error}");
++        } else {
++            assert!(state.error.is_none());
++        }
++        let healthy_state = snapshot
++            .mcp_servers
++            .iter()
++            .find(|state| state.name == "healthy")
++            .unwrap();
++        assert!(healthy_state.error.is_none());
++        assert!(healthy_state.tools.contains(&"healthy__echo".to_owned()));
++        let tools = server.config_builder_snapshot().await.tools;
++        assert!(!tools.iter().any(|tool| tool.name.starts_with("fixture__")));
++        assert!(
++            tools
++                .iter()
++                .any(|tool| tool.name == "healthy__echo" && tool.registered)
++        );
++        server.shutdown().await;
++    }
++}
++
++#[test]
++fn valid_discovered_batches_keep_name_collisions_fatal() {
++    let fixture = fixture_with_list_mode("collision");
++    let error = fixture.registry().err().expect("duplicate discovered name");
++    assert!(format!("{error:#}").contains("duplicate tool registration"));
++
++    let mut first = Fixture::new(1_000, None);
++    let second = Fixture::new(1_000, None);
++    first.config.tools.mcp_servers[0].name = "same name".into();
++    let mut second_config = second.config.tools.mcp_servers[0].clone();
++    second_config.name = "same.name".into();
++    first.config.tools.mcp_servers.push(second_config);
++    let error = first
++        .registry()
++        .err()
++        .expect("sanitized cross-server name collision");
++    assert!(format!("{error:#}").contains("duplicate tool registration"));
++}
++
++#[tokio::test]
++async fn invalid_schema_batch_is_rejected_before_potential_name_collisions() {
++    let fixture = fixture_with_list_mode("invalid_collision");
++    let mut config = fixture.config.clone();
++    config.active_provider = None;
++    config.providers.clear();
++    let server = proteus_core::app_server::AgentAppServer::launch(
++        config,
++        fixture.dir.path().to_owned(),
++        None,
++    )
++    .await
++    .expect("invalid batch is a server-local discovery error");
++    let snapshot = server.addons_snapshot().await;
++    let state = snapshot
++        .mcp_servers
++        .iter()
++        .find(|state| state.name == "fixture")
++        .unwrap();
++    assert!(state.tools.is_empty());
++    let error = state.error.as_ref().expect("invalid input schema");
++    assert!(error.contains("invalid input schema"), "{error}");
++    assert!(!error.contains("duplicate tool registration"), "{error}");
++    assert!(
++        !server
++            .config_builder_snapshot()
++            .await
++            .tools
++            .iter()
++            .any(|tool| tool.name.starts_with("fixture__"))
++    );
++    server.shutdown().await;
++}
+diff --git a/crates/proteus-core/tests/mcp_client/server.py b/crates/proteus-core/tests/mcp_client/server.py
+--- a/crates/proteus-core/tests/mcp_client/server.py
++++ b/crates/proteus-core/tests/mcp_client/server.py
+@@ -13,6 +13,7 @@
+ EVENT_LOG = os.environ["MCP_FIXTURE_EVENT_LOG"]
+ GENERATION_FILE = os.environ["MCP_FIXTURE_GENERATION_FILE"]
+ INIT_MODE = os.environ.get("MCP_FIXTURE_INIT_MODE", "ok")
++LIST_MODE = os.environ.get("MCP_FIXTURE_LIST_MODE", "ok")
+ WRITE_LOCK = threading.Lock()
+ CANCEL_LOCK = threading.Lock()
+ CANCELLED = {}
+@@ -204,6 +205,20 @@
+     elif method == "tools/list":
+         cursor = params.get("cursor")
+         event(f"list:{cursor or 'first'}")
++        if LIST_MODE != "ok":
++            valid = tool("echo", "valid discovery tool")
++            invalid = tool("invalid", "invalid nested input schema", {
++                "message": {"type": "invalid-type"},
++            })
++            tools = {
++                "empty": [],
++                "invalid_first": [invalid, valid],
++                "invalid_last": [valid, invalid],
++                "collision": [valid, valid],
++                "invalid_collision": [valid, valid, invalid],
++            }[LIST_MODE]
++            result(request_id, {"tools": tools})
++            continue
+         if cursor is None:
+             result(request_id, {
+                 "tools": [tool("echo", "echo a label", {
+diff --git a/docs/guides/configuration.md b/docs/guides/configuration.md
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -981,6 +981,13 @@
+ от config file. Runtime превращает entries в ordered canonical
+ `InstructionBlock` list.
+ 
++Если Config Builder восстанавливает отсутствующий standalone profile из
++загруженной конфигурации, file-backed entries сохраняют `file`, а не копию
++уже прочитанного `text`. Inline entries сохраняют свой текст и порядок.
++Это восстановление по прежнему пути: оно не переносит relative references
++и не восстанавливает отсутствующие prompt assets. Существующие source entries
++и directory overlays при обычном Save не переписываются этим преобразованием.
++
+ Packaged `opencode-default.md` сохраняется как настраиваемый пример, но профиль
+ `opencode` его не использует. `proteus-opencode-module` импортирует pinned
+ `@opencode/core@2.0.22`: native system template и model plugins выполняются
+@@ -1213,7 +1220,12 @@
+ задаёт рабочий каталог процесса; относительный путь отсчитывается от workspace.
+ Неудачный start/handshake/list изолируется на этом сервере: его tools не
+ регистрируются, остальные подключения работают, ошибка видна в `/addons`.
+-Name collision остаётся блокирующей ошибкой сборки. Список `tools` в MCP status
++Весь discovered list сначала проверяется, включая input schemas; ошибка любого
++элемента отклоняет весь список до регистрации, без сохранения valid prefix.
++Только успешно подготовленный список участвует в общей регистрации, где name
++collision остаётся блокирующей ошибкой сборки. Если список содержит и invalid
++schema, и потенциальную collision, сначала отклоняется discovery этого сервера:
++collision из уже отклонённого списка не проверяется. Список `tools` в MCP status
+ отражает discovery при подготовке epoch, а не непрерывную проверку live health.
+ 
+ Текущий MCP scope — stdio tool discovery/invocation. HTTP, OAuth, resources,
+@@ -1556,6 +1568,14 @@
+ runtime snapshot меняется одним обновлением. Он не создаёт components/exports
+ из воздуха: selection доступен только для entries текущего catalog. Existing
+ `components` и opaque `module_config` сохраняются.
++
++Выбор `active_provider` не редактирует определения `providers`. В существующем
++TOML/JSON-профиле и directory overlay конструктор сохраняет как явные
++определения, так и отсутствие этой секции: провайдеры из includes/fragments
++не копируются в верхний файл при сохранении других настроек. Явные локальные
++переопределения остаются приоритетными. При первом сохранении отсутствующего
++standalone-файла записывается полная конфигурация, включая определения
++провайдеров, нужные её выбору модели.
+ 
+ `GET /config/builder` возвращает для каждого модуля nullable `config_schema`.
+ Модельные exports находятся в `model_modules`, обработчики — в
+@@ -1625,6 +1645,12 @@
+ 
+ Save сериализует read/prepare/persist/publish по каноническому пути профиля;
+ повторное сохранение читает актуальный source, а файл заменяется atomic rename.
++После применения request итоговый config проходит те же semantic checks,
++что загрузка с диска: выбор provider, допустимые `module_config` slots, hooks
++и prompt commands. Неизвестный slot отвергается до подготовки сборки, записи
++истории и файла; live config и epoch остаются прежними. Разрешение instruction
++files остаётся в reader: уже загруженный текст не проверяется как новый source.
++TOML-представимость значений и подготовка runtime остаются отдельными проверками.
+ Все fallible проверки runtime проходят до persistence. Выбор модели и reload
+ используют один lock, поэтому изменение selection не может сорвать publication
+ уже записанного config. Принятый save завершается и при отключении HTTP caller.
