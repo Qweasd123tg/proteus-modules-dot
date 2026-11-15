@@ -1,0 +1,1842 @@
+--- a/examples/performance/coding-harness/README.md
++++ b/examples/performance/coding-harness/README.md
+@@ -96,6 +96,74 @@
+ Сохранённые исходные контроли находятся в
+ `target/performance/coding-harness/corpus-controls.json`.
+ 
++## Terminal outcome Native Pi
++
++Для pinned Pi 1.5.2 (`b4afdddf44e059c67ccf5097e5317d913521b470`)
++`agent_end` завершает лишь низкоуровневый проход: после него возможны retry,
++compaction и continuation. Общий `pi_terminal.py` использует окончательный
++assistant из последнего `agent_end.messages` перед `agent_settled` и сбрасывает
++его при новой активности. Для clean generation требуются ровно `expected_turns`
++settlements, каждый с `stopReason=stop` и `aborted=false`, без незавершённого хвоста.
++Прочие и неизвестные причины не считаются clean success этого coding evaluator;
++это не универсальное объявление `toolUse` или `deferred` ошибками протокола Pi.
++
++Metrics сохраняют прежние ошибки попыток и usage, отдельно записывают
++`pi_outcome` с итоговыми settlements и наблюдавшимися stop reasons. Успешное
++восстановление больше не проваливает pipeline только из-за старого error.
++Невосстановленный terminal `length` даёт diagnostic `length limit` и остаётся
++отдельным от grader PASS. Промежуточный recovered length сохраняется в
++`observed_stop_reasons`, но не становится terminal output-limit failure.
++
++Runner по-прежнему требует успешный exit, отсутствие timeout, model/reasoning
++verification и continuity. Report fallback использует тот же generation predicate:
++это не доказательство успешного CLI postprocessing или полноты всех billable calls.
++Полнота generation по-прежнему не гарантирует presence каждой usage category;
++проверка observed completion rows описана ниже.
++Старый неуспешный artifact без полной settlement boundary теперь даёт unknown.
++Сохранённый `pipeline_ok=true` fast path не переоценивается, старые результаты,
++оценки и benchmark таблицы автоматически не переписываются.
++
++Локальные synthetic controls, без CLI/API/LLM:
++
++```sh
++python3 -B examples/performance/coding-harness/pi_terminal_test.py
++python3 -B examples/performance/coding-harness/usage_report_test.py
++```
++
++## Coverage наблюдаемых native usage rows
++
++Pi и Codex учитывают usage не только по surviving dict-valued blocks.
++`expected_usage_rows` сохраняет число наблюдавшихся assistant `message_end`
++для Pi или `turn.completed` для Codex. Это **не** число всех provider requests,
++пропавших событий или billable calls; Codex `model_requests` остаётся unknown.
++`native_usage` сохраняет прежний список реально найденных dict-valued blocks,
++без вставленных вымышленных rows.
++
++Общий `usage_evidence` выдаёт строгий `provider_usage` только если для category
++есть integer contribution от каждой expected row. Отсутствующая, null или
++non-dict usage row делает full totals unknown, не zero. Отдельно сохраняются
++`partial_reported_usage_sums` и per-category `usage_fields_reported_by_rows`.
++Нет observation — partial null/count 0; одна row с reported zero — partial 0/count 1.
++Для Pi combined input требует `input`, `cacheRead`, `cacheWrite` в одной row;
++части разных неполных rows не складываются в выдуманное полное observation.
++
++Report projection из PR126 сохраняет такие partial sums отдельно от full totals.
++При ожидаемых nonnegative token counters это observed lower bounds, не доказанная
++цена полного run. Exact-int правило не валидирует arbitrary malformed data:
++negative integers не исправляются и не запрещаются этим изменением.
++Завершение pipeline/generation и полнота token fields остаются разными понятиями.
++Valid complete totals и raw usage не меняются; historical files/scores не
++пересчитываются автоматически. Исчезнувший целый completion event или auxiliary
++usage, которого нет в этом stream, данным cardinality check не обнаруживается.
++OpenCode сохраняет прежние значения totals через совместимый `sum_usage` wrapper;
++новая expected-event cardinality для него не заявляется.
++
++Focused synthetic check без native CLI/API/LLM:
++
++```sh
++python3 -B examples/performance/coding-harness/native_usage_test.py
++```
++
+ ## Живой запуск
+ 
+ Одиночный запуск профиля Pi с явной моделью и независимой проверкой результата.
+@@ -129,6 +197,17 @@
+ возвращает ненулевой exit при любом FAIL. Повтор учитывается отдельно от шести
+ первых попыток. `report.py` проверяет одинаковые prompt/repository hashes.
+ 
++Короткий и длинный отчёты используют одну политику полноты usage. Числовой
++subtotal сам по себе не подтверждает завершение generation: для незавершённого
++запуска полные `tokens` и итоговые `input`/`cached`/`output` остаются unknown.
++Исходные числа сохраняются в `reported_usage`, наблюдаемые нижние границы —
++в `observed_partial_usage`. Сводка первичных попыток отдельно содержит
++`known_token_runs` и `observed_token_sums`; повторы не входят в эти суммы.
++Нулевой observed sum без known runs не доказывает нулевой полный расход.
++Флаг `usage_complete` описывает завершение по существующей policy и не означает,
++что провайдер сообщил каждую token category. Метрики grader/pipeline, правила
++отбора и сохранённые результаты прогонов этим представлением не меняются.
++
+ `proteus-codex` можно добавить как самостоятельную конфигурацию. Для Flash она
+ использует Pi model transport и JSON surface настоящего patch engine. Native
+ Codex с этим endpoint сейчас помечается unavailable после HTTP 403 на Responses
+--- a/examples/performance/coding-harness/adapters.py
++++ b/examples/performance/coding-harness/adapters.py
+@@ -5,6 +5,8 @@
+ import shutil
+ import tomllib
+ from collections import Counter
++
++from pi_terminal import pi_outcome
+ 
+ HERE = Path(__file__).resolve().parent
+ CORE = HERE.parents[2]
+@@ -249,32 +251,34 @@
+                 'all_tool_calls': len(actions),
+                 'models': sorted({c['model'] for c in contexts}),
+                 'reasoning_efforts': sorted({c['effort'] for c in contexts if c.get('effort')}),
+-                'provider_usage': sum_usage(rows, {'input_tokens': 'input_tokens',
+-                                                  'cached_input_tokens': 'cached_input_tokens',
+-                                                  'output_tokens': 'output_tokens'}),
++                **usage_evidence(rows, {'input_tokens': 'input_tokens',
++                                        'cached_input_tokens': 'cached_input_tokens',
++                                        'output_tokens': 'output_tokens'}, len(completed)),
+                 'settled': bool(completed), 'events': len(events),
+                 'errors': [e for e in events if e.get('type') in ('error', 'turn.failed')]}
+     if agent == 'pi':
+         messages = [e['message'] for e in events if e.get('type') == 'message_end'
+                     and isinstance(e.get('message'), dict) and e['message'].get('role') == 'assistant']
++        outcome = pi_outcome(events)
+         rows = [m['usage'] for m in messages if isinstance(m.get('usage'), dict)]
+         levels = [row['thinkingLevel'] for path in (output/'runtime/pi-sessions').glob('*.jsonl')
+                   for row in json_lines(path) if row.get('type') == 'thinking_level_change']
+-        totals = sum_usage(rows, {'uncached_input_tokens': 'input', 'cached_input_tokens': 'cacheRead',
+-                                  'cache_creation_input_tokens': 'cacheWrite', 'output_tokens': 'output',
+-                                  'reasoning_output_tokens': 'reasoning'})
+-        parts = [totals.get(k) for k in ['uncached_input_tokens', 'cached_input_tokens',
+-                                       'cache_creation_input_tokens']]
+-        totals['input_tokens'] = sum(parts) if all(p is not None for p in parts) else None
+-        return {'native_usage': rows, 'provider_usage': totals, 'model_requests': len(messages),
++        evidence = usage_evidence(rows, {'uncached_input_tokens': 'input', 'cached_input_tokens': 'cacheRead',
++                                         'cache_creation_input_tokens': 'cacheWrite', 'output_tokens': 'output',
++                                         'reasoning_output_tokens': 'reasoning',
++                                         'input_tokens': ('input', 'cacheRead', 'cacheWrite')}, len(messages))
++        return {'native_usage': rows, **evidence, 'model_requests': len(messages),
+                 'tool_names': dict(Counter(p.get('name','unknown') for m in messages
+                                           for p in m.get('content',[]) if p.get('type') == 'toolCall')),
+                 'all_tool_calls': sum(p.get('type') == 'toolCall' for m in messages for p in m.get('content',[])),
+                 'models': sorted({m.get('model', '') for m in messages}),
+                 'providers': sorted({m['provider'] for m in messages if m.get('provider')}),
+                 'reasoning_efforts': sorted(set(levels)),
+-                'settled': any(e.get('type') == 'agent_end' for e in events),
+-                'errors': [m.get('errorMessage') for m in messages if m.get('stopReason') in ('error','aborted')]}
++                'pi_outcome': outcome,
++                'settled': bool(outcome['settlements']) and not outcome['pending'],
++                'errors': [m.get('errorMessage') for m in messages if m.get('stopReason') in ('error','aborted')]
++                          + ['Native Pi terminal response reached the length limit.'
++                             for item in outcome['settlements'] if item['stop_reason'] == 'length']}
+     native = json.loads((output/'runtime/native/usage.json').read_text())
+     rows = native['sessions']
+     messages = native['assistant_messages']
+@@ -301,8 +305,22 @@
+ 
+ 
+ def sum_usage(rows, mapping):
+-    totals = {}
++    return usage_evidence(rows, mapping, len(rows))['provider_usage']
++
++
++def usage_evidence(rows, mapping, expected_rows):
++    """Keep observed contributions without treating absent completed-event rows as zero."""
++    totals, partial, known = {}, {}, {}
+     for field, native in mapping.items():
+-        values = [r.get(native) for r in rows]
+-        totals[field] = sum(values) if values and all(type(v) is int for v in values) else None
+-    return totals
++        keys = (native,) if isinstance(native, str) else native
++        values = []
++        for row in rows:
++            parts = [row.get(key) for key in keys]
++            if parts and all(type(value) is int for value in parts):
++                values.append(sum(parts))
++        known[field] = len(values)
++        partial[field] = sum(values) if values else None
++        totals[field] = (partial[field] if type(expected_rows) is int and expected_rows > 0
++                         and len(rows) == expected_rows and len(values) == expected_rows else None)
++    return {'provider_usage': totals, 'partial_reported_usage_sums': partial,
++            'usage_fields_reported_by_rows': known, 'expected_usage_rows': expected_rows}
+--- /dev/null
++++ b/examples/performance/coding-harness/grader_loaders.md
+@@ -0,0 +1,20 @@
++# Узкая проверка загрузчиков grader
++
++```sh
++python3 -B examples/performance/coding-harness/grader_loaders_test.py -v
++```
++
++Это stdlib loader-only controls с собственными синтетическими Python-модулями,
++не запуск полного pytest grader, CLI archive или реального benchmark. Декоратор
++pytest заменён только для загрузки файла с объявлениями тестов. Journal grader
++использует один локальный helper для archive и measurements: регистрация в
++`sys.modules` до исполнения допускает обычные dataclasses с postponed annotations.
++Success оставляет свежий модуль под служебным именем; при `BaseException` прежняя
++запись (включая `None`) восстанавливается, а при её отсутствии новая удаляется.
++Повторная успешная загрузка остаётся свежей, без изменения старого module object.
++
++Остальные grading assertions и задача не меняются. Исправление loader не
++переоценивает сохранённые результаты: пересмотр требует исходного workspace,
++подробного traceback и отдельно зафиксированной версии grader. Эти controls
++не подтверждают корректность archive, полную совместимость grader или изменение
++каких-либо опубликованных benchmark scores.
+--- /dev/null
++++ b/examples/performance/coding-harness/grader_loaders_test.py
+@@ -0,0 +1,141 @@
++"""Loader-only controls with synthetic modules; not the archive grading suite."""
++from contextlib import contextmanager
++import importlib
++from pathlib import Path
++import runpy
++import shutil
++import sys
++import tempfile
++from types import ModuleType, SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++HERE = Path(__file__).resolve().parent
++
++
++class GraderLoaderTests(unittest.TestCase):
++    @contextmanager
++    def grader(self, root, case='journal-segments'):
++        code = root/'examples/performance/history-scale'
++        code.mkdir(parents=True)
++        shutil.copyfile(HERE.parent/'history-scale/journal.py', code/'journal.py')
++        grader = HERE/'long_repo_fixtures'/case/'grader/test_outputs.py'
++        # Use the actual loader functions. Only pytest's declaration decorator is
++        # stubbed; no pytest collection or general archive/CLI grading is run.
++        pytest_stub = SimpleNamespace(mark=SimpleNamespace(
++            parametrize=lambda *args, **kwargs: lambda function: function))
++        with patch.dict(sys.modules), patch.object(sys, 'path', sys.path.copy()):
++            sys.modules['pytest'] = pytest_stub
++            for name in ('journal', 'archive_under_test', 'usage_under_test', 'phase_under_test'):
++                sys.modules.pop(name, None)
++            sys.path.insert(0, str(code))
++            journal = importlib.import_module('journal')
++            self.assertEqual(Path(journal.__file__), code/'journal.py')
++            scope = runpy.run_path(str(grader))
++            entry = scope['archiver' if case == 'journal-segments' else 'load']
++            entry.__globals__.update(ROOT=root, CODE=code)
++            yield scope, code
++
++    def test_archive_supports_postponed_annotation_dataclass(self):
++        with tempfile.TemporaryDirectory() as directory:
++            with self.grader(Path(directory)) as (scope, code):
++                (code/'archive.py').write_text(
++                    'from __future__ import annotations\nfrom dataclasses import dataclass\n'
++                    '@dataclass\nclass Row:\n    value: int\n'
++                    'def archive():\n    return Row(7)\n')
++                value = scope['archiver']()()
++                self.assertEqual(value.value, 7)
++                self.assertIs(sys.modules[value.__class__.__module__].Row, type(value))
++
++    def test_existing_consumer_loader_supports_dataclass(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            with self.grader(root) as (scope, code):
++                (code/'archive.py').write_text('def archive(source, output):\n    output.mkdir()\n')
++                measurements = root/'examples/performance/code-mode/measurements.py'
++                measurements.parent.mkdir()
++                measurements.write_text(
++                    'from __future__ import annotations\nfrom dataclasses import dataclass, asdict\n'
++                    '@dataclass\nclass Row:\n    all_tool_calls: int\n'
++                    'def measure(session):\n    return asdict(Row(0))\n')
++                # This one real consumer test body uses only our trivial archive
++                # and measurement fixtures, plus the unchanged journal helpers.
++                # Passing it is not evidence of a valid archive implementation.
++                scope['test_existing_consumers_and_public_helpers'](root)
++                self.assertEqual(sys.modules['usage_under_test'].Row(0).all_tool_calls, 0)
++
++    def test_success_reloads_fresh_module_without_mutating_previous_binding(self):
++        with tempfile.TemporaryDirectory() as directory:
++            with self.grader(Path(directory)) as (scope, code):
++                previous = ModuleType('archive_under_test')
++                previous.value = 'previous'
++                sys.modules['archive_under_test'] = previous
++                source = code/'archive.py'
++                source.write_text('def archive():\n    return 1\n')
++                first = scope['archiver']()
++                loaded = sys.modules['archive_under_test']
++                self.assertIsNot(loaded, previous)
++                self.assertEqual(previous.value, 'previous')
++                self.assertEqual(first(), 1)
++                source.write_text('def archive():\n    return 22\n')
++                second = scope['archiver']()
++                self.assertIsNot(sys.modules['archive_under_test'], loaded)
++                self.assertEqual(first(), 1)
++                self.assertEqual(second(), 22)
++                self.assertIs(sys.modules['archive_under_test'].archive, second)
++
++    def test_failed_load_removes_new_registration_and_propagates_exception(self):
++        with tempfile.TemporaryDirectory() as directory:
++            with self.grader(Path(directory)) as (scope, code):
++                fixture = ModuleType('loader_error_fixture')
++                sys.modules[fixture.__name__] = fixture
++                for error in (ValueError('synthetic'), SystemExit('synthetic')):
++                    with self.subTest(error=type(error).__name__):
++                        fixture.error = error
++                        (code/'archive.py').write_text(
++                            'import sys\nfrom loader_error_fixture import error\n'
++                            'assert sys.modules[__name__].__dict__ is globals()\nraise error\n')
++                        with self.assertRaises(type(error)) as caught:
++                            scope['archiver']()
++                        self.assertIs(caught.exception, error)
++                        self.assertNotIn('archive_under_test', sys.modules)
++
++    def test_failed_load_restores_previous_module_or_none(self):
++        with tempfile.TemporaryDirectory() as directory:
++            with self.grader(Path(directory)) as (scope, code):
++                fixture = ModuleType('loader_error_fixture')
++                sys.modules[fixture.__name__] = fixture
++                previous = ModuleType('archive_under_test')
++                previous.value = 'unchanged'
++                (code/'archive.py').write_text(
++                    'import sys\nfrom loader_error_fixture import error\n'
++                    'assert sys.modules[__name__].__dict__ is globals()\nraise error\n')
++                for binding in (previous, None):
++                    for error in (ValueError('synthetic'), SystemExit('synthetic')):
++                        with self.subTest(binding=binding, error=type(error).__name__):
++                            sys.modules['archive_under_test'] = binding
++                            fixture.error = error
++                            with self.assertRaises(type(error)) as caught:
++                                scope['archiver']()
++                            self.assertIs(caught.exception, error)
++                            self.assertIn('archive_under_test', sys.modules)
++                            self.assertIs(sys.modules['archive_under_test'], binding)
++                self.assertEqual(previous.value, 'unchanged')
++
++    def test_existing_sampler_registration_control(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            with self.grader(root, 'sampler-phase-report') as (scope, _):
++                module = root/'examples/performance/common/phase_report.py'
++                module.parent.mkdir()
++                module.write_text(
++                    'from __future__ import annotations\nfrom dataclasses import dataclass\n'
++                    '@dataclass\nclass Row:\n    value: int\n'
++                    'def summarize():\n    return Row(7)\n')
++                value = scope['load']()()
++                self.assertEqual(value.value, 7)
++                self.assertIs(sys.modules[value.__class__.__module__].Row, type(value))
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/coding-harness/long_repo_fixtures/journal-segments/grader/test_outputs.py
++++ b/examples/performance/coding-harness/long_repo_fixtures/journal-segments/grader/test_outputs.py
+@@ -13,11 +13,25 @@
+ import journal
+ 
+ 
++def load_module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    missing = object()
++    previous = sys.modules.get(spec.name, missing)
++    sys.modules[spec.name] = module
++    try:
++        spec.loader.exec_module(module)
++    except BaseException:
++        if previous is missing:
++            sys.modules.pop(spec.name, None)
++        else:
++            sys.modules[spec.name] = previous
++        raise
++    return module
++
++
+ def archiver():
+-    spec = importlib.util.spec_from_file_location('archive_under_test', CODE/'archive.py')
+-    module = importlib.util.module_from_spec(spec)
+-    spec.loader.exec_module(module)
+-    return module.archive
++    return load_module('archive_under_test', CODE/'archive.py').archive
+ 
+ 
+ def source(path, n=7):
+@@ -162,8 +176,7 @@
+     src,dst=tmp_path/'source',tmp_path/'out'
+     src.mkdir();(src/'journal.jsonl').write_text('')
+     archiver()(src,dst)
+-    spec=importlib.util.spec_from_file_location('usage_under_test',ROOT/'examples/performance/code-mode/measurements.py')
+-    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
++    module=load_module('usage_under_test',ROOT/'examples/performance/code-mode/measurements.py')
+     assert module.measure(dst)['all_tool_calls'] == 0
+     m={'id':'m','role':'User','parts':[{'payload':{'Text':{'text':'hello'}}}]}
+     assert journal.text(m)=='hello'
+--- a/examples/performance/coding-harness/long_report.py
++++ b/examples/performance/coding-harness/long_report.py
+@@ -7,6 +7,8 @@
+ from pathlib import Path
+ import re
+ from statistics import median
++
++from usage_report import TOKENS, json_lines, known_sum, project_usage, read_json, summarize_usage
+ 
+ HERE = Path(__file__).resolve().parent
+ CORE = HERE.parents[2]
+@@ -23,27 +25,6 @@
+     'ledger-recovery': 'Многофайловое хранилище с crash recovery, миграцией и concurrent writers',
+     'go-review': 'Три последовательных запроса на SGF parser, territory counting и интеграцию',
+ }
+-TOKENS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')
+-
+-
+-def read_json(path):
+-    return json.loads(path.read_text()) if path.is_file() else None
+-
+-
+-def json_lines(path):
+-    if path.is_file():
+-        with path.open(errors='replace') as stream:
+-            for line in stream:
+-                try:
+-                    value = json.loads(line)
+-                except json.JSONDecodeError:
+-                    continue
+-                if isinstance(value, dict):
+-                    yield value
+-
+-
+-def known_sum(values):
+-    return sum(values) if values and all(type(value) is int for value in values) else None
+ 
+ 
+ def midpoint(values):
+@@ -208,40 +189,6 @@
+             'review_flags': flags}
+ 
+ 
+-def usage_completion(path, result, metrics):
+-    if result.get('pipeline_ok') and not result.get('timed_out'):
+-        return True, 'The complete task pipeline settled and exported its reported usage.'
+-    agent = result.get('agent')
+-    if agent == 'proteus':
+-        failures = metrics.get('failures', [])
+-        all_answered = (type(metrics.get('model_requests')) is int
+-                        and metrics.get('model_requests') == metrics.get('model_responses'))
+-        settled = metrics.get('settlements') or []
+-        if all_answered and settled and all(item.get('status') == 'success' for item in settled) and not any(
+-            isinstance(item, dict) and item.get('kind') == 'model' for item in failures
+-        ):
+-            return True, 'Every canonical model exchange and task settlement completed before the CLI teardown error.'
+-    elif agent == 'pi':
+-        completed = 0
+-        failed = False
+-        for event in json_lines(path/'stdout.jsonl'):
+-            if event.get('type') == 'agent_end' and not event.get('willRetry'):
+-                completed += 1
+-            message = event.get('message', {})
+-            if event.get('type') == 'message_end' and message.get('role') == 'assistant':
+-                failed |= message.get('stopReason') in ('error', 'aborted', 'pending')
+-        if completed >= result.get('expected_turns', 1) and not failed:
+-            return True, 'Each requested Pi turn emitted a final agent_end before the CLI error.'
+-    elif agent == 'opencode':
+-        native = read_json(path/'runtime/native/usage.json') or {}
+-        primary = native.get('assistant_messages', [])
+-        if (metrics.get('settled') and primary and primary[-1].get('finish') == 'stop'
+-                and sum(msg.get('finish') == 'stop' for msg in primary) >= result.get('expected_turns', 1)
+-                and not metrics.get('errors')):
+-            return True, 'The native session succeeded and its final assistant stopped before the CLI teardown error.'
+-    return False, 'The generation or task did not settle; recorded usage is a lower bound and can omit the active request.'
+-
+-
+ def failure_taxonomy(result, grade, failures):
+     classes = []
+     text = json.dumps(failures, ensure_ascii=False)
+@@ -308,8 +255,6 @@
+                               sum(item.get('origin') == 'direct' for item in metrics['requests'])
+                               if metrics.get('requests') else metrics.get('model_requests')),
+            'usage_includes_auxiliary': metrics.get('usage_includes_auxiliary_requests', False),
+-           'tokens': metrics.get('provider_usage', {}),
+-           'observed_partial_usage': metrics.get('partial_reported_usage_sums', {}),
+            'failures_by_kind': dict(kinds), 'failure_count': len(failures), 'tools': metrics.get('tool_names', {}),
+            'compactions': metrics.get('compactions'), 'model_verified': result.get('model_verified', False),
+            'reasoning_verified': result.get('reasoning_verified', False),
+@@ -339,13 +284,7 @@
+                 'last_assistant_age_seconds': round((stamp-max(created))/1000, 3),
+                 'last_completed_before_error_age_seconds': round((stamp-max(before_error))/1000, 3) if before_error else None,
+                 'outer_timed_out': result.get('timed_out', False)}
+-    row['usage_complete'], row['usage_completeness_reason'] = usage_completion(path, result, metrics)
+-    row['reported_usage'] = dict(row['tokens'])
+-    row['observed_partial_usage'] = {key: value if type(value) is int else
+-                                   row['observed_partial_usage'].get(key)
+-                                   for key, value in {**{key: None for key in TOKENS}, **row['reported_usage']}.items()}
+-    if not row['usage_complete']:
+-        row['tokens'] = {key: None for key in row['tokens']}
++    row.update(project_usage(path, result, metrics))
+     row['failure_taxonomy'] = failure_taxonomy(result, grade, failures)
+     row['length_limit_failures'] = sum(isinstance(item, dict) and 'length limit' in json.dumps(item) for item in failures)
+     try:
+@@ -368,18 +307,14 @@
+         selected = [row for row in rows if row['arm'] == arm and row['attempt'] == 1]
+         done = [row for row in selected if row['state'] == 'graded']
+         observed = [row for row in selected if 'tokens' in row]
+-        values = {key: [row['tokens'].get(key) for row in observed] for key in TOKENS}
++        usage = summarize_usage(observed)
+         stats.append({'arm': arm, 'expected_tasks': len(expected_cases), 'graded': len(done),
+                       'passed': sum(row['pass'] for row in done),
+                       'grade_passed': sum(row['grade'] is True for row in done),
+                       'pipeline_failed_with_task_pass': sum(row['grade'] is True and not row['pipeline_ok'] for row in done), 'failed': sum(not row['pass'] for row in done),
+                       'timed_out': sum(row.get('timed_out', False) for row in done),
+                       'observed_runs': len(observed),
+-                      'tokens': {key: known_sum(items) for key, items in values.items()},
+-                      'known_token_runs': {key: sum(value is not None for value in items) for key, items in values.items()},
+-                      'observed_token_sums': {key: sum(
+-                          row['tokens'][key] if type(row['tokens'].get(key)) is int else
+-                          row.get('observed_partial_usage', {}).get(key) or 0 for row in observed) for key in TOKENS},
++                      **usage,
+                       'median_seconds': midpoint([row.get('seconds') for row in done]),
+                       'median_actions': midpoint([row.get('actions') for row in done]),
+                       'median_requests': midpoint([row.get('requests') for row in done]),
+--- /dev/null
++++ b/examples/performance/coding-harness/native_usage_test.py
+@@ -0,0 +1,171 @@
++"""Synthetic completed-event accounting; no native CLI or model invocation."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++import adapters
++import long_report
++import report
++import usage_report
++
++MISSING = object()
++PI = {'input': 10, 'cacheRead': 100, 'cacheWrite': 0, 'output': 5}
++CODEX = {'input_tokens': 110, 'cached_input_tokens': 100, 'output_tokens': 5}
++
++
++class NativeUsageChecks(unittest.TestCase):
++    def metrics(self, path, agent, blocks):
++        events = []
++        if agent == 'pi':
++            messages = []
++            if blocks:
++                events.append({'type': 'agent_start'})
++            for index, block in enumerate(blocks):
++                final = index == len(blocks)-1
++                message = {'role': 'assistant', 'model': 'fixture',
++                           'stopReason': 'stop' if final else 'toolUse', 'content': []}
++                if not final:
++                    message['content'] = [{'type': 'toolCall', 'id': str(index), 'name': 'read',
++                                           'arguments': {'path': 'fixture.txt'}}]
++                if block is not MISSING:
++                    message['usage'] = block
++                messages.append(message)
++                events.append({'type': 'message_end', 'message': message})
++                if not final:
++                    result = {'role': 'toolResult', 'toolCallId': str(index), 'content': []}
++                    messages.append(result)
++                    events.append({'type': 'message_end', 'message': result})
++            if blocks:
++                events += [{'type': 'agent_end', 'willRetry': False, 'messages': messages},
++                           {'type': 'agent_settled', 'aborted': False}]
++        else:
++            for block in blocks:
++                event = {'type': 'turn.completed'}
++                if block is not MISSING:
++                    event['usage'] = block
++                events.append(event)
++        raw = ''.join(json.dumps(event)+'\n' for event in events)
++        (path/'stdout.jsonl').write_text(raw)
++        metrics = adapters.metrics(agent, path)
++        self.assertEqual((path/'stdout.jsonl').read_text(), raw)
++        return metrics
++
++    def assert_missing_row(self, path, agent, known):
++        metrics = self.metrics(path, agent, [known, MISSING])
++        # Both red controls fail here on baseline, before any new-field access.
++        self.assertIsNone(metrics['provider_usage']['input_tokens'])
++        self.assertIsNone(metrics['provider_usage']['output_tokens'])
++        self.assertEqual(metrics['partial_reported_usage_sums']['input_tokens'], 110)
++        self.assertEqual(metrics['partial_reported_usage_sums']['output_tokens'], 5)
++        self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 1)
++        self.assertEqual(metrics['expected_usage_rows'], 2)
++        self.assertEqual(metrics['native_usage'], [known])
++        self.assertEqual(metrics['model_requests'], 2 if agent == 'pi' else None)
++
++    def test_pi_missing_whole_usage_row_is_not_a_complete_total(self):
++        with tempfile.TemporaryDirectory() as directory:
++            self.assert_missing_row(Path(directory), 'pi', PI)
++
++    def test_codex_missing_whole_usage_row_is_not_a_complete_total(self):
++        with tempfile.TemporaryDirectory() as directory:
++            self.assert_missing_row(Path(directory), 'codex', CODEX)
++
++    def test_complete_values_and_native_rows_are_preserved(self):
++        for agent, known in [('pi', PI), ('codex', CODEX)]:
++            with self.subTest(agent=agent), tempfile.TemporaryDirectory() as directory:
++                metrics = self.metrics(Path(directory), agent, [known, known])
++                self.assertEqual(metrics['native_usage'], [known, known])
++                self.assertEqual(metrics['expected_usage_rows'], 2)
++                for field, value in [('input_tokens', 220), ('cached_input_tokens', 200), ('output_tokens', 10)]:
++                    self.assertEqual(metrics['provider_usage'][field], value)
++                    self.assertEqual(metrics['partial_reported_usage_sums'][field], value)
++                    self.assertEqual(metrics['usage_fields_reported_by_rows'][field], 2)
++                if agent == 'pi':
++                    self.assertIsNone(metrics['provider_usage']['reasoning_output_tokens'])
++                    self.assertEqual(metrics['usage_fields_reported_by_rows']['reasoning_output_tokens'], 0)
++
++    def test_absent_invalid_empty_and_zero_observations_remain_distinct(self):
++        for agent, known in [('pi', PI), ('codex', CODEX)]:
++            variants = [MISSING, None, False, 0, [], 'invalid', {}]
++            for missing in variants:
++                with self.subTest(agent=agent, missing=repr(missing)), tempfile.TemporaryDirectory() as directory:
++                    metrics = self.metrics(Path(directory), agent, [known, missing])
++                    self.assertIsNone(metrics['provider_usage']['input_tokens'])
++                    self.assertEqual(metrics['partial_reported_usage_sums']['input_tokens'], 110)
++                    self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 1)
++                    self.assertEqual(metrics['native_usage'], [known]+([missing] if isinstance(missing, dict) else []))
++            for blocks in [[], [MISSING], [{}]]:
++                with self.subTest(agent=agent, no_observations=len(blocks)), tempfile.TemporaryDirectory() as directory:
++                    metrics = self.metrics(Path(directory), agent, blocks)
++                    self.assertIsNone(metrics['provider_usage']['input_tokens'])
++                    self.assertIsNone(metrics['partial_reported_usage_sums']['input_tokens'])
++                    self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 0)
++                    self.assertEqual(metrics['expected_usage_rows'], len(blocks))
++            zero = {key: 0 for key in known}
++            with tempfile.TemporaryDirectory() as directory:
++                metrics = self.metrics(Path(directory), agent, [zero, MISSING])
++                self.assertIsNone(metrics['provider_usage']['input_tokens'])
++                self.assertEqual(metrics['partial_reported_usage_sums']['input_tokens'], 0)
++                self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 1)
++
++    def test_pi_composite_input_requires_components_in_the_same_row(self):
++        blocks = [{'input': 10}, {'cacheRead': 100, 'cacheWrite': 0}, PI]
++        with tempfile.TemporaryDirectory() as directory:
++            metrics = self.metrics(Path(directory), 'pi', blocks)
++            self.assertIsNone(metrics['provider_usage']['input_tokens'])
++            self.assertEqual(metrics['partial_reported_usage_sums']['input_tokens'], 110)
++            self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 1)
++            self.assertEqual(metrics['partial_reported_usage_sums']['uncached_input_tokens'], 20)
++            self.assertEqual(metrics['partial_reported_usage_sums']['cached_input_tokens'], 200)
++            self.assertEqual(metrics['native_usage'], blocks)
++        for invalid in [None, True, 1.5, '10']:
++            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
++                metrics = self.metrics(Path(directory), 'pi', [PI, {**PI, 'input': invalid}])
++                self.assertIsNone(metrics['provider_usage']['input_tokens'])
++                self.assertEqual(metrics['partial_reported_usage_sums']['input_tokens'], 110)
++                self.assertEqual(metrics['usage_fields_reported_by_rows']['input_tokens'], 1)
++                self.assertEqual(metrics['provider_usage']['output_tokens'], 10)
++
++    def test_sum_usage_wrapper_preserves_existing_value_policy(self):
++        cases = [[], [{}], [{'v': 0}], [{'v': 1}, {'v': 2}], [{'v': -3}, {'v': 1}],
++                 [{'v': True}], [{'v': 1.0}], [{'v': '1'}], [{'v': None}], [{'v': 1}, {}]]
++        for rows in cases:
++            with self.subTest(rows=rows):
++                values = [row.get('v') for row in rows]
++                expected = sum(values) if values and all(type(value) is int for value in values) else None
++                self.assertEqual(adapters.sum_usage(rows, {'tokens': 'v'}), {'tokens': expected})
++
++    def test_short_and_long_reports_keep_partial_evidence_without_full_totals(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            path = root/'fixture_case_1_pi'
++            path.mkdir()
++            metrics = self.metrics(path, 'pi', [PI, MISSING])
++            result = {'agent': 'pi', 'model': 'fixture', 'reasoning': 'high', 'pipeline_ok': True,
++                      'returncode': 0, 'timed_out': False, 'expected_turns': 1, 'wall_seconds': 1.0,
++                      'prompt_sha256': 'fixture', 'fixture_files_sha256': {'fixture.txt': 'same'}, 'metrics': metrics}
++            (path/'result.json').write_text(json.dumps(result))
++            (path/'grading.json').write_text(json.dumps({'passed': True}))
++            before = {file.name: file.read_bytes() for file in path.iterdir()}
++            short = report.read_rows([root], [])[0]
++            long = long_report.read_trial(path, 'case', 'pi', 1)
++            for row in [short, long]:
++                self.assertTrue(row['pass'])
++                self.assertTrue(row['usage_complete'])
++                self.assertIsNone(row['tokens']['input_tokens'])
++                self.assertEqual(row['observed_partial_usage']['input_tokens'], 110)
++            short_summary = report.summarize([short])[0]
++            long_summary = long_report.summarize([long], ['pi'], ['case'])[0]
++            self.assertIsNone(short_summary['input'])
++            self.assertIsNone(long_summary['tokens']['input_tokens'])
++            self.assertEqual(short_summary['known_token_runs']['input_tokens'], 0)
++            self.assertEqual(short_summary['observed_token_sums']['input_tokens'], 110)
++            self.assertEqual(short_summary['observed_token_sums'], long_summary['observed_token_sums'])
++            self.assertEqual(before, {file.name: file.read_bytes() for file in path.iterdir()})
++            direct = usage_report.project_usage(path, result, metrics)
++            self.assertEqual(direct['observed_partial_usage'], short['observed_partial_usage'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/examples/performance/coding-harness/pi_terminal.py
+@@ -0,0 +1,48 @@
++"""Final generation evidence from the pinned Pi JSON session lifecycle."""
++
++
++def pi_outcome(events):
++    settlements = []
++    observed_stops = []
++    started = False
++    pending = False
++    terminal = None
++    for event in events:
++        kind = event.get('type')
++        if kind == 'agent_start':
++            started = True
++            pending = True
++            terminal = None
++        elif kind in ('message_start', 'message_update', 'message_end'):
++            message = event.get('message', {})
++            role = message.get('role') if isinstance(message, dict) else None
++            if kind == 'message_end' and role == 'assistant':
++                observed_stops.append(message.get('stopReason'))
++            # JSON message_update omits message and only carries assistant deltas.
++            if kind == 'message_update' or role in ('user', 'assistant'):
++                pending = True
++                terminal = None
++        elif kind == 'agent_end':
++            terminal = None
++            messages = event.get('messages')
++            if started and event.get('willRetry') is False and isinstance(messages, list):
++                assistant = next((message for message in reversed(messages)
++                                  if isinstance(message, dict) and message.get('role') == 'assistant'), {})
++                terminal = assistant.get('stopReason')
++            started = False
++            pending = True
++        elif kind == 'agent_settled':
++            settlements.append({'stop_reason': terminal, 'aborted': event.get('aborted')})
++            started = False
++            pending = False
++            terminal = None
++    return {'settlements': settlements, 'pending': pending, 'observed_stop_reasons': observed_stops}
++
++
++def successful_pi_generations(outcome, expected_turns):
++    """Clean final generations, not a guarantee of successful CLI teardown or complete billing."""
++    settlements = outcome.get('settlements', [])
++    return (type(expected_turns) is int and expected_turns > 0
++            and outcome.get('pending') is False and len(settlements) == expected_turns
++            and all(item.get('stop_reason') == 'stop' and item.get('aborted') is False
++                    for item in settlements))
+--- /dev/null
++++ b/examples/performance/coding-harness/pi_terminal_test.py
+@@ -0,0 +1,186 @@
++"""Offline Pi terminal-generation controls; no native CLI or model execution."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++import adapters
++import long_report
++import runner
++import usage_report
++
++
++class PiTerminalChecks(unittest.TestCase):
++    def attempt(self, stop='stop', *, retry=False):
++        message = {'role': 'assistant', 'model': 'fixture', 'stopReason': stop,
++                   'content': [], 'usage': {'input': 10, 'cacheRead': 2, 'cacheWrite': 0, 'output': 3}}
++        if stop in ('error', 'aborted'):
++            message['errorMessage'] = 'synthetic 503' if stop == 'error' else 'synthetic abort'
++        return [{'type': 'agent_start'},
++                {'type': 'message_start', 'message': {'role': 'assistant', 'stopReason': 'pending'}},
++                {'type': 'message_end', 'message': message},
++                {'type': 'agent_end', 'willRetry': retry, 'messages': [message]}]
++
++    def settled(self, aborted=False):
++        return {'type': 'agent_settled', 'aborted': aborted}
++
++    def evaluate(self, path, events, expected=1, **overrides):
++        (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++        sessions = path/'runtime/pi-sessions'
++        sessions.mkdir(parents=True, exist_ok=True)
++        (sessions/'fixture.jsonl').write_text(json.dumps({'type': 'thinking_level_change',
++                                                        'thinkingLevel': 'high'})+'\n')
++        metrics = adapters.metrics('pi', path)
++        result = {'agent': 'pi', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                  'timed_out': False, 'metrics': metrics, 'expected_turns': expected,
++                  'continuity_verified': True}
++        result.update(overrides)
++        runner.check_pipeline(result)
++        return result, usage_report.project_usage(path, result, metrics)
++
++    def test_recovered_error_is_not_terminal_failure(self):
++        recovered = self.attempt()
++        events = (self.attempt('error', retry=True)
++                  + [{'type': 'auto_retry_start', 'attempt': 1}]
++                  + recovered[:-1]
++                  + [{'type': 'auto_retry_end', 'success': True, 'attempt': 1}]
++                  + recovered[-1:]+[self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            result, usage = self.evaluate(path, events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['errors'], ['synthetic 503'])
++            self.assertEqual(result['metrics']['model_requests'], 2)
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['error', 'stop'])
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(usage['reported_usage']['input_tokens'], 24)
++            teardown, fallback = self.evaluate(path, events, returncode=1)
++            self.assertFalse(teardown['pipeline_ok'])
++            self.assertTrue(fallback['usage_complete'])
++
++    def test_terminal_length_is_not_clean_success(self):
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), self.attempt('length')+[self.settled()])
++            self.assertFalse(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['pi_outcome']['settlements'],
++                             [{'stop_reason': 'length', 'aborted': False}])
++            failures = result['metrics']['errors']
++            self.assertIn('model_output_limit', long_report.failure_taxonomy(result, {'passed': True}, failures)['classes'])
++            self.assertTrue(result['metrics']['settled'])
++            self.assertFalse(usage['usage_complete'])
++            self.assertIsNone(usage['tokens']['input_tokens'])
++            self.assertEqual(usage['reported_usage']['input_tokens'], 12)
++            self.assertEqual(usage['observed_partial_usage']['input_tokens'], 12)
++
++    def test_recovered_length_keeps_diagnostics_without_terminal_limit_failure(self):
++        events = (self.attempt('length')
++                  + [{'type': 'compaction_start', 'reason': 'overflow'},
++                     {'type': 'compaction_end', 'reason': 'overflow', 'aborted': False, 'willRetry': True}]
++                  + self.attempt()+[self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['length', 'stop'])
++            self.assertEqual(result['metrics']['errors'], [])
++            self.assertNotIn('model_output_limit', long_report.failure_taxonomy(result, {'passed': True}, [])['classes'])
++            self.assertTrue(usage['usage_complete'])
++
++    def test_tool_use_can_reach_clean_answer_in_one_low_level_run(self):
++        tool = self.attempt('toolUse')
++        call = {'type': 'toolCall', 'id': 'call-1', 'name': 'read', 'arguments': {'path': 'fixture.txt'}}
++        tool[2]['message']['content'] = [call]
++        answer = self.attempt()
++        result_message = {'role': 'toolResult', 'toolCallId': 'call-1', 'content': []}
++        events = (tool[:-1]
++                  + [{'type': 'message_end', 'message': result_message},
++                     {'type': 'turn_end'}, {'type': 'turn_start'}]
++                  + answer[1:-1]
++                  + [{'type': 'agent_end', 'willRetry': False,
++                      'messages': [tool[2]['message'], result_message, answer[2]['message']]}, self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(result['metrics']['model_requests'], 2)
++            self.assertEqual(result['metrics']['all_tool_calls'], 1)
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['toolUse', 'stop'])
++
++    def test_each_requested_run_requires_its_own_successful_settlement(self):
++        clean = self.attempt()+[self.settled()]
++        failed = self.attempt('error')+[self.settled()]
++        cases = [(clean+clean, 2, True), (failed+clean, 2, False),
++                 (clean, 2, False), (clean+clean, 1, False),
++                 (clean, 0, False), (clean, -1, False), (clean, True, False), (clean, '1', False)]
++        for events, expected, success in cases:
++            with self.subTest(expected=expected, events=len(events)), tempfile.TemporaryDirectory() as directory:
++                result, usage = self.evaluate(Path(directory), events, expected)
++                self.assertEqual(result['pipeline_ok'], success)
++                self.assertEqual(usage['usage_complete'], success)
++
++    def test_missing_or_invalidated_terminal_evidence_is_not_success(self):
++        completed = self.attempt()
++        cases = [completed,
++                 completed+[{'type': 'agent_start'}, self.settled()],
++                 completed+[{'type': 'message_start', 'message': {'role': 'assistant'}}, self.settled()],
++                 completed+[{'type': 'message_update', 'assistantMessageEvent': {'type': 'text_delta'}}, self.settled()],
++                 completed+[{'type': 'message_start', 'message': {'role': 'user'}}, self.settled()],
++                 completed+[self.settled(), {'type': 'agent_start'}],
++                 completed+[self.settled(True)],
++                 completed+[{'type': 'agent_settled'}],
++                 completed[1:]+[self.settled()],
++                 completed[:-1]+[{'type': 'agent_end', 'willRetry': False}, self.settled()],
++                 completed[:-1]+[{'type': 'agent_end', 'willRetry': False, 'messages': {}}, self.settled()],
++                 [{'type': 'agent_end', 'willRetry': False}, self.settled()]]
++        cases += [self.attempt(stop)+[self.settled()] for stop in
++                  ['error', 'aborted', 'pending', 'toolUse', 'deferred', 'future-stop', None]]
++        cases += [self.attempt(retry=True)+[self.settled()]]
++        for index, events in enumerate(cases):
++            with self.subTest(case=index), tempfile.TemporaryDirectory() as directory:
++                result, usage = self.evaluate(Path(directory), events)
++                self.assertFalse(result['pipeline_ok'])
++                self.assertFalse(usage['usage_complete'])
++
++    def test_pipeline_guards_remain_separate_from_generation_completion(self):
++        events = self.attempt()+[self.settled()]
++        overrides = [{'returncode': 1}, {'timed_out': True}, {'model': 'different'},
++                     {'reasoning': 'low'}, {'expected_turns': 2, 'continuity_verified': False}]
++        for changes in overrides:
++            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
++                result, _ = self.evaluate(Path(directory), events, **changes)
++                self.assertFalse(result['pipeline_ok'])
++        with tempfile.TemporaryDirectory() as directory:
++            events = (self.attempt()
++                      + [{'type': 'compaction_start', 'reason': 'threshold'},
++                         {'type': 'compaction_end', 'reason': 'threshold', 'errorMessage': 'synthetic failure'}]
++                      + [self.settled()])
++            result, usage = self.evaluate(Path(directory), events, returncode=1)
++            self.assertFalse(result['pipeline_ok'])
++            self.assertTrue(usage['usage_complete'])
++
++    def test_other_arm_pipeline_policies_are_unchanged(self):
++        codex = {'agent': 'codex', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                 'metrics': {'settled': True, 'errors': [], 'models': ['fixture'], 'reasoning_efforts': ['high']}}
++        runner.check_pipeline(codex)
++        self.assertTrue(codex['pipeline_ok'])
++        codex['metrics']['errors'] = ['synthetic failure']
++        runner.check_pipeline(codex)
++        self.assertFalse(codex['pipeline_ok'])
++        proteus = {'agent': 'proteus', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                   'metrics': {'model_refs': [json.dumps({'model': 'fixture'})],
++                               'reasoning_refs': [json.dumps({'effort': 'high'})],
++                               'settlements': [{'status': 'success', 'error': None}],
++                               'model_requests': 2, 'model_responses': 2,
++                               'failures': [{'kind': 'model', 'message': 'recovered synthetic error'}]}}
++        runner.check_pipeline(proteus)
++        self.assertTrue(proteus['pipeline_ok'])
++
++    def test_stored_pipeline_success_fast_path_is_not_regraded(self):
++        with tempfile.TemporaryDirectory() as directory:
++            result = {'agent': 'pi', 'pipeline_ok': True, 'timed_out': False}
++            usage = usage_report.project_usage(Path(directory), result, {'provider_usage': {'input_tokens': 12}})
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(usage['tokens']['input_tokens'], 12)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/coding-harness/report.py
++++ b/examples/performance/coding-harness/report.py
+@@ -5,6 +5,8 @@
+ import json
+ from pathlib import Path
+ from statistics import median
++
++from usage_report import project_usage, summarize_usage
+ 
+ 
+ def read_rows(directories, excluded):
+@@ -25,15 +27,18 @@
+             identities.add(key)
+             grade = json.loads((file.parent/'grading.json').read_text())
+             metrics = result['metrics']
+-            rows.append({'model':result['model'], 'effort':result['reasoning'], 'case':case,
++            row = {'model':result['model'], 'effort':result['reasoning'], 'case':case,
+                          'attempt':int(repeat), 'arm':arm, 'source':str(file.resolve()),
+                          'prompt_sha256':result['prompt_sha256'],
+                          'repo_sha256':hashlib.sha256(json.dumps(result['fixture_files_sha256'],sort_keys=True).encode()).hexdigest(),
+                          'pipeline_ok':result['pipeline_ok'], 'grade':grade['passed'],
+                          'pass':result['pipeline_ok'] and grade['passed'], 'seconds':result['wall_seconds'],
++                         'returncode':result.get('returncode'), 'timed_out':result.get('timed_out', False),
+                          'failures':metrics.get('failures', metrics.get('errors', [])),
+                          'actions':metrics.get('all_tool_calls'), 'tools':metrics.get('tool_names', {}),
+-                         'requests':metrics.get('model_requests'), 'tokens':metrics.get('provider_usage', {})})
++                         'requests':metrics.get('model_requests')}
++            row.update(project_usage(file.parent, result, metrics))
++            rows.append(row)
+     return rows
+ 
+ 
+@@ -52,15 +57,18 @@
+     stats = []
+     for (model,effort,arm),runs in sorted(by_config.items()):
+         primary = [r for r in runs if r['attempt']==1]
++        usage = summarize_usage(primary)
+         tools = Counter()
+         for r in primary:
+             tools.update(r['tools'])
+         stats.append({'model':model,'effort':effort,'arm':arm,
+                       'primary_attempts':len(primary),'primary_passed':sum(r['pass'] for r in primary),
+                       'repeat_attempts':len(runs)-len(primary),'repeat_passed':sum(r['pass'] for r in runs if r['attempt']>1),
+-                      'input':complete_sum([r['tokens'].get('input_tokens') for r in primary]),
+-                      'cached':complete_sum([r['tokens'].get('cached_input_tokens') for r in primary]),
+-                      'output':complete_sum([r['tokens'].get('output_tokens') for r in primary]),
++                      'input':usage['tokens']['input_tokens'],
++                      'cached':usage['tokens']['cached_input_tokens'],
++                      'output':usage['tokens']['output_tokens'],
++                      'known_token_runs':usage['known_token_runs'],
++                      'observed_token_sums':usage['observed_token_sums'],
+                       'requests':complete_sum([r['requests'] for r in primary]),
+                       'actions':complete_sum([r['actions'] for r in primary]),'tools':dict(tools),
+                       'median_wall_seconds':round(median(r['seconds'] for r in primary),2)})
+--- a/examples/performance/coding-harness/runner.py
++++ b/examples/performance/coding-harness/runner.py
+@@ -12,6 +12,7 @@
+ 
+ import adapters
+ import open_code_native
++from pi_terminal import successful_pi_generations
+ 
+ 
+ def digest(path):
+@@ -99,7 +100,8 @@
+         models = metrics.get('models', [])
+         efforts = metrics.get('reasoning_efforts', [])
+         settled = metrics.get('settled', False)
+-        complete = not metrics.get('errors')
++        complete = (successful_pi_generations(metrics.get('pi_outcome', {}), report.get('expected_turns', 1))
++                    if report['agent'] == 'pi' else not metrics.get('errors'))
+     expected_model = report['model'].split('/', 1)[-1]
+     report['model_verified'] = bool(models) and all(model == expected_model for model in models)
+     if report['agent'] == 'opencode' or '/' in report['model']:
+--- /dev/null
++++ b/examples/performance/coding-harness/usage_report.py
+@@ -0,0 +1,77 @@
++"""Shared usage evidence projection for short and long harness reports."""
++import json
++
++from pi_terminal import pi_outcome, successful_pi_generations
++
++TOKENS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')
++
++
++def read_json(path):
++    return json.loads(path.read_text()) if path.is_file() else None
++
++
++def json_lines(path):
++    if path.is_file():
++        with path.open(errors='replace') as stream:
++            for line in stream:
++                try:
++                    value = json.loads(line)
++                except json.JSONDecodeError:
++                    continue
++                if isinstance(value, dict):
++                    yield value
++
++
++def known_sum(values):
++    return sum(values) if values and all(type(value) is int for value in values) else None
++
++
++def usage_completion(path, result, metrics):
++    if result.get('pipeline_ok') and not result.get('timed_out'):
++        return True, 'The complete task pipeline settled and exported its reported usage.'
++    agent = result.get('agent')
++    if agent == 'proteus':
++        failures = metrics.get('failures', [])
++        all_answered = (type(metrics.get('model_requests')) is int
++                        and metrics.get('model_requests') == metrics.get('model_responses'))
++        settled = metrics.get('settlements') or []
++        if all_answered and settled and all(item.get('status') == 'success' for item in settled) and not any(
++            isinstance(item, dict) and item.get('kind') == 'model' for item in failures
++        ):
++            return True, 'Every canonical model exchange and task settlement completed before the CLI teardown error.'
++    elif agent == 'pi':
++        outcome = pi_outcome(json_lines(path/'stdout.jsonl'))
++        if successful_pi_generations(outcome, result.get('expected_turns', 1)):
++            return True, 'Each requested Pi run settled after a clean final generation; CLI postprocessing can still fail.'
++    elif agent == 'opencode':
++        native = read_json(path/'runtime/native/usage.json') or {}
++        primary = native.get('assistant_messages', [])
++        if (metrics.get('settled') and primary and primary[-1].get('finish') == 'stop'
++                and sum(msg.get('finish') == 'stop' for msg in primary) >= result.get('expected_turns', 1)
++                and not metrics.get('errors')):
++            return True, 'The native session succeeded and its final assistant stopped before the CLI teardown error.'
++    return False, 'The generation or task did not settle; recorded usage is a lower bound and can omit the active request.'
++
++
++def project_usage(path, result, metrics):
++    """Retain reported lower bounds separately from lifecycle-complete totals."""
++    complete, reason = usage_completion(path, result, metrics)
++    reported = dict(metrics.get('provider_usage', {}))
++    partial = metrics.get('partial_reported_usage_sums', {})
++    observed = {key: value if type(value) is int else partial.get(key)
++                for key, value in {**{key: None for key in TOKENS}, **reported}.items()}
++    return {'usage_complete': complete, 'usage_completeness_reason': reason,
++            'reported_usage': reported, 'observed_partial_usage': observed,
++            'tokens': dict(reported) if complete else {key: None for key in reported}}
++
++
++def summarize_usage(rows):
++    """Aggregate the selected runs without promoting partial evidence to totals."""
++    values = {key: [row['tokens'].get(key) for row in rows] for key in TOKENS}
++    return {'tokens': {key: known_sum(items) for key, items in values.items()},
++            'known_token_runs': {key: sum(value is not None for value in items)
++                                 for key, items in values.items()},
++            'observed_token_sums': {key: sum(
++                row['tokens'][key] if type(row['tokens'].get(key)) is int else
++                row.get('observed_partial_usage', {}).get(key) or 0 for row in rows)
++                for key in TOKENS}}
+--- /dev/null
++++ b/examples/performance/coding-harness/usage_report_test.py
+@@ -0,0 +1,144 @@
++"""Synthetic artifact controls for shared short/long usage projection."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++import long_report
++import report
++import usage_report
++
++
++class UsageReportChecks(unittest.TestCase):
++    def trial(self, root, case, attempt=1, *, pipeline=True, grade=True,
++              timed_out=False, tokens=None, partial=None, events=()):
++        path = root/f'fixture_{case}_{attempt}_pi'
++        path.mkdir()
++        metrics = {'provider_usage': tokens or {}, 'model_requests': 1,
++                   'all_tool_calls': 2, 'tool_names': {'read_file': 2}, 'errors': []}
++        if partial is not None:
++            metrics['partial_reported_usage_sums'] = partial
++        result = {'agent': 'pi', 'model': 'fixture', 'reasoning': 'high',
++                  'pipeline_ok': pipeline, 'timed_out': timed_out,
++                  'returncode': 124 if timed_out else 0, 'expected_turns': 1,
++                  'wall_seconds': 1.0, 'prompt_sha256': 'prompt',
++                  'fixture_files_sha256': {'fixture.txt': 'contents'}, 'metrics': metrics}
++        (path/'result.json').write_text(json.dumps(result))
++        (path/'grading.json').write_text(json.dumps({'passed': grade}))
++        (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++        return path, result
++
++    def test_short_and_long_keep_same_complete_and_partial_row_evidence(self):
++        tokens = {'input_tokens': 10, 'cached_input_tokens': 2, 'output_tokens': 3}
++        for complete in [True, False]:
++            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                path, _ = self.trial(root, 'case', pipeline=complete, timed_out=not complete,
++                                     tokens=tokens)
++                original = {file.name: file.read_bytes() for file in path.iterdir()}
++                short = report.read_rows([root], [])[0]
++                long = long_report.read_trial(path, 'case', 'pi', 1)
++                for key in ['tokens', 'reported_usage', 'observed_partial_usage',
++                            'usage_complete', 'usage_completeness_reason', 'timed_out']:
++                    self.assertEqual(short[key], long[key], key)
++                self.assertEqual(short['usage_complete'], complete)
++                self.assertEqual(short['tokens']['input_tokens'], 10 if complete else None)
++                self.assertEqual(short['reported_usage']['input_tokens'], 10)
++                self.assertEqual(short['observed_partial_usage']['input_tokens'], 10)
++                self.assertEqual(original, {file.name: file.read_bytes() for file in path.iterdir()})
++
++    def test_partial_primary_is_not_promoted_and_repeat_does_not_enter_totals(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            first, _ = self.trial(root, 'first', grade=False,
++                                  tokens={'input_tokens': 10, 'cached_input_tokens': 2, 'output_tokens': 3})
++            second, _ = self.trial(root, 'second', pipeline=False, timed_out=True,
++                                   tokens={'input_tokens': 20, 'cached_input_tokens': 4, 'output_tokens': 6})
++            repeat, _ = self.trial(root, 'second', 2,
++                                   tokens={'input_tokens': 1000, 'cached_input_tokens': 200, 'output_tokens': 300})
++            short_rows = report.read_rows([root], [])
++            short = report.summarize(short_rows)[0]
++            long_rows = [long_report.read_trial(first, 'first', 'pi', 1),
++                         long_report.read_trial(second, 'second', 'pi', 1),
++                         long_report.read_trial(repeat, 'second', 'pi', 2)]
++            long = long_report.summarize(long_rows, ['pi'], ['first', 'second'])[0]
++            self.assertEqual(short['primary_attempts'], 2)
++            self.assertEqual(short['primary_passed'], 0)
++            self.assertEqual(short['repeat_attempts'], 1)
++            self.assertEqual(short['repeat_passed'], 1)
++            self.assertEqual(short['requests'], 2)
++            self.assertEqual(short['actions'], 4)
++            for field in ['input', 'cached', 'output']:
++                self.assertIsNone(short[field])
++            self.assertEqual(short['known_token_runs'], long['known_token_runs'])
++            self.assertEqual(short['observed_token_sums'], long['observed_token_sums'])
++            self.assertEqual(short['known_token_runs']['input_tokens'], 1)
++            self.assertEqual(short['observed_token_sums']['input_tokens'], 30)
++            self.assertEqual(short['observed_token_sums']['output_tokens'], 9)
++            self.assertIsNone(long['tokens']['input_tokens'])
++
++    def test_complete_run_with_missing_category_keeps_observed_partial_evidence(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.trial(root, 'case', tokens={'input_tokens': None, 'output_tokens': 3},
++                       partial={'input_tokens': 7})
++            row = report.read_rows([root], [])[0]
++            summary = report.summarize([row])[0]
++            self.assertTrue(row['usage_complete'])
++            self.assertIsNone(summary['input'])
++            self.assertEqual(summary['output'], 3)
++            self.assertEqual(summary['known_token_runs']['input_tokens'], 0)
++            self.assertEqual(summary['observed_token_sums']['input_tokens'], 7)
++            self.assertEqual(row['reported_usage']['input_tokens'], None)
++
++    def test_explicit_zero_and_no_observation_have_distinct_coverage(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            zero = usage_report.project_usage(path, {'pipeline_ok': True},
++                                               {'provider_usage': {'input_tokens': 0}})
++            empty = usage_report.project_usage(path, {'pipeline_ok': True}, {})
++            zeros = usage_report.summarize_usage([zero])
++            absent = usage_report.summarize_usage([empty])
++            self.assertEqual(zeros['tokens']['input_tokens'], 0)
++            self.assertEqual(zeros['known_token_runs']['input_tokens'], 1)
++            self.assertIsNone(absent['tokens']['input_tokens'])
++            self.assertEqual(absent['known_token_runs']['input_tokens'], 0)
++            self.assertEqual(zeros['observed_token_sums']['input_tokens'], 0)
++            self.assertEqual(absent['observed_token_sums']['input_tokens'], 0)
++            zero['tokens']['input_tokens'] = 9
++            self.assertEqual(zero['reported_usage']['input_tokens'], 0)
++
++    def test_existing_teardown_completion_policy_is_not_replaced_by_pipeline_boolean(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            events = [{'type': 'agent_start'},
++                      {'type': 'agent_end', 'willRetry': False,
++                       'messages': [{'role': 'assistant', 'stopReason': 'stop'}]},
++                      {'type': 'agent_settled', 'aborted': False}]
++            (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++            complete = usage_report.project_usage(path,
++                {'agent': 'pi', 'pipeline_ok': False, 'expected_turns': 1},
++                {'provider_usage': {'input_tokens': 10}})
++            self.assertTrue(complete['usage_complete'])
++            self.assertEqual(complete['tokens']['input_tokens'], 10)
++            canonical = usage_report.project_usage(path,
++                {'agent': 'proteus', 'pipeline_ok': False},
++                {'model_requests': 1, 'model_responses': 1,
++                 'settlements': [{'status': 'success'}], 'failures': [],
++                 'provider_usage': {'input_tokens': 12}})
++            self.assertTrue(canonical['usage_complete'])
++            self.assertEqual(canonical['tokens']['input_tokens'], 12)
++
++    def test_pair_identity_guard_still_rejects_different_inputs(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.trial(root, 'case', tokens={'input_tokens': 1})
++            second, result = self.trial(root, 'case', 2, tokens={'input_tokens': 1})
++            result['prompt_sha256'] = 'different'
++            (second/'result.json').write_text(json.dumps(result))
++            with self.assertRaisesRegex(ValueError, 'fixture or prompt differs'):
++                report.summarize(report.read_rows([root], []))
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/common/README.md
++++ b/examples/performance/common/README.md
+@@ -70,6 +70,25 @@
+ показатель одного интервала. Накопительные counters сохраняют последнее
+ успешное наблюдение при временных ошибках чтения.
+ 
++### Атрибуция целого интервала фазе
++
++`interval_start_monotonic_ns` хранит предыдущую точку времени самого `Tree`,
++соответствующую `interval_seconds`; у первой выборки это `null`. `Recorder`
++добавляет `phase_interval_eligible`, используя общий `PhaseIntervals`:
++интервал допустим для фазовой CPU/IO сводки только при известном положительном
++интервале, совпадающем имени фазы и начале не раньше последней метки этой фазы.
++Каждая новая метка, даже с прежним именем, начинает новую эпоху. Интервал,
++пересекающий метку, не делится пропорционально и не приписывается новой фазе.
++
++Это контракт упорядоченного потока одного `Tree` и одного монотонного clock,
++а не общий валидатор произвольной telemetry. Метка отражает момент наблюдения
++launcher, не точное время более раннего driver event; последовательное чтение
++`/proc` по-прежнему не атомарно. Проверка границ не устраняет missing baselines
++отдельных процессов/counters и не делает lifetime accounting полным.
++Сами raw counters, lifetime totals и точечные измерения памяти не меняются.
++Старые samples без interval-start provenance не доказывают пригодность для
++этого способа фазовой атрибуции.
++
+ `read_bytes`/`write_bytes` — kernel storage IO, а `rchar`/`wchar` учитывают и
+ кэшированные операции. **Финальные CPU/IO между последней выборкой и выходом,
+ а также дети, целиком родившиеся и завершившиеся между выборками, не
+--- a/examples/performance/common/proc_sampler.py
++++ b/examples/performance/common/proc_sampler.py
+@@ -7,6 +7,7 @@
+ 
+ import argparse
+ import json
++import math
+ import os
+ from pathlib import Path
+ import time
+@@ -17,6 +18,7 @@
+ IO_KEYS = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes", "cancelled_write_bytes")
+ COUNTERS = ("cpu_ticks", "minor_faults", "major_faults") + IO_KEYS
+ GROUPS = ("gui", "backend", "modules", "extensions", "other")
++PHASE_INTERVAL_POLICY = "whole-observed-interval/v1"
+ 
+ 
+ def read_stat(path: Path) -> dict:
+@@ -200,6 +202,7 @@
+             "root_pid": self.root, "root_start_ticks": self.root_start,
+             "processes": processes, "groups": groups,
+             **self._memory_totals(processes), "process_count": len(processes),
++            "interval_start_monotonic_ns": self.previous_ns,
+             "interval_seconds": elapsed, "interval_cpu_percent_one_core": cpu_percent,
+             "interval_counters": deltas if elapsed is not None else None,
+             "cpu_missing_baseline_pids": cpu_missing_baselines,
+@@ -244,14 +247,40 @@
+         }
+ 
+ 
++class PhaseIntervals:
++    """Attribute only intervals wholly after the latest observed phase marker."""
++    def __init__(self):
++        self.phase = None
++        self.started_ns = None
++
++    def observe(self, event):
++        if event.get("type") == "phase":
++            self.phase = event.get("phase")
++            self.started_ns = event.get("monotonic_ns")
++            return False
++        if event.get("type") != "sample":
++            return False
++        start = event.get("interval_start_monotonic_ns")
++        end = event.get("monotonic_ns")
++        elapsed = event.get("interval_seconds")
++        return (self.phase is not None and event.get("phase") == self.phase
++                and type(self.started_ns) is int and type(start) is int and type(end) is int
++                and self.started_ns <= start < end
++                and type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed > 0)
++
++
+ class Recorder:
+     """Flush each JSONL event so a failed benchmark retains its partial evidence."""
+     def __init__(self, tree: Tree, path: Path | str):
+         self.tree = tree
+         self.file = open(path, "w", encoding="utf-8")
+         self.phase: str | None = None
++        self.phase_intervals = PhaseIntervals()
+ 
+     def write(self, event: dict) -> dict:
++        eligible = self.phase_intervals.observe(event)
++        if event.get("type") == "sample":
++            event["phase_interval_eligible"] = eligible
+         self.file.write(json.dumps(event, ensure_ascii=False) + "\n")
+         self.file.flush()
+         return event
+--- a/examples/performance/history-scale/README.md
++++ b/examples/performance/history-scale/README.md
+@@ -193,6 +193,26 @@
+ sampled peaks, resident medians и CPU weighted mean по длительности интервалов
+ (100% — одно ядро). `VmHWM` разных процессов не складывается в пик дерева.
+ 
++CPU median/peak, weighted mean и phase interval counters включают только
++интервалы, целиком начинающиеся не раньше последней наблюдённой метки фазы
++(`whole-observed-interval/v1`). Общая проверка используется и при записи subject
++сводки, и при чтении raw full-tree samples в `../summarize.py`. Память и её пики
++сохраняются по всем выборкам. Нет пригодных интервалов: CPU равен `null`/`н/д`,
++а не измеренному нулю. Суммы counters по пустому множеству остаются нулевыми,
++поэтому читать их нужно вместе с `eligible_interval_samples` и
++`observed_interval_seconds`, не как стоимость всей фазы.
++
++`excluded_interval_samples`, `excluded_interval_seconds` и
++`excluded_interval_counters` явно показывают исключённые наблюдения. Сумма
++исключённых секунд не включает неизвестную длительность первой выборки и не
++измеряет все ненаблюдённые промежутки. Raw samples и lifetime totals не
++перезаписываются, работа из пересекающего интервала не теряется из них.
++`phase_interval_policy` отмечает новую семантику. При сравнении старых данных
++сохранённые subject phase aggregates показываются без перерасчёта с legacy
++предупреждением; full-tree CPU из raw samples без точного начала интервала
++показывается как `н/д`, при сохранении памяти. Это явная новая read-time
++проекция, а не исправление опубликованных исторических результатов.
++
+ Первые запуски используют свежие копии canonical inputs, но кэш ОС не
+ очищается: это не cold boot и не измерение allocation count. Restart сохраняет
+ derived files именно своего случая. Sequential `/proc` scan не атомарен;
+--- a/examples/performance/history-scale/measurement.py
++++ b/examples/performance/history-scale/measurement.py
+@@ -9,7 +9,7 @@
+ import time
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+-from proc_sampler import Recorder, Tree, table
++from proc_sampler import PHASE_INTERVAL_POLICY, Recorder, Tree, table
+ 
+ 
+ def classifier(args):
+@@ -44,7 +44,8 @@
+         event["subject"] = subject
+         self.log.write(event)
+         self.small.append(dict(phase=event["phase"], monotonic_ns=event["monotonic_ns"],
+-                               interval_seconds=event["interval_seconds"], **subject))
++                               interval_seconds=event["interval_seconds"],
++                               phase_interval_eligible=event["phase_interval_eligible"], **subject))
+         if subject["pss_swap_kib"] > self.args.max_pss_mib * 1024:
+             raise MemoryError(f"subject PSS+SwapPss exceeded {self.args.max_pss_mib} MiB")
+         if subject["memory_incomplete_pids"]:
+@@ -66,11 +67,22 @@
+         for phase in sorted({sample["phase"] for sample in self.small}):
+             samples = [sample for sample in self.small if sample["phase"] == phase]
+             phases[phase] = dict(samples=len(samples))
+-            for key in ("rss_kib", "pss_kib", "pss_swap_kib", "swap_pss_kib", "private_kib", "cpu_percent_one_core"):
++            for key in ("rss_kib", "pss_kib", "pss_swap_kib", "swap_pss_kib", "private_kib"):
+                 values = [sample[key] for sample in samples]
+                 phases[phase][key] = dict(median=statistics.median(values), peak=max(values))
+-            elapsed = sum(sample["interval_seconds"] or 0 for sample in samples)
+-            phase_counters = {field: sum(sample["interval_counters"][field] for sample in samples)
++            intervals = [sample for sample in samples if sample.get("phase_interval_eligible") is True]
++            excluded = [sample for sample in samples if sample.get("phase_interval_eligible") is not True]
++            cpu = [sample["cpu_percent_one_core"] for sample in intervals]
++            phases[phase]["cpu_percent_one_core"] = dict(median=statistics.median(cpu) if cpu else None,
++                                                        peak=max(cpu) if cpu else None)
++            phases[phase]["eligible_interval_samples"] = len(intervals)
++            phases[phase]["excluded_interval_samples"] = len(excluded)
++            phases[phase]["excluded_interval_seconds"] = sum(sample["interval_seconds"] or 0 for sample in excluded)
++            phases[phase]["excluded_interval_counters"] = {
++                field: sum(sample["interval_counters"][field] for sample in excluded)
++                for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar")}
++            elapsed = sum(sample["interval_seconds"] for sample in intervals)
++            phase_counters = {field: sum(sample["interval_counters"][field] for sample in intervals)
+                               for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar")}
+             phases[phase]["observed_interval_counters"] = phase_counters
+             phases[phase]["observed_interval_seconds"] = elapsed
+@@ -80,7 +92,7 @@
+         counters = {field: sum(row.get(field, 0) for row in observed)
+                     for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar", "minor_faults", "major_faults")}
+         counters["cpu_seconds"] = counters["cpu_ticks"] / self.tree.clock_ticks
+-        return dict(phases=phases, subject_observed_counters=counters,
++        return dict(phases=phases, phase_interval_policy=PHASE_INTERVAL_POLICY, subject_observed_counters=counters,
+                     sampled_peak_pss_swap_kib=max((sample["pss_swap_kib"] for sample in self.small), default=0),
+                     sampled_peak_rss_kib=max((sample["rss_kib"] for sample in self.small), default=0),
+                     sampling_scope="actual Core backends + reference modules; Python/driver control overhead separately grouped",
+--- a/examples/performance/history-scale/test_harness.py
++++ b/examples/performance/history-scale/test_harness.py
+@@ -203,7 +203,7 @@
+         metrics.tree = SimpleNamespace(last={}, clock_ticks=100, totals=lambda: {})
+         metrics.small = []
+         for elapsed, ticks in ((0.1, 10), (0.9, 0)):
+-            metrics.small.append(dict(phase="idle", interval_seconds=elapsed, rss_kib=10, pss_kib=8,
++            metrics.small.append(dict(phase="idle", interval_seconds=elapsed, phase_interval_eligible=True, rss_kib=10, pss_kib=8,
+                 pss_swap_kib=9, swap_pss_kib=1, private_kib=4, cpu_percent_one_core=100 * ticks / 100 / elapsed,
+                 interval_counters=dict(cpu_ticks=ticks, read_bytes=0, write_bytes=0, rchar=0, wchar=0)))
+         phase = metrics.summary()["phases"]["idle"]
+--- /dev/null
++++ b/examples/performance/history-scale/test_phase_intervals.py
+@@ -0,0 +1,209 @@
++"""Deterministic phase attribution using a private fake proc tree; no child processes."""
++from contextlib import redirect_stdout
++import io
++import json
++from pathlib import Path
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++from measurement import Metrics, Tree
++import proc_sampler
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import summarize
++
++
++class PhaseIntervalTests(unittest.TestCase):
++    def process(self, proc, cpu=0, rss=100):
++        path = proc/'100'
++        path.mkdir(parents=True, exist_ok=True)
++        fields = ['0'] * 22
++        fields[0], fields[1], fields[11], fields[12], fields[19] = 'S', '1', str(cpu), '0', '100'
++        (path/'stat').write_text('100 (synthetic) '+' '.join(fields))
++        (path/'smaps_rollup').write_text(f'Rss: {rss} kB\nPss: 80 kB\nSwapPss: 2 kB\nPrivate_Clean: 3 kB\nPrivate_Dirty: 4 kB\n')
++        (path/'io').write_text(f'read_bytes: {cpu*10}\nwrite_bytes: {cpu*20}\nrchar: {cpu*30}\nwchar: {cpu*40}\n')
++        (path/'status').write_text('VmHWM: 10000 kB\nThreads: 1\n')
++        (path/'cmdline').write_bytes(b'/synthetic/backend\0')
++        (proc/'uptime').write_text('1000 0\n')
++
++    def scenario(self, root, *, boundary_sample=False, finish=True, boundary_rss=100):
++        proc = root/'proc'
++        case = root/'case'
++        case.mkdir()
++        self.process(proc)
++        tree = Tree(100, root_group='backend', proc=proc)
++        tree.clock_ticks = 100
++        clock = SimpleNamespace(ns=1_000_000_000)
++        args = SimpleNamespace(max_pss_mib=1024, timeout=60, interval=0.1)
++        with patch.object(proc_sampler.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
++             patch.object(proc_sampler.time, 'monotonic', side_effect=lambda: clock.ns/1e9):
++            metrics = Metrics(tree, case, args)
++            try:
++                metrics.mark('first_launch')
++                metrics.sample()
++                clock.ns = 2_000_000_000
++                self.process(proc, cpu=100, rss=boundary_rss)
++                if boundary_sample:
++                    metrics.sample()
++                metrics.mark('resident_idle')
++                if not boundary_sample:
++                    metrics.sample()
++                if finish:
++                    clock.ns = 3_000_000_000
++                    self.process(proc, cpu=100)
++                    metrics.sample()
++                measurement = metrics.summary()
++            finally:
++                metrics.close()
++        events = [json.loads(line) for line in (case/'samples.jsonl').read_text().splitlines()]
++        return case, measurement, events
++
++    def render(self, root, case, measurement):
++        source = root/'report.json'
++        output = root/'comparison.md'
++        source.write_text(json.dumps({'status': 'complete', 'mode': 'agent-control', 'runs': [
++            {'status': 'passed', 'mode': 'agent-control', 'messages_per_session': 1,
++             'peers': 1, 'path': str(case), 'measurement': measurement}]}))
++        original = {path: path.read_bytes() for path in [source, case/'samples.jsonl']}
++        with patch.object(sys, 'argv', ['summarize.py', '--active-before', str(source), '--output', str(output)]), \
++             redirect_stdout(io.StringIO()):
++            summarize.main()
++        self.assertEqual(original, {path: path.read_bytes() for path in original})
++        return output.read_text()
++
++    def full_tree_row(self, text):
++        return next(line for line in text.splitlines() if line.startswith('|') and '+ управляющий процесс' in line)
++
++    def test_phase_summary_does_not_charge_launch_work_to_idle(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, events = self.scenario(Path(directory), boundary_rss=400)
++            idle = measurement['phases']['resident_idle']
++            # Behavioral red assertion occurs before access to new evidence fields.
++            self.assertEqual(idle['cpu_percent_one_core_weighted_mean'], 0)
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': 0, 'peak': 0})
++            self.assertEqual(idle['observed_interval_counters']['cpu_ticks'], 0)
++            self.assertEqual(idle['excluded_interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(idle['excluded_interval_counters']['read_bytes'], 1000)
++            self.assertEqual(idle['observed_interval_seconds'], 1)
++            self.assertEqual(idle['excluded_interval_seconds'], 1)
++            self.assertEqual(idle['eligible_interval_samples'], 1)
++            self.assertEqual(idle['excluded_interval_samples'], 1)
++            self.assertEqual(idle['samples'], 2)
++            self.assertEqual(idle['rss_kib'], {'median': 250, 'peak': 400})
++            self.assertEqual(measurement['subject_observed_counters']['cpu_ticks'], 100)
++            self.assertEqual(measurement['full_tree']['cpu_ticks'], 100)
++            samples = [event for event in events if event.get('type') == 'sample' and event['phase'] == 'resident_idle']
++            self.assertEqual(samples[0]['interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(samples[0]['interval_start_monotonic_ns'], 1_000_000_000)
++            self.assertFalse(samples[0]['phase_interval_eligible'])
++            self.assertTrue(samples[1]['phase_interval_eligible'])
++
++    def test_full_tree_comparison_does_not_charge_launch_work_to_idle(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            case, measurement, _ = self.scenario(root)
++            text = self.render(root, case, measurement)
++            self.assertEqual(self.full_tree_row(text).split('|')[-2].strip(), '0.00')
++            self.assertIn('1/2', text)
++
++    def test_explicit_old_phase_boundary_sample_preserves_attribution(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, _ = self.scenario(Path(directory), boundary_sample=True)
++            launch = measurement['phases']['first_launch']
++            idle = measurement['phases']['resident_idle']
++            self.assertEqual(launch['observed_interval_counters']['cpu_ticks'], 100)
++            self.assertEqual(launch['cpu_percent_one_core_weighted_mean'], 100)
++            self.assertEqual(idle['cpu_percent_one_core_weighted_mean'], 0)
++            self.assertEqual(idle['eligible_interval_samples'], 1)
++            self.assertEqual(idle['excluded_interval_samples'], 0)
++
++    def test_every_marker_starts_an_epoch_even_when_label_returns_or_repeats(self):
++        tracker = proc_sampler.PhaseIntervals()
++        def mark(phase, time):
++            tracker.observe({'type': 'phase', 'phase': phase, 'monotonic_ns': time})
++        def sample(start, end, phase='A'):
++            return tracker.observe({'type': 'sample', 'phase': phase, 'interval_start_monotonic_ns': start,
++                                    'monotonic_ns': end, 'interval_seconds': (end-start)/1e9})
++        mark('A', 0)
++        self.assertTrue(sample(0, 10))
++        mark('B', 12)
++        mark('A', 15)
++        self.assertFalse(sample(10, 20))
++        self.assertTrue(sample(20, 30))
++        mark('A', 35)
++        self.assertFalse(sample(30, 40))
++        self.assertTrue(sample(40, 50))
++
++    def test_unknown_or_empty_interval_coverage_is_not_zero_cpu(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, measurement, _ = self.scenario(Path(directory), finish=False)
++            idle = measurement['phases']['resident_idle']
++            self.assertIsNone(idle['cpu_percent_one_core_weighted_mean'])
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': None, 'peak': None})
++            self.assertEqual(idle['rss_kib']['median'], 100)
++            self.assertEqual(idle['excluded_interval_counters']['cpu_ticks'], 100)
++        tracker = proc_sampler.PhaseIntervals()
++        sample = {'type': 'sample', 'phase': 'idle', 'interval_start_monotonic_ns': 10,
++                  'monotonic_ns': 20, 'interval_seconds': 1e-8}
++        self.assertFalse(tracker.observe(sample))
++        tracker.observe({'type': 'phase', 'phase': 'idle', 'monotonic_ns': 10})
++        for changes in [{'interval_start_monotonic_ns': None}, {'interval_start_monotonic_ns': True},
++                        {'interval_seconds': None}, {'interval_seconds': 0}, {'interval_seconds': -1},
++                        {'interval_seconds': float('nan')}, {'monotonic_ns': 10}, {'phase': 'different'}]:
++            with self.subTest(changes=changes):
++                self.assertFalse(tracker.observe({**sample, **changes}))
++
++    def test_legacy_raw_samples_keep_memory_but_not_unproven_full_tree_cpu(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            case, measurement, events = self.scenario(root)
++            for event in events:
++                event.pop('interval_start_monotonic_ns', None)
++                event.pop('phase_interval_eligible', None)
++            (case/'samples.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++            measurement.pop('phase_interval_policy')
++            measurement['phases']['resident_idle']['cpu_percent_one_core_weighted_mean'] = 50
++            text = self.render(root, case, measurement)
++            full = self.full_tree_row(text)
++            self.assertEqual(full.split('|')[-2].strip(), 'н/д')
++            self.assertIn('0.10', full)
++            subject = next(line for line in text.splitlines() if line.startswith('|')
++                           and ': resident_idle ' in line and '+ управляющий процесс' not in line)
++            self.assertEqual(subject.split('|')[-2].strip(), '50.00')
++            self.assertIn('без ретроактивного пересчёта', text)
++
++    def test_same_phase_weighted_cpu_and_all_memory_samples_are_retained(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            self.process(root/'proc')
++            tree = Tree(100, root_group='backend', proc=root/'proc')
++            tree.clock_ticks = 100
++            clock = SimpleNamespace(ns=1_000_000_000)
++            args = SimpleNamespace(max_pss_mib=1024, timeout=60)
++            with patch.object(proc_sampler.time, 'monotonic_ns', side_effect=lambda: clock.ns), \
++                 patch.object(proc_sampler.time, 'monotonic', side_effect=lambda: clock.ns/1e9):
++                metrics = Metrics(tree, root, args)
++                try:
++                    metrics.mark('idle')
++                    metrics.sample()
++                    clock.ns = 1_100_000_000
++                    self.process(root/'proc', cpu=10, rss=200)
++                    metrics.sample()
++                    clock.ns = 2_000_000_000
++                    self.process(root/'proc', cpu=10, rss=300)
++                    metrics.sample()
++                    idle = metrics.summary()['phases']['idle']
++                finally:
++                    metrics.close()
++            self.assertAlmostEqual(idle['cpu_percent_one_core_weighted_mean'], 10)
++            self.assertEqual(idle['cpu_percent_one_core'], {'median': 50, 'peak': 100})
++            self.assertEqual(idle['rss_kib'], {'median': 200, 'peak': 300})
++            self.assertEqual(idle['eligible_interval_samples'], 2)
++            self.assertEqual(idle['excluded_interval_samples'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/summarize.py
++++ b/examples/performance/summarize.py
+@@ -6,6 +6,8 @@
+ import math
+ from pathlib import Path
+ import statistics
++
++from common.proc_sampler import PHASE_INTERVAL_POLICY, PhaseIntervals
+ 
+ 
+ def get(value, *keys):
+@@ -110,6 +112,9 @@
+                 readiness[(scenario, 'внешнее наблюдение готовности, мс')][side].append(external * 1000 if number(external) else None)
+             else:
+                 phases = measurement.get('phases', {})
++                if phases and measurement.get('phase_interval_policy') != PHASE_INTERVAL_POLICY:
++                    notices.append(f'{path}: сохранённые subject phase CPU aggregates не подтверждают whole-interval policy; '
++                                   'они показаны как записаны, без ретроактивного пересчёта.')
+                 memory[scenario + ': пик всего кейса'][side].append(dict(
+                     peak_rss=measurement.get('sampled_peak_rss_kib'),
+                     peak_pss_swap=measurement.get('sampled_peak_pss_swap_kib')))
+@@ -123,6 +128,10 @@
+                     values.update(peak_rss=get(data, 'rss_kib', 'peak'), peak_pss_swap=get(data, 'pss_swap_kib', 'peak'),
+                                   cpu=data.get('cpu_percent_one_core_weighted_mean'))
+                     memory[scenario + ': ' + phase][side].append(values)
++                    if data.get('excluded_interval_seconds', 0) > 0:
++                        notices.append(f'{path}, {phase}: из phase CPU/IO исключено '
++                                       f'{data["excluded_interval_seconds"]:.6g} с смешанных/неподтверждённых интервалов; '
++                                       f'учтено {data.get("observed_interval_seconds", 0):.6g} с.')
+                 if kind == 'idle':
+                     for cache in ('first', 'restart'):
+                         for key in ('all_http_bound_ms', 'all_snapshots_ready_ms'):
+@@ -131,18 +140,27 @@
+                     events = measurement.get('events', [])
+                     samples_path = Path(row.get('path', path.parent)) / 'samples.jsonl'
+                     if samples_path.is_file():
+-                        samples = [item for line in samples_path.read_text().splitlines()
+-                                   if (item := json.loads(line)).get('type') == 'sample'
+-                                   and item.get('phase') == 'resident_idle']
++                        phase_intervals = PhaseIntervals()
++                        samples = []
++                        for line in samples_path.read_text().splitlines():
++                            item = json.loads(line)
++                            eligible = phase_intervals.observe(item)
++                            if item.get('type') == 'sample' and item.get('phase') == 'resident_idle':
++                                item['phase_interval_eligible'] = eligible
++                                samples.append(item)
+                         if samples:
+                             values = {key: statistics.median(item[key] for item in samples)
+                                       for key in ('rss_kib','pss_kib','swap_pss_kib','pss_swap_kib')}
+-                            intervals = [item for item in samples if item.get('interval_seconds')]
++                            intervals = [item for item in samples if item['phase_interval_eligible']]
+                             values.update(peak_rss=max(item['rss_kib'] for item in samples),
+                                           peak_pss_swap=max(item['pss_swap_kib'] for item in samples),
+                                           cpu=sum((item.get('interval_cpu_percent_one_core') or 0)*item['interval_seconds'] for item in intervals)
+                                           / sum(item['interval_seconds'] for item in intervals) if intervals else None)
+                             memory[scenario+': resident_idle + управляющий процесс'][side].append(values)
++                            if len(intervals) != len(samples):
++                                notices.append(f'{samples_path}: full-tree idle CPU использует '
++                                               f'{len(intervals)}/{len(samples)} сэмплов с подтверждённым целым интервалом; '
++                                               'границы и legacy samples без interval-start provenance исключены, память сохранена.')
+                     for phase in ('parent_ready', 'all_models_entered', 'round_settled'):
+                         elapsed = [event.get('elapsed_ms') for event in events if event.get('phase') == phase]
+                         readiness[(scenario, phase + ' (первое событие), мс')][side].append(elapsed[0] if elapsed else None)
+@@ -155,11 +173,13 @@
+              'и read_file; Python/driver overhead исключён из измеряемой памяти. Число сообщений задано в каждой сессии.', '',
+              'Дополнительные строки «+ управляющий процесс» включают Rust AgentControl driver и всё его дерево; внешний Python измеритель в них не входит.', '',
+              'CPU — среднее с весом по времени внутри фазы (100% = одно ядро), затем медиана повторов. '
++             'Новая history-scale policy учитывает лишь интервалы целиком после наблюдавшегося phase marker; '
++             'coverage и исключения приведены отдельно. Сохранённые legacy aggregates не переоцениваются. '
+              'RSS суммирует разделяемые страницы; PSS распределяет их. PSS+SwapPss учитывает вытеснение в swap. '
+              'Пики — максимумы одновременных сэмплов внутри каждого кейса/фазы, затем медиана повторов; '
+              'короткие пики между сэмплами могут быть пропущены. OS cache не сбрасывается; first — пустой кэш приложения, restart — повторный процесс.', '']
+     if notices:
+-        lines += ['## Незавершённые прогоны', ''] + [f'- {escape(item)}' for item in notices] + ['']
++        lines += ['## Ограничения и неполные данные', ''] + [f'- {escape(item)}' for item in notices] + ['']
+     lines += ['## Память и CPU', '']
+     memory_rows = []
+     for scenario, sides in sorted(memory.items()):
+--- a/scripts/build_module.py
++++ b/scripts/build_module.py
+@@ -35,9 +35,10 @@
+ 
+ 
+ def build_packages(profile="dev", target_dir=None, env=None, destination=None, reuse=False):
++    """Resolve caller-owned output paths before changing the child working directory."""
+     source = resolve("modules")
+     command = [sys.executable, str(source / "package.py"), "--profile", profile]
+-    command += ["--bundle", str(destination)] if destination else ["--print-artifacts"]
++    command += ["--bundle", str(Path(destination).resolve())] if destination else ["--print-artifacts"]
+     if target_dir:
+         command += ["--target-dir", str(Path(target_dir).resolve())]
+     if reuse:
+--- /dev/null
++++ b/scripts/test_build_module_paths.py
+@@ -0,0 +1,114 @@
++"""Caller-owned path identity at the packager command boundary; no child runs."""
++from contextlib import chdir
++import importlib.util
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import types
++import unittest
++from unittest.mock import Mock, patch
++
++
++HERE = Path(__file__).resolve().parent
++
++
++def load_builder():
++    sources = types.ModuleType('sources')
++    sources.resolve = Mock(side_effect=AssertionError('Unexpected source resolution'))
++    path = HERE / 'build_module.py'
++    spec = importlib.util.spec_from_file_location('_path_identity_builder', path)
++    module = importlib.util.module_from_spec(spec)
++    with patch.dict(sys.modules, {'sources': sources, spec.name: module}):
++        spec.loader.exec_module(module)
++    if Path(module.__file__).resolve() != path:
++        raise AssertionError('Wrong builder module')
++    return module
++
++
++class BuildModulePathTests(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory(prefix='module-path-identity-')
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        self.caller = self.root / 'caller'
++        self.caller.mkdir()
++        self.modules = self.root / 'different-modules-checkout'
++        self.modules.mkdir()
++        self.builder = load_builder()
++        self.builder.resolve = Mock(return_value=self.modules)
++        patcher = patch.object(self.builder.subprocess, 'check_output', return_value='')
++        self.output = patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def command(self):
++        self.output.assert_called_once()
++        args, kwargs = self.output.call_args
++        self.assertEqual(kwargs['cwd'], self.modules)
++        self.assertTrue(kwargs['text'])
++        return args[0], kwargs
++
++    def test_relative_bundle_and_target_dir_use_callers_directory(self):
++        env = {'SYNTHETIC_OPTION': 'value'}
++        with chdir(self.caller):
++            result = self.builder.build_packages(
++                'release', 'target-cache', env, Path('delivered runtime'), reuse=True,
++            )
++        command, kwargs = self.command()
++        self.assertIsNone(result)
++        self.assertEqual(command, [
++            sys.executable, str(self.modules / 'package.py'), '--profile', 'release',
++            '--bundle', str(self.caller / 'delivered runtime'),
++            '--target-dir', str(self.caller / 'target-cache'), '--no-build',
++        ])
++        self.assertIs(kwargs['env'], env)
++        self.assertFalse((self.caller / 'delivered runtime').exists())
++        self.assertFalse((self.modules / 'delivered runtime').exists())
++
++    def test_dot_and_parent_bundle_paths_are_resolved_before_foreign_cwd(self):
++        for supplied, expected in ((Path('.'), self.caller),
++                                   (Path('../output'), self.root / 'output'),
++                                   ('string-output', self.caller / 'string-output')):
++            with self.subTest(supplied=supplied):
++                self.output.reset_mock()
++                with chdir(self.caller):
++                    self.builder.build_packages(destination=supplied)
++                command, _ = self.command()
++                self.assertEqual(command[command.index('--bundle') + 1], str(expected))
++
++    def test_absolute_unicode_bundle_stays_one_unchanged_argument(self):
++        destination = self.root / 'absolute bundle 候補'
++        with chdir(self.caller):
++            self.builder.build_packages(destination=destination)
++        command, _ = self.command()
++        self.assertEqual(command, [
++            sys.executable, str(self.modules / 'package.py'), '--profile', 'dev',
++            '--bundle', str(destination),
++        ])
++        self.assertFalse(destination.exists())
++
++    def test_artifact_listing_keeps_existing_json_return_contract(self):
++        artifacts = {'fixture': str(self.root / 'unused-binary')}
++        self.output.return_value = json.dumps(artifacts)
++        target = self.root / 'absolute-target'
++        with chdir(self.caller):
++            result = self.builder.build_packages(target_dir=target)
++        command, kwargs = self.command()
++        self.assertEqual(result, artifacts)
++        self.assertEqual(command, [
++            sys.executable, str(self.modules / 'package.py'), '--profile', 'dev',
++            '--print-artifacts', '--target-dir', str(target),
++        ])
++        self.assertIsNone(kwargs['env'])
++
++    def test_packager_failure_is_not_swallowed(self):
++        error = subprocess.CalledProcessError(7, ['synthetic-command'])
++        self.output.side_effect = error
++        with chdir(self.caller), self.assertRaises(subprocess.CalledProcessError) as caught:
++            self.builder.build_packages(destination=Path('out'))
++        self.assertIs(caught.exception, error)
++
++
++if __name__ == '__main__':
++    unittest.main()
