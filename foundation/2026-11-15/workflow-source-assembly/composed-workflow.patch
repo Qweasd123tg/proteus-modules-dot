@@ -1,0 +1,1415 @@
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -22,11 +22,20 @@
+     let mut compactable_history = Vec::new();
+ 
+     for message in messages {
++        summary_history.push(message.clone());
+         if is_structured_ephemeral_context_message(message) {
+-            ephemeral_context.push(message.clone());
+-            summary_history.push(message.clone());
++            // Request scope alone does not make a message independent context.
++            // Tool pairs belong in the summary input, but this replacement
++            // retains only users and a summary, not the calls they refer to.
++            if !message.parts.iter().any(|part| {
++                matches!(
++                    part.payload,
++                    ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
++                )
++            }) {
++                ephemeral_context.push(message.clone());
++            }
+         } else {
+-            summary_history.push(message.clone());
+             compactable_history.push(message.clone());
+         }
+     }
+--- a/hook/codex-context-preparation/src/tests.rs
++++ b/hook/codex-context-preparation/src/tests.rs
+@@ -120,6 +120,7 @@
+     summary::{COMPACTION_PROMPT, SUMMARY_PREFIX, validate_summary_response_for_test},
+ };
+ 
++mod history_recovery;
+ mod stream_recovery;
+ 
+ #[derive(Default)]
+--- /dev/null
++++ b/hook/codex-context-preparation/src/tests/history_recovery.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use proteus_contracts::model_standard::PartScope;
++
++#[test]
++fn request_tool_pairs_are_summarized_not_reinjected_without_their_calls() {
++    for call_scope in [PartScope::Conversation, PartScope::Request] {
++        for compact in [false, true] {
++            let mut context = CanonicalMessage::text(MessageRole::User, "workspace context");
++            context.parts[0].scope = PartScope::Request;
++            let mut marker = CanonicalMessage::text(
++                MessageRole::User,
++                "<turn_aborted>interrupted</turn_aborted>",
++            );
++            marker.parts[0].scope = PartScope::Request;
++            let mut call = CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![ContentPart::ToolCall {
++                    call: ToolCall::new("old-call", "read_file", json!({"path":"old"})),
++                }],
++            );
++            call.parts[0].scope = call_scope;
++            let mut result = CanonicalMessage::new(
++                MessageRole::Tool,
++                vec![ContentPart::ToolResult {
++                    result: ToolResult::error("old-call".into(), "aborted"),
++                }],
++            )
++            .with_tool_call_id("old-call".into());
++            result.parts[0].scope = PartScope::Request;
++            let messages = vec![
++                context.clone(),
++                CanonicalMessage::text(MessageRole::User, "previous request"),
++                call.clone(),
++                result.clone(),
++                marker.clone(),
++                CanonicalMessage::text(MessageRole::User, "continue"),
++            ];
++            let mut host = TestHost::with_response("summary");
++            let prepared = input(messages.clone(), if compact { 500 } else { 0 });
++            let original = prepared.preparation();
++            let output = compact_with_host(prepared, &mut host);
++            proteus_contracts::contracts::validate_context_preparation_output(&original, &output)
++                .unwrap();
++            assert_eq!(output.changed, compact);
++            if compact {
++                assert!(
++                    !output
++                        .messages
++                        .iter()
++                        .flat_map(|message| &message.parts)
++                        .any(|part| matches!(
++                            part.payload,
++                            ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
++                        ))
++                );
++                assert!(output.messages.contains(&context));
++                assert!(output.messages.contains(&marker));
++                let requests = host.requests.lock().unwrap();
++                assert_eq!(requests.len(), 1);
++                assert!(requests[0].messages.contains(&call));
++                assert!(requests[0].messages.contains(&result));
++            } else {
++                assert_eq!(output.messages, messages);
++                assert!(host.requests.lock().unwrap().is_empty());
++            }
++        }
++    }
++}
+--- a/workflow/coding-workflow/src/codex_loop.rs
++++ b/workflow/coding-workflow/src/codex_loop.rs
+@@ -36,7 +36,7 @@
+         &mut turn.model_messages,
+         &input.runtime.interrupted_turns,
+     );
+-    super::codex_recovery::normalize_missing_tool_outputs(&mut turn.model_messages);
++    super::history::normalize_missing_tool_outputs(&mut turn.model_messages);
+     match run_loop(&input, host, module_id, &mut turn, stream_retry) {
+         Ok((text, metadata)) => turn
+             .finish(host, text, metadata)
+--- a/workflow/coding-workflow/src/codex_recovery.rs
++++ b/workflow/coding-workflow/src/codex_recovery.rs
+@@ -1,9 +1,6 @@
+-use std::collections::HashSet;
+-
+ use proteus_contracts::{
+     contracts::WorkflowHistoryInterruption,
+-    domain::ToolResult,
+-    model_standard::{CanonicalMessage, ContentPart, MessageRole, PartProvenance, PartScope},
++    model_standard::{CanonicalMessage, MessageRole, PartProvenance, PartScope},
+ };
+ 
+ const INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+@@ -38,38 +35,6 @@
+         marker.parts[0].provenance = PartProvenance::Runtime;
+         marker.parts[0].scope = PartScope::Request;
+         messages.insert(index + 1, marker);
+-    }
+-}
+-
+-/// Pinned Codex context_manager/normalize.rs: missing call outputs become
+-/// prompt-only "aborted" outputs. This does not assert whether an effect ran.
+-/// The journal and durable history retain the original unresolved call.
+-pub(crate) fn normalize_missing_tool_outputs(messages: &mut Vec<CanonicalMessage>) {
+-    let completed = messages
+-        .iter()
+-        .flat_map(|message| &message.parts)
+-        .filter_map(|part| match &part.payload {
+-            ContentPart::ToolResult { result } => Some(result.call_id.clone()),
+-            _ => None,
+-        })
+-        .collect::<HashSet<_>>();
+-    let mut inserts = Vec::new();
+-    for (index, message) in messages.iter().enumerate() {
+-        for part in &message.parts {
+-            if let ContentPart::ToolCall { call } = &part.payload
+-                && !completed.contains(&call.id)
+-            {
+-                let mut output = crate::history::tool_result_message(ToolResult::error(
+-                    call.id.clone(),
+-                    "aborted",
+-                ));
+-                output.parts[0].scope = PartScope::Request;
+-                inserts.push((index + 1, output));
+-            }
+-        }
+-    }
+-    for (index, output) in inserts.into_iter().rev() {
+-        messages.insert(index, output);
+     }
+ }
+ 
+--- a/workflow/coding-workflow/src/history.rs
++++ b/workflow/coding-workflow/src/history.rs
+@@ -1,3 +1,5 @@
++use std::collections::HashSet;
++
+ use proteus_contracts::{
+     domain::{MessageId, ToolResult},
+     model_standard::{CanonicalMessage, ContentPart, MessageRole, PartScope},
+@@ -9,6 +11,35 @@
+     let call_id = result.call_id.clone();
+     CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult { result }])
+         .with_tool_call_id(call_id)
++}
++
++/// Pinned Codex context_manager/normalize.rs: missing call outputs become
++/// prompt-only "aborted" outputs. This does not assert whether an effect ran.
++/// The journal and durable history retain the original unresolved call.
++pub(crate) fn normalize_missing_tool_outputs(messages: &mut Vec<CanonicalMessage>) {
++    let completed = messages
++        .iter()
++        .flat_map(|message| &message.parts)
++        .filter_map(|part| match &part.payload {
++            ContentPart::ToolResult { result } => Some(result.call_id.clone()),
++            _ => None,
++        })
++        .collect::<HashSet<_>>();
++    let mut inserts = Vec::new();
++    for (index, message) in messages.iter().enumerate() {
++        for part in &message.parts {
++            if let ContentPart::ToolCall { call } = &part.payload
++                && !completed.contains(&call.id)
++            {
++                let mut output = tool_result_message(ToolResult::error(call.id.clone(), "aborted"));
++                output.parts[0].scope = PartScope::Request;
++                inserts.push((index + 1, output));
++            }
++        }
++    }
++    for (index, output) in inserts.into_iter().rev() {
++        messages.insert(index, output);
++    }
+ }
+ 
+ pub(crate) fn current_user_index(
+--- a/workflow/coding-workflow/src/host.rs
++++ b/workflow/coding-workflow/src/host.rs
+@@ -50,15 +50,19 @@
+     phase: &str,
+     last_usage: Option<&LastModelUsage>,
+ ) -> Result<PreparedRequest, ProcessModuleError> {
++    let mut instructions = vec![InstructionBlock::new(
++        InstructionKind::System,
++        system_instructions,
++        100,
++    )];
++    // Keep runtime order and priorities, including the host's continuation reason.
++    // The workflow base precedes runtime blocks; phase-specific blocks follow them.
++    instructions.extend(input.runtime.instructions.iter().cloned());
+     request_from_state_with_instruction_blocks_and_options(
+         input,
+         host,
+         messages,
+-        vec![InstructionBlock::new(
+-            InstructionKind::System,
+-            system_instructions,
+-            100,
+-        )],
++        instructions,
+         developer_instructions,
+         phase,
+         RequestOptions {
+--- a/workflow/coding-workflow/src/lib.rs
++++ b/workflow/coding-workflow/src/lib.rs
+@@ -20,6 +20,7 @@
+ mod output_text;
+ mod plan_execute_review;
+ mod project_check;
++mod sampling;
+ mod scaffold;
+ mod single_loop;
+ mod token_accounting;
+--- a/workflow/coding-workflow/src/plan_execute_review.rs
++++ b/workflow/coding-workflow/src/plan_execute_review.rs
+@@ -1,15 +1,15 @@
+ use crate::{MAX_TOOL_ROUNDS, PLAN_EXECUTE_REVIEW_MODULE_ID};
+ use crate::{
+-    host::{complete_model, emit_event, execute_or_handle_tool, request_from_state},
++    host::execute_or_handle_tool,
+     metadata::{output_metadata_with_extra, with_workflow_phase},
+     output_text::output_text,
+-    scaffold::{PersistentRepair, TurnScaffold},
++    sampling::{SamplingStep, sample_step},
++    scaffold::TurnScaffold,
+     token_accounting::LastModelUsage,
+-    validation::{response_output_message, validate_model_response},
++    validation::response_output_message,
+ };
+ use proteus_contracts::{
+     contracts::WorkflowFailure,
+-    domain::{Event, ToolChoice},
+     model_standard::FinishReason,
+     process_module::{
+         ProcessModuleError, WorkflowModuleHostMut, WorkflowModuleInput, WorkflowModuleOutput,
+@@ -58,47 +58,20 @@
+     let mut last_usage: Option<LastModelUsage> = None;
+     let mut plan_tool_rounds_used = 0usize;
+     for plan_round in 0..=MAX_PLAN_TOOL_ROUNDS {
+-        let mut prepared = request_from_state(
++        // The last plan round must finish with text, not a pending tool call.
++        let forced_text_round = plan_round == MAX_PLAN_TOOL_ROUNDS;
++        let plan_response = sample_step(
+             input,
+             host,
+-            &turn.model_messages,
+-            PLAN_SYSTEM_INSTRUCTIONS,
+-            Some(PLAN_DEVELOPER_INSTRUCTIONS),
+-            "plan",
+-            last_usage.as_ref(),
+-        )?;
+-        if turn.apply_compaction_report(
+-            prepared.compaction.as_ref(),
+-            prepared.preparation_target.as_ref(),
+-            &prepared.request.messages,
+-            PersistentRepair::Rebuild,
+-        )? {
+-            last_usage = None;
+-            turn.checkpoint(host, &[])?;
+-            prepared.request.messages = turn.model_messages.clone();
+-        }
+-        let mut plan_request = prepared.request;
+-        // Последняя итерация принудительно без tools: plan-фаза обязана
+-        // закончиться текстовым планом, а не подвисшим tool call.
+-        let forced_text_round = plan_round == MAX_PLAN_TOOL_ROUNDS;
+-        if forced_text_round {
+-            plan_request = plan_request.with_tool_choice(ToolChoice::None);
+-            plan_request.tools.clear();
+-        }
+-        emit_event(
+-            host,
+-            &Event::ModelRequestPrepared {
+-                model: plan_request.model.clone(),
++            turn,
++            &mut last_usage,
++            SamplingStep {
++                phase: "plan",
++                system_instructions: PLAN_SYSTEM_INSTRUCTIONS,
++                developer_instructions: Some(PLAN_DEVELOPER_INSTRUCTIONS),
++                disable_tools: forced_text_round,
+             },
+         )?;
+-        let plan_response = complete_model(host, &plan_request, "plan")?;
+-        emit_event(
+-            host,
+-            &Event::ModelResponseReceived {
+-                finish_reason: plan_response.finish_reason.clone(),
+-            },
+-        )?;
+-        validate_model_response("plan", &plan_request, &plan_response)?;
+         let plan_messages = plan_response
+             .messages
+             .into_iter()
+@@ -117,23 +90,8 @@
+         if forced_text_round || !should_run_tools {
+             // The private plan must survive canonical durable ACK replacement,
+             // without becoming public conversation history.
+-            for message in turn
+-                .model_messages
+-                .iter_mut()
+-                .rev()
+-                .take(plan_messages.len())
+-            {
+-                // The provider response is already a durable canonical record.
+-                // A differently scoped private projection needs its own identity.
+-                let source = message.id;
+-                message.id = proteus_contracts::domain::new_message_id();
+-                message.metadata["workflow_private_source_message"] = json!(source);
+-                for part in &mut message.parts {
+-                    part.part_id = proteus_contracts::domain::new_part_id();
+-                    part.provenance = proteus_contracts::model_standard::PartProvenance::Runtime;
+-                    part.scope = proteus_contracts::model_standard::PartScope::Request;
+-                }
+-            }
++            let start = turn.model_messages.len() - plan_messages.len();
++            make_private_projection(&mut turn.model_messages[start..]);
+             break;
+         }
+         plan_tool_rounds_used += 1;
+@@ -149,40 +107,18 @@
+     let mut draft_finish_reason = None;
+     let mut tool_round_limit_reached = true;
+     for _round in 0..MAX_TOOL_ROUNDS {
+-        let mut prepared = request_from_state(
++        let response = sample_step(
+             input,
+             host,
+-            &turn.model_messages,
+-            PLAN_SYSTEM_INSTRUCTIONS,
+-            Some(EXECUTE_DEVELOPER_INSTRUCTIONS),
+-            "execute",
+-            last_usage.as_ref(),
+-        )?;
+-        if turn.apply_compaction_report(
+-            prepared.compaction.as_ref(),
+-            prepared.preparation_target.as_ref(),
+-            &prepared.request.messages,
+-            PersistentRepair::Rebuild,
+-        )? {
+-            last_usage = None;
+-            turn.checkpoint(host, &[])?;
+-            prepared.request.messages = turn.model_messages.clone();
+-        }
+-        let request = prepared.request;
+-        emit_event(
+-            host,
+-            &Event::ModelRequestPrepared {
+-                model: request.model.clone(),
++            turn,
++            &mut last_usage,
++            SamplingStep {
++                phase: "execute",
++                system_instructions: PLAN_SYSTEM_INSTRUCTIONS,
++                developer_instructions: Some(EXECUTE_DEVELOPER_INSTRUCTIONS),
++                disable_tools: false,
+             },
+         )?;
+-        let response = complete_model(host, &request, "execute")?;
+-        emit_event(
+-            host,
+-            &Event::ModelResponseReceived {
+-                finish_reason: response.finish_reason.clone(),
+-            },
+-        )?;
+-        validate_model_response("execute", &request, &response)?;
+ 
+         let finish_reason = response.finish_reason.clone();
+         turn.model_messages
+@@ -200,6 +136,9 @@
+                 .extend(response.messages.iter().cloned());
+         }
+         if !should_run_tools {
++            // The draft is also request-only, not a durable steering anchor.
++            let start = turn.model_messages.len() - response.messages.len();
++            make_private_projection(&mut turn.model_messages[start..]);
+             draft_finish_reason = Some(finish_reason);
+             tool_round_limit_reached = false;
+             break;
+@@ -213,40 +152,18 @@
+         }
+     }
+ 
+-    let mut prepared = request_from_state(
++    let final_response = sample_step(
+         input,
+         host,
+-        &turn.model_messages,
+-        PLAN_SYSTEM_INSTRUCTIONS,
+-        Some(REVIEW_DEVELOPER_INSTRUCTIONS),
+-        "review",
+-        last_usage.as_ref(),
+-    )?;
+-    if turn.apply_compaction_report(
+-        prepared.compaction.as_ref(),
+-        prepared.preparation_target.as_ref(),
+-        &prepared.request.messages,
+-        PersistentRepair::Rebuild,
+-    )? {
+-        turn.checkpoint(host, &[])?;
+-        prepared.request.messages = turn.model_messages.clone();
+-    }
+-    let mut review_request = prepared.request.with_tool_choice(ToolChoice::None);
+-    review_request.tools.clear();
+-    emit_event(
+-        host,
+-        &Event::ModelRequestPrepared {
+-            model: review_request.model.clone(),
++        turn,
++        &mut last_usage,
++        SamplingStep {
++            phase: "review",
++            system_instructions: PLAN_SYSTEM_INSTRUCTIONS,
++            developer_instructions: Some(REVIEW_DEVELOPER_INSTRUCTIONS),
++            disable_tools: true,
+         },
+     )?;
+-    let final_response = complete_model(host, &review_request, "review")?;
+-    emit_event(
+-        host,
+-        &Event::ModelResponseReceived {
+-            finish_reason: final_response.finish_reason.clone(),
+-        },
+-    )?;
+-    validate_model_response("review", &review_request, &final_response)?;
+ 
+     let final_message = response_output_message("review", &final_response)?.clone();
+     turn.model_messages
+@@ -275,3 +192,35 @@
+     );
+     turn.finish(host, text, metadata)
+ }
++
++/// A private phase projection must not reuse the provider's durable identities.
++/// Empty-part messages retain the existing ACK/compaction classification limit.
++fn make_private_projection(messages: &mut [proteus_contracts::model_standard::CanonicalMessage]) {
++    use proteus_contracts::model_standard::{PartProvenance, PartScope};
++    use serde_json::Value;
++
++    for message in messages {
++        let source = message.id;
++        message.id = proteus_contracts::domain::new_message_id();
++        match &mut message.metadata {
++            Value::Object(metadata) => {
++                metadata.insert("workflow_private_source_message".to_owned(), json!(source));
++            }
++            Value::Null => {
++                message.metadata = json!({ "workflow_private_source_message": source });
++            }
++            other => {
++                let previous = std::mem::replace(other, Value::Null);
++                message.metadata = json!({
++                    "workflow_private_source_message": source,
++                    "previous_metadata": previous,
++                });
++            }
++        }
++        for part in &mut message.parts {
++            part.part_id = proteus_contracts::domain::new_part_id();
++            part.provenance = PartProvenance::Runtime;
++            part.scope = PartScope::Request;
++        }
++    }
++}
+--- /dev/null
++++ b/workflow/coding-workflow/src/sampling.rs
+@@ -0,0 +1,71 @@
++//! Shared sampling lifecycle for the non-streaming reference workflows.
++//!
++//! Phase selection and history/tool-result ownership remain with the caller.
++use crate::{
++    host::{complete_model, emit_event, request_from_state},
++    scaffold::{PersistentRepair, TurnScaffold},
++    token_accounting::LastModelUsage,
++    validation::validate_model_response,
++};
++use proteus_contracts::{
++    domain::{Event, ToolChoice},
++    model_standard::CanonicalModelResponse,
++    process_module::{ProcessModuleError, WorkflowModuleHostMut, WorkflowModuleInput},
++};
++
++pub(crate) struct SamplingStep<'a> {
++    pub phase: &'a str,
++    pub system_instructions: &'a str,
++    pub developer_instructions: Option<&'a str>,
++    pub disable_tools: bool,
++}
++
++pub(crate) fn sample_step(
++    input: &WorkflowModuleInput,
++    host: &mut WorkflowModuleHostMut<'_>,
++    turn: &mut TurnScaffold,
++    last_usage: &mut Option<LastModelUsage>,
++    step: SamplingStep<'_>,
++) -> Result<CanonicalModelResponse, ProcessModuleError> {
++    let mut prepared = request_from_state(
++        input,
++        host,
++        &turn.model_messages,
++        step.system_instructions,
++        step.developer_instructions,
++        step.phase,
++        last_usage.as_ref(),
++    )?;
++    if turn.apply_compaction_report(
++        prepared.compaction.as_ref(),
++        prepared.preparation_target.as_ref(),
++        &prepared.request.messages,
++        PersistentRepair::Rebuild,
++    )? {
++        *last_usage = None;
++        turn.checkpoint(host, &[])?;
++        prepared.request.messages = turn.model_messages.clone();
++    }
++    let mut request = prepared.request;
++    // Preserve preparation's selected-tool budget. Suppress tools only after
++    // any history replacement has been acknowledged, as in the original loops.
++    if step.disable_tools {
++        request.tools.clear();
++        request.tool_choice = ToolChoice::None;
++    }
++    emit_event(
++        host,
++        &Event::ModelRequestPrepared {
++            model: request.model.clone(),
++        },
++    )?;
++    let response = complete_model(host, &request, step.phase)?;
++    emit_event(
++        host,
++        &Event::ModelResponseReceived {
++            finish_reason: response.finish_reason.clone(),
++        },
++    )?;
++    validate_model_response(step.phase, &request, &response)?;
++    Ok(response)
++}
+--- a/workflow/coding-workflow/src/scaffold.rs
++++ b/workflow/coding-workflow/src/scaffold.rs
+@@ -142,6 +142,7 @@
+         input: &WorkflowModuleInput,
+     ) -> Result<Self, ProcessModuleError> {
+         let mut turn = Self::begin_without_context(host, input)?;
++        crate::history::normalize_missing_tool_outputs(&mut turn.model_messages);
+         turn.inject_context(host, input, 0)?;
+         Ok(turn)
+     }
+--- a/workflow/coding-workflow/src/single_loop.rs
++++ b/workflow/coding-workflow/src/single_loop.rs
+@@ -1,15 +1,15 @@
+ use crate::SINGLE_LOOP_MODULE_ID;
+ use crate::{
+-    host::{complete_model, emit_event, execute_tools, request_from_state},
++    host::execute_tools,
+     metadata::{output_metadata, output_metadata_with_extra},
+     output_text::output_text,
+-    scaffold::{PersistentRepair, TurnScaffold},
++    sampling::{SamplingStep, sample_step},
++    scaffold::TurnScaffold,
+     token_accounting::LastModelUsage,
+-    validation::{response_output_message, validate_model_response},
++    validation::response_output_message,
+ };
+ use proteus_contracts::{
+     contracts::WorkflowFailure,
+-    domain::{Event, ToolChoice},
+     model_standard::FinishReason,
+     process_module::{
+         ProcessModuleError, WorkflowModuleHostMut, WorkflowModuleInput, WorkflowModuleOutput,
+@@ -45,40 +45,18 @@
+     let mut last_usage: Option<LastModelUsage> = None;
+ 
+     for _round in 0..max_tool_rounds {
+-        let mut prepared = request_from_state(
++        let response = sample_step(
+             input,
+             host,
+-            &turn.model_messages,
+-            SYSTEM_INSTRUCTIONS,
+-            None,
+-            "single_loop",
+-            last_usage.as_ref(),
+-        )?;
+-        if turn.apply_compaction_report(
+-            prepared.compaction.as_ref(),
+-            prepared.preparation_target.as_ref(),
+-            &prepared.request.messages,
+-            PersistentRepair::Rebuild,
+-        )? {
+-            last_usage = None;
+-            turn.checkpoint(host, &[])?;
+-            prepared.request.messages = turn.model_messages.clone();
+-        }
+-        let request = prepared.request;
+-        emit_event(
+-            host,
+-            &Event::ModelRequestPrepared {
+-                model: request.model.clone(),
++            turn,
++            &mut last_usage,
++            SamplingStep {
++                phase: "single_loop",
++                system_instructions: SYSTEM_INSTRUCTIONS,
++                developer_instructions: None,
++                disable_tools: false,
+             },
+         )?;
+-        let response = complete_model(host, &request, "single_loop")?;
+-        emit_event(
+-            host,
+-            &Event::ModelResponseReceived {
+-                finish_reason: response.finish_reason.clone(),
+-            },
+-        )?;
+-        validate_model_response("single_loop", &request, &response)?;
+ 
+         turn.model_messages
+             .extend(response.messages.iter().cloned());
+@@ -115,41 +93,18 @@
+         turn.checkpoint(host, &[])?;
+     }
+ 
+-    let mut prepared = request_from_state(
++    let response = sample_step(
+         input,
+         host,
+-        &turn.model_messages,
+-        SYSTEM_INSTRUCTIONS,
+-        None,
+-        "single_loop_final",
+-        last_usage.as_ref(),
+-    )?;
+-    if turn.apply_compaction_report(
+-        prepared.compaction.as_ref(),
+-        prepared.preparation_target.as_ref(),
+-        &prepared.request.messages,
+-        PersistentRepair::Rebuild,
+-    )? {
+-        turn.checkpoint(host, &[])?;
+-        prepared.request.messages = turn.model_messages.clone();
+-    }
+-    let mut request = prepared.request;
+-    request.tools.clear();
+-    request.tool_choice = ToolChoice::None;
+-    emit_event(
+-        host,
+-        &Event::ModelRequestPrepared {
+-            model: request.model.clone(),
++        turn,
++        &mut last_usage,
++        SamplingStep {
++            phase: "single_loop_final",
++            system_instructions: SYSTEM_INSTRUCTIONS,
++            developer_instructions: None,
++            disable_tools: true,
+         },
+     )?;
+-    let response = complete_model(host, &request, "single_loop_final")?;
+-    emit_event(
+-        host,
+-        &Event::ModelResponseReceived {
+-            finish_reason: response.finish_reason.clone(),
+-        },
+-    )?;
+-    validate_model_response("single_loop_final", &request, &response)?;
+ 
+     turn.model_messages
+         .extend(response.messages.iter().cloned());
+--- a/workflow/coding-workflow/src/tests.rs
++++ b/workflow/coding-workflow/src/tests.rs
+@@ -7,12 +7,15 @@
+ mod codex_tool_dispatch;
+ mod dynamic_tool_surface;
+ mod failure_history;
++mod instruction_propagation;
+ mod intents;
+ mod output_helpers;
+ mod plan_execute_review;
++mod private_projection;
+ mod preparation;
+ mod project_check_workflow;
+ mod request_accounting;
++mod resumed_history;
+ mod single_loop;
+ 
+ use serde_json::Value;
+--- /dev/null
++++ b/workflow/coding-workflow/src/tests/instruction_propagation.rs
+@@ -0,0 +1,161 @@
++use super::*;
++use proteus_contracts::contracts::{WorkflowContinuation, WorkflowHistoryUpdate};
++
++fn input_with_instructions(continued: bool) -> WorkflowModuleInput {
++    let mut input = workflow_input("answer the question");
++    input.runtime.instructions = vec![
++        InstructionBlock::new(InstructionKind::System, "profile system", 100),
++        InstructionBlock::new(InstructionKind::Developer, "shared text", 80),
++        InstructionBlock::new(InstructionKind::Project, "shared text", 80),
++        InstructionBlock::new(InstructionKind::UserPreference, "profile preference", 0),
++    ];
++    if continued {
++        let candidate = CanonicalMessage::text(MessageRole::Assistant, "first candidate");
++        let reason = "Include the requested verification result";
++        input.runtime.continuation = Some(WorkflowContinuation {
++            attempt: 1,
++            reason: reason.to_owned(),
++            current_user_message_id: input.history[0].id,
++            history: WorkflowHistoryUpdate::new(vec![candidate.clone()]),
++        });
++        input.history.push(candidate);
++        // Match Core's reviewed_workflow boundary: the reason is already a block.
++        input.runtime.instructions.push(InstructionBlock::new(
++            InstructionKind::Developer,
++            reason,
++            128,
++        ));
++    }
++    input
++}
++
++#[test]
++fn legacy_request_builder_keeps_base_runtime_and_phase_blocks_in_order() {
++    for runtime_blocks in [
++        Vec::new(),
++        input_with_instructions(true).runtime.instructions,
++    ] {
++        let mut input = workflow_input("answer the question");
++        input.runtime.instructions = runtime_blocks.clone();
++        let host = FakeHost::default();
++        let prepared = crate::host::request_from_state(
++            &input,
++            &host,
++            &input.history,
++            "workflow system",
++            Some("phase instruction"),
++            "execute",
++            None,
++        )
++        .expect("request prepares");
++
++        let mut expected = vec![InstructionBlock::new(
++            InstructionKind::System,
++            "workflow system",
++            100,
++        )];
++        expected.extend(runtime_blocks.clone());
++        expected.push(InstructionBlock::new(
++            InstructionKind::Developer,
++            "phase instruction",
++            90,
++        ));
++        assert_eq!(prepared.request.instructions, expected);
++        assert_eq!(input.runtime.instructions, runtime_blocks);
++    }
++}
++
++fn assert_legacy_requests(
++    workflow: &dyn WorkflowModule,
++    input: &WorkflowModuleInput,
++    phases: &[&str],
++    has_phase_instruction: bool,
++) {
++    let mut host = FakeHost::default();
++    workflow
++        .run_json(serde_json::to_string(input).unwrap(), &mut host)
++        .expect("workflow succeeds");
++    let requests = host.requests.lock().unwrap();
++    assert_eq!(requests.len(), phases.len());
++    let compactions = host.compactions.lock().unwrap();
++    assert_eq!(
++        compactions
++            .iter()
++            .map(|input| input.reason.as_deref())
++            .collect::<Vec<_>>(),
++        phases.iter().copied().map(Some).collect::<Vec<_>>()
++    );
++    for (request, preparation) in requests.iter().zip(compactions.iter()) {
++        assert_eq!(
++            preparation.request.as_ref().unwrap().instructions,
++            request.instructions
++        );
++        let runtime_end = 1 + input.runtime.instructions.len();
++        assert_eq!(
++            request.instructions.len(),
++            runtime_end + usize::from(has_phase_instruction)
++        );
++        assert_eq!(request.instructions[0].kind, InstructionKind::System);
++        assert_eq!(request.instructions[0].priority, 100);
++        assert!(!request.instructions[0].text.is_empty());
++        assert_eq!(
++            &request.instructions[1..runtime_end],
++            input.runtime.instructions.as_slice()
++        );
++        if has_phase_instruction {
++            assert_eq!(
++                request.instructions[runtime_end].kind,
++                InstructionKind::Developer
++            );
++            assert_eq!(request.instructions[runtime_end].priority, 90);
++        }
++    }
++}
++
++#[test]
++fn profile_and_review_instructions_reach_every_legacy_sampling_path() {
++    for continued in [false, true] {
++        let input = input_with_instructions(continued);
++        assert_legacy_requests(
++            &CodingSingleLoopWorkflow::default(),
++            &input,
++            &["single_loop"],
++            false,
++        );
++        assert_legacy_requests(
++            &CodingSingleLoopWorkflow { max_tool_rounds: 0 },
++            &input,
++            &["single_loop_final"],
++            false,
++        );
++        assert_legacy_requests(
++            &CodingPlanExecuteReviewWorkflow,
++            &input,
++            &["plan", "execute", "review"],
++            true,
++        );
++    }
++}
++
++#[test]
++fn codex_first_and_follow_up_requests_keep_runtime_blocks_exactly_once() {
++    for continued in [false, true] {
++        let input = input_with_instructions(continued);
++        let mut host = FakeHost::with_responses(vec![
++            CanonicalModelResponse::new(
++                CanonicalMessage::text(MessageRole::Assistant, "working"),
++                Vec::new(),
++                FinishReason::Stop,
++            )
++            .with_end_turn(false),
++        ]);
++        CodingCodexLoopWorkflow
++            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++            .expect("workflow succeeds");
++        let requests = host.requests.lock().unwrap();
++        assert_eq!(requests.len(), 2);
++        for request in requests.iter() {
++            assert_eq!(request.instructions, input.runtime.instructions);
++        }
++    }
++}
+--- /dev/null
++++ b/workflow/coding-workflow/src/tests/private_projection.rs
+@@ -0,0 +1,210 @@
++use super::*;
++use proteus_contracts::model_standard::{PartProvenance, PartScope};
++
++fn text_response(message: CanonicalMessage) -> CanonicalModelResponse {
++    CanonicalModelResponse::new(message, Vec::new(), FinishReason::Stop)
++}
++
++fn assert_private_projection(projected: &CanonicalMessage, source: &CanonicalMessage) {
++    assert_ne!(projected.id, source.id);
++    assert_eq!(
++        projected.metadata["workflow_private_source_message"],
++        json!(source.id)
++    );
++    assert_eq!(projected.parts.len(), source.parts.len());
++    let mut normalized = projected.clone();
++    normalized.id = source.id;
++    normalized.metadata = source.metadata.clone();
++    for (part, original) in normalized.parts.iter_mut().zip(&source.parts) {
++        assert_ne!(part.part_id, original.part_id);
++        assert_eq!(part.provenance, PartProvenance::Runtime);
++        assert_eq!(part.scope, PartScope::Request);
++        part.part_id = original.part_id;
++        part.provenance = original.provenance;
++        part.scope = original.scope;
++    }
++    // All fields other than projection identity, scope, provenance and metadata
++    // remain canonical payload facts, including provider phase and ordering.
++    assert_eq!(&normalized, source);
++}
++
++#[test]
++fn terminal_plan_and_draft_project_every_message_and_part() {
++    let input = workflow_input("answer");
++    let plan = vec![
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![
++                ContentPart::ReasoningSummary {
++                    text: "outline".into(),
++                },
++                ContentPart::Text {
++                    text: "plan one".into(),
++                },
++            ],
++        )
++        .with_phase(MessagePhase::Commentary)
++        .with_metadata(json!({"provider": "plan"})),
++        CanonicalMessage::text(MessageRole::Assistant, "plan two")
++            .with_phase(MessagePhase::FinalAnswer),
++    ];
++    let draft = vec![
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![
++                ContentPart::Opaque {
++                    format: "test.opaque".into(),
++                    data: json!({"ordered": [1, 2]}),
++                },
++                ContentPart::Text {
++                    text: "draft one".into(),
++                },
++            ],
++        )
++        .with_name("draft")
++        .with_phase(MessagePhase::Commentary),
++        CanonicalMessage::text(MessageRole::Assistant, "draft two")
++            .with_phase(MessagePhase::FinalAnswer),
++    ];
++    let final_message = CanonicalMessage::text(MessageRole::Assistant, "final");
++    let mut host = FakeHost::with_responses(vec![
++        CanonicalModelResponse::from_messages(plan.clone(), Vec::new(), FinishReason::Stop),
++        CanonicalModelResponse::from_messages(draft.clone(), Vec::new(), FinishReason::Stop),
++        text_response(final_message.clone()),
++    ]);
++    let result = CodingPlanExecuteReviewWorkflow
++        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .unwrap();
++    let output: WorkflowModuleOutput = serde_json::from_str(&result).unwrap();
++    assert_eq!(output.new_messages, vec![final_message]);
++
++    let requests = host.requests.lock().unwrap();
++    assert_eq!(requests.len(), 3);
++    let plan_start = requests[1].messages.len() - plan.len();
++    let projected_plan = &requests[1].messages[plan_start..];
++    let draft_start = requests[2].messages.len() - draft.len();
++    let projected_draft = &requests[2].messages[draft_start..];
++    for (projected, source) in projected_plan.iter().zip(&plan) {
++        assert_private_projection(projected, source);
++        assert_eq!(projected.metadata["workflow_phase"], "plan");
++        assert_eq!(
++            projected.metadata["workflow_module"],
++            PLAN_EXECUTE_REVIEW_MODULE_ID
++        );
++        assert!(
++            !requests[2].messages.iter().any(|message| message.id == source.id)
++        );
++    }
++    assert_eq!(projected_plan[0].metadata["provider"], "plan");
++    for (projected, source) in projected_draft.iter().zip(&draft) {
++        assert_private_projection(projected, source);
++        assert!(projected.metadata.get("workflow_phase").is_none());
++        assert!(
++            !requests[2].messages.iter().any(|message| message.id == source.id)
++        );
++    }
++    let projected = projected_plan.iter().chain(projected_draft);
++    let ids = projected
++        .clone()
++        .map(|message| message.id)
++        .collect::<std::collections::HashSet<_>>();
++    let part_ids = projected
++        .flat_map(|message| &message.parts)
++        .map(|part| part.part_id)
++        .collect::<std::collections::HashSet<_>>();
++    assert_eq!(ids.len(), 4);
++    assert_eq!(part_ids.len(), 6);
++    // Exercise the actual rebuild classifier, not a second implementation of it.
++    let durable = crate::history::persistent_messages_from_model_messages(&requests[2].messages);
++    assert!(durable.iter().all(|message| !ids.contains(&message.id)));
++}
++
++#[test]
++fn private_draft_preserves_all_metadata_shapes_without_phase_tagging() {
++    for metadata in [
++        Value::Null,
++        json!({"provider": 7, "workflow_private_source_message": "old"}),
++        json!("provider metadata"),
++        json!(["provider", {"value": 7}]),
++        json!(42),
++        json!(false),
++    ] {
++        let draft = CanonicalMessage::text(MessageRole::Assistant, "draft")
++            .with_metadata(metadata.clone());
++        let mut host = FakeHost::with_responses(vec![
++            text_response(CanonicalMessage::text(MessageRole::Assistant, "plan")),
++            text_response(draft.clone()),
++            text_response(CanonicalMessage::text(MessageRole::Assistant, "final")),
++        ]);
++        CodingPlanExecuteReviewWorkflow
++            .run_json(
++                serde_json::to_string(&workflow_input("answer")).unwrap(),
++                &mut host,
++            )
++            .unwrap();
++        let requests = host.requests.lock().unwrap();
++        let projected = requests[2].messages.last().unwrap();
++        assert_private_projection(projected, &draft);
++        let expected = match metadata {
++            Value::Object(mut object) => {
++                object.insert("workflow_private_source_message".into(), json!(draft.id));
++                Value::Object(object)
++            }
++            Value::Null => json!({"workflow_private_source_message": draft.id}),
++            other => json!({
++                "workflow_private_source_message": draft.id,
++                "previous_metadata": other,
++            }),
++        };
++        assert_eq!(projected.metadata, expected);
++    }
++}
++
++#[test]
++fn private_projection_leaves_tool_bearing_responses_and_final_canonical() {
++    let tool = test_tool("read_file", "Read", ToolSafety::ReadOnly);
++    let plan_tool = tool_call_response(ToolCall::new(
++        new_call_id(),
++        "read_file",
++        json!({"path": "plan.rs"}),
++    ));
++    let execute_tool = tool_call_response(ToolCall::new(
++        new_call_id(),
++        "read_file",
++        json!({"path": "execute.rs"}),
++    ));
++    let draft = CanonicalMessage::text(MessageRole::Assistant, "draft");
++    let final_message = CanonicalMessage::text(MessageRole::Assistant, "final");
++    let mut host = FakeHost::with_responses(vec![
++        plan_tool.clone(),
++        text_response(CanonicalMessage::text(MessageRole::Assistant, "plan")),
++        execute_tool.clone(),
++        text_response(draft.clone()),
++        text_response(final_message.clone()),
++    ])
++    .with_tools(vec![tool.clone()], vec![tool]);
++    let result = CodingPlanExecuteReviewWorkflow
++        .run_json(
++            serde_json::to_string(&workflow_input("answer")).unwrap(),
++            &mut host,
++        )
++        .unwrap();
++    let output: WorkflowModuleOutput = serde_json::from_str(&result).unwrap();
++    let plan_source = &plan_tool.messages[0];
++    let saved_plan = output
++        .new_messages
++        .iter()
++        .find(|message| message.id == plan_source.id)
++        .unwrap();
++    assert_eq!(saved_plan.parts, plan_source.parts);
++    assert_eq!(saved_plan.metadata["workflow_phase"], "plan");
++    assert!(saved_plan.metadata.get("workflow_private_source_message").is_none());
++    assert!(output.new_messages.contains(&execute_tool.messages[0]));
++    assert!(output.new_messages.contains(&final_message));
++    assert!(!output.new_messages.iter().any(|message| message.id == draft.id));
++    let requests = host.requests.lock().unwrap();
++    assert_eq!(requests.len(), 5);
++    assert_private_projection(requests[4].messages.last().unwrap(), &draft);
++    assert!(requests[4].messages.contains(&execute_tool.messages[0]));
++    assert_eq!(host.executed_calls.lock().unwrap().len(), 2);
++}
+--- /dev/null
++++ b/workflow/coding-workflow/src/tests/resumed_history.rs
+@@ -0,0 +1,202 @@
++use super::*;
++use crate::history::normalize_missing_tool_outputs;
++use proteus_contracts::{
++    contracts::{WorkflowCheckpointAck, WorkflowHistoryInterruption, WorkflowHistoryUpdate},
++    model_standard::PartScope,
++};
++
++fn resumed_input(result: Option<ToolResult>) -> WorkflowModuleInput {
++    let mut input = workflow_input("continue");
++    let current = input.history.pop().unwrap();
++    input.history = vec![
++        CanonicalMessage::text(MessageRole::User, "previous request"),
++        tool_call_response(ToolCall::new(
++            "old-call",
++            "read_file",
++            json!({"path":"old"}),
++        ))
++        .messages
++        .remove(0),
++    ];
++    if let Some(result) = result {
++        input
++            .history
++            .push(crate::history::tool_result_message(result));
++    }
++    input.history.push(current);
++    input
++}
++
++fn results_for<'a>(messages: &'a [CanonicalMessage], id: &str) -> Vec<(&'a ToolResult, PartScope)> {
++    messages
++        .iter()
++        .flat_map(|message| &message.parts)
++        .filter_map(|part| match &part.payload {
++            ContentPart::ToolResult { result } if result.call_id == id => {
++                Some((result, part.scope))
++            }
++            _ => None,
++        })
++        .collect()
++}
++
++fn assert_resumed(workflow: &dyn WorkflowModule, expected_requests: usize) {
++    for real_result in [
++        None,
++        Some(ToolResult::ok("old-call".into(), "known result")),
++        Some(ToolResult::error("old-call".into(), "known failure")),
++    ] {
++        let input = resumed_input(real_result.clone());
++        let mut host = FakeHost::default();
++        let output: WorkflowModuleOutput = serde_json::from_str(
++            &workflow
++                .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++                .unwrap(),
++        )
++        .unwrap();
++        let requests = host.requests.lock().unwrap();
++        assert_eq!(requests.len(), expected_requests);
++        for request in requests.iter() {
++            let results = results_for(&request.messages, "old-call");
++            assert_eq!(results.len(), 1, "resumed request must close the old call");
++            match &real_result {
++                Some(real) => assert_eq!(results[0].0, real),
++                None => {
++                    assert_eq!(
++                        results[0].0,
++                        &ToolResult::error("old-call".into(), "aborted")
++                    );
++                    assert_eq!(results[0].1, PartScope::Request);
++                }
++            }
++        }
++        // The recovery must precede context preparation, not only provider encoding.
++        for compaction in host.compactions.lock().unwrap().iter() {
++            assert_eq!(results_for(&compaction.messages, "old-call").len(), 1);
++        }
++        assert_no_executed_calls(&host);
++        assert!(results_for(&output.new_messages, "old-call").is_empty());
++        assert!(output.history_replacement.is_none());
++        for checkpoint in host.checkpoints.lock().unwrap().iter() {
++            assert!(results_for(&checkpoint.history.new_messages, "old-call").is_empty());
++            assert!(checkpoint.history.history_replacement.is_none());
++            assert!(checkpoint.tool_results.is_empty());
++        }
++    }
++}
++
++#[test]
++fn resumed_single_loop_closes_history_without_recording_a_fake_execution() {
++    assert_resumed(&CodingSingleLoopWorkflow::default(), 1);
++}
++
++#[test]
++fn resumed_plan_execute_review_closes_history_in_all_three_phases() {
++    assert_resumed(&CodingPlanExecuteReviewWorkflow, 3);
++}
++
++#[test]
++fn resumed_codex_loop_keeps_existing_recovery_contract() {
++    assert_resumed(&CodingCodexLoopWorkflow, 1);
++}
++
++#[test]
++fn missing_outputs_preserve_real_results_order_and_are_idempotent() {
++    let calls = ["a", "b", "c"].map(|id| ToolCall::new(id, "read_file", json!({"path":id})));
++    let mut messages = vec![
++        CanonicalMessage::new(
++            MessageRole::Assistant,
++            calls
++                .iter()
++                .cloned()
++                .map(|call| ContentPart::ToolCall { call })
++                .collect(),
++        ),
++        crate::history::tool_result_message(ToolResult::ok("b".into(), "real")),
++        CanonicalMessage::text(MessageRole::User, "continue"),
++    ];
++    let original = messages.clone();
++    normalize_missing_tool_outputs(&mut messages);
++    assert_eq!(messages[0], original[0]);
++    assert_eq!(messages[3..], original[1..]);
++    assert_eq!(results_for(&messages[1..2], "a").len(), 1);
++    assert_eq!(results_for(&messages[2..3], "c").len(), 1);
++    assert_eq!(
++        results_for(&messages, "b")[0].0,
++        &ToolResult::ok("b".into(), "real")
++    );
++    let normalized = messages.clone();
++    normalize_missing_tool_outputs(&mut messages);
++    assert_eq!(messages, normalized);
++}
++
++#[test]
++fn codex_interruption_marker_follows_the_synthetic_result() {
++    let mut input = resumed_input(None);
++    let boundary = input.history[1].id;
++    let turn_id = new_turn_id();
++    input
++        .runtime
++        .interrupted_turns
++        .push(WorkflowHistoryInterruption {
++            turn_id,
++            after_message_id: boundary,
++        });
++    let mut host = FakeHost::default();
++    CodingCodexLoopWorkflow
++        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .unwrap();
++    let requests = host.requests.lock().unwrap();
++    let messages = &requests[0].messages;
++    let call_index = messages
++        .iter()
++        .position(|message| message.id == boundary)
++        .unwrap();
++    assert_eq!(
++        results_for(&messages[call_index + 1..call_index + 2], "old-call").len(),
++        1
++    );
++    assert_eq!(messages[call_index + 2].id, turn_id);
++    assert_eq!(messages[call_index + 2].parts[0].part_id, turn_id);
++    assert_eq!(messages[call_index + 2].parts[0].scope, PartScope::Request);
++    assert_eq!(messages[call_index + 3], *input.history.last().unwrap());
++}
++
++#[test]
++fn canonical_ack_retains_request_result_without_persisting_it() {
++    let input = resumed_input(None);
++    let mut host = FakeHost::default();
++    let mut turn = crate::scaffold::TurnScaffold::begin(&mut host, &input).unwrap();
++    assert_eq!(results_for(&turn.model_messages, "old-call").len(), 1);
++    let candidate = turn.model_messages.clone();
++    let material = ContextPreparationInput::new(candidate.clone(), None);
++    let compacted = proteus_contracts::contracts::ContextPreparationOutput::changed(
++        candidate.clone(),
++        Some("retained history".into()),
++    );
++    let report =
++        proteus_contracts::domain::HistoryCompactionReport::from_context_preparation_output(
++            &material, &compacted,
++        );
++    turn.apply_compaction_report(
++        Some(&report),
++        None,
++        &candidate,
++        crate::scaffold::PersistentRepair::Rebuild,
++    )
++    .unwrap();
++    assert!(results_for(&turn.persistent_messages, "old-call").is_empty());
++    *host.checkpoint_ack.lock().unwrap() = Some(WorkflowCheckpointAck {
++        history: WorkflowHistoryUpdate::new(vec![])
++            .with_history_replacement(input.history.clone())
++            .with_compactions(vec![report]),
++        messages: input.history.clone(),
++        revision: Some(1),
++    });
++    turn.checkpoint(&host, &[]).unwrap();
++    assert_eq!(turn.persistent_messages, input.history);
++    assert_eq!(results_for(&turn.model_messages, "old-call").len(), 1);
++    let checkpoints = host.checkpoints.lock().unwrap();
++    let persisted = checkpoints[0].history.history_replacement.as_ref().unwrap();
++    assert!(results_for(persisted, "old-call").is_empty());
++}
+--- a/workflow/coding-workflow/src/workflows.rs
++++ b/workflow/coding-workflow/src/workflows.rs
+@@ -1,6 +1,8 @@
+ use proteus_contracts::{
+     contracts::WorkflowFailure,
+-    process_module::{WorkflowModule, WorkflowModuleHostMut, WorkflowModuleInput},
++    process_module::{
++        WorkflowModule, WorkflowModuleHostMut, WorkflowModuleInput, WorkflowModuleOutput,
++    },
+ };
+ 
+ use super::{
+@@ -30,18 +32,9 @@
+         input_json: String,
+         host: &mut WorkflowModuleHostMut<'_>,
+     ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_single_loop(input, host, self.max_tool_rounds) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++        let input = decode_input(&input_json)?;
++        let output = run_single_loop(input, host, self.max_tool_rounds)?;
++        encode_output(&output)
+     }
+ }
+ 
+@@ -51,18 +44,9 @@
+         input_json: String,
+         host: &mut WorkflowModuleHostMut<'_>,
+     ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_codex_loop(input, host, CODEX_LOOP_MODULE_ID) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++        let input = decode_input(&input_json)?;
++        let output = run_codex_loop(input, host, CODEX_LOOP_MODULE_ID)?;
++        encode_output(&output)
+     }
+ }
+ 
+@@ -72,18 +56,9 @@
+         input_json: String,
+         host: &mut WorkflowModuleHostMut<'_>,
+     ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_plan_execute_review(input, host) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++        let input = decode_input(&input_json)?;
++        let output = run_plan_execute_review(input, host)?;
++        encode_output(&output)
+     }
+ }
+ 
+@@ -93,21 +68,16 @@
+         input_json: String,
+         host: &mut WorkflowModuleHostMut<'_>,
+     ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_project_check(input, host) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(json),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error.into()),
+-        }
++        let input = decode_input(&input_json)?;
++        let output = run_project_check(input, host)?;
++        encode_output(&output)
+     }
+ }
+ 
+-fn workflow_err<T>(error: impl ToString) -> Result<T, WorkflowFailure> {
+-    Err(WorkflowFailure::new(error.to_string()))
++fn decode_input(input_json: &str) -> Result<WorkflowModuleInput, WorkflowFailure> {
++    serde_json::from_str(input_json).map_err(|error| WorkflowFailure::new(error.to_string()))
+ }
++
++fn encode_output(output: &WorkflowModuleOutput) -> Result<String, WorkflowFailure> {
++    serde_json::to_string(output).map_err(|error| WorkflowFailure::new(error.to_string()))
++}
