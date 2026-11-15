@@ -1,0 +1,305 @@
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -169,6 +169,21 @@
+ - `event`: `context`, `event` (`session_opened`, `run_settled`, `navigation_changed`),
+   необязательный `session_dir`, `document` — аргумент активного документа
+   этого расширения. Отсутствие сессии/документа означает null.
++  При `documents.active_panes.v1` каждое событие также содержит
++  `active_pane_documents: [string]`: аргументы документов этого расширения,
++  активных в каждой pane отображаемой области чата. Список целиком заменяет
++  предыдущий в данном context; пустой список передаётся как `[]`. Другие
++  расширения, неактивные вкладки и фоновые области в него не входят.
++  `document` сохраняет отдельный смысл focused document.
++  Это логическая проекция раскладки, **не фактическая видимость**: Settings,
++  перекрытие или минимизация окна не исключают её документы. Чтения cached
++  previews могут продолжаться под Settings. Новый context получает проекцию
++  до своего первого render, даже если snapshot общей сессии уже известен.
++  SDK хранит список отдельно для каждого context, не на сессию.
++  Пакет Files требует эту аддитивную возможность протокола 4: старый клиент
++  должен отклонить новый пакет по required_features. Пакеты, не использующие
++  список, могут работать без feature; SDK считает отсутствующее поле пустым
++  списком, но не подменяет его focused document.
+ - При `session_events: true`: `session_snapshot` с `context`, `session_dir`, `state`,
+   `entries`; затем `session_update` с `context`, `session_dir`, `update`. Снимок повторяется
+   при смене активного чата. Обновление `type: state` заменяет `state`;
+--- a/packages/files/extension.json
++++ b/packages/files/extension.json
+@@ -19,7 +19,8 @@
+   "required_features": [
+     "widgets.controls.v1",
+     "surfaces.preview.v1",
+-    "documents.retarget.v1"
++    "documents.retarget.v1",
++    "documents.active_panes.v1"
+   ],
+   "author": "Proteus Project"
+ }
+--- a/packages/files/src/document.rs
++++ b/packages/files/src/document.rs
+@@ -56,10 +56,10 @@
+     fn body(&mut self, host: &Host, path: &str, mode: &str) -> Result<Value> {
+         let diff = mode == "diff";
+         let key = (path.to_owned(), mode.to_owned());
+-        // The server bounds each preview. Recheck only the active document on
+-        // the package's existing poll interval; hidden retained views keep their
+-        // snapshot until activation, and sibling views share this one read.
+-        let active = host.active_document.as_ref().and_then(Value::as_str) == Some(path);
++        // Recheck cached previews in active panes, not just the focused pane.
++        // This logical projection also applies under Settings/occlusion. Other
++        // retained cached views stay lazy, and siblings share this one read.
++        let active = host.active_pane_documents.iter().any(|argument| argument == path);
+         let stale = self
+             .documents
+             .get(&key)
+@@ -297,7 +297,7 @@
+     }
+ 
+     #[test]
+-    fn active_file_and_diff_recheck_after_poll_but_hidden_cached_views_do_not_read() {
++    fn active_pane_file_and_diff_recheck_without_focus_but_other_cached_views_do_not_read() {
+         use std::io::{BufRead, BufReader, Write};
+         use std::net::TcpListener;
+         use std::sync::{
+@@ -351,14 +351,15 @@
+                 origin,
+                 token: "synthetic".into(),
+             });
+-            host.active_document = Some(json!("shared.rs"));
++            host.active_document = Some(json!("another.rs"));
++            host.active_pane_documents = vec!["shared.rs".into(), "another.rs".into()];
+             assert_eq!(
+                 files.body(&host, "shared.rs", mode).unwrap()["text"],
+                 "OLD!"
+             );
+             let key = ("shared.rs".into(), mode.into());
+             files.documents.get_mut(&key).unwrap().checked = Instant::now() - crate::POLL;
+-            host.active_document = Some(json!("another.rs"));
++            host.active_pane_documents = vec!["another.rs".into()];
+             assert_eq!(
+                 files.body(&host, "shared.rs", mode).unwrap()["text"],
+                 "OLD!"
+@@ -368,7 +369,7 @@
+                 1,
+                 "hidden snapshot must be lazy"
+             );
+-            host.active_document = Some(json!("shared.rs"));
++            host.active_pane_documents = vec!["shared.rs".into(), "another.rs".into()];
+             assert_eq!(
+                 files.body(&host, "shared.rs", mode).unwrap()["text"],
+                 "NEW!"
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -84,6 +84,9 @@
+     session_event_epoch: u64,
+     session_snapshot_epoch: u64,
+     pub active_document: Option<Value>,
++    /// Active document arguments of this context's displayed-space panes.
++    /// This is logical layout, not native visibility (including under Settings).
++    pub active_pane_documents: Vec<String>,
+     pub command_error: Option<String>,
+     views: BTreeMap<String, (Surface, Option<String>)>,
+     shown: HashMap<String, Value>,
+@@ -120,6 +123,7 @@
+             session_event_epoch: 0,
+             session_snapshot_epoch: 0,
+             active_document: None,
++            active_pane_documents: Vec::new(),
+             command_error: None,
+             views: BTreeMap::new(),
+             shown: HashMap::new(),
+@@ -746,8 +750,13 @@
+                 self.prune_sessions();
+             }
+             "event" => {
++                let active_pane_documents = match message.get_mut("active_pane_documents") {
++                    Some(documents) => serde_json::from_value(documents.take())?,
++                    None => Vec::new(),
++                };
+                 self.active_document =
+                     Some(message.at("document").clone()).filter(|document| !document.is_null());
++                self.active_pane_documents = active_pane_documents;
+                 let event = message.str("event");
+                 if matches!(event, "session_opened" | "run_settled") {
+                     self.session_event_epoch = self.session_event_epoch.wrapping_add(1);
+@@ -870,3 +879,6 @@
+ 
+ #[cfg(test)]
+ mod payload_tests;
++
++#[cfg(test)]
++mod navigation_tests;
+--- /dev/null
++++ b/sdk/src/host/navigation_tests.rs
+@@ -0,0 +1,115 @@
++use super::*;
++
++#[derive(Default)]
++struct NavigationProbe {
++    rendered: Vec<(String, Option<Value>, Vec<String>)>,
++}
++
++impl Extension for NavigationProbe {
++    fn render(&mut self, host: &mut Host, view: &str, _: Surface, _: Option<&str>) -> Result {
++        self.rendered.push((
++            view.into(),
++            host.active_document.clone(),
++            host.active_pane_documents.clone(),
++        ));
++        Ok(())
++    }
++}
++
++fn context(host: &mut Host, extension: &mut NavigationProbe, id: &str) {
++    host.handle(extension, json!({"type":"context", "context":id,
++        "workspace":"/fixture/project", "session_dir":"/fixture/session"})).unwrap();
++}
++
++fn navigation(host: &mut Host, extension: &mut NavigationProbe, id: &str,
++    focused: Option<&str>, documents: &[&str]) {
++    host.handle(extension, json!({"type":"event", "context":id,
++        "event":"navigation_changed", "session_dir":"/fixture/session",
++        "document":focused, "active_pane_documents":documents})).unwrap();
++}
++
++fn render(host: &mut Host, extension: &mut NavigationProbe, context: &str, view: &str) {
++    host.handle(extension, json!({"type":"render", "context":context,
++        "view":view, "surface":"document", "argument":"fixture.rs",
++        "session_dir":"/fixture/session"})).unwrap();
++}
++
++#[test]
++fn bootstrap_list_is_available_before_first_render_independently_of_focus() {
++    let (mut host, mut extension) = (Host::default(), NavigationProbe::default());
++    context(&mut host, &mut extension, "window");
++    navigation(&mut host, &mut extension, "window", None, &["left.rs", "right.rs"]);
++    assert!(extension.rendered.is_empty());
++    render(&mut host, &mut extension, "window", "first");
++    assert_eq!(extension.rendered, vec![
++        ("first".into(), None, vec!["left.rs".into(), "right.rs".into()]),
++    ]);
++}
++
++#[test]
++fn contexts_in_one_session_keep_independent_lists_during_poll_style_renders() {
++    let (mut host, mut extension) = (Host::default(), NavigationProbe::default());
++    for (id, focused, documents) in [
++        ("a", Some("a.rs"), vec!["a.rs", "a2.rs"]),
++        ("b", None, vec!["b.rs"]),
++    ] {
++        context(&mut host, &mut extension, id);
++        navigation(&mut host, &mut extension, id, focused, &documents);
++        render(&mut host, &mut extension, id, id);
++    }
++    extension.rendered.clear();
++    host.render_every_context(&mut extension);
++    assert_eq!(extension.rendered, vec![
++        ("a".into(), Some(json!("a.rs")), vec!["a.rs".into(), "a2.rs".into()]),
++        ("b".into(), None, vec!["b.rs".into()]),
++    ]);
++}
++
++#[test]
++fn replacement_empty_and_absent_lists_do_not_fall_back_to_focused_document() {
++    let (mut host, mut extension) = (Host::default(), NavigationProbe::default());
++    context(&mut host, &mut extension, "window");
++    navigation(&mut host, &mut extension, "window", Some("a.rs"), &["a.rs", "b.rs"]);
++    navigation(&mut host, &mut extension, "window", Some("a.rs"), &[]);
++    assert!(host.active_pane_documents.is_empty());
++    assert_eq!(host.active_document, Some(json!("a.rs")));
++    navigation(&mut host, &mut extension, "window", Some("b.rs"), &["b.rs"]);
++    host.handle(&mut extension, json!({"type":"event", "context":"window",
++        "event":"navigation_changed", "document":"b.rs"})).unwrap();
++    assert!(host.active_pane_documents.is_empty());
++    assert_eq!(host.active_document, Some(json!("b.rs")));
++}
++
++#[test]
++fn rehost_and_close_do_not_inherit_another_contexts_list() {
++    let (mut host, mut extension) = (Host::default(), NavigationProbe::default());
++    context(&mut host, &mut extension, "source");
++    navigation(&mut host, &mut extension, "source", Some("source.rs"), &["source.rs"]);
++    render(&mut host, &mut extension, "source", "moving");
++    context(&mut host, &mut extension, "target");
++    navigation(&mut host, &mut extension, "target", None, &["target.rs"]);
++    host.handle(&mut extension, json!({"type":"rehost", "view":"moving",
++        "context":"target"})).unwrap();
++    host.handle(&mut extension, json!({"type":"close_context", "context":"source"})).unwrap();
++    extension.rendered.clear();
++    host.render_every_context(&mut extension);
++    assert_eq!(extension.rendered, vec![
++        ("moving".into(), None, vec!["target.rs".into()]),
++    ]);
++    host.handle(&mut extension, json!({"type":"close", "view":"moving"})).unwrap();
++    host.handle(&mut extension, json!({"type":"close_context", "context":"target"})).unwrap();
++    assert!(host.active_pane_documents.is_empty());
++    context(&mut host, &mut extension, "fresh");
++    assert!(host.active_pane_documents.is_empty());
++}
++
++#[test]
++fn new_context_starts_empty_until_its_own_navigation_arrives() {
++    let (mut host, mut extension) = (Host::default(), NavigationProbe::default());
++    context(&mut host, &mut extension, "a");
++    navigation(&mut host, &mut extension, "a", Some("a.rs"), &["a.rs"]);
++    context(&mut host, &mut extension, "b");
++    assert!(host.active_pane_documents.is_empty());
++    host.activate_context("a");
++    assert_eq!(host.active_pane_documents, ["a.rs"]);
++}
+--- a/sdk/src/host/scopes.rs
++++ b/sdk/src/host/scopes.rs
+@@ -9,6 +9,7 @@
+     pub(super) workspace: Option<String>,
+     pub(super) session: Option<String>,
+     pub(super) active_document: Option<Value>,
++    pub(super) active_pane_documents: Vec<String>,
+ }
+ 
+ #[derive(Default)]
+@@ -73,6 +74,7 @@
+         {
+             previous.workspace = self.workspace.take();
+             previous.active_document = self.active_document.take();
++            previous.active_pane_documents = std::mem::take(&mut self.active_pane_documents);
+             previous.session = self.session.clone();
+         }
+         let Some(scope) = self.contexts.get_mut(context) else {
+@@ -80,6 +82,7 @@
+         };
+         self.workspace = scope.workspace.take();
+         self.active_document = scope.active_document.take();
++        self.active_pane_documents = std::mem::take(&mut scope.active_pane_documents);
+         let session = scope.session.clone();
+         self.current_context = Some(context.into());
+         self.activate_session(session);
+@@ -121,9 +124,11 @@
+                         workspace: self.workspace.clone(),
+                         session: self.session.clone(),
+                         active_document: None,
++                        active_pane_documents: Vec::new(),
+                     },
+                 );
+                 if self.current_context.is_none() {
++                    self.active_pane_documents = Vec::new();
+                     self.current_context = Some(context.into());
+                 }
+             }
+@@ -186,6 +191,7 @@
+             .collect();
+         self.sessions.retain(|session, _| live.contains(session));
+         if self.current_context.is_none() && self.contexts.is_empty() {
++            self.active_pane_documents = Vec::new();
+             self.session = None;
+             SessionContext::default().mount(self);
+         }
+--- a/tests/wire.py
++++ b/tests/wire.py
+@@ -240,7 +240,7 @@
+                 message=json.loads(line);self.wire.append(message);self.messages.put(message)
+             self.messages.put(None)
+         self.reader=threading.Thread(target=read,daemon=True);self.reader.start()
+-        self.send({"type":"hello","protocol":4,"features":["session.settings.v1","session.tool_state.v1","manifest.dependencies.tools.v1","manifest.dependencies.core.v1","widgets.controls.v1","widgets.search.v1","widgets.selection.v1","widgets.diff.v1","widgets.lanes.v2","widgets.disclosure.v1","widgets.setting_row.v1","widgets.setting_row.reset.v1","surfaces.badge.visibility.v1","widgets.person.v1","documents.title.v1","documents.retarget.v1","widgets.picker.v1","widgets.picker.v2","widgets.picker.v3","widgets.transitions.v1","widgets.status.v1","surfaces.content.v1","widgets.svg.v1","widgets.rich_text.v1","widgets.rich_text.inlines.v1","widgets.svg.typography.v1","widgets.content.v1","widgets.code_embedded.v1","surfaces.preview.v1","surfaces.page.embedded.v1","surfaces.activity.v1","surfaces.invalidate.v1","surfaces.content.invalidate.v1"],"workspace":"" if preview else "/workspace","server":{"origin":origin,"token":"" if preview else "fixture"}})
++        self.send({"type":"hello","protocol":4,"features":["session.settings.v1","session.tool_state.v1","manifest.dependencies.tools.v1","manifest.dependencies.core.v1","widgets.controls.v1","widgets.search.v1","widgets.selection.v1","widgets.diff.v1","widgets.lanes.v2","widgets.disclosure.v1","widgets.setting_row.v1","widgets.setting_row.reset.v1","surfaces.badge.visibility.v1","widgets.person.v1","documents.title.v1","documents.retarget.v1","documents.active_panes.v1","widgets.picker.v1","widgets.picker.v2","widgets.picker.v3","widgets.transitions.v1","widgets.status.v1","surfaces.content.v1","widgets.svg.v1","widgets.rich_text.v1","widgets.rich_text.inlines.v1","widgets.svg.typography.v1","widgets.content.v1","widgets.code_embedded.v1","surfaces.preview.v1","surfaces.page.embedded.v1","surfaces.activity.v1","surfaces.invalidate.v1","surfaces.content.invalidate.v1"],"workspace":"" if preview else "/workspace","server":{"origin":origin,"token":"" if preview else "fixture"}})
+         if self.manifest.get("session_events") and not preview:
+             self.send({"type":"session_snapshot","session_dir":"/session","state":state(),"entries":[{"role":"user","tool":None,"subagent":None},entry()]})
+ 

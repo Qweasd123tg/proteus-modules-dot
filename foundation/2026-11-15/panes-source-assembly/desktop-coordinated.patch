@@ -1,0 +1,269 @@
+--- a/src/declarative/process/tests.rs
++++ b/src/declarative/process/tests.rs
+@@ -339,6 +339,7 @@
+             context: "fixture".into(),
+             event: HostEventKind::RunSettled,
+             document: None,
++            active_pane_documents: Vec::new(),
+             session_dir: None,
+         })
+         .unwrap();
+--- a/src/declarative/protocol.rs
++++ b/src/declarative/protocol.rs
+@@ -43,6 +43,7 @@
+     "widgets.person.v1",
+     "documents.title.v1",
+     "documents.retarget.v1",
++    "documents.active_panes.v1",
+     "surfaces.content.v1",
+     "surfaces.content.invalidate.v1",
+     "widgets.svg.v1",
+@@ -125,6 +126,9 @@
+         event: HostEventKind,
+         #[serde(skip_serializing_if = "Option::is_none")]
+         document: Option<String>,
++        /// Extension-owned active tabs of the displayed space's panes.
++        /// Logical layout projection, not native visibility or occlusion.
++        active_pane_documents: Vec<String>,
+         #[serde(skip_serializing_if = "Option::is_none")]
+         session_dir: Option<PathBuf>,
+     },
+--- a/src/ui/extensions/declarative/runtime/scopes.rs
++++ b/src/ui/extensions/declarative/runtime/scopes.rs
+@@ -3,6 +3,7 @@
+ 
+ use super::*;
+ use crate::ui::chat::Chat;
++use crate::ui::extensions::host::DocumentNavigation;
+ use crate::ui::workspace::Workspace;
+ use gpui_kit::component::*;
+ 
+@@ -14,7 +15,7 @@
+     current: &std::path::Path,
+     workspace: &std::path::Path,
+     session_dir: Option<PathBuf>,
+-    document: Option<String>,
++    navigation: DocumentNavigation,
+ ) -> Option<[Outgoing; 2]> {
+     (current != workspace).then(|| {
+         [
+@@ -27,7 +28,8 @@
+                 context: context.into(),
+                 event: HostEventKind::NavigationChanged,
+                 session_dir,
+-                document,
++                document: navigation.focused,
++                active_pane_documents: navigation.active_panes,
+             },
+         ]
+     })
+@@ -85,7 +87,10 @@
+             Path::new("/project-a"),
+             Path::new("/project-b"),
+             session,
+-            Some("README.md".into()),
++            super::DocumentNavigation {
++                focused: Some("README.md".into()),
++                active_panes: vec!["README.md".into(), "src/main.rs".into()],
++            },
+         )
+         .unwrap();
+         let messages: Vec<_> = messages
+@@ -96,7 +101,7 @@
+             messages,
+             vec![
+                 serde_json::json!({"type":"context", "context":"window", "workspace":"/project-b", "session_dir":"/sessions/chat-b"}),
+-                serde_json::json!({"type":"event", "context":"window", "event":"navigation_changed", "session_dir":"/sessions/chat-b", "document":"README.md"}),
++                serde_json::json!({"type":"event", "context":"window", "event":"navigation_changed", "session_dir":"/sessions/chat-b", "document":"README.md", "active_pane_documents":["README.md", "src/main.rs"]}),
+             ]
+         );
+         // Repeated status/catalog refreshes leave retained extension views alone.
+@@ -106,7 +111,7 @@
+                 Path::new("/project-b"),
+                 Path::new("/project-b"),
+                 Some("/sessions/chat-b".into()),
+-                None
++                super::DocumentNavigation::default()
+             )
+             .is_none()
+         );
+@@ -203,6 +208,7 @@
+         let Some(scope) = self.scopes.get(context) else {
+             return;
+         };
++        let initialize_navigation = !scope.announced;
+         let host = scope.host.clone();
+         let session = self
+             .lifetime
+@@ -226,10 +232,22 @@
+         if self.lifetime.session() && self.extension.manifest.session_events && !snapshot_known {
+             self.send(&host.session_snapshot(self.extension.manifest.session_entries, cx));
+         }
++        if self.lifetime.session() && initialize_navigation {
++            // Context/snapshot do not carry per-context document selection.
++            let navigation = host.document_navigation(cx);
++            self.send(&Outgoing::Event {
++                context: context.into(),
++                event: HostEventKind::NavigationChanged,
++                session_dir: session.clone(),
++                document: navigation.focused,
++                active_pane_documents: navigation.active_panes,
++            });
++        }
+         if let Some(scope) = self.scopes.get_mut(context) {
+             scope.session = session;
+             scope.workspace = workspace;
+-            scope.announced = true;
++            // A deferred launch must not inherit an announcement sent to no process.
++            scope.announced = self.process.is_some();
+         }
+     }
+ 
+@@ -249,7 +267,7 @@
+                 &scope.workspace,
+                 &workspace,
+                 scope.host.session_dir(cx),
+-                scope.host.active_document(cx),
++                scope.host.document_navigation(cx),
+             );
+             scope.workspace = workspace;
+             if let Some(messages) = messages {
+@@ -281,11 +299,13 @@
+         if event == HostEventKind::SessionOpened {
+             self.announce_scope(context, cx);
+         }
++        let navigation = host.document_navigation(cx);
+         self.send(&Outgoing::Event {
+             context: context.into(),
+             event,
+             session_dir: host.session_dir(cx),
+-            document: host.active_document(cx),
++            document: navigation.focused,
++            active_pane_documents: navigation.active_panes,
+         });
+         if session_changed {
+             let views: Vec<_> = self
+--- /dev/null
++++ b/src/ui/extensions/host/document_navigation_tests.rs
+@@ -0,0 +1,60 @@
++use super::DocumentNavigation;
++use crate::tabs::{self, Edge, TabLayout};
++
++fn split_documents() -> (TabLayout, String, String, String) {
++    let (left, right, hidden) = (
++        tabs::document("files", "left.rs"),
++        tabs::document("files", "right.rs"),
++        tabs::document("files", "hidden.rs"),
++    );
++    let mut layout = TabLayout::default();
++    for id in [&left, &hidden, &right] {
++        layout.open(id, |_| false);
++    }
++    let pane = layout.focused;
++    layout.split(&right, pane, Edge::Right);
++    layout.activate(pane, &left);
++    (layout, left, right, hidden)
++}
++
++#[test]
++fn every_active_document_pane_is_projected_without_hidden_tabs() {
++    let (layout, _, _, hidden) = split_documents();
++    assert!(layout.contains(&hidden));
++    let navigation = DocumentNavigation::for_layout(&layout, "files");
++    assert_eq!(navigation.focused.as_deref(), Some("left.rs"));
++    assert_eq!(navigation.active_panes, ["left.rs", "right.rs"]);
++}
++
++#[test]
++fn focus_changes_do_not_remove_other_active_panes_and_close_removes_its_argument() {
++    let (mut layout, left, right, _) = split_documents();
++    layout.focus(layout.pane_of(&right).unwrap());
++    let navigation = DocumentNavigation::for_layout(&layout, "files");
++    assert_eq!(navigation.focused.as_deref(), Some("right.rs"));
++    assert_eq!(navigation.active_panes, ["left.rs", "right.rs"]);
++    layout.close(&right);
++    layout.activate(layout.pane_of(&left).unwrap(), &left);
++    let navigation = DocumentNavigation::for_layout(&layout, "files");
++    assert_eq!(navigation.focused.as_deref(), Some("left.rs"));
++    assert_eq!(navigation.active_panes, ["left.rs"]);
++}
++
++#[test]
++fn a_focused_chat_or_other_extension_does_not_hide_an_owned_sibling() {
++    for other in ["codex:fixture".to_owned(), tabs::document("git", "diff")] {
++        let (mut layout, _, _, _) = split_documents();
++        layout.open(&other, |_| false);
++        let navigation = DocumentNavigation::for_layout(&layout, "files");
++        assert_eq!(navigation.focused, None);
++        assert_eq!(navigation.active_panes, ["right.rs"]);
++        assert!(DocumentNavigation::for_layout(&layout, "absent").active_panes.is_empty());
++    }
++}
++
++#[test]
++fn empty_layout_has_no_document_projection() {
++    let navigation = DocumentNavigation::for_layout(&TabLayout::default(), "files");
++    assert_eq!(navigation.focused, None);
++    assert!(navigation.active_panes.is_empty());
++}
+--- a/src/ui/extensions/host.rs
++++ b/src/ui/extensions/host.rs
+@@ -13,6 +13,30 @@
+ 
+ mod scope;
+ pub(in crate::ui) use scope::{Lifetime, RuntimeScope, ViewOwner};
++
++/// One logical layout sample. Settings/occlusion do not change this projection.
++#[derive(Default)]
++pub(in crate::ui) struct DocumentNavigation {
++    pub(in crate::ui) focused: Option<String>,
++    pub(in crate::ui) active_panes: Vec<String>,
++}
++
++impl DocumentNavigation {
++    fn for_layout(layout: &crate::tabs::TabLayout, extension: &str) -> Self {
++        let argument = |id: &str| {
++            crate::tabs::split_document(id)
++                .filter(|(owner, _)| *owner == extension)
++                .map(|(_, argument)| argument.to_owned())
++        };
++        Self {
++            focused: layout.active(layout.focused).and_then(|id| argument(id)),
++            active_panes: layout.visible().filter_map(argument).collect(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod document_navigation_tests;
+ 
+ /// What an extension gets from the client: read access to the active chat's
+ /// session,
+@@ -450,18 +474,19 @@
+             .is_none_or(|root| workspace.space_root_key().as_ref() == Some(root))
+     }
+ 
+-    pub(in crate::ui) fn active_document(&self, cx: &App) -> Option<String> {
+-        if !self.runtime_scope.lifetime.session() {
+-            return None;
+-        }
+-        let workspace = self.workspace.upgrade()?;
++    pub(in crate::ui) fn document_navigation(&self, cx: &App) -> DocumentNavigation {
++        if !self.runtime_scope.lifetime.session() {
++            return DocumentNavigation::default();
++        }
++        let Some(workspace) = self.workspace.upgrade() else {
++            return DocumentNavigation::default();
++        };
+         let workspace = workspace.read(cx);
+         if !self.displays_space(workspace) {
+-            return None;
++            return DocumentNavigation::default();
+         }
+         let layout = workspace.tab_layout(cx);
+-        let (owner, argument) = crate::tabs::split_document(layout.active(layout.focused)?)?;
+-        (owner == self.extension).then(|| argument.to_string())
++        DocumentNavigation::for_layout(&layout, self.extension)
+     }
+ 
+     /// Calls `on_event` for every host event while `cx`'s entity lives.
