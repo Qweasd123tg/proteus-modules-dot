@@ -1,0 +1,261 @@
+--- a/workflow/opencode-runtime/README.md
++++ b/workflow/opencode-runtime/README.md
+@@ -72,3 +72,27 @@
+ OpenCode DB не воспроизводится. Поэтому этот профиль нельзя объявлять полной
+ эквивалентностью всей vanilla упряжке; это перенесённые upstream slots с явно
+ ограниченной поверхностью. Строгая OS containment задаётся launch configuration.
++
++### Граница tool-result media
++
++Общая projection `nativeContext` для workflow estimate и compaction сохраняет
++`ToolResult.output`, text blocks и inline `image/*` как native `Tool.Content`
++(text либо file с data URI). Обратная projection запроса compaction в Core
++сохраняет их как типизированный `ToolResult`, включая failed status и error
++message. В output переносится только первый блок, если он text; image-first
++content не переупорядочивается. Multi-text native content теперь возвращается
++как output + text blocks, а не JSON-строка массива. Error без native envelope
++сохраняет прежний scalar/JSON fallback.
++
++Это модельно-видимое преобразование, не exact DTO round-trip: служебные native
++names/metadata не восстанавливаются, а upstream может убрать пустой text или
++намеренно flatten/prune историю и media при уменьшении compaction request.
++Эти upstream policy не заменяются. Поддержка MIME image/* сохраняет MIME/data,
++но не обещает принятие каждого формата выбранным provider. Binary/PDF и Json
++в tool content остаются явно неподдержанными; non-inline user attachments не
++изменены. Payload не читается из внешнего URI и не превращается молча в текст.
++
++Новые targeted controls находятся в tests/{compaction,workflow,files}.test.mjs:
++оба направления text/image/error, image-first ordering, PNG continuation без
++compactor и с auto:false, и настоящий native PNG reader → projection. Они
++требуют точных штатных dependencies и не заменяют full package/Core gate.
+--- a/workflow/opencode-runtime/compaction.mjs
++++ b/workflow/opencode-runtime/compaction.mjs
+@@ -46,6 +46,47 @@
+         if (payload.Opaque || payload.ToolCall || payload.ToolResult || payload.Image) return [];
+         throw new Error(`Unsupported OpenCode compaction part ${Object.keys(payload).join(",")}`);
+     }).join("\n");
++}
++
++function nativeResultContent(result) {
++    return [{ type: "text", text: result.output }, ...(result.content ?? []).map(item => {
++        if (item.type === "text") return { type: "text", text: item.text };
++        if (item.type === "image" && typeof item.mime_type === "string" && /^image\//i.test(item.mime_type)
++            && typeof item.data === "string") {
++            return { type: "file", mime: item.mime_type, uri: `data:${item.mime_type};base64,${item.data}` };
++        }
++        throw new Error("Unsupported canonical OpenCode tool-result content; only text and inline images are bridged");
++    })];
++}
++
++function canonicalToolResult(part) {
++    const value = part.result.value;
++    const failed = part.result.type === "error";
++    const envelope = failed && value !== null && typeof value === "object"
++        && Object.hasOwn(value, "error") && Array.isArray(value.content);
++    const blocks = part.result.type === "content" ? value : envelope ? value.content : null;
++    let output;
++    let error = null;
++    let content = [];
++    if (blocks !== null) {
++        // Only a leading text block can become output without reordering media.
++        const leadingText = blocks[0]?.type === "text";
++        output = leadingText ? blocks[0].text : "";
++        content = (leadingText ? blocks.slice(1) : blocks).map(item => {
++            if (item.type === "text") return { type: "text", text: item.text };
++            const match = item.type === "file" && /^data:([^;]+);base64,(.*)$/s.exec(item.uri);
++            if (!match || match[1] !== item.mime || !/^image\//i.test(item.mime)) {
++                throw new Error("Unsupported native OpenCode tool-result attachment; expected an inline image");
++            }
++            return { type: "image", mime_type: item.mime, data: match[2] };
++        });
++        if (failed) error = typeof value.error?.message === "string" ? value.error.message
++            : typeof value.error === "string" ? value.error : JSON.stringify(value.error) ?? output;
++    } else {
++        output = typeof value === "string" ? value : JSON.stringify(value);
++        error = failed ? JSON.stringify(value) : null;
++    }
++    return { ToolResult: { result: { call_id: part.id, ok: !failed, output, content, error, metadata: null } } };
+ }
+ 
+ /** Canonical -> native durable message shapes. No private database or HTTP. */
+@@ -88,10 +129,7 @@
+                 if (payload.Opaque) return [];
+                 if (!payload.ToolCall) throw new Error("Unsupported assistant part in OpenCode compaction");
+                 const call = payload.ToolCall.call, result = results.get(call.id);
+-                const content = result ? [{ type: "text", text: result.output }, ...(result.content ?? []).map(item => {
+-                    if (item.type !== "text") throw new Error("OpenCode tool-result media needs an explicit canonical media bridge");
+-                    return { type: "text", text: item.text };
+-                })] : [];
++                const content = result ? nativeResultContent(result) : [];
+                 return [{ type: "tool", id: call.id, name: call.name,
+                     state: result ? result.ok ? { status: "completed", input: call.args, content } :
+                         { status: "error", input: call.args, content, error: { message: result.error ?? result.output } } :
+@@ -122,9 +160,7 @@
+         if (part.type === "text" || part.type === "reasoning") return { Text: { text: part.text } };
+         if (part.type === "tool-call") return { ToolCall: { call: { id: part.id, name: part.name,
+             args: part.input, surface: "function", raw_arguments: null } } };
+-        if (part.type === "tool-result") return { ToolResult: { result: { call_id: part.id,
+-            ok: part.result.type !== "error", output: typeof part.result.value === "string" ? part.result.value : JSON.stringify(part.result.value),
+-            content: [], error: part.result.type === "error" ? JSON.stringify(part.result.value) : null, metadata: null } } };
++        if (part.type === "tool-result") return canonicalToolResult(part);
+         if (part.type === "media" && part.media.data !== undefined) return { Image: { image: {
+             data: part.media.data, mime_type: part.media.mediaType } } };
+         throw new Error(`Unsupported upstream compaction prompt content ${part.type}`);
+--- a/workflow/opencode-runtime/tests/compaction.test.mjs
++++ b/workflow/opencode-runtime/tests/compaction.test.mjs
+@@ -179,3 +179,80 @@
+     };
+     await assert.rejects(createCompactionExport(binding({})).invoke("hook.invoke", fixture(), host.invocation), /turn canceled/);
+ });
++
++const imageBlock = { type: "image", mime_type: "image/png",
++    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC" };
++function toolMediaFixture(ok = true, content = [imageBlock], output = "Image output") {
++    const input = fixture();
++    const call = { id: "image-call", name: "read", args: { path: "image.png" }, surface: "function", raw_arguments: null };
++    const result = { call_id: call.id, ok, output, content, error: ok ? null : "Read failed after partial output", metadata: null };
++    input.event.output.messages.splice(2, 0,
++        canonical("Assistant", { ToolCall: { call } }, "model"),
++        canonical("Tool", { ToolResult: { result } }, "tool"));
++    return { input, call, result };
++}
++function projectedTool(context) {
++    return context.messages.flatMap(message => message.type === "assistant" ? message.content : [])
++        .find(part => part.type === "tool" && part.id === "image-call");
++}
++function callbackResult(host) {
++    return host.requests[0].messages.flatMap(message => message.parts)
++        .find(part => part.payload.ToolResult?.result.call_id === "image-call").payload.ToolResult.result;
++}
++
++test("native context retains ordered tool text and inline image for success and error", async () => {
++    const content = [{ type: "text", text: "before" }, imageBlock, { type: "text", text: "after" }];
++    for (const ok of [true, false]) {
++        const { input } = toolMediaFixture(ok, content);
++        input.event.input.token_estimate = null;
++        const before = structuredClone(input);
++        const context = await nativeContext(input.event.input, input.event.output.messages);
++        const tool = projectedTool(context);
++        assert.equal(tool.state.status, ok ? "completed" : "error");
++        assert.deepEqual(tool.state.content, [{ type: "text", text: "Image output" },
++            { type: "text", text: "before" },
++            { type: "file", mime: imageBlock.mime_type, uri: `data:${imageBlock.mime_type};base64,${imageBlock.data}` },
++            { type: "text", text: "after" }]);
++        if (!ok) assert.equal(tool.state.error.message, "Read failed after partial output");
++        assert.ok(Number.isFinite(estimateContext(context)));
++        if (ok) {
++            const plain = toolMediaFixture(true, content.filter(item => item.type !== "image")).input;
++            plain.event.input.token_estimate = null;
++            const plainContext = await nativeContext(plain.event.input, plain.event.output.messages);
++            assert.equal(estimateContext(context) - estimateContext(plainContext), 1500,
++                "pinned native unmeasured image estimate, not a measured-token anchor");
++        }
++        assert.deepEqual(input, before);
++    }
++});
++
++test("actual native compaction callback keeps typed tool text image and failure", async () => {
++    for (const ok of [true, false]) {
++        for (const content of [[], [{ type: "text", text: "additional text" }],
++            [imageBlock, { type: "text", text: "after image" }]]) {
++            const { input, result } = toolMediaFixture(ok, content), before = structuredClone(input), host = fakeHost();
++            await createCompactionExport(binding({})).invoke("hook.invoke", input, host.invocation);
++            assert.deepEqual(callbackResult(host), result);
++            assert.deepEqual(input, before);
++        }
++    }
++});
++
++test("image-first native content does not move later text before the image", async () => {
++    const { input } = toolMediaFixture(true, [imageBlock, { type: "text", text: "later" }], "");
++    const context = await nativeContext(input.event.input, input.event.output.messages);
++    projectedTool(context).state.content.shift(); // Native normalization may omit the leading empty text.
++    const host = fakeHost();
++    await runNativeCompaction(context, input.event.input.request, {}, host.invocation);
++    const result = callbackResult(host);
++    assert.equal(result.output, "");
++    assert.deepEqual(result.content, [imageBlock, { type: "text", text: "later" }]);
++});
++
++test("unsupported non-image tool content is explicit rather than silently discarded", async () => {
++    for (const block of [{ type: "binary", mime_type: "application/pdf", data: "cGRm" },
++        { type: "json", value: { unsupported: true } }]) {
++        const { input } = toolMediaFixture(true, [block]);
++        await assert.rejects(nativeContext(input.event.input, input.event.output.messages), /only text and inline images/);
++    }
++});
+--- a/workflow/opencode-runtime/tests/files.test.mjs
++++ b/workflow/opencode-runtime/tests/files.test.mjs
+@@ -130,3 +130,21 @@
+     assert.equal(invalid.ok,false);
+     await assert.rejects(readFile(`${cwd}/must-not-exist`));
+ });
++
++test("native PNG reader output has a compatible native context projection", async t => {
++    const { nativeContext } = await import("../compaction.mjs");
++    const { canonical } = await import("../../../components/module-runtime-js/canonical.mjs");
++    const cwd = await fixture(t), path = resolve(cwd, "pixel.png");
++    const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
++    await writeFile(path, Buffer.from(data, "base64"));
++    const request = input(cwd, "read", { path }, "png-producer");
++    const result = await executeNativeFile(request);
++    assert.equal(result.ok, true, result.error);
++    assert.deepEqual(result.content, [{ type: "image", mime_type: "image/png", data }]);
++    const messages = [canonical("Assistant", { ToolCall: { call: request.call } }, "model"),
++        canonical("Tool", { ToolResult: { result } }, "tool")];
++    const context = await nativeContext({ request: { model: { provider: "openai", model: "gpt-6.1-sol" } } }, messages);
++    const tool = context.messages[0].content[0];
++    assert.deepEqual(tool.state.content, [{ type: "text", text: result.output },
++        { type: "file", mime: "image/png", uri: `data:image/png;base64,${data}` }]);
++});
+--- a/workflow/opencode-runtime/tests/workflow.test.mjs
++++ b/workflow/opencode-runtime/tests/workflow.test.mjs
+@@ -268,3 +268,48 @@
+     );
+     assert.ok(!JSON.stringify(result.result.new_messages).includes("incomplete-append"));
+ });
++
++for (const compactor of ["absent", "auto:false"]) {
++    test(`PNG tool result reaches the next sampling with compactor ${compactor}`, async () => {
++        const { createCompactionExport } = await import("../compaction.mjs");
++        const call = { id: "png-read", name: "read", args: { path: "image.png" }, surface: "function", raw_arguments: null };
++        const tool = { name: "read", description: "Read image", input_schema: definition({ name: "read", input: NativeReadInput }).inputSchema };
++        const image = { type: "image", mime_type: "image/png",
++            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC" };
++        const toolResult = { call_id: call.id, ok: true, output: "Image read successfully", content: [image], error: null, metadata: null };
++        let steps = 0, executions = 0, sampled;
++        const invocation = { signal: new AbortController().signal, async hostCall(method, params) {
++            if (method === "host.context.build") return { chunks: [], token_estimate: null };
++            if (method === "host.tools.select") return { tools: [tool] };
++            if (method === "host.context.prepare") {
++                const output = { messages: params.input.messages, changed: false };
++                if (compactor === "auto:false") {
++                    const hook = createCompactionExport({ slot: "hook", module_id: "opencode_compact", contract_version: "v6",
++                        composition: "ordered_many", module_config: { auto: false } });
++                    const skipped = await hook.invoke("hook.invoke", { event: { event: "before_context",
++                        target: null, input: params.input, output } }, invocation);
++                    assert.equal(skipped.result.action, "continue");
++                }
++                return { output, target: null };
++            }
++            if (method === "host.history.checkpoint") return { revision: null };
++            if (method === "host.events.emit") return {};
++            if (method === "host.model.stream.start") {
++                steps++;
++                if (steps === 2) assert.deepEqual(params.request.messages.at(-1).parts[0].payload.ToolResult.result, toolResult);
++                sampled = steps === 1 ? { ...reply(""), messages: [canonical("Assistant", { ToolCall: { call } }, "model")],
++                    tool_calls: [call], finish_reason: "ToolCalls" } : reply("image handled");
++                return { stream_id: "png-stream" };
++            }
++            if (method === "host.model.stream.next") return { type: "response", response: sampled };
++            if (method === "host.tools.execute") { executions++; return structuredClone(toolResult); }
++            throw new Error(method);
++        } };
++        const result = await workflow({ task: { cwd: "/work", text: "read image" }, history: [message("User", "read image")],
++            runtime: { instructions: [], max_input_tokens: 128000, model_ref: request.model, reasoning: request.reasoning } }, invocation);
++        assert.equal(result.status, "success", JSON.stringify(result.failure));
++        assert.equal(result.result.output.text, "image handled");
++        assert.equal(steps, 2);
++        assert.equal(executions, 1);
++    });
++}
