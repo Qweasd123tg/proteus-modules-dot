@@ -1,0 +1,177 @@
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -64,6 +64,17 @@
+         .context("serialized module_config TOML could not be parsed")
+ }
+ 
++/// Initial source must retain file references, not their resolved runtime text.
++fn initial_profile_source(config: &AppConfig) -> AppConfig {
++    let mut source = config.clone();
++    for entry in &mut source.instructions {
++        if entry.file.is_some() {
++            entry.text = None;
++        }
++    }
++    source
++}
++
+ #[cfg(test)]
+ pub(super) async fn persist_config_builder(path: &Path, config: &AppConfig) -> Result<()> {
+     persist_config_builder_with_components(path, config, &BTreeSet::new()).await
+@@ -89,7 +100,7 @@
+         && path.file_name().and_then(|name| name.to_str())
+             != Some(crate::core::CONFIG_BUILDER_OVERLAY)
+     {
+-        toml::to_string_pretty(config)
++        toml::to_string_pretty(&initial_profile_source(config))
+             .context("cannot serialize initial profile")?
+             .parse::<toml_edit::DocumentMut>()?
+     } else {
+@@ -229,7 +240,9 @@
+     let mut document: Value = match tokio::fs::read(path).await {
+         Ok(bytes) => serde_json::from_slice(&bytes)
+             .with_context(|| format!("failed to parse config JSON at {}", path.display()))?,
+-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => next.clone(),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            serde_json::to_value(initial_profile_source(config))?
++        }
+         Err(error) => return Err(error.into()),
+     };
+     let root = document
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -166,6 +166,8 @@
+     assert_eq!(saved["agent_control"]["max_depth"], 3);
+ }
+ 
++mod instruction_bootstrap;
++
+ #[tokio::test]
+ async fn json_profile_save_does_not_apply_toml_value_restrictions() {
+     let dir = tempfile::tempdir().unwrap();
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
+@@ -0,0 +1,107 @@
++use super::*;
++
++async fn write_profile(path: &Path, source: &Value) {
++    let text = if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::to_string_pretty(source).unwrap()
++    } else {
++        toml::to_string_pretty(source).unwrap()
++    };
++    tokio::fs::write(path, text).await.unwrap();
++}
++
++async fn read_profile(path: &Path) -> Value {
++    let text = tokio::fs::read_to_string(path).await.unwrap();
++    if path.extension().is_some_and(|extension| extension == "json") {
++        serde_json::from_str(&text).unwrap()
++    } else {
++        let value: toml::Value = toml::from_str(&text).unwrap();
++        serde_json::to_value(value).unwrap()
++    }
++}
++
++#[tokio::test]
++async fn missing_standalone_profile_preserves_instruction_sources() {
++    for extension in ["toml", "json"] {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(format!("profile.{extension}"));
++        let relative = dir.path().join("relative.md");
++        let absolute = dir.path().join("absolute.md");
++        tokio::fs::write(&relative, "relative v1").await.unwrap();
++        tokio::fs::write(&absolute, "absolute v1").await.unwrap();
++        let instructions = serde_json::json!([
++            {"kind": "System", "file": "relative.md", "priority": 100},
++            {"kind": "Developer", "text": "inline text", "priority": 90},
++            {"kind": "System", "file": absolute, "priority": 80}
++        ]);
++        write_profile(&path, &serde_json::json!({"instructions": instructions})).await;
++        let mut config = AppConfig::load(Some(&path)).await.unwrap();
++        let runtime_instructions = serde_json::to_value(&config.instructions).unwrap();
++        assert_eq!(config.instructions[0].text.as_deref(), Some("relative v1"));
++        assert_eq!(config.instructions[2].text.as_deref(), Some("absolute v1"));
++
++        config.tools.enabled = vec!["managed-change".into()];
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], instructions);
++
++        tokio::fs::remove_file(&path).await.unwrap();
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], instructions);
++        assert_eq!(serde_json::to_value(&config.instructions).unwrap(), runtime_instructions);
++        let loaded = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(serde_json::to_value(&loaded.instructions).unwrap(), runtime_instructions);
++        assert_eq!(loaded.tools.enabled, config.tools.enabled);
++
++        tokio::fs::write(&relative, "relative v2").await.unwrap();
++        tokio::fs::write(&absolute, "absolute v2").await.unwrap();
++        let loaded = AppConfig::load(Some(&path)).await.unwrap();
++        assert_eq!(loaded.instructions[0].text.as_deref(), Some("relative v2"));
++        assert_eq!(loaded.instructions[1].text.as_deref(), Some("inline text"));
++        assert_eq!(loaded.instructions[2].text.as_deref(), Some("absolute v2"));
++    }
++}
++
++#[tokio::test]
++async fn bootstrap_does_not_substitute_cached_text_for_missing_instruction_assets() {
++    for extension in ["toml", "json"] {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join(format!("profile.{extension}"));
++        let asset = dir.path().join("rules.md");
++        tokio::fs::write(&asset, "cached text").await.unwrap();
++        let source = serde_json::json!({"instructions": [
++            {"kind": "System", "file": "rules.md", "priority": 100}
++        ]});
++        write_profile(&path, &source).await;
++        let config = AppConfig::load(Some(&path)).await.unwrap();
++        tokio::fs::remove_file(&path).await.unwrap();
++        tokio::fs::remove_file(&asset).await.unwrap();
++        persist_config_builder(&path, &config).await.unwrap();
++        assert_eq!(read_profile(&path).await["instructions"], source["instructions"]);
++        let error = AppConfig::load(Some(&path)).await.unwrap_err();
++        assert!(format!("{error:#}").contains("failed to read instructions file"));
++        assert_eq!(config.instructions[0].text.as_deref(), Some("cached text"));
++    }
++}
++
++#[tokio::test]
++async fn directory_overlay_does_not_materialize_resolved_instructions() {
++    let dir = tempfile::tempdir().unwrap();
++    let source = dir.path().join("base.toml");
++    let asset = dir.path().join("rules.md");
++    let instructions = serde_json::json!([
++        {"kind": "System", "file": "rules.md", "priority": 100}
++    ]);
++    write_profile(&source, &serde_json::json!({"instructions": instructions})).await;
++    tokio::fs::write(&asset, "v1").await.unwrap();
++    let target = config_builder_target_path(Some(dir.path())).unwrap();
++    for text in ["v2", "v3"] {
++        let mut config = AppConfig::load(Some(dir.path())).await.unwrap();
++        config.tools.enabled = vec![text.into()];
++        persist_config_builder(&target, &config).await.unwrap();
++        assert!(read_profile(&target).await.get("instructions").is_none());
++        assert_eq!(read_profile(&source).await["instructions"], instructions);
++        tokio::fs::write(&asset, text).await.unwrap();
++        let loaded = AppConfig::load(Some(dir.path())).await.unwrap();
++        assert_eq!(loaded.instructions[0].text.as_deref(), Some(text));
++        assert_eq!(loaded.tools.enabled, config.tools.enabled);
++    }
++}
+--- a/docs/guides/configuration.md
++++ b/docs/guides/configuration.md
+@@ -980,6 +980,13 @@
+ Entry задаёт ровно одно из `file` и `text`. Relative file path считается
+ от config file. Runtime превращает entries в ordered canonical
+ `InstructionBlock` list.
++
++Если Config Builder восстанавливает отсутствующий standalone profile из
++загруженной конфигурации, file-backed entries сохраняют `file`, а не копию
++уже прочитанного `text`. Inline entries сохраняют свой текст и порядок.
++Это восстановление по прежнему пути: оно не переносит relative references
++и не восстанавливает отсутствующие prompt assets. Существующие source entries
++и directory overlays при обычном Save не переписываются этим преобразованием.
+ 
+ Packaged `opencode-default.md` сохраняется как настраиваемый пример, но профиль
+ `opencode` его не использует. `proteus-opencode-module` импортирует pinned
