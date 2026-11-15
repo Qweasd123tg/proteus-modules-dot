@@ -1,0 +1,357 @@
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -189,7 +189,8 @@
+         .unwrap_or(Lucide::Puzzle)
+ }
+ 
+-/// Every surface shares one process, retained until its workspace closes.
++/// Default runtime selected for new surfaces in a host. Rehosting can replace
++/// a default while existing surfaces still retain the previous runtime.
+ #[derive(Default)]
+ struct Runtimes(HashMap<(EntityId, &'static str), WeakEntity<Runtime>>);
+ 
+@@ -200,6 +201,34 @@
+ #[derive(Default)]
+ struct ViewRuntimes(HashMap<(super::host::ViewOwner, &'static str), WeakEntity<Runtime>>);
+ impl Global for ViewRuntimes {}
++
++/// Live recipients created by runtime(), independent of host default selection.
++/// Weak entries do not extend surface/workspace ownership; later registrations
++/// remove expired entries. Entity identity also removes rehost aliases.
++#[derive(Default)]
++struct LiveRuntimes(HashMap<EntityId, (&'static str, WeakEntity<Runtime>)>);
++impl Global for LiveRuntimes {}
++
++fn register_runtime(extension: &'static str, runtime: &Entity<Runtime>, cx: &mut App) {
++    let runtimes = &mut cx.default_global::<LiveRuntimes>().0;
++    runtimes.retain(|_, (_, runtime)| runtime.upgrade().is_some());
++    runtimes.insert(runtime.entity_id(), (extension, runtime.downgrade()));
++}
++
++/// Snapshot recipients before callbacks, without borrowing individual runtimes.
++/// None selects every package for reload; Some preserves package-local fanout.
++fn live_runtimes(extension: Option<&str>, cx: &App) -> Vec<Entity<Runtime>> {
++    cx.try_global::<LiveRuntimes>()
++        .map(|runtimes| {
++            runtimes
++                .0
++                .values()
++                .filter(|(owner, _)| extension.is_none_or(|extension| *owner == extension))
++                .filter_map(|(_, runtime)| runtime.upgrade())
++                .collect()
++        })
++        .unwrap_or_default()
++}
+ 
+ fn runtime_of(host: &Host, cx: &App) -> Option<Entity<Runtime>> {
+     if let Some(owner) = host.runtime_scope().owner {
+@@ -221,6 +250,7 @@
+         return Some(runtime);
+     }
+     let runtime = cx.new(|cx| Runtime::new(extension, host.clone(), window, cx));
++    register_runtime(&extension.manifest.id, &runtime, cx);
+     if let Some(owner) = host.runtime_scope().owner {
+         let runtimes = &mut cx.default_global::<ViewRuntimes>().0;
+         runtimes.retain(|_, runtime| runtime.upgrade().is_some());
+@@ -346,30 +376,7 @@
+ 
+ /// Reload packages in live surfaces after an explicit install/update/rescan.
+ pub(super) fn reload_runtimes(cx: &mut App) {
+-    let runtimes: Vec<_> = cx
+-        .try_global::<Runtimes>()
+-        .map(|runtimes| {
+-            runtimes
+-                .0
+-                .values()
+-                .filter_map(WeakEntity::upgrade)
+-                .collect()
+-        })
+-        .unwrap_or_default();
+-    for runtime in runtimes {
+-        runtime.update(cx, |runtime, cx| runtime.reload(cx));
+-    }
+-    let view_runtimes: Vec<_> = cx
+-        .try_global::<ViewRuntimes>()
+-        .map(|runtimes| {
+-            runtimes
+-                .0
+-                .values()
+-                .filter_map(WeakEntity::upgrade)
+-                .collect()
+-        })
+-        .unwrap_or_default();
+-    for runtime in view_runtimes {
++    for runtime in live_runtimes(None, cx) {
+         runtime.update(cx, |runtime, cx| runtime.reload(cx));
+     }
+ }
+--- /dev/null
++++ b/src/ui/extensions/declarative/runtime/invalidation/live_runtime_registry.rs
+@@ -0,0 +1,175 @@
++//! Proposed registry regressions. Fixtures do not call attach, render or reload.
++//! Fixtures construct Runtime directly and explicitly register it; production
++//! factory registration still needs separate source/integration verification.
++
++use super::runtimes;
++use super::super::super::{
++    Host, Installed, LiveRuntimes, Runtimes, Runtime, ViewRuntimes, live_runtimes,
++    register_runtime, rehost_runtime, runtime_of,
++};
++use crate::ui::extensions::host::Lifetime;
++use crate::ui::workspace::Workspace;
++use gpui_kit::*;
++use std::collections::HashSet;
++
++fn with_context(run: impl FnOnce(&mut Window, &mut App)) {
++    let mut cx = ::gpui::TestAppContext::single();
++    cx.update(|cx| {
++        gpui_kit::init(cx);
++        crate::ui::prefs::init_in_memory(cx);
++    });
++    cx.add_empty_window().update(|window, cx| run(window, cx));
++}
++
++fn fixture(
++    extension: &'static str,
++    lifetime: Lifetime,
++    window: &mut Window,
++    cx: &mut App,
++) -> (Entity<Workspace>, Host, Entity<Runtime>) {
++    let workspace = cx.new(|cx| Workspace::test_empty(window, cx));
++    let host = Host::new(workspace.downgrade(), extension);
++    let host = if lifetime == Lifetime::Workspace {
++        host
++    } else {
++        host.isolated(lifetime)
++    };
++    let installed = Box::leak(Box::new(Installed {
++        dir: "/synthetic-registry-fixture".into(),
++        revision: 0,
++        manifest: serde_json::from_value(serde_json::json!({
++            "protocol": 4, "id": extension, "title": "Registry fixture",
++            "command": ["never-start"], "surfaces": {"document": {}}
++        }))
++        .unwrap(),
++    }));
++    let runtime = cx.new(|cx| Runtime::new(installed, host.clone(), window, cx));
++    register_runtime(&installed.manifest.id, &runtime, cx);
++    if let Some(owner) = host.runtime_scope().owner {
++        cx.default_global::<ViewRuntimes>()
++            .0
++            .insert((owner, extension), runtime.downgrade());
++    } else {
++        cx.default_global::<Runtimes>()
++            .0
++            .insert((host.identity(), extension), runtime.downgrade());
++    }
++    (workspace, host, runtime)
++}
++
++fn ids(runtimes: Vec<Entity<Runtime>>) -> HashSet<EntityId> {
++    let count = runtimes.len();
++    let ids: HashSet<_> = runtimes
++        .into_iter()
++        .map(|runtime| runtime.entity_id())
++        .collect();
++    assert_eq!(ids.len(), count, "each live recipient is returned once");
++    ids
++}
++
++#[::core::prelude::v1::test]
++fn rehost_keeps_displaced_recipient_and_changes_only_default_selection() {
++    with_context(|window, cx| {
++        let (_a, host_a, moved) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        let (_b, host_b, retained) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        assert_eq!(runtime_of(&host_b, cx).unwrap().entity_id(), retained.entity_id());
++        rehost_runtime(&moved, &host_b, cx);
++        assert_eq!(runtime_of(&host_a, cx).unwrap().entity_id(), moved.entity_id());
++        assert_eq!(runtime_of(&host_b, cx).unwrap().entity_id(), moved.entity_id());
++        let expected = HashSet::from([moved.entity_id(), retained.entity_id()]);
++        assert_eq!(ids(runtimes("registry-fixture", cx)), expected);
++        assert_eq!(ids(live_runtimes(None, cx)), expected);
++        // Repeated moves/aliases do not duplicate fanout or reload recipients.
++        rehost_runtime(&moved, &host_b, cx);
++        assert_eq!(ids(runtimes("registry-fixture", cx)), expected);
++    });
++}
++
++#[::core::prelude::v1::test]
++fn owned_views_and_other_packages_preserve_lookup_and_fanout_boundaries() {
++    with_context(|window, cx| {
++        let (_a, production_host, production) =
++            fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        let (_b, settings_host, settings) =
++            fixture("registry-fixture", Lifetime::Settings, window, cx);
++        let (_c, preview_host, preview) =
++            fixture("registry-fixture", Lifetime::Preview, window, cx);
++        let (_d, foreign_host, foreign) = fixture("other-fixture", Lifetime::Workspace, window, cx);
++        for (host, runtime) in [
++            (&production_host, &production),
++            (&settings_host, &settings),
++            (&preview_host, &preview),
++            (&foreign_host, &foreign),
++        ] {
++            assert_eq!(runtime_of(host, cx).unwrap().entity_id(), runtime.entity_id());
++        }
++        assert_eq!(
++            ids(runtimes("registry-fixture", cx)),
++            HashSet::from([production.entity_id(), settings.entity_id(), preview.entity_id()])
++        );
++        assert_eq!(ids(runtimes("other-fixture", cx)), HashSet::from([foreign.entity_id()]));
++        assert!(runtimes("absent-fixture", cx).is_empty());
++        assert_eq!(live_runtimes(None, cx).len(), 4);
++    });
++}
++
++#[::core::prelude::v1::test]
++fn registering_again_does_not_duplicate_or_change_defaults() {
++    with_context(|window, cx| {
++        let (_a, host_a, first) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        let (_b, host_b, second) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        register_runtime("registry-fixture", &first, cx);
++        register_runtime("registry-fixture", &first, cx);
++        assert_eq!(runtime_of(&host_a, cx).unwrap().entity_id(), first.entity_id());
++        assert_eq!(runtime_of(&host_b, cx).unwrap().entity_id(), second.entity_id());
++        assert_eq!(
++            ids(runtimes("registry-fixture", cx)),
++            HashSet::from([first.entity_id(), second.entity_id()])
++        );
++    });
++}
++
++#[::core::prelude::v1::test]
++fn expired_weak_entries_are_skipped_and_pruned_without_removing_live_entries() {
++    with_context(|window, cx| {
++        let (_a, _host_a, old) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        let (_b, _host_b, live) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        // Deterministic expired-reference fixture, not a native GC timing test.
++        cx.default_global::<LiveRuntimes>()
++            .0
++            .insert(old.entity_id(), ("registry-fixture", WeakEntity::new_invalid()));
++        assert_eq!(ids(runtimes("registry-fixture", cx)), HashSet::from([live.entity_id()]));
++        assert_eq!(cx.global::<LiveRuntimes>().0.len(), 2);
++        let (_c, _host_c, new) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        assert!(!cx.global::<LiveRuntimes>().0.contains_key(&old.entity_id()));
++        assert_eq!(
++            ids(runtimes("registry-fixture", cx)),
++            HashSet::from([live.entity_id(), new.entity_id()])
++        );
++        assert_eq!(cx.global::<LiveRuntimes>().0.len(), 2);
++    });
++}
++
++#[::core::prelude::v1::test]
++fn snapshots_release_the_global_borrow_before_subsequent_registration() {
++    with_context(|window, cx| {
++        let (_a, _host_a, first) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        let snapshot = live_runtimes(None, cx);
++        let (_b, _host_b, second) = fixture("registry-fixture", Lifetime::Workspace, window, cx);
++        assert_eq!(ids(snapshot), HashSet::from([first.entity_id()]));
++        assert_eq!(
++            ids(live_runtimes(None, cx)),
++            HashSet::from([first.entity_id(), second.entity_id()])
++        );
++    });
++}
++
++#[::core::prelude::v1::test]
++fn empty_registry_needs_no_default_global() {
++    with_context(|_window, cx| {
++        assert!(cx.try_global::<LiveRuntimes>().is_none());
++        assert!(runtimes("absent-fixture", cx).is_empty());
++        assert!(live_runtimes(None, cx).is_empty());
++        assert!(cx.try_global::<LiveRuntimes>().is_none());
++    });
++}
+--- a/src/ui/extensions/declarative/runtime/invalidation.rs
++++ b/src/ui/extensions/declarative/runtime/invalidation.rs
+@@ -5,24 +5,6 @@
+ use super::Runtime;
+ use crate::declarative::protocol::SurfaceKind;
+ use gpui_kit::*;
+-use std::collections::HashSet;
+-use std::hash::Hash;
+-
+-/// Rehosting can register one runtime under several host identities. Select
+-/// each live runtime once, including the sender, without retaining a registry
+-/// borrow while calling any runtime.
+-fn targets<'a, I: Eq + Hash, T>(
+-    extension: &str,
+-    entries: impl IntoIterator<Item = (&'a str, I, T)>,
+-) -> Vec<T> {
+-    let mut seen = HashSet::new();
+-    entries
+-        .into_iter()
+-        .filter_map(|(owner, identity, runtime)| {
+-            (owner == extension && seen.insert(identity)).then_some(runtime)
+-        })
+-        .collect()
+-}
+ 
+ pub(super) fn broadcast(extension: &str, cx: &mut App) {
+     broadcast_kind(extension, false, cx);
+@@ -33,30 +15,7 @@
+ }
+ 
+ pub(super) fn runtimes(extension: &str, cx: &App) -> Vec<Entity<Runtime>> {
+-    let mut runtimes = cx
+-        .try_global::<super::super::Runtimes>()
+-        .map(|runtimes| {
+-            targets(
+-                extension,
+-                runtimes.0.iter().filter_map(|((_, owner), runtime)| {
+-                    let runtime = runtime.upgrade()?;
+-                    Some((*owner, runtime.entity_id(), runtime))
+-                }),
+-            )
+-        })
+-        .unwrap_or_default();
+-    if let Some(owned) = cx.try_global::<super::super::ViewRuntimes>() {
+-        runtimes.extend(
+-            owned
+-                .0
+-                .values()
+-                .filter_map(WeakEntity::upgrade)
+-                .filter(|runtime| runtime.read(cx).extension_id() == extension),
+-        );
+-    }
+-    let mut seen = HashSet::new();
+-    runtimes.retain(|runtime| seen.insert(runtime.entity_id()));
+-    runtimes
++    super::super::live_runtimes(Some(extension), cx)
+ }
+ 
+ fn broadcast_kind(extension: &str, all: bool, cx: &mut App) {
+@@ -121,29 +80,10 @@
+ }
+ 
+ #[cfg(test)]
++mod live_runtime_registry;
++
++#[cfg(test)]
+ mod tests {
+-    use super::targets;
+-
+-    #[test]
+-    fn targets_include_sender_and_other_hosts_but_exclude_other_extensions_and_aliases() {
+-        let entries = [
+-            ("fixture-renderer", 1, ("settings-host", "sender")),
+-            ("fixture-renderer", 2, ("chat-host", "chat")),
+-            ("other-renderer", 3, ("chat-host", "other-package")),
+-            ("fixture-renderer", 2, ("rehosted-chat", "same-process")),
+-            ("fixture-renderer", 4, ("second-chat-host", "second-chat")),
+-        ];
+-        assert_eq!(
+-            targets("fixture-renderer", entries),
+-            vec![
+-                ("settings-host", "sender"),
+-                ("chat-host", "chat"),
+-                ("second-chat-host", "second-chat"),
+-            ]
+-        );
+-        assert!(targets("absent-renderer", entries).is_empty());
+-    }
+-
+     #[test]
+     fn settings_invalidation_advances_content_generation_without_a_mounted_runtime() {
+         let cx = ::gpui::TestAppContext::single();
