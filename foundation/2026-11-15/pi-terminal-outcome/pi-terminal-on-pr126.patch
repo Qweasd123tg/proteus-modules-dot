@@ -1,0 +1,380 @@
+--- a/examples/performance/coding-harness/README.md
++++ b/examples/performance/coding-harness/README.md
+@@ -96,6 +96,39 @@
+ Сохранённые исходные контроли находятся в
+ `target/performance/coding-harness/corpus-controls.json`.
+ 
++## Terminal outcome Native Pi
++
++Для pinned Pi 1.5.2 (`b4afdddf44e059c67ccf5097e5317d913521b470`)
++`agent_end` завершает лишь низкоуровневый проход: после него возможны retry,
++compaction и continuation. Общий `pi_terminal.py` использует окончательный
++assistant из последнего `agent_end.messages` перед `agent_settled` и сбрасывает
++его при новой активности. Для clean generation требуются ровно `expected_turns`
++settlements, каждый с `stopReason=stop` и `aborted=false`, без незавершённого хвоста.
++Прочие и неизвестные причины не считаются clean success этого coding evaluator;
++это не универсальное объявление `toolUse` или `deferred` ошибками протокола Pi.
++
++Metrics сохраняют прежние ошибки попыток и usage, отдельно записывают
++`pi_outcome` с итоговыми settlements и наблюдавшимися stop reasons. Успешное
++восстановление больше не проваливает pipeline только из-за старого error.
++Невосстановленный terminal `length` даёт diagnostic `length limit` и остаётся
++отдельным от grader PASS. Промежуточный recovered length сохраняется в
++`observed_stop_reasons`, но не становится terminal output-limit failure.
++
++Runner по-прежнему требует успешный exit, отсутствие timeout, model/reasoning
++verification и continuity. Report fallback использует тот же generation predicate:
++это не доказательство успешного CLI postprocessing или полноты всех billable calls.
++Все прежние ограничения usage categories и отсутствующих usage rows остаются.
++Старый неуспешный artifact без полной settlement boundary теперь даёт unknown.
++Сохранённый `pipeline_ok=true` fast path не переоценивается, старые результаты,
++оценки и benchmark таблицы автоматически не переписываются.
++
++Локальные synthetic controls, без CLI/API/LLM:
++
++```sh
++python3 -B examples/performance/coding-harness/pi_terminal_test.py
++python3 -B examples/performance/coding-harness/usage_report_test.py
++```
++
+ ## Живой запуск
+ 
+ Одиночный запуск профиля Pi с явной моделью и независимой проверкой результата.
+--- a/examples/performance/coding-harness/adapters.py
++++ b/examples/performance/coding-harness/adapters.py
+@@ -5,6 +5,8 @@
+ import shutil
+ import tomllib
+ from collections import Counter
++
++from pi_terminal import pi_outcome
+ 
+ HERE = Path(__file__).resolve().parent
+ CORE = HERE.parents[2]
+@@ -257,6 +259,7 @@
+     if agent == 'pi':
+         messages = [e['message'] for e in events if e.get('type') == 'message_end'
+                     and isinstance(e.get('message'), dict) and e['message'].get('role') == 'assistant']
++        outcome = pi_outcome(events)
+         rows = [m['usage'] for m in messages if isinstance(m.get('usage'), dict)]
+         levels = [row['thinkingLevel'] for path in (output/'runtime/pi-sessions').glob('*.jsonl')
+                   for row in json_lines(path) if row.get('type') == 'thinking_level_change']
+@@ -273,8 +276,11 @@
+                 'models': sorted({m.get('model', '') for m in messages}),
+                 'providers': sorted({m['provider'] for m in messages if m.get('provider')}),
+                 'reasoning_efforts': sorted(set(levels)),
+-                'settled': any(e.get('type') == 'agent_end' for e in events),
+-                'errors': [m.get('errorMessage') for m in messages if m.get('stopReason') in ('error','aborted')]}
++                'pi_outcome': outcome,
++                'settled': bool(outcome['settlements']) and not outcome['pending'],
++                'errors': [m.get('errorMessage') for m in messages if m.get('stopReason') in ('error','aborted')]
++                          + ['Native Pi terminal response reached the length limit.'
++                             for item in outcome['settlements'] if item['stop_reason'] == 'length']}
+     native = json.loads((output/'runtime/native/usage.json').read_text())
+     rows = native['sessions']
+     messages = native['assistant_messages']
+--- /dev/null
++++ b/examples/performance/coding-harness/pi_terminal.py
+@@ -0,0 +1,48 @@
++"""Final generation evidence from the pinned Pi JSON session lifecycle."""
++
++
++def pi_outcome(events):
++    settlements = []
++    observed_stops = []
++    started = False
++    pending = False
++    terminal = None
++    for event in events:
++        kind = event.get('type')
++        if kind == 'agent_start':
++            started = True
++            pending = True
++            terminal = None
++        elif kind in ('message_start', 'message_update', 'message_end'):
++            message = event.get('message', {})
++            role = message.get('role') if isinstance(message, dict) else None
++            if kind == 'message_end' and role == 'assistant':
++                observed_stops.append(message.get('stopReason'))
++            # JSON message_update omits message and only carries assistant deltas.
++            if kind == 'message_update' or role in ('user', 'assistant'):
++                pending = True
++                terminal = None
++        elif kind == 'agent_end':
++            terminal = None
++            messages = event.get('messages')
++            if started and event.get('willRetry') is False and isinstance(messages, list):
++                assistant = next((message for message in reversed(messages)
++                                  if isinstance(message, dict) and message.get('role') == 'assistant'), {})
++                terminal = assistant.get('stopReason')
++            started = False
++            pending = True
++        elif kind == 'agent_settled':
++            settlements.append({'stop_reason': terminal, 'aborted': event.get('aborted')})
++            started = False
++            pending = False
++            terminal = None
++    return {'settlements': settlements, 'pending': pending, 'observed_stop_reasons': observed_stops}
++
++
++def successful_pi_generations(outcome, expected_turns):
++    """Clean final generations, not a guarantee of successful CLI teardown or complete billing."""
++    settlements = outcome.get('settlements', [])
++    return (type(expected_turns) is int and expected_turns > 0
++            and outcome.get('pending') is False and len(settlements) == expected_turns
++            and all(item.get('stop_reason') == 'stop' and item.get('aborted') is False
++                    for item in settlements))
+--- /dev/null
++++ b/examples/performance/coding-harness/pi_terminal_test.py
+@@ -0,0 +1,186 @@
++"""Offline Pi terminal-generation controls; no native CLI or model execution."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++import adapters
++import long_report
++import runner
++import usage_report
++
++
++class PiTerminalChecks(unittest.TestCase):
++    def attempt(self, stop='stop', *, retry=False):
++        message = {'role': 'assistant', 'model': 'fixture', 'stopReason': stop,
++                   'content': [], 'usage': {'input': 10, 'cacheRead': 2, 'cacheWrite': 0, 'output': 3}}
++        if stop in ('error', 'aborted'):
++            message['errorMessage'] = 'synthetic 503' if stop == 'error' else 'synthetic abort'
++        return [{'type': 'agent_start'},
++                {'type': 'message_start', 'message': {'role': 'assistant', 'stopReason': 'pending'}},
++                {'type': 'message_end', 'message': message},
++                {'type': 'agent_end', 'willRetry': retry, 'messages': [message]}]
++
++    def settled(self, aborted=False):
++        return {'type': 'agent_settled', 'aborted': aborted}
++
++    def evaluate(self, path, events, expected=1, **overrides):
++        (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
++        sessions = path/'runtime/pi-sessions'
++        sessions.mkdir(parents=True, exist_ok=True)
++        (sessions/'fixture.jsonl').write_text(json.dumps({'type': 'thinking_level_change',
++                                                        'thinkingLevel': 'high'})+'\n')
++        metrics = adapters.metrics('pi', path)
++        result = {'agent': 'pi', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                  'timed_out': False, 'metrics': metrics, 'expected_turns': expected,
++                  'continuity_verified': True}
++        result.update(overrides)
++        runner.check_pipeline(result)
++        return result, usage_report.project_usage(path, result, metrics)
++
++    def test_recovered_error_is_not_terminal_failure(self):
++        recovered = self.attempt()
++        events = (self.attempt('error', retry=True)
++                  + [{'type': 'auto_retry_start', 'attempt': 1}]
++                  + recovered[:-1]
++                  + [{'type': 'auto_retry_end', 'success': True, 'attempt': 1}]
++                  + recovered[-1:]+[self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory)
++            result, usage = self.evaluate(path, events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['errors'], ['synthetic 503'])
++            self.assertEqual(result['metrics']['model_requests'], 2)
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['error', 'stop'])
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(usage['reported_usage']['input_tokens'], 24)
++            teardown, fallback = self.evaluate(path, events, returncode=1)
++            self.assertFalse(teardown['pipeline_ok'])
++            self.assertTrue(fallback['usage_complete'])
++
++    def test_terminal_length_is_not_clean_success(self):
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), self.attempt('length')+[self.settled()])
++            self.assertFalse(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['pi_outcome']['settlements'],
++                             [{'stop_reason': 'length', 'aborted': False}])
++            failures = result['metrics']['errors']
++            self.assertIn('model_output_limit', long_report.failure_taxonomy(result, {'passed': True}, failures)['classes'])
++            self.assertTrue(result['metrics']['settled'])
++            self.assertFalse(usage['usage_complete'])
++            self.assertIsNone(usage['tokens']['input_tokens'])
++            self.assertEqual(usage['reported_usage']['input_tokens'], 12)
++            self.assertEqual(usage['observed_partial_usage']['input_tokens'], 12)
++
++    def test_recovered_length_keeps_diagnostics_without_terminal_limit_failure(self):
++        events = (self.attempt('length')
++                  + [{'type': 'compaction_start', 'reason': 'overflow'},
++                     {'type': 'compaction_end', 'reason': 'overflow', 'aborted': False, 'willRetry': True}]
++                  + self.attempt()+[self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['length', 'stop'])
++            self.assertEqual(result['metrics']['errors'], [])
++            self.assertNotIn('model_output_limit', long_report.failure_taxonomy(result, {'passed': True}, [])['classes'])
++            self.assertTrue(usage['usage_complete'])
++
++    def test_tool_use_can_reach_clean_answer_in_one_low_level_run(self):
++        tool = self.attempt('toolUse')
++        call = {'type': 'toolCall', 'id': 'call-1', 'name': 'read', 'arguments': {'path': 'fixture.txt'}}
++        tool[2]['message']['content'] = [call]
++        answer = self.attempt()
++        result_message = {'role': 'toolResult', 'toolCallId': 'call-1', 'content': []}
++        events = (tool[:-1]
++                  + [{'type': 'message_end', 'message': result_message},
++                     {'type': 'turn_end'}, {'type': 'turn_start'}]
++                  + answer[1:-1]
++                  + [{'type': 'agent_end', 'willRetry': False,
++                      'messages': [tool[2]['message'], result_message, answer[2]['message']]}, self.settled()])
++        with tempfile.TemporaryDirectory() as directory:
++            result, usage = self.evaluate(Path(directory), events)
++            self.assertTrue(result['pipeline_ok'])
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(result['metrics']['model_requests'], 2)
++            self.assertEqual(result['metrics']['all_tool_calls'], 1)
++            self.assertEqual(result['metrics']['pi_outcome']['observed_stop_reasons'], ['toolUse', 'stop'])
++
++    def test_each_requested_run_requires_its_own_successful_settlement(self):
++        clean = self.attempt()+[self.settled()]
++        failed = self.attempt('error')+[self.settled()]
++        cases = [(clean+clean, 2, True), (failed+clean, 2, False),
++                 (clean, 2, False), (clean+clean, 1, False),
++                 (clean, 0, False), (clean, -1, False), (clean, True, False), (clean, '1', False)]
++        for events, expected, success in cases:
++            with self.subTest(expected=expected, events=len(events)), tempfile.TemporaryDirectory() as directory:
++                result, usage = self.evaluate(Path(directory), events, expected)
++                self.assertEqual(result['pipeline_ok'], success)
++                self.assertEqual(usage['usage_complete'], success)
++
++    def test_missing_or_invalidated_terminal_evidence_is_not_success(self):
++        completed = self.attempt()
++        cases = [completed,
++                 completed+[{'type': 'agent_start'}, self.settled()],
++                 completed+[{'type': 'message_start', 'message': {'role': 'assistant'}}, self.settled()],
++                 completed+[{'type': 'message_update', 'assistantMessageEvent': {'type': 'text_delta'}}, self.settled()],
++                 completed+[{'type': 'message_start', 'message': {'role': 'user'}}, self.settled()],
++                 completed+[self.settled(), {'type': 'agent_start'}],
++                 completed+[self.settled(True)],
++                 completed+[{'type': 'agent_settled'}],
++                 completed[1:]+[self.settled()],
++                 completed[:-1]+[{'type': 'agent_end', 'willRetry': False}, self.settled()],
++                 completed[:-1]+[{'type': 'agent_end', 'willRetry': False, 'messages': {}}, self.settled()],
++                 [{'type': 'agent_end', 'willRetry': False}, self.settled()]]
++        cases += [self.attempt(stop)+[self.settled()] for stop in
++                  ['error', 'aborted', 'pending', 'toolUse', 'deferred', 'future-stop', None]]
++        cases += [self.attempt(retry=True)+[self.settled()]]
++        for index, events in enumerate(cases):
++            with self.subTest(case=index), tempfile.TemporaryDirectory() as directory:
++                result, usage = self.evaluate(Path(directory), events)
++                self.assertFalse(result['pipeline_ok'])
++                self.assertFalse(usage['usage_complete'])
++
++    def test_pipeline_guards_remain_separate_from_generation_completion(self):
++        events = self.attempt()+[self.settled()]
++        overrides = [{'returncode': 1}, {'timed_out': True}, {'model': 'different'},
++                     {'reasoning': 'low'}, {'expected_turns': 2, 'continuity_verified': False}]
++        for changes in overrides:
++            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
++                result, _ = self.evaluate(Path(directory), events, **changes)
++                self.assertFalse(result['pipeline_ok'])
++        with tempfile.TemporaryDirectory() as directory:
++            events = (self.attempt()
++                      + [{'type': 'compaction_start', 'reason': 'threshold'},
++                         {'type': 'compaction_end', 'reason': 'threshold', 'errorMessage': 'synthetic failure'}]
++                      + [self.settled()])
++            result, usage = self.evaluate(Path(directory), events, returncode=1)
++            self.assertFalse(result['pipeline_ok'])
++            self.assertTrue(usage['usage_complete'])
++
++    def test_other_arm_pipeline_policies_are_unchanged(self):
++        codex = {'agent': 'codex', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                 'metrics': {'settled': True, 'errors': [], 'models': ['fixture'], 'reasoning_efforts': ['high']}}
++        runner.check_pipeline(codex)
++        self.assertTrue(codex['pipeline_ok'])
++        codex['metrics']['errors'] = ['synthetic failure']
++        runner.check_pipeline(codex)
++        self.assertFalse(codex['pipeline_ok'])
++        proteus = {'agent': 'proteus', 'model': 'fixture', 'reasoning': 'high', 'returncode': 0,
++                   'metrics': {'model_refs': [json.dumps({'model': 'fixture'})],
++                               'reasoning_refs': [json.dumps({'effort': 'high'})],
++                               'settlements': [{'status': 'success', 'error': None}],
++                               'model_requests': 2, 'model_responses': 2,
++                               'failures': [{'kind': 'model', 'message': 'recovered synthetic error'}]}}
++        runner.check_pipeline(proteus)
++        self.assertTrue(proteus['pipeline_ok'])
++
++    def test_stored_pipeline_success_fast_path_is_not_regraded(self):
++        with tempfile.TemporaryDirectory() as directory:
++            result = {'agent': 'pi', 'pipeline_ok': True, 'timed_out': False}
++            usage = usage_report.project_usage(Path(directory), result, {'provider_usage': {'input_tokens': 12}})
++            self.assertTrue(usage['usage_complete'])
++            self.assertEqual(usage['tokens']['input_tokens'], 12)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/examples/performance/coding-harness/runner.py
++++ b/examples/performance/coding-harness/runner.py
+@@ -12,6 +12,7 @@
+ 
+ import adapters
+ import open_code_native
++from pi_terminal import successful_pi_generations
+ 
+ 
+ def digest(path):
+@@ -99,7 +100,8 @@
+         models = metrics.get('models', [])
+         efforts = metrics.get('reasoning_efforts', [])
+         settled = metrics.get('settled', False)
+-        complete = not metrics.get('errors')
++        complete = (successful_pi_generations(metrics.get('pi_outcome', {}), report.get('expected_turns', 1))
++                    if report['agent'] == 'pi' else not metrics.get('errors'))
+     expected_model = report['model'].split('/', 1)[-1]
+     report['model_verified'] = bool(models) and all(model == expected_model for model in models)
+     if report['agent'] == 'opencode' or '/' in report['model']:
+--- a/examples/performance/coding-harness/usage_report.py
++++ b/examples/performance/coding-harness/usage_report.py
+@@ -1,5 +1,7 @@
+ """Shared usage evidence projection for short and long harness reports."""
+ import json
++
++from pi_terminal import pi_outcome, successful_pi_generations
+ 
+ TOKENS = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')
+ 
+@@ -38,16 +40,9 @@
+         ):
+             return True, 'Every canonical model exchange and task settlement completed before the CLI teardown error.'
+     elif agent == 'pi':
+-        completed = 0
+-        failed = False
+-        for event in json_lines(path/'stdout.jsonl'):
+-            if event.get('type') == 'agent_end' and not event.get('willRetry'):
+-                completed += 1
+-            message = event.get('message', {})
+-            if event.get('type') == 'message_end' and message.get('role') == 'assistant':
+-                failed |= message.get('stopReason') in ('error', 'aborted', 'pending')
+-        if completed >= result.get('expected_turns', 1) and not failed:
+-            return True, 'Each requested Pi turn emitted a final agent_end before the CLI error.'
++        outcome = pi_outcome(json_lines(path/'stdout.jsonl'))
++        if successful_pi_generations(outcome, result.get('expected_turns', 1)):
++            return True, 'Each requested Pi run settled after a clean final generation; CLI postprocessing can still fail.'
+     elif agent == 'opencode':
+         native = read_json(path/'runtime/native/usage.json') or {}
+         primary = native.get('assistant_messages', [])
+--- a/examples/performance/coding-harness/usage_report_test.py
++++ b/examples/performance/coding-harness/usage_report_test.py
+@@ -111,7 +111,11 @@
+     def test_existing_teardown_completion_policy_is_not_replaced_by_pipeline_boolean(self):
+         with tempfile.TemporaryDirectory() as directory:
+             path = Path(directory)
+-            (path/'stdout.jsonl').write_text(json.dumps({'type': 'agent_end', 'willRetry': False})+'\n')
++            events = [{'type': 'agent_start'},
++                      {'type': 'agent_end', 'willRetry': False,
++                       'messages': [{'role': 'assistant', 'stopReason': 'stop'}]},
++                      {'type': 'agent_settled', 'aborted': False}]
++            (path/'stdout.jsonl').write_text(''.join(json.dumps(event)+'\n' for event in events))
+             complete = usage_report.project_usage(path,
+                 {'agent': 'pi', 'pipeline_ok': False, 'expected_turns': 1},
+                 {'provider_usage': {'input_tokens': 10}})
