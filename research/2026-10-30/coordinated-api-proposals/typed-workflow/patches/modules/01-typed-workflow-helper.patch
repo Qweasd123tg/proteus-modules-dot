@@ -1,0 +1,1269 @@
+diff --git a/components/module-runtime/src/exports/workflow_tests/host.rs b/components/module-runtime/src/exports/workflow_tests/host.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b37137156600b338d65336625607600c2f43d63f
+--- /dev/null
++++ b/components/module-runtime/src/exports/workflow_tests/host.rs
+@@ -0,0 +1,54 @@
++use proteus_contracts::process_module::{ProcessModuleResult, WorkflowModuleHost};
++
++pub(super) struct NoHost;
++
++impl WorkflowModuleHost for NoHost {
++    fn checkpoint_history_json(&self, _checkpoint_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn is_cancelled(&self) -> ProcessModuleResult<bool> {
++        panic!("probe workflow must not call the host")
++    }
++    fn queued_user_messages(&self) -> ProcessModuleResult<u32> {
++        panic!("probe workflow must not call the host")
++    }
++    fn build_context_json(&self, _task_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn start_model_stream_json(&self, _request_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn next_model_stream_json(&self, _cursor_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++
++    fn complete_model_json(&self, _request_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn prepare_context_json(&self, _input_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn visible_tools_json(&self, _cwd: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn select_tools_json(&self, _request_json: String) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn execute_tool_json(
++        &self,
++        _task_json: String,
++        _call_json: String,
++    ) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++    fn emit_event_json(&self, _event_json: String) -> ProcessModuleResult<()> {
++        panic!("probe workflow must not call the host")
++    }
++    fn execute_tools_json(
++        &self,
++        _task_json: String,
++        _calls_json: String,
++    ) -> ProcessModuleResult<String> {
++        panic!("probe workflow must not call the host")
++    }
++}
+diff --git a/components/module-runtime/src/exports/workflow_tests.rs b/components/module-runtime/src/exports/workflow_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7d4f23f594ef5b76324899058bbd30b24cafe28
+--- /dev/null
++++ b/components/module-runtime/src/exports/workflow_tests.rs
+@@ -0,0 +1,213 @@
++use std::sync::{Arc, Mutex};
++
++use proteus_contracts::{
++    contracts::{
++        PROCESS_WORKFLOW_CONTRACT_VERSION, ProcessModuleComposition, ProcessWorkflowRuntimeInfo,
++        WorkflowFailure, WorkflowHistoryUpdate,
++    },
++    domain::{AgentOutput, AgentTask, PermissionMode, ReasoningConfig, new_execution_id},
++    model_standard::{CanonicalMessage, ContentPart, MessageRole, ModelFailure, ModelFailureKind},
++    process_module::{WorkflowModule, WorkflowModuleOutput},
++};
++use serde_json::json;
++
++use super::*;
++
++mod host;
++use host::NoHost;
++
++struct Probe {
++    seen: Arc<Mutex<Vec<WorkflowModuleInput>>>,
++    result: Mutex<Option<Result<WorkflowModuleOutput, WorkflowFailure>>>,
++}
++
++impl WorkflowModule for Probe {
++    fn run(
++        &self,
++        input: WorkflowModuleInput,
++        _host: &mut dyn WorkflowModuleHost,
++    ) -> Result<WorkflowModuleOutput, WorkflowFailure> {
++        self.seen.lock().unwrap().push(input);
++        self.result.lock().unwrap().take().expect("one invocation")
++    }
++}
++
++fn fixture(
++    result: Result<WorkflowModuleOutput, WorkflowFailure>,
++) -> (ModuleExport, Arc<Mutex<Vec<WorkflowModuleInput>>>) {
++    let seen = Arc::new(Mutex::new(Vec::new()));
++    let mut modules = CollectedModules::default();
++    modules.workflows.insert(
++        "probe".into(),
++        Box::new(Probe {
++            seen: Arc::clone(&seen),
++            result: Mutex::new(Some(result)),
++        }),
++    );
++    let binding = ProcessComponentExportInitialize::new(
++        "workflow",
++        "probe",
++        PROCESS_WORKFLOW_CONTRACT_VERSION,
++        ProcessModuleComposition::SelectOne,
++        json!({"selected_export": true}),
++        std::iter::empty::<String>(),
++    );
++    (ModuleExport::new(binding, modules, None), seen)
++}
++
++fn input() -> ProcessWorkflowInput {
++    ProcessWorkflowInput {
++        task: AgentTask::new("owned task", ".".into()),
++        history: vec![CanonicalMessage::text(MessageRole::User, "owned history")],
++        runtime: ProcessWorkflowRuntimeInfo {
++            execution_id: new_execution_id(),
++            conversation: None,
++            model_ref: None,
++            model_context: Vec::new(),
++            interrupted_turns: Vec::new(),
++            instructions: Vec::new(),
++            intent: None,
++            continuation: None,
++            permission_mode: PermissionMode::Normal,
++            reasoning: ReasoningConfig::default(),
++            max_input_tokens: None,
++            model_timeout_ms: 1000,
++            context_timeout_ms: 1000,
++            workflow_timeout_ms: 0,
++        },
++    }
++}
++
++fn output() -> WorkflowModuleOutput {
++    WorkflowModuleOutput {
++        output: AgentOutput::new("done", json!({})),
++        new_messages: vec![CanonicalMessage::text(MessageRole::Assistant, "done")],
++        history_replacement: None,
++        compactions: Vec::new(),
++    }
++}
++
++#[test]
++fn helper_receives_owned_input_and_only_the_bound_export_config() {
++    let expected = input();
++    let params = serde_json::to_value(&expected).unwrap();
++    let task_pointer = params["task"]["text"].as_str().unwrap().as_ptr();
++    let (export, seen) = fixture(Ok(output()));
++    let response = export.workflow(params, &mut NoHost).unwrap();
++    assert_eq!(response["status"], "success");
++    let seen = seen.lock().unwrap();
++    assert_eq!(seen.len(), 1);
++    assert_eq!(seen[0].task, expected.task);
++    assert_eq!(seen[0].history, expected.history);
++    assert_eq!(seen[0].runtime, expected.runtime);
++    assert_eq!(seen[0].config, json!({"selected_export": true}));
++    assert_eq!(seen[0].task.text.as_ptr(), task_pointer);
++}
++
++#[test]
++fn process_decode_stays_strict_before_helper_invocation() {
++    let valid = serde_json::to_value(input()).unwrap();
++    let mut malformed = vec![{
++        let mut value = valid.clone();
++        value["config"] = json!({"cannot_override_binding": true});
++        value
++    }];
++    for field in ["conversation", "model_ref", "continuation"] {
++        let mut value = valid.clone();
++        value["runtime"].as_object_mut().unwrap().remove(field);
++        malformed.push(value);
++    }
++    let mut missing_history = valid;
++    missing_history.as_object_mut().unwrap().remove("history");
++    malformed.push(missing_history);
++    for params in malformed {
++        let (export, seen) = fixture(Ok(output()));
++        assert!(export.workflow(params, &mut NoHost).is_err());
++        assert!(seen.lock().unwrap().is_empty());
++    }
++}
++
++#[test]
++fn history_replacement_option_is_not_collapsed() {
++    for replacement in [None, Some(Vec::new())] {
++        let mut expected = output();
++        expected.history_replacement = replacement.clone();
++        let (export, _) = fixture(Ok(expected.clone()));
++        let response = export
++            .workflow(serde_json::to_value(input()).unwrap(), &mut NoHost)
++            .unwrap();
++        let ProcessWorkflowResponse::Success { result } = serde_json::from_value(response).unwrap()
++        else {
++            panic!("expected successful envelope")
++        };
++        assert_eq!(result.history_replacement, replacement);
++        assert_eq!(result.new_messages, expected.new_messages);
++        assert_eq!(result.compactions, expected.compactions);
++    }
++}
++
++#[test]
++fn algorithm_failure_preserves_explicit_history_and_model_cause() {
++    let completed = CanonicalMessage::text(MessageRole::Assistant, "completed before failure");
++    let model_failure = ModelFailure::new(ModelFailureKind::StreamDisconnected, "stream lost")
++        .with_completed_messages(vec![completed.clone()]);
++    let expected = WorkflowFailure {
++        message: "workflow stopped".into(),
++        history: Some(
++            WorkflowHistoryUpdate::new(vec![completed]).with_history_replacement(Vec::new()),
++        ),
++        model_failure: Some(model_failure),
++    };
++    let (export, _) = fixture(Err(expected.clone()));
++    let response = export
++        .workflow(serde_json::to_value(input()).unwrap(), &mut NoHost)
++        .unwrap();
++    assert_eq!(
++        serde_json::from_value::<ProcessWorkflowResponse>(response).unwrap(),
++        ProcessWorkflowResponse::failed(expected),
++    );
++}
++
++#[test]
++fn helper_no_longer_imposes_a_text_parser_depth_limit() {
++    let mut expected = output();
++    let mut metadata = Value::Null;
++    for _ in 0..160 {
++        metadata = Value::Array(vec![metadata]);
++    }
++    expected.output.metadata = metadata.clone();
++    // Characterize the removed helper parse, not the actual transport parser.
++    let old_text = serde_json::to_string(&expected).unwrap();
++    assert!(serde_json::from_str::<WorkflowModuleOutput>(&old_text).is_err());
++    let (export, _) = fixture(Ok(expected));
++    let response = export
++        .workflow(serde_json::to_value(input()).unwrap(), &mut NoHost)
++        .unwrap();
++    assert_eq!(response["result"]["output"]["metadata"], metadata);
++    // The real wire reader remains strict; typed helper acceptance is not a
++    // promise that this deliberately oversized nesting can cross that boundary.
++    assert!(serde_json::from_str::<Value>(&serde_json::to_string(&response).unwrap()).is_err());
++}
++
++#[cfg(unix)]
++#[test]
++fn unencodable_output_path_is_a_transport_error_not_an_algorithm_failure() {
++    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
++
++    let mut expected = output();
++    expected.new_messages = vec![CanonicalMessage::new(
++        MessageRole::Assistant,
++        vec![ContentPart::FileRef {
++            path: PathBuf::from(OsString::from_vec(vec![0xff])),
++            content: None,
++        }],
++    )];
++    // Previously workflows.rs mapped this encoding error to WorkflowFailure.
++    assert!(serde_json::to_string(&expected).is_err());
++    let (export, seen) = fixture(Ok(expected));
++    let error = export
++        .workflow(serde_json::to_value(input()).unwrap(), &mut NoHost)
++        .unwrap_err();
++    assert!(error.downcast_ref::<serde_json::Error>().is_some());
++    assert_eq!(seen.lock().unwrap().len(), 1);
++}
+diff --git a/components/module-runtime/src/exports.rs b/components/module-runtime/src/exports.rs
+index d2fd5125cf84737bb8a003378d31a6294a3852e1..5e6bef92de8fa5c0e80613611de546aae910b4a2 100644
+--- a/components/module-runtime/src/exports.rs
++++ b/components/module-runtime/src/exports.rs
+@@ -10,7 +10,7 @@ use proteus_contracts::{
+     },
+     process_module::{
+         ContextBuilderModuleInput, PolicyModuleInvocationContext, PolicyModuleVisibilityContext,
+-        ToolModuleInvocationContext, WorkflowModuleInput, WorkflowModuleOutput,
++        ToolModuleInvocationContext, WorkflowModuleHost, WorkflowModuleInput,
+     },
+ };
+ use proteus_module_protocol::process_contract_authority;
+@@ -99,7 +99,7 @@ impl ModuleExport {
+             "policy" => self.policy(method, params),
+             "context" => self.context(params, bridge),
+             "context_provider" => self.context_provider(method, params),
+-            "workflow" => self.workflow(params, bridge),
++            "workflow" => self.workflow(params, &mut WorkflowHostBridge(bridge.clone())),
+             slot => bail!("reference-module does not dispatch slot {slot:?}"),
+         }
+     }
+@@ -265,7 +265,7 @@ impl ModuleExport {
+         )?))
+     }
+ 
+-    fn workflow(&self, params: Value, bridge: &HostBridge) -> Result<Value> {
++    fn workflow(&self, params: Value, host: &mut dyn WorkflowModuleHost) -> Result<Value> {
+         let input: ProcessWorkflowInput = decode(params)?;
+         let workflow = self
+             .modules
+@@ -278,12 +278,10 @@ impl ModuleExport {
+             config: self.binding.module_config.clone(),
+             runtime: input.runtime,
+         };
+-        let mut host = WorkflowHostBridge(bridge.clone());
+-        let output = match workflow.run_json(serde_json::to_string(&module_input)?, &mut host) {
++        let output = match workflow.run(module_input, host) {
+             Ok(output) => output,
+             Err(failure) => return encode(ProcessWorkflowResponse::failed(failure)),
+         };
+-        let output: WorkflowModuleOutput = serde_json::from_str(output.as_str())?;
+         let mut result = WorkflowOutput::new(output.output, output.new_messages)
+             .with_compactions(output.compactions);
+         if let Some(messages) = output.history_replacement {
+@@ -310,3 +308,6 @@ impl proteus_module_sdk::Export for ModuleExport {
+         self.dispatch(method, params, host)
+     }
+ }
++
++#[cfg(test)]
++mod workflow_tests;
+diff --git a/docs/reference.md b/docs/reference.md
+index 0fc12b0525a9518c5014865492d6541798df5490..58d459bec7525ad2bc857e64fc2c81a963c41e7f 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -118,6 +118,13 @@ readable immutable prefix, не fsync durability или гарантирован
+   а JSON кодируйте один раз у process/HTTP/storage writer. API, требующий строку,
+   и подпись точных bytes — конкретные исключения, не повод для roundtrip
+   между соседними helpers. Strict validation и wire format сохраняются.
++  `WorkflowModule::run` использует именно owned typed input/output. Его alpha
++  contract не обещает внутреннюю serde normalization: helper-only parse/depth
++  errors удалены; unencodable output даёт transport error при кодировании
++  terminal response. Ошибка алгоритма сохраняет `WorkflowFailure`, включая
++  model cause и completed history. Wire validation, callbacks, checkpoint ACK
++  и различие `None`/`Some([])` history replacement не меняются. Не возвращайте
++  `run_json` wrapper ради совместимости старых Rust потребителей.
+   В OpenAI HTTP retry одна фаза повторяет уже подготовленный request: JSON
+   body сериализуется один раз, попытки разделяют immutable bytes reqwest.
+   Encoded body живёт до конца фазы, включая backoff; drop future освобождает
+diff --git a/workflow/coding-workflow/src/tests/cache.rs b/workflow/coding-workflow/src/tests/cache.rs
+index f97263c746589a69459d770db8042ce0749f91c2..50b592f13d7c5537a6ecec9afeb8e24962861d6e 100644
+--- a/workflow/coding-workflow/src/tests/cache.rs
++++ b/workflow/coding-workflow/src/tests/cache.rs
+@@ -22,14 +22,12 @@ fn stable_context_keeps_the_next_turn_wire_input_append_only() {
+         .as_ref()
+         .unwrap()
+         .session_id;
+-    let first_input_json = serde_json::to_string(&first_input).expect("first input json");
++
+     let mut first_host = FakeHost::default().with_context_text("stable workspace context");
+ 
+-    let first_output_json = CodingSingleLoopWorkflow::default()
+-        .run_json(first_input_json, &mut first_host)
++    let first_output = CodingSingleLoopWorkflow::default()
++        .run(first_input.clone(), &mut first_host)
+         .expect("first workflow turn succeeds");
+-    let first_output: WorkflowModuleOutput =
+-        serde_json::from_str(first_output_json.as_str()).expect("first output json");
+     let first_request = first_host.requests.lock().expect("first requests")[0].clone();
+ 
+     let mut second_input = workflow_input("second question");
+@@ -44,11 +42,11 @@ fn stable_context_keeps_the_next_turn_wire_input_append_only() {
+         .as_mut()
+         .unwrap()
+         .session_id = session_id;
+-    let second_input_json = serde_json::to_string(&second_input).expect("second input json");
++
+     let mut second_host = FakeHost::default().with_context_text("stable workspace context");
+ 
+     CodingSingleLoopWorkflow::default()
+-        .run_json(second_input_json, &mut second_host)
++        .run(second_input, &mut second_host)
+         .expect("second workflow turn succeeds");
+     let second_request = second_host.requests.lock().expect("second requests")[0].clone();
+ 
+diff --git a/workflow/coding-workflow/src/tests/codex_loop.rs b/workflow/coding-workflow/src/tests/codex_loop.rs
+index ac16bdb432c03ddcdd74d9f58390beb5bbb3804a..3f87e60b114346343011b438ad283ad37537cf91 100644
+--- a/workflow/coding-workflow/src/tests/codex_loop.rs
++++ b/workflow/coding-workflow/src/tests/codex_loop.rs
+@@ -38,7 +38,7 @@ fn codex_loop_carries_overflow_estimate_until_provider_reports_usage() {
+     ];
+     let mut host = FakeHost::with_responses(responses);
+     CodingCodexLoopWorkflow
+-        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+ 
+     let compactions = host.compactions.lock().expect("compactions");
+@@ -62,7 +62,7 @@ fn repeated_overflow_does_not_force_compaction_estimate() {
+     ];
+     let mut host = FakeHost::default();
+     CodingCodexLoopWorkflow
+-        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+ 
+     let compactions = host.compactions.lock().expect("compactions");
+@@ -81,7 +81,7 @@ fn codex_loop_runs_tool_round_then_stops_on_non_tool_response() {
+         "runtime codex base instructions",
+         100,
+     )];
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let apply_patch = test_tool("apply_patch", "Apply patch", ToolSafety::WritesFiles);
+     let call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+@@ -95,11 +95,9 @@ fn codex_loop_runs_tool_round_then_stops_on_non_tool_response() {
+     ])
+     .with_tools(vec![read_file.clone(), apply_patch], vec![read_file]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "final answer");
+     assert_eq!(
+@@ -177,7 +175,7 @@ fn codex_loop_runs_tool_round_then_stops_on_non_tool_response() {
+ #[test]
+ fn codex_loop_returns_completed_tool_progress_when_the_next_model_call_fails() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+     let completed = CanonicalMessage::text(MessageRole::Assistant, "finished commentary")
+@@ -192,7 +190,7 @@ fn codex_loop_returns_completed_tool_progress_when_the_next_model_call_fails() {
+         );
+ 
+     let failure = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("second model call must fail");
+ 
+     assert_eq!(failure.model_failure, Some(model_failure));
+@@ -224,7 +222,7 @@ fn codex_loop_returns_completed_tool_progress_when_the_next_model_call_fails() {
+ #[test]
+ fn codex_loop_omits_history_when_the_first_model_call_fails() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::default().with_model_failure(
+         1,
+         ProcessModuleError::from_model_failure(
+@@ -233,7 +231,7 @@ fn codex_loop_omits_history_when_the_first_model_call_fails() {
+     );
+ 
+     let failure = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("first model call must fail");
+ 
+     assert!(failure.history.is_none());
+@@ -242,7 +240,7 @@ fn codex_loop_omits_history_when_the_first_model_call_fails() {
+ 
+ #[test]
+ fn codex_loop_does_not_preserve_summary_output_from_a_failed_compactor() {
+-    let input_json = serde_json::to_string(&workflow_input("change code")).unwrap();
++    let input = workflow_input("change code");
+     let summary = CanonicalMessage::text(MessageRole::Assistant, "internal summary");
+     let summary_tool = tool_call_response(ToolCall::new("summary_call", "read_file", json!({})))
+         .messages
+@@ -255,9 +253,7 @@ fn codex_loop_does_not_preserve_summary_output_from_a_failed_compactor() {
+         ..FakeHost::default()
+     };
+ 
+-    let failure = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
+-        .unwrap_err();
++    let failure = CodingCodexLoopWorkflow.run(input, &mut host).unwrap_err();
+     assert!(
+         failure.history.is_none(),
+         "summary output is not workflow history"
+@@ -280,13 +276,13 @@ fn codex_loop_returns_applied_compaction_when_model_call_fails() {
+         vec![generated_summary],
+         Some("compacted summary".to_owned()),
+     );
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::default()
+         .with_compaction_outputs(vec![compacted_output])
+         .with_model_failure(1, ProcessModuleError::new("provider failed"));
+ 
+     let failure = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("model call must fail");
+ 
+     let history = failure.history.expect("applied compaction state");
+@@ -299,7 +295,7 @@ fn codex_loop_returns_applied_compaction_when_model_call_fails() {
+ #[test]
+ fn codex_loop_continues_when_provider_sets_end_turn_false() {
+     let input = workflow_input("continue until the provider ends the turn");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::with_responses(vec![
+         CanonicalModelResponse::new(
+             CanonicalMessage::text(MessageRole::Assistant, "intermediate"),
+@@ -315,11 +311,9 @@ fn codex_loop_continues_when_provider_sets_end_turn_false() {
+         .with_end_turn(true),
+     ]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "final answer");
+     assert_eq!(host.requests.lock().expect("requests").len(), 2);
+@@ -336,7 +330,7 @@ fn codex_loop_continues_when_provider_sets_end_turn_false() {
+ #[test]
+ fn codex_loop_preserves_commentary_and_uses_the_last_message_as_final_output() {
+     let input = workflow_input("preserve Codex response item phases");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let response = CanonicalModelResponse::from_messages(
+         vec![
+             CanonicalMessage::text(MessageRole::Assistant, "checking files")
+@@ -349,11 +343,9 @@ fn codex_loop_preserves_commentary_and_uses_the_last_message_as_final_output() {
+     );
+     let mut host = FakeHost::with_responses(vec![response]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(&output_json).expect("workflow output json");
+ 
+     assert_eq!(output.output.text, "done");
+     let assistant_messages = output
+@@ -369,7 +361,7 @@ fn codex_loop_preserves_commentary_and_uses_the_last_message_as_final_output() {
+ #[test]
+ fn codex_loop_empty_final_response_stays_strict_by_default() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+     let mut host = FakeHost::with_responses(vec![
+@@ -382,11 +374,9 @@ fn codex_loop_empty_final_response_stays_strict_by_default() {
+     ])
+     .with_tools(vec![read_file.clone()], vec![read_file]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "<empty model response>");
+     assert!(!output.output.text.contains("read_file ok"));
+@@ -403,7 +393,7 @@ fn codex_loop_empty_final_response_stays_strict_by_default() {
+ #[test]
+ fn codex_loop_errors_on_tool_finish_without_tool_calls() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::with_responses(vec![CanonicalModelResponse::new(
+         CanonicalMessage::text(MessageRole::Assistant, ""),
+         Vec::new(),
+@@ -411,7 +401,7 @@ fn codex_loop_errors_on_tool_finish_without_tool_calls() {
+     )]);
+ 
+     let error = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -438,7 +428,7 @@ fn codex_loop_errors_on_tool_finish_without_tool_calls() {
+ #[test]
+ fn codex_loop_errors_on_length_response() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::with_responses(vec![CanonicalModelResponse::new(
+         CanonicalMessage::text(MessageRole::Assistant, "partial"),
+         Vec::new(),
+@@ -446,7 +436,7 @@ fn codex_loop_errors_on_length_response() {
+     )]);
+ 
+     let error = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(error.message.as_str().contains("length limit"));
+@@ -461,7 +451,7 @@ fn codex_loop_errors_on_length_response() {
+ #[test]
+ fn codex_loop_errors_when_tool_calls_do_not_match_message_parts() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+     let mut host = FakeHost::with_responses(vec![CanonicalModelResponse::new(
+@@ -472,7 +462,7 @@ fn codex_loop_errors_when_tool_calls_do_not_match_message_parts() {
+     .with_tools(vec![read_file.clone()], vec![read_file]);
+ 
+     let error = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -492,7 +482,7 @@ fn codex_loop_errors_when_tool_calls_do_not_match_message_parts() {
+ #[test]
+ fn codex_loop_rejects_message_only_tool_call_before_finishing() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let hidden_call = ToolCall::new(
+         new_call_id(),
+         "hidden_write",
+@@ -508,7 +498,7 @@ fn codex_loop_rejects_message_only_tool_call_before_finishing() {
+     )]);
+ 
+     let error = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -523,7 +513,7 @@ fn codex_loop_rejects_message_only_tool_call_before_finishing() {
+ #[test]
+ fn codex_loop_returns_unrequested_tool_error_to_model_without_execution() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let apply_patch = test_tool("apply_patch", "Apply patch", ToolSafety::WritesFiles);
+     let call = ToolCall::new(
+@@ -541,11 +531,9 @@ fn codex_loop_returns_unrequested_tool_error_to_model_without_execution() {
+     ])
+     .with_tools(vec![read_file.clone(), apply_patch], vec![read_file]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "recovered final");
+     assert!(
+@@ -575,7 +563,7 @@ fn codex_loop_returns_unrequested_tool_error_to_model_without_execution() {
+ #[test]
+ fn codex_loop_errors_when_changed_compaction_drops_current_user_message() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut bad_output = proteus_contracts::contracts::ContextPreparationOutput::changed(
+         vec![CanonicalMessage::text(MessageRole::User, "summary only")],
+         Some("summary only".to_owned()),
+@@ -596,7 +584,7 @@ fn codex_loop_errors_when_changed_compaction_drops_current_user_message() {
+     ]);
+ 
+     let error = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -633,14 +621,12 @@ fn codex_loop_separates_compacted_history_from_new_turn_messages() {
+         vec![generated_summary],
+         Some("compacted summary".to_owned()),
+     );
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::default().with_compaction_outputs(vec![compacted_output]);
+ 
+-    let output_json = CodingCodexLoopWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingCodexLoopWorkflow
++        .run(input.clone(), &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     let compactions = host.compactions.lock().unwrap();
+     assert_eq!(
+diff --git a/workflow/coding-workflow/src/tests/codex_stream_recovery.rs b/workflow/coding-workflow/src/tests/codex_stream_recovery.rs
+index 16dd56e8d38c09cee323343c004d39565d05ec74..1fbbe76b9195aee182c6052e423f8bc5dbf73fdd 100644
+--- a/workflow/coding-workflow/src/tests/codex_stream_recovery.rs
++++ b/workflow/coding-workflow/src/tests/codex_stream_recovery.rs
+@@ -27,12 +27,9 @@ fn codex_stream_retry_budget_is_per_sampling_request_and_preserves_progress() {
+             (3, sample_failure(kind, second.clone())),
+         ]);
+ 
+-        let output: WorkflowModuleOutput = serde_json::from_str(
+-            &CodingCodexLoopWorkflow
+-                .run_json(serde_json::to_string(&input).unwrap(), &mut host)
+-                .expect("each successful sampling request resets the stream budget"),
+-        )
+-        .unwrap();
++        let output = CodingCodexLoopWorkflow
++            .run(input, &mut host)
++            .expect("each successful sampling request resets the stream budget");
+         let requests = host.requests.lock().unwrap();
+         assert_eq!(requests.len(), 4);
+         assert_eq!(requests[1].messages.last(), Some(&first));
+@@ -87,7 +84,7 @@ fn codex_stream_completed_items_do_not_reset_the_retry_budget() {
+     *host.model_failures.lock().unwrap() =
+         VecDeque::from([(1, disconnected(first.clone())), (2, terminal.clone())]);
+     let failure = CodingCodexLoopWorkflow
+-        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .run(input, &mut host)
+         .expect_err("completed messages must not grant another retry");
+     assert_eq!(host.requests.lock().unwrap().len(), 2);
+     assert_eq!(failure.model_failure, terminal.model_failure);
+@@ -115,7 +112,7 @@ fn codex_stream_retry_requires_the_typed_cause_and_can_be_disabled() {
+         let mut host = FakeHost::default()
+             .with_model_failure(1, ProcessModuleError::from_model_failure(expected.clone()));
+         let failure = CodingCodexLoopWorkflow
+-            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++            .run(input, &mut host)
+             .expect_err("no retry");
+         assert_eq!(host.requests.lock().unwrap().len(), 1);
+         assert_eq!(failure.model_failure, Some(expected));
+@@ -151,9 +148,7 @@ fn completed_tools_are_drained_before_terminal_model_failure() {
+         let mut host = FakeHost::default()
+             .with_tools(vec![read.clone()], vec![read])
+             .with_model_failure(1, ProcessModuleError::from_model_failure(expected.clone()));
+-        let failure = CodingCodexLoopWorkflow
+-            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
+-            .unwrap_err();
++        let failure = CodingCodexLoopWorkflow.run(input, &mut host).unwrap_err();
+         assert_eq!(failure.model_failure, Some(expected));
+         assert_eq!(
+             host.executed_calls.lock().unwrap().as_slice(),
+diff --git a/workflow/coding-workflow/src/tests/codex_tool_dispatch.rs b/workflow/coding-workflow/src/tests/codex_tool_dispatch.rs
+index 5a3db66e12306a8b70881f23758553a5d64301d0..336a65152cfc4907047105c850f96f4d13d0ae0e 100644
+--- a/workflow/coding-workflow/src/tests/codex_tool_dispatch.rs
++++ b/workflow/coding-workflow/src/tests/codex_tool_dispatch.rs
+@@ -28,10 +28,7 @@ fn codex_keeps_model_call_and_declares_the_adapted_execution_once() {
+         vec![test_tool("shell", "Shell", ToolSafety::RunsCommands)],
+     );
+     CodingCodexLoopWorkflow
+-        .run_json(
+-            serde_json::to_string(&workflow_input("patch")).unwrap(),
+-            &mut host,
+-        )
++        .run(workflow_input("patch"), &mut host)
+         .unwrap();
+     let executed = host.executed_calls.lock().unwrap();
+     assert_eq!(executed.len(), 1);
+@@ -60,10 +57,7 @@ fn hidden_shell_is_not_adapted_into_a_visible_patch_tool() {
+         vec![test_tool("apply_patch", "Patch", ToolSafety::WritesFiles)],
+     );
+     CodingCodexLoopWorkflow
+-        .run_json(
+-            serde_json::to_string(&workflow_input("patch")).unwrap(),
+-            &mut host,
+-        )
++        .run(workflow_input("patch"), &mut host)
+         .unwrap();
+     assert!(host.executed_calls.lock().unwrap().is_empty());
+     assert!(host.checkpoints.lock().unwrap()[0].tool_results.is_empty());
+@@ -83,10 +77,7 @@ fn ordinary_workflow_does_not_apply_codex_command_adaptation() {
+         ],
+     );
+     CodingSingleLoopWorkflow::default()
+-        .run_json(
+-            serde_json::to_string(&workflow_input("patch")).unwrap(),
+-            &mut host,
+-        )
++        .run(workflow_input("patch"), &mut host)
+         .unwrap();
+     assert_eq!(*host.executed_calls.lock().unwrap(), vec![call]);
+ }
+@@ -99,10 +90,7 @@ fn invalid_raw_shell_arguments_are_not_repaired_by_patch_adaptation() {
+         vec![test_tool("shell", "Shell", ToolSafety::RunsCommands)],
+     );
+     CodingCodexLoopWorkflow
+-        .run_json(
+-            serde_json::to_string(&workflow_input("patch")).unwrap(),
+-            &mut host,
+-        )
++        .run(workflow_input("patch"), &mut host)
+         .unwrap();
+     assert_eq!(*host.executed_calls.lock().unwrap(), vec![call]);
+ }
+diff --git a/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs b/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
+index 0f403d3b38c4bd85ccaafcf8f2aaa2e423274089..1a2fa186a86b7195e787d3459f2df33c579ac10e 100644
+--- a/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
++++ b/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
+@@ -64,7 +64,7 @@ fn proteus_tool_call_preserves_execution_identity_and_actual_result() {
+         }),
+     );
+     let input = workflow_input("call hidden tool");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let hidden_echo = test_tool("hidden_echo", "Echo hidden file", ToolSafety::ReadOnly);
+     let mut host = FakeHost::with_responses(vec![
+         tool_call_response(outer_call.clone()),
+@@ -76,11 +76,9 @@ fn proteus_tool_call_preserves_execution_identity_and_actual_result() {
+     ])
+     .with_tools(vec![hidden_echo], Vec::new());
+ 
+-    let output_json = CodingSingleLoopWorkflow::default()
+-        .run_json(input_json, &mut host)
++    let output = CodingSingleLoopWorkflow::default()
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     let executed_calls = host.executed_calls.lock().expect("executed calls");
+     assert_eq!(executed_calls.len(), 1);
+diff --git a/workflow/coding-workflow/src/tests/failure_history.rs b/workflow/coding-workflow/src/tests/failure_history.rs
+index 03d8b7ae1ab454258086070c8390f3289262af02..95bec4bbecc5062d14ae523a748ea8f87a9c71bb 100644
+--- a/workflow/coding-workflow/src/tests/failure_history.rs
++++ b/workflow/coding-workflow/src/tests/failure_history.rs
+@@ -31,10 +31,7 @@ fn regression_workflows_preserve_completed_tool_after_model_failure() {
+                 .with_tool_results(vec![result.clone()])
+                 .with_model_failure(2, ProcessModuleError::new("next request failed"));
+             let failure = workflow
+-                .run_json(
+-                    serde_json::to_string(&workflow_input("read and explain")).unwrap(),
+-                    &mut host,
+-                )
++                .run(workflow_input("read and explain"), &mut host)
+                 .unwrap_err();
+             assert_eq!(host.executed_calls.lock().unwrap().as_slice(), &[call]);
+             let history = failure
+diff --git a/workflow/coding-workflow/src/tests/intents.rs b/workflow/coding-workflow/src/tests/intents.rs
+index 0b387b4be070565362a1d81d454cf7b7d0cc60fd..e420d2a1d7ac66f474349b424686479e9e9e2d51 100644
+--- a/workflow/coding-workflow/src/tests/intents.rs
++++ b/workflow/coding-workflow/src/tests/intents.rs
+@@ -21,11 +21,11 @@ fn planning_intents_are_workflow_instructions_and_preserve_user_text() {
+             input.runtime.intent = Some(intent.into());
+             input.runtime.permission_mode = mode;
+             let mut host = FakeHost::default();
+-            let json = serde_json::to_string(&input).unwrap();
++
+             let result = if codex {
+-                CodingCodexLoopWorkflow.run_json(json, &mut host)
++                CodingCodexLoopWorkflow.run(input.clone(), &mut host)
+             } else {
+-                CodingSingleLoopWorkflow::default().run_json(json, &mut host)
++                CodingSingleLoopWorkflow::default().run(input.clone(), &mut host)
+             };
+             result.unwrap();
+             let requests = host.requests.lock().unwrap();
+@@ -59,7 +59,7 @@ fn invalid_or_unsupported_intents_fail_before_context_model_or_tools() {
+         let mut host = FakeHost::default();
+         assert!(
+             CodingCodexLoopWorkflow
+-                .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++                .run(input.clone(), &mut host)
+                 .is_err()
+         );
+         assert!(host.context_builds.lock().unwrap().is_empty());
+@@ -70,15 +70,15 @@ fn invalid_or_unsupported_intents_fail_before_context_model_or_tools() {
+     input.runtime.intent = Some("planning.start".into());
+     input.runtime.permission_mode = PermissionMode::Plan;
+     let mut host = FakeHost::default();
+-    let json = serde_json::to_string(&input).unwrap();
++
+     assert!(
+         CodingProjectCheckWorkflow
+-            .run_json(json.clone(), &mut host)
++            .run(input.clone(), &mut host)
+             .is_err()
+     );
+     assert!(
+         CodingPlanExecuteReviewWorkflow
+-            .run_json(json, &mut host)
++            .run(input.clone(), &mut host)
+             .is_err()
+     );
+     assert!(host.executed_calls.lock().unwrap().is_empty());
+diff --git a/workflow/coding-workflow/src/tests/plan_execute_review.rs b/workflow/coding-workflow/src/tests/plan_execute_review.rs
+index dbcca52002c84cddbf98bda6036044f0fc178022..ef9bb007cf546842774d431736524f6ccdf23fa0 100644
+--- a/workflow/coding-workflow/src/tests/plan_execute_review.rs
++++ b/workflow/coding-workflow/src/tests/plan_execute_review.rs
+@@ -4,7 +4,7 @@ use super::*;
+ fn plan_execute_review_runs_plan_execute_and_review_requests() {
+     let mut input = workflow_input("change code");
+     input.runtime.reasoning = ReasoningConfig::new(Some("high".to_owned()), true);
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::with_responses(vec![
+         CanonicalModelResponse::new(
+             CanonicalMessage::text(MessageRole::Assistant, "plan"),
+@@ -25,11 +25,9 @@ fn plan_execute_review_runs_plan_execute_and_review_requests() {
+         ),
+     ]);
+ 
+-    let output_json = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingPlanExecuteReviewWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "final");
+     assert_eq!(
+@@ -89,7 +87,7 @@ fn plan_execute_review_runs_plan_execute_and_review_requests() {
+ #[test]
+ fn plan_execute_review_executes_read_only_plan_tool_calls_before_execute() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let plan_call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+     let mut host = FakeHost::with_responses(vec![
+@@ -112,11 +110,9 @@ fn plan_execute_review_executes_read_only_plan_tool_calls_before_execute() {
+     ])
+     .with_tools(vec![read_file.clone()], vec![read_file]);
+ 
+-    let output_json = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingPlanExecuteReviewWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     let executed = host.executed_calls.lock().expect("executed calls");
+     assert_eq!(executed.len(), 1);
+@@ -154,7 +150,7 @@ fn plan_execute_review_executes_read_only_plan_tool_calls_before_execute() {
+ #[test]
+ fn plan_execute_review_errors_when_plan_calls_non_readonly_tool() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let apply_patch = test_tool("apply_patch", "Apply patch", ToolSafety::WritesFiles);
+     let call = ToolCall::new(
+@@ -166,7 +162,7 @@ fn plan_execute_review_errors_when_plan_calls_non_readonly_tool() {
+         .with_tools(vec![read_file, apply_patch.clone()], vec![apply_patch]);
+ 
+     let error = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -181,7 +177,7 @@ fn plan_execute_review_errors_when_plan_calls_non_readonly_tool() {
+ #[test]
+ fn plan_execute_review_errors_when_execute_calls_unrequested_tool() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let apply_patch = test_tool("apply_patch", "Apply patch", ToolSafety::WritesFiles);
+     let call = ToolCall::new(
+@@ -200,7 +196,7 @@ fn plan_execute_review_errors_when_execute_calls_unrequested_tool() {
+     .with_tools(vec![read_file.clone(), apply_patch], vec![read_file]);
+ 
+     let error = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -215,7 +211,7 @@ fn plan_execute_review_errors_when_execute_calls_unrequested_tool() {
+ #[test]
+ fn plan_execute_review_errors_when_review_calls_tool() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let call = ToolCall::new(new_call_id(), "read_file", json!({ "path": "src/lib.rs" }));
+     let mut host = FakeHost::with_responses(vec![
+@@ -234,7 +230,7 @@ fn plan_execute_review_errors_when_review_calls_tool() {
+     .with_tools(vec![read_file.clone()], vec![read_file]);
+ 
+     let error = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+@@ -249,7 +245,7 @@ fn plan_execute_review_errors_when_review_calls_tool() {
+ #[test]
+ fn plan_execute_review_stops_plan_tool_loop_at_round_limit() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let mut responses = Vec::new();
+     for _ in 0..3 {
+@@ -277,11 +273,9 @@ fn plan_execute_review_stops_plan_tool_loop_at_round_limit() {
+     let mut host =
+         FakeHost::with_responses(responses).with_tools(vec![read_file.clone()], vec![read_file]);
+ 
+-    let output_json = CodingPlanExecuteReviewWorkflow
+-        .run_json(input_json, &mut host)
++    let output = CodingPlanExecuteReviewWorkflow
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     // Максимум 3 tool-раунда в plan-фазе; последний plan-запрос идёт без tools.
+     let executed = host.executed_calls.lock().expect("executed calls");
+diff --git a/workflow/coding-workflow/src/tests/project_check_workflow.rs b/workflow/coding-workflow/src/tests/project_check_workflow.rs
+index 1bda1b256a869efc9a5a1931b96616b164cc4a6b..9909c039c6c8203fb33e6c53cb998ff28735a3d8 100644
+--- a/workflow/coding-workflow/src/tests/project_check_workflow.rs
++++ b/workflow/coding-workflow/src/tests/project_check_workflow.rs
+@@ -1,11 +1,9 @@
+ use super::*;
+ 
+ fn run_project_check(input: WorkflowModuleInput, host: &mut FakeHost) -> WorkflowModuleOutput {
+-    let input_json = serde_json::to_string(&input).expect("workflow input json");
+-    let output_json = CodingProjectCheckWorkflow
+-        .run_json(input_json, host)
+-        .unwrap_or_else(|error| panic!("project check failed: {}", error.message));
+-    serde_json::from_str(&output_json).expect("workflow output json")
++    CodingProjectCheckWorkflow
++        .run(input, host)
++        .unwrap_or_else(|error| panic!("project check failed: {}", error.message))
+ }
+ 
+ fn successful_tool(output: &str, metadata: Value) -> ToolResult {
+diff --git a/workflow/coding-workflow/src/tests/request_accounting.rs b/workflow/coding-workflow/src/tests/request_accounting.rs
+index 49419241c53d166dc0d31d618994bba85ee18cb5..1afd6e732125b7e936c7ba248939d145a4684284 100644
+--- a/workflow/coding-workflow/src/tests/request_accounting.rs
++++ b/workflow/coding-workflow/src/tests/request_accounting.rs
+@@ -205,7 +205,7 @@ fn codex_stream_emits_one_usage_snapshot_only_for_successful_terminal_request()
+                 )),
+             );
+         CodingCodexLoopWorkflow
+-            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++            .run(input.clone(), &mut host)
+             .unwrap();
+         let events = host.events.lock().unwrap();
+         let snapshots = events
+@@ -235,7 +235,7 @@ fn codex_stream_emits_one_usage_snapshot_only_for_successful_terminal_request()
+         )),
+     );
+     CodingCodexLoopWorkflow
+-        .run_json(serde_json::to_string(&input).unwrap(), &mut host)
++        .run(input.clone(), &mut host)
+         .unwrap_err();
+     assert!(
+         !host
+@@ -268,9 +268,7 @@ fn structured_only_tool_result_growth_reaches_preflight_compaction() {
+             .with_tool_results(vec![
+                 ToolResult::ok("fixture".into(), "").with_content(vec![content]),
+             ]);
+-        CodingCodexLoopWorkflow
+-            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
+-            .unwrap();
++        CodingCodexLoopWorkflow.run(input, &mut host).unwrap();
+         let compactions = host.compactions.lock().unwrap();
+         compactions[1].token_estimate.unwrap()
+     };
+@@ -357,12 +355,9 @@ fn image_only_current_user_survives_first_request_and_mid_turn_text_only_replace
+         proteus_contracts::contracts::ContextPreparationOutput::unchanged(vec![]),
+         compacted,
+     ]);
+-    let output: WorkflowModuleOutput = serde_json::from_str(
+-        &CodingCodexLoopWorkflow
+-            .run_json(serde_json::to_string(&input).unwrap(), &mut host)
+-            .unwrap(),
+-    )
+-    .unwrap();
++    let output = CodingCodexLoopWorkflow
++        .run(input.clone(), &mut host)
++        .unwrap();
+     let requests = host.requests.lock().unwrap();
+     assert!(
+         requests[0]
+diff --git a/workflow/coding-workflow/src/tests/single_loop.rs b/workflow/coding-workflow/src/tests/single_loop.rs
+index e3510824df5019d836d53b38e6e79fe98b58da49..a9cb5597132f9dc4cdf04045662f3f3cf08cb7a2 100644
+--- a/workflow/coding-workflow/src/tests/single_loop.rs
++++ b/workflow/coding-workflow/src/tests/single_loop.rs
+@@ -3,14 +3,12 @@ use super::*;
+ #[test]
+ fn single_loop_calls_host_and_returns_new_messages() {
+     let input = workflow_input("hello");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let mut host = FakeHost::default();
+ 
+-    let output_json = CodingSingleLoopWorkflow::default()
+-        .run_json(input_json, &mut host)
++    let output = CodingSingleLoopWorkflow::default()
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     assert_eq!(output.output.text, "done");
+     assert_eq!(
+@@ -66,17 +64,15 @@ fn single_loop_calls_host_and_returns_new_messages() {
+ #[test]
+ fn single_loop_adds_dynamic_meta_tools_when_tool_selection_hides_candidates() {
+     let input = workflow_input("inspect history");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let git_log = test_tool("git_log", "Show commit history", ToolSafety::ReadOnly);
+     let mut host =
+         FakeHost::default().with_tools(vec![read_file.clone(), git_log], vec![read_file]);
+ 
+-    let output_json = CodingSingleLoopWorkflow::default()
+-        .run_json(input_json, &mut host)
++    CodingSingleLoopWorkflow::default()
++        .run(input, &mut host)
+         .expect("workflow succeeds");
+-    let _output: WorkflowModuleOutput =
+-        serde_json::from_str(output_json.as_str()).expect("output json");
+ 
+     let requests = host.requests.lock().expect("requests");
+     let tool_names = requests[0]
+@@ -104,7 +100,7 @@ fn single_loop_adds_dynamic_meta_tools_when_tool_selection_hides_candidates() {
+ #[test]
+ fn single_loop_errors_when_model_calls_unrequested_tool() {
+     let input = workflow_input("change code");
+-    let input_json = serde_json::to_string(&input).expect("input json");
++
+     let read_file = test_tool("read_file", "Read file", ToolSafety::ReadOnly);
+     let apply_patch = test_tool("apply_patch", "Apply patch", ToolSafety::WritesFiles);
+     let call = ToolCall::new(
+@@ -116,7 +112,7 @@ fn single_loop_errors_when_model_calls_unrequested_tool() {
+         .with_tools(vec![read_file.clone(), apply_patch], vec![read_file]);
+ 
+     let error = CodingSingleLoopWorkflow::default()
+-        .run_json(input_json, &mut host)
++        .run(input, &mut host)
+         .expect_err("workflow must fail");
+ 
+     assert!(
+diff --git a/workflow/coding-workflow/src/workflows.rs b/workflow/coding-workflow/src/workflows.rs
+index d5aceb6ddf49970c16698634ea4738fa04ca0ee1..caf58c12e1fb3149fc28ee8205e8246f6bedd87f 100644
+--- a/workflow/coding-workflow/src/workflows.rs
++++ b/workflow/coding-workflow/src/workflows.rs
+@@ -1,6 +1,8 @@
+ use proteus_contracts::{
+     contracts::WorkflowFailure,
+-    process_module::{WorkflowModule, WorkflowModuleHostMut, WorkflowModuleInput},
++    process_module::{
++        WorkflowModule, WorkflowModuleHostMut, WorkflowModuleInput, WorkflowModuleOutput,
++    },
+ };
+ 
+ use super::{
+@@ -25,89 +27,41 @@ pub struct CodingCodexLoopWorkflow;
+ pub struct CodingProjectCheckWorkflow;
+ 
+ impl WorkflowModule for CodingSingleLoopWorkflow {
+-    fn run_json(
++    fn run(
+         &self,
+-        input_json: String,
++        input: WorkflowModuleInput,
+         host: &mut WorkflowModuleHostMut<'_>,
+-    ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_single_loop(input, host, self.max_tool_rounds) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++    ) -> Result<WorkflowModuleOutput, WorkflowFailure> {
++        run_single_loop(input, host, self.max_tool_rounds)
+     }
+ }
+ 
+ impl WorkflowModule for CodingCodexLoopWorkflow {
+-    fn run_json(
++    fn run(
+         &self,
+-        input_json: String,
++        input: WorkflowModuleInput,
+         host: &mut WorkflowModuleHostMut<'_>,
+-    ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_codex_loop(input, host, CODEX_LOOP_MODULE_ID) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++    ) -> Result<WorkflowModuleOutput, WorkflowFailure> {
++        run_codex_loop(input, host, CODEX_LOOP_MODULE_ID)
+     }
+ }
+ 
+ impl WorkflowModule for CodingPlanExecuteReviewWorkflow {
+-    fn run_json(
++    fn run(
+         &self,
+-        input_json: String,
++        input: WorkflowModuleInput,
+         host: &mut WorkflowModuleHostMut<'_>,
+-    ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_plan_execute_review(input, host) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(String::from(json)),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error),
+-        }
++    ) -> Result<WorkflowModuleOutput, WorkflowFailure> {
++        run_plan_execute_review(input, host)
+     }
+ }
+ 
+ impl WorkflowModule for CodingProjectCheckWorkflow {
+-    fn run_json(
++    fn run(
+         &self,
+-        input_json: String,
++        input: WorkflowModuleInput,
+         host: &mut WorkflowModuleHostMut<'_>,
+-    ) -> Result<String, WorkflowFailure> {
+-        let input: WorkflowModuleInput = match serde_json::from_str(input_json.as_str()) {
+-            Ok(input) => input,
+-            Err(error) => return workflow_err(error),
+-        };
+-
+-        match run_project_check(input, host) {
+-            Ok(output) => match serde_json::to_string(&output) {
+-                Ok(json) => Ok(json),
+-                Err(error) => workflow_err(error),
+-            },
+-            Err(error) => Err(error.into()),
+-        }
++    ) -> Result<WorkflowModuleOutput, WorkflowFailure> {
++        run_project_check(input, host).map_err(Into::into)
+     }
+ }
+-
+-fn workflow_err<T>(error: impl ToString) -> Result<T, WorkflowFailure> {
+-    Err(WorkflowFailure::new(error.to_string()))
+-}
