@@ -1,0 +1,222 @@
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -511,7 +511,10 @@
+                 .iter_mut()
+                 .find(|tool| tool.call_id == call_id)
+         }) {
+-            update_tool(tool, status, result, metadata, compact);
++            // Nested child tools are previews in both foreground and background
++            // cards; `compact` separately controls background JSON retention.
++            let preview = result.map(|text| truncate_utf8(text, MAX_SUBAGENT_TOOL_RESULT_BYTES));
++            update_tool(tool, status, preview, metadata, compact);
+             return true;
+         }
+     }
+@@ -527,8 +530,8 @@
+ ) {
+     tool.status = status.to_owned();
+     if let Some(result) = result {
+-        // Copy the retained prefix, without keeping a full result's allocation.
+-        tool.result = Some(truncate_utf8(result, MAX_SUBAGENT_TOOL_RESULT_BYTES).to_owned());
++        // Store the selected projection: full root result or bounded child slice.
++        tool.result = Some(result.to_owned());
+     }
+     if let Some(metadata) = metadata {
+         if let Some(value) = metadata.get("tool_terminal") {
+--- a/crates/proteus-core/src/app_server/turn_progress/tests.rs
++++ b/crates/proteus-core/src/app_server/turn_progress/tests.rs
+@@ -597,3 +597,6 @@
+ 
+ #[path = "tests/reasoning.rs"]
+ mod reasoning;
++
++#[path = "tests/tool_previews.rs"]
++mod tool_previews;
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/turn_progress/tests/tool_previews.rs
+@@ -0,0 +1,58 @@
++use super::*;
++
++#[test]
++fn child_result_preview_is_independent_of_background_json_compaction() {
++    for background in [false, true] {
++        let mut progress = TurnProgress::default();
++        let child = child_thread_id();
++        if background {
++            apply(
++                &mut progress,
++                Event::ToolCallRequested {
++                    call: ToolCall::new("spawn", "spawn_agent", json!({"task_name": "scan"})),
++                },
++            );
++        }
++        apply(
++            &mut progress,
++            Event::SubagentStarted {
++                role: "helper".into(),
++                description: Some("scan".into()),
++                child_thread_id: child,
++            },
++        );
++        let args = json!({"input": "x".repeat(MAX_BACKGROUND_TOOL_JSON_BYTES + 1)});
++        let metadata = json!({"detail": "y".repeat(MAX_BACKGROUND_TOOL_JSON_BYTES + 1)});
++        let long = "a".repeat(MAX_SUBAGENT_TOOL_RESULT_BYTES - 1) + &"я".repeat(100_000);
++        progress.apply(&envelope(
++            child,
++            Event::ToolCallRequested {
++                call: ToolCall::new("child-tool", "probe", args.clone()),
++            },
++        ));
++        progress.apply(&envelope(
++            child,
++            Event::ToolFinished {
++                result: ToolResult::ok("child-tool".into(), long.clone())
++                    .with_metadata(metadata.clone()),
++            },
++        ));
++        let rows = if background {
++            &progress.background_subagents
++        } else {
++            &progress.messages
++        };
++        let tool = &rows[0].subagent.as_ref().unwrap().tools[0];
++        let retained = tool.result.as_ref().unwrap();
++        assert_eq!(retained, &long[..MAX_SUBAGENT_TOOL_RESULT_BYTES - 1]);
++        assert!(retained.capacity() < long.len());
++        assert_eq!(tool.status, "done");
++        if background {
++            assert_eq!(tool.args["truncated"], true);
++            assert_eq!(tool.metadata["truncated"], true);
++        } else {
++            assert_eq!(tool.args, args);
++            assert_eq!(tool.metadata, metadata);
++        }
++    }
++}
+--- a/crates/proteus-core/src/app_server/events/tests.rs
++++ b/crates/proteus-core/src/app_server/events/tests.rs
+@@ -6,6 +6,8 @@
+ 
+ #[cfg(unix)]
+ mod active_followup;
++
++mod tool_results;
+ 
+ #[tokio::test]
+ async fn failed_prestart_keeps_validated_prefix_and_ephemeral_input_until_retry_or_clear() {
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/events/tests/tool_results.rs
+@@ -0,0 +1,93 @@
++use super::*;
++use crate::{
++    domain::{ToolCall, ToolContent, ToolResult},
++    model_standard::{CanonicalMessage, ContentPart, MessageRole},
++};
++use serde_json::json;
++
++#[tokio::test]
++async fn root_tool_text_matches_live_reconnect_and_completed_projection() {
++    let long = "x".repeat(10_000) + "я FINAL_DIAGNOSTIC";
++    let mut failure = ToolResult::error("call".into(), long.clone());
++    failure.output = "lower-priority output".into();
++    for result in [
++        ToolResult::ok("call".into(), "short control"),
++        ToolResult::ok("call".into(), long.clone()),
++        failure,
++        ToolResult::ok("call".into(), "").with_content(vec![ToolContent::Text {
++            text: long.clone(),
++        }]),
++        ToolResult::ok("call".into(), "").with_content(vec![ToolContent::Json {
++            value: json!({"detail": long}),
++        }]),
++        ToolResult::ok("call".into(), ""),
++    ] {
++        let result = result.with_metadata(json!({"source": "projection-test"}));
++        let expected = result.text_or_status();
++        let call = ToolCall::new("call", "probe", json!({"input": "synthetic"}));
++        let (events, _) = test_event_channel(8);
++        let sink = RuntimeEventSink::default();
++        assert!(sink.0.set(events.clone()).is_ok());
++        let context = EventContext::new(
++            events.pending_snapshot().session_id,
++            new_thread_id(),
++            Some(new_turn_id()),
++        );
++        let mut live = events.subscribe_session();
++        assert!(matches!(
++            live.recv().await.unwrap(),
++            AppServerEvent::PendingRequestsUpdated { .. }
++        ));
++        assert!(matches!(
++            live.recv().await.unwrap(),
++            AppServerEvent::SessionSnapshot { .. }
++        ));
++        for (index, event) in [
++            Event::TurnStarted {
++                session_id: context.session_id,
++                thread_id: context.thread_id,
++                turn_id: context.turn_id.unwrap(),
++            },
++            Event::ToolCallRequested { call: call.clone() },
++            Event::ToolFinished { result: result.clone() },
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            sink.append(EventEnvelope::new(context.clone(), index as u64 + 1, event))
++                .await
++                .unwrap();
++            let AppServerEvent::Runtime { envelope } = live.recv().await.unwrap() else {
++                panic!("live runtime event")
++            };
++            if let Event::ToolFinished { result: delivered } = envelope.event {
++                assert_eq!(delivered, result);
++            }
++        }
++
++        let mut reopened = events.subscribe_session();
++        assert!(matches!(
++            reopened.recv().await.unwrap(),
++            AppServerEvent::PendingRequestsUpdated { .. }
++        ));
++        let AppServerEvent::SessionSnapshot { snapshot } = reopened.recv().await.unwrap() else {
++            panic!("reconnect snapshot")
++        };
++        assert_eq!(snapshot.transcript.len(), 1);
++        let tool = snapshot.transcript[0].tool.as_ref().unwrap();
++        assert_eq!(tool.result.as_deref(), Some(expected.as_str()));
++        assert_eq!(tool.metadata, result.metadata);
++        assert_eq!(tool.status, if result.ok { "done" } else { "failed" });
++
++        let completed = crate::app_server::transcript_messages(&[
++            CanonicalMessage::new(MessageRole::Assistant, vec![ContentPart::ToolCall { call }]),
++            CanonicalMessage::new(MessageRole::Tool, vec![ContentPart::ToolResult { result }]),
++        ]);
++        let expected_tool = serde_json::to_value(tool).unwrap();
++        assert_eq!(serde_json::to_value(&completed[0].tool).unwrap(), expected_tool);
++        events.finish_progress(Ok(completed.into()));
++        let settled = events.session_snapshot().unwrap();
++        assert_eq!(settled.transcript.len(), 1);
++        assert_eq!(serde_json::to_value(&settled.transcript[0].tool).unwrap(), expected_tool);
++    }
++}
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1267,6 +1267,17 @@
+ runtime и записи settlement. При переполнении клиентского ring подписка
+ повторяет получение снимка, а не пытается восстановить потерянные deltas.
+ 
++Корневая tool-карточка в live progress сохраняет полный `text_or_status()`
++принятого `ToolFinished`, как и проекция canonical transcript: повторный
++10_000-byte cap при reconnect не применяется. Вложенные tool-карточки ребёнка
++в родительском progress остаются previews с UTF-8 prefix до 10_000 bytes,
++как для foreground, так и для background children. Background JSON args и
++metadata по-прежнему имеют отдельную compact-проекцию.
++Это не новый общий output budget: существующий Core cap ограничивает строки
++`output`/`error`, но не гарантирует предел для structured-content fallback.
++Полная корневая строка удерживается до сброса progress и копируется в snapshot;
++совокупный byte budget этого live view данной правкой не вводится.
++
+ Один app-server run может выполнять несколько root turns из очереди follow-up.
+ Перед `TurnStarted` следующего root turn сервер обновляет завершённый префикс
+ из уже подтверждённой истории, включая ограниченную страницу и её cursor для
