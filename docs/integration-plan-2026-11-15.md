@@ -1,5 +1,92 @@
 # Proteus: bounded integration plan for PR86–154
 
+## Current integration decision, refreshed 2026-11-16
+
+**Do not use the historical order below as an apply queue.** Upstream has already
+adopted much of it. The original 2026-11-15 plan is retained below as historical
+context; this section supersedes its refs, pending-work status and recommended
+application order, not its historical evidence.
+
+Fresh main refs were checked against the published patch targets:
+- Core: `cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d`.
+- Modules: `b7e3ca3c23b9440c8c1a9e1d15386d02ef8586c7`.
+- Desktop: `79499f2d639a3185384bed75f29b6919b811fe7c`.
+- Extensions: `ae6479c5accc404d5a635fdeff1397a8b3016416`.
+- Delivery before this documentation update: `f113e3848ba41870fa81e957c4f54bd3f94e3510`, through #167.
+
+### Already adopted: do not reapply historical assemblies
+
+| Delivery family | Current upstream evidence | Decision |
+|---|---|---|
+| #156 workflow | Modules [d463a4b](https://github.com/Proteus-harness/Proteus-modules/commit/d463a4bfd931acd6ba044a984495b2e92d3e9f2a), with adapted tests | Review current code; do not replay whole assembly |
+| #157 config | Core [2192786](https://github.com/Proteus-harness/Proteus-core/commit/219278601251068b4f1d624d6ebce94922635c22), followed by named models and inline roles | Old persistence diff is obsolete; inspect new source ownership |
+| #158 provider | Modules [9a69146](https://github.com/Proteus-harness/Proteus-modules/commit/9a69146634cf1a5751a770fe0efe311fbcff68dc), including transport-test adaptations | Do not reapply old alternatives |
+| #159 text and #163 list_dir | Modules [852efd3](https://github.com/Proteus-harness/Proteus-modules/commit/852efd31f54d90956814f1a6c4830a3c41c9eb92); #163 complete reverse-check succeeds | Already present, not pending fixes |
+| #160 settings | Desktop [84923bc](https://github.com/Proteus-harness/Proteus-desktop/commit/84923bcd0c73843b1a04a2f47de658afa697beec), with adaptations | Review current behavior rather than reapply |
+| #162 reporting | Core [55206ae](https://github.com/Proteus-harness/Proteus-core/commit/55206ae5e7d8d3fd8876e1dd345a577194f6d523); complete reverse-check succeeds | Do not replay or reinterpret historical scores |
+| #164 portable compatibility | Desktop [48aa785](https://github.com/Proteus-harness/Proteus-desktop/commit/48aa78530460c54a5151106c8bdbb3faf3a399aa); both alternatives reverse-check | Apply neither alternative again |
+
+These are source-adoption findings, not new runtime acceptance. Adapted tests,
+formatting and later development mean an unsuccessful reverse-check alone does
+not establish that a fix is missing.
+
+### Remaining bounded work and gates
+
+1. **#165/#166 source cuts:** seven #165 cuts and three #166 Rust cleanups remain
+   forward-applicable. All 20 target blobs match their published preimages.
+   Qualify the four independent model-pack cuts together using the normal
+   `python3 scripts/test.py -p model-pack --lib` gate: dead terminal reader,
+   truthful OpenAI fallback-test scope, instruction prefix and metadata
+   transport. Keep parser ownership, Core cache/mailbox and Desktop native
+   changes separate because their behavioral boundaries differ. Text
+   applicability does not establish native test success or performance gains.
+2. **#167 inherited model choice:** a bounded source-only candidate now addresses
+   choice-key persistence through plain file includes. It deliberately refuses
+   inherited catalogue edits and clearing inherited selection. Its regression
+   proposal has not been compiled or run; it is not a replacement for all
+   config persistence or a runtime-qualified release.
+3. **#161 active panes:** Desktop already adopted prerequisite #146 navigation
+   bootstrap, but not `documents.active_panes.v1`. The old composed Desktop
+   patch conflicts with the adopted bootstrap. Prepare only the still-missing
+   Desktop delta, coordinate Extensions and native/wire tests, then explicitly
+   update the component release pin. Do not ship Files requiring the capability
+   before host support. Logical panes do not establish actual visibility.
+4. **#166 skills sharing:** four duplicate implementations can have one owner
+   without dropping the fifteen Python controls in either pinned lane.
+   An isolated 50-file source-layout bundle was qualified with all fifteen
+   shared Python controls in the current pinned lane and ten expected refusal cases. This is not the former
+   bare-current-directory/private-entrypoint contract. Core remains pinned to
+   `1fc3ef223d10322815dd9290a50d045bc95402bb` in that compatibility lane.
+   Before active adoption, retain explicit packaging closure and obtain
+   exact-head affected hosted CI. The source-bundle qualification does not
+   supply toolchain, Git dependencies, binaries or outer resource envelope.
+5. **#166 envelope:** requires an explicit new active frozen-source validation
+   revision. Do not rewrite historical attestations or bypass freeze failures.
+   NaN/insertion-driven history revision remains a separate semantic HOLD.
+
+Desktop's current component manifest selects the Core/Modules/Extensions refs
+above. Modules and Desktop compile-time Core dependencies instead use
+`185225a7103088c444788374ca425d230060f55a`. These are distinct pinning layers:
+do not roll them back to the historical `41bdfffa` below or blindly bump them
+to Core main. Different SHAs alone do not prove incompatibility.
+
+### Evidence boundary for this refresh
+
+The source-adoption reconciliation checked 23 published patch blobs, 141
+materialized source/artifact blobs and forward/reverse patch dry-runs against
+the refs above. Ten source candidates had exact unchanged target identities.
+The separate source-bundle qualification repeated archive extraction, Python
+controls, source-freeze refusals and exact patch apply/reverse in independent
+copies. These counts are different scopes, not a total product test count.
+
+No new Rust/Cargo build, native tests, Core probe, hosted gate, UI or benchmark
+was run. Visible empty check/status lists are not PASS. No upstream source,
+dependency pins or active workflows were changed by this documentation update.
+
+---
+
+## Historical plan, 2026-11-15
+
 Date: 2026-11-15. **Documentation only. No candidate patch, project test, compiler, runtime or benchmark was executed in this planning pass. No upstream source or dependency pin was changed.**
 
 ## Scope and snapshot
