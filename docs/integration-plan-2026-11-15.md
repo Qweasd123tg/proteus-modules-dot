@@ -18,6 +18,8 @@ Fresh main refs were checked against the published patch targets:
 
 | Delivery family | Current upstream evidence | Decision |
 |---|---|---|
+| #86 Core validation | Core [2192786](https://github.com/Proteus-harness/Proteus-core/commit/219278601251068b4f1d624d6ebce94922635c22); shared pass and original regression file retained at current main | Source scope adopted; do not reapply historical patch |
+| #86 Modules recovery + compactor | Modules [d463a4b](https://github.com/Proteus-harness/Proteus-modules/commit/d463a4bfd931acd6ba044a984495b2e92d3e9f2a); all nine target files unchanged at current main | Both coupled changes adopted; not a new runtime pass |
 | #145 Files listing knowledge | Extensions [ae6479c](https://github.com/Proteus-harness/Proteus-desktop-extensions/commit/ae6479c5accc404d5a635fdeff1397a8b3016416): failed listings remain unknown; failed collapsed reads expire on refresh | Adopted; do not reapply the source candidate |
 | #147 Git per-view tabs | Same Extensions commit: addressed tab selection and close cleanup; history/cache remain shared | Adopted; not a native selection/reconciliation qualification |
 | #152 folded Expand All | Same Extensions commit: known folded ancestors retain expansion/refresh intent without spending descendant traversal budget | Adopted; do not reapply or count as a new finding |
@@ -33,6 +35,64 @@ Fresh main refs were checked against the published patch targets:
 These are source-adoption findings, not new runtime acceptance. Adapted tests,
 formatting and later development mean an unsuccessful reverse-check alone does
 not establish that a fix is missing.
+
+### PR #86 source reconciliation, 2026-11-16
+
+**Both #86 source changes are already adopted; do not reapply either historical
+patch to current main.** This check is limited to #86 Core validation and the
+coupled Modules history/compactor correction. It makes no new finding about
+#87–89, other delivery families, or a combined runtime stack.
+
+The published patches and checksum file were read at delivery
+`f2264bbab27f0086f606e1caba43e5aadb44478b`. Their SHA-256 values match the
+[original package](../foundation/2026-11-14/reviewed-simplification/SHA256SUMS):
+Core `5e7be929ccb284ba5d1ebd4165e31d2245a54369c6983b723ed8a1c22621faf0`,
+Modules `6d868451aacd1716d1d20c4c76ad46bb9b124d95dbaa7559897beca77a26d83f`.
+Each patch passed `git apply --no-index --check --whitespace=error-all`
+and was applied in an isolated copy of its exact preimages: Core
+`89997df995df7c39b713e16aba216ecb19c8f497`, Modules
+`3270dc0f894eaf4d0360306052b806099b8f5351`.
+The output was compared with the adoption commits and the refreshed main refs
+listed above. All 44 materialized source snapshots, both patch blobs, the
+checksum file and the previous plan matched their Git blob identities.
+
+- **Core:** at [2192786](https://github.com/Proteus-harness/Proteus-core/commit/219278601251068b4f1d624d6ebce94922635c22),
+  four of seven complete target files equal the #86 output. The remaining
+  differences are removal of an unused import, additional test registrations
+  and fixture adaptations, and additional documentation; all #86 hunks are
+  retained and the complete reverse-check succeeds at that commit.
+  At current `cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d`, the
+  [shared validator](https://github.com/Proteus-harness/Proteus-core/blob/cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d/crates/proteus-core/src/core/config/validation.rs)
+  and [309-line regression file](https://github.com/Proteus-harness/Proteus-core/blob/cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d/crates/proteus-core/src/app_server/config_builder/tests/validation.rs)
+  remain byte-identical to the patch output. Save and loader remain wired to
+  `validate_semantics`; the separately read watcher still uses the loader and
+  defensive rereads. Later named-model, inline-role and physical-path changes
+  alter surrounding source, so current whole-patch reverse-check fails in four
+  files. That failure is context drift, not evidence that #86 is absent.
+- **Modules:** at [d463a4b](https://github.com/Proteus-harness/Proteus-modules/commit/d463a4bfd931acd6ba044a984495b2e92d3e9f2a),
+  eight of nine complete target files equal the #86 output. The only difference
+  in the ninth, `workflow/coding-workflow/src/tests.rs`, is two additional
+  test-module registrations; `mod resumed_history;` remains present.
+  All nine target files are unchanged at current
+  `b7e3ca3c23b9440c8c1a9e1d15386d02ef8586c7`. This includes both the shared
+  request-only missing-output normalizer and the compactor correction, not one
+  half of that coupled change. Whole-patch reverse-check fails only at the
+  changed test-registration context.
+
+All **11 proposed test functions** remain in byte-identical new test files:
+four Core validation tests, six workflow resumed-history tests and one compactor
+test. Their assertions were read, including rejected Save state preservation,
+request-only synthetic results, no repeated tool execution, interruption order,
+canonical ACK and removal of request-scoped tool pairs from replacement context.
+Independent read-only review repeated the patch/output comparison and found no
+blocker to this source-adoption conclusion.
+
+**No Cargo/Rust build, project test, process/HTTP scenario, native UI or benchmark
+was run in this reconciliation.** Exact-current-head GitHub check-runs, commit
+statuses and Actions runs were empty for both repositories, not PASS. The
+historical 48/121 scoped passes remain historical. No upstream source,
+dependency pin, deployed binary or active workflow was changed; later
+model/source changes and combined runtime behavior still need their own gates.
 
 ### Extensions source reconciliation, 2026-11-16
 
