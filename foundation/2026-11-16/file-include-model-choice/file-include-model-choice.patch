@@ -1,0 +1,141 @@
+--- a/crates/proteus-core/src/core/config/loading.rs
++++ b/crates/proteus-core/src/core/config/loading.rs
+@@ -52,6 +52,49 @@
+         config
+             .with_resolved_instructions(instructions_config_path, inputs)
+             .await
++    }
++
++    /// For a plain include wrapper, retain the inherited choice spelling before
++    /// model normalization erases it. Inline sources and managed overlays have
++    /// distinct ownership rules and are deliberately excluded.
++    pub(crate) fn inherited_model_choice_key(path: &Path) -> Result<Option<&'static str>> {
++        if !config_selection(path)?.is_empty() {
++            return Ok(None);
++        }
++        let physical = physical_config_path(path);
++        if !physical.is_file()
++            || physical.file_name().and_then(|name| name.to_str())
++                == Some(super::CONFIG_BUILDER_OVERLAY)
++        {
++            return Ok(None);
++        }
++        let mut local = load_config_value(&physical)?;
++        let includes = take_config_includes(&mut local)?;
++        if includes.is_empty()
++            || ["models", "providers"]
++                .iter()
++                .any(|key| local.get(*key).is_some())
++        {
++            return Ok(None);
++        }
++        let base_dir = physical.parent().unwrap_or_else(|| Path::new("."));
++        let mut value = Value::Object(Map::new());
++        let mut inputs = ConfigInputs::default();
++        for include in includes {
++            let included = load_config_path_value(
++                &resolve_config_include(base_dir, &include),
++                &mut BTreeSet::new(),
++                &mut inputs,
++            )?;
++            merge_config_value(&mut value, included);
++        }
++        Ok(if value.get("model").is_some() {
++            Some("model")
++        } else if value.get("active_provider").is_some() {
++            Some("active_provider")
++        } else {
++            None
++        })
+     }
+ 
+     pub async fn resolve_config_path(path: Option<&Path>) -> Result<Option<PathBuf>> {
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -129,7 +129,13 @@
+     {
+         super::inline_source::remove_selected_role_model(outer, &selection)?;
+     }
+-    persist_toml_model_source(&mut doc, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_toml_model_source(
++        &mut doc,
++        config,
++        baseline.as_ref(),
++        !selection.is_empty(),
++        AppConfig::inherited_model_choice_key(path)?,
++    )?;
+     if doc
+         .get("permissions")
+         .is_none_or(|item| !item.is_table_like())
+@@ -301,7 +307,13 @@
+     let root = crate::core::selected_config_value_mut(&mut document, &selection)?
+         .as_object_mut()
+         .context("config JSON root must be an object")?;
+-    persist_json_model_source(root, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_json_model_source(
++        root,
++        config,
++        baseline.as_ref(),
++        !selection.is_empty(),
++        AppConfig::inherited_model_choice_key(path)?,
++    )?;
+     let omit_model_settings = !selection.is_empty()
+         && omitted_model_settings_unchanged(
+             config,
+@@ -384,8 +396,16 @@
+     config: &AppConfig,
+     baseline: Option<&AppConfig>,
+     inline: bool,
++    inherited_choice: Option<&str>,
+ ) -> Result<()> {
+     let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
++    if let Some(key) = inherited_choice {
++        validate_inherited_model_edit(config, choice_changed, presets_changed)?;
++        if choice_changed {
++            document[key] = toml_edit::value(config.active_provider.as_ref().unwrap().clone());
++        }
++        return Ok(());
++    }
+     let named = document.get("models").is_some() || document.get("model").is_some();
+     let had_providers = document.get("providers").is_some();
+     // Unrelated edits must not turn the loader's inherited bootstrap choice
+@@ -428,8 +448,16 @@
+     config: &AppConfig,
+     baseline: Option<&AppConfig>,
+     inline: bool,
++    inherited_choice: Option<&str>,
+ ) -> Result<()> {
+     let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
++    if let Some(key) = inherited_choice {
++        validate_inherited_model_edit(config, choice_changed, presets_changed)?;
++        if choice_changed {
++            source.insert(key.into(), Value::String(config.active_provider.as_ref().unwrap().clone()));
++        }
++        return Ok(());
++    }
+     let source_has_choice = source.contains_key("model") || source.contains_key("active_provider");
+     let named = source.contains_key("models") || source.contains_key("model");
+     let had_providers = source.contains_key("providers");
+@@ -455,3 +483,22 @@
+     }
+     Ok(())
+ }
++
++// An additive wrapper cannot delete an inherited selection or safely replace a
++// catalogue's representation. Reject these edits before any atomic_write rather
++// than publish source which normalizes differently (or cannot be reloaded).
++fn validate_inherited_model_edit(
++    config: &AppConfig,
++    choice_changed: bool,
++    presets_changed: bool,
++) -> Result<()> {
++    anyhow::ensure!(
++        !presets_changed,
++        "edit the included model catalogue at its owning source"
++    );
++    anyhow::ensure!(
++        !choice_changed || config.active_provider.is_some(),
++        "cannot remove an inherited model selection from an additive include wrapper"
++    );
++    Ok(())
++}
