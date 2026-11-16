@@ -18,6 +18,10 @@ Fresh main refs were checked against the published patch targets:
 
 | Delivery family | Current upstream evidence | Decision |
 |---|---|---|
+| #145 Files listing knowledge | Extensions [ae6479c](https://github.com/Proteus-harness/Proteus-desktop-extensions/commit/ae6479c5accc404d5a635fdeff1397a8b3016416): failed listings remain unknown; failed collapsed reads expire on refresh | Adopted; do not reapply the source candidate |
+| #147 Git per-view tabs | Same Extensions commit: addressed tab selection and close cleanup; history/cache remain shared | Adopted; not a native selection/reconciliation qualification |
+| #152 folded Expand All | Same Extensions commit: known folded ancestors retain expansion/refresh intent without spending descendant traversal budget | Adopted; do not reapply or count as a new finding |
+| #154 Markdown prefix boundary | Same Extensions commit: CR/LF lookahead revalidation for retained code/math prefixes | Adopted; EXT-L1 footnotes and universal warm/cold equivalence remain open |
 | #156 workflow | Modules [d463a4b](https://github.com/Proteus-harness/Proteus-modules/commit/d463a4bfd931acd6ba044a984495b2e92d3e9f2a), with adapted tests | Review current code; do not replay whole assembly |
 | #157 config | Core [2192786](https://github.com/Proteus-harness/Proteus-core/commit/219278601251068b4f1d624d6ebce94922635c22), followed by named models and inline roles | Old persistence diff is obsolete; inspect new source ownership |
 | #158 provider | Modules [9a69146](https://github.com/Proteus-harness/Proteus-modules/commit/9a69146634cf1a5751a770fe0efe311fbcff68dc), including transport-test adaptations | Do not reapply old alternatives |
@@ -29,6 +33,34 @@ Fresh main refs were checked against the published patch targets:
 These are source-adoption findings, not new runtime acceptance. Adapted tests,
 formatting and later development mean an unsuccessful reverse-check alone does
 not establish that a fix is missing.
+
+### Extensions source reconciliation, 2026-11-16
+
+A follow-up check used delivery `c9aa240cba9ec889429c0d821fba5ad67333cfe0`
+and independently refreshed Extensions main, still
+`ae6479c5accc404d5a635fdeff1397a8b3016416`. This is additional evidence for
+#145/#147/#152/#154, not a rerun of the earlier #168 reconciliation.
+
+The four published patch blobs were checked with
+`git apply --no-index --check --whitespace=error-all`, then applied in an isolated copy
+of their exact `f82b3ad753cf397f8a931b193aa1943af1ef07a7` preimages.
+The resulting four production files (`files/src/tree.rs`, `git/src/main.rs`,
+`git/src/panel.rs`, `markdown-render/src/render.rs`, all under `packages/`)
+are byte-identical to the current upstream files. All 22 proposed Rust test
+functions are present: 6+6 Files, 6 Git and 4 Markdown. Full comparison of the
+three affected test files found only formatting/trailing-comma differences,
+including the adapted existing Git call sites; no test assertions were dropped.
+All 18 materialized preimage/current/patch/plan blobs matched their Git identities.
+
+Upstream additionally contains two NDJSON warm/cold process controls in
+[`tests/test_markdown_streaming.py`](https://github.com/Proteus-harness/Proteus-desktop-extensions/blob/ae6479c5accc404d5a635fdeff1397a8b3016416/tests/test_markdown_streaming.py)
+and replaces the stale package-count literal in `tests/test_bundle.py` with
+manifest-derived package identities/counts. Their source was read, not executed.
+The commit author's Rust/Python pass totals remain author-reported: this check
+ran no Rust/Cargo, Python project tests, packaged binary, wire or UI.
+Exact-head GitHub check-runs, commit statuses and Actions runs were empty,
+which is not PASS. Source adoption does not resolve last-good Files/error UI,
+stale folded heads, broader native/session tab coherence or Markdown footnotes.
 
 ### Remaining bounded work and gates
 
