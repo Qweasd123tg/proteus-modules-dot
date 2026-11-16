@@ -20,6 +20,7 @@ Fresh main refs were checked against the published patch targets:
 |---|---|---|
 | #86 Core validation | Core [2192786](https://github.com/Proteus-harness/Proteus-core/commit/219278601251068b4f1d624d6ebce94922635c22); shared pass and original regression file retained at current main | Source scope adopted; do not reapply historical patch |
 | #86 Modules recovery + compactor | Modules [d463a4b](https://github.com/Proteus-harness/Proteus-modules/commit/d463a4bfd931acd6ba044a984495b2e92d3e9f2a); all nine target files unchanged at current main | Both coupled changes adopted; not a new runtime pass |
+| #87 → #88 → #89 Core lifecycle | Core [990449c](https://github.com/Proteus-harness/Proteus-core/commit/990449c41c6e9df5dccb60639df0cdf38b976704); complete production/test hunks retained at current main, with later run-turn extraction | All three source scopes adopted; do not reapply the historical chain; background routing remains separate |
 | #145 Files listing knowledge | Extensions [ae6479c](https://github.com/Proteus-harness/Proteus-desktop-extensions/commit/ae6479c5accc404d5a635fdeff1397a8b3016416): failed listings remain unknown; failed collapsed reads expire on refresh | Adopted; do not reapply the source candidate |
 | #147 Git per-view tabs | Same Extensions commit: addressed tab selection and close cleanup; history/cache remain shared | Adopted; not a native selection/reconciliation qualification |
 | #152 folded Expand All | Same Extensions commit: known folded ancestors retain expansion/refresh intent without spending descendant traversal budget | Adopted; do not reapply or count as a new finding |
@@ -93,6 +94,78 @@ statuses and Actions runs were empty for both repositories, not PASS. The
 historical 48/121 scoped passes remain historical. No upstream source,
 dependency pin, deployed binary or active workflow was changed; later
 model/source changes and combined runtime behavior still need their own gates.
+
+### PR #87–89 source reconciliation, 2026-11-16
+
+**The complete #87 → #88 → #89 source chain is already adopted; do not reapply
+it to current main.** This is source preservation, not a new runtime pass or
+confirmation that the separately documented background-routing gap is fixed.
+
+The three published patches were read at delivery
+`801ae5f28246cd1128dee5e9cf07a82d89e56b87`. All three SHA-256 sums match their
+package checksum files:
+[#87](../foundation/2026-11-14/peer-cancel-settlement/SHA256SUMS),
+[#88](../foundation/2026-11-14/user-input-queue-identity/SHA256SUMS) and
+[#89](../foundation/2026-11-14/descendant-origin/SHA256SUMS).
+They passed `git apply --no-index --check --whitespace=error-all` and were
+applied in dependency order to an isolated copy of their exact target preimages
+at Core `89997df995df7c39b713e16aba216ecb19c8f497`. This was a source-data
+comparison, not execution of the patched project. All 47 materialized
+source/artifact snapshots, including the current extracted turn owner, matched
+their Git blob identities.
+
+At [990449c](https://github.com/Proteus-harness/Proteus-core/commit/990449c41c6e9df5dccb60639df0cdf38b976704),
+**12 of 13 complete target files equal the final chain output byte for byte**.
+The only different file, `docs/guides/runtime-and-events.md`, retains every
+series hunk and has three unrelated changes concerning reasoning events, task
+lifecycle error visibility and usage quota. Reverse application also succeeds
+in dependency-reversed order, #89 → #88 → #87. Checking #87 alone after #89 is
+not a valid completeness test because #89 changes its context.
+
+GitHub ancestry comparison confirms the original base is an ancestor of
+990449c (13 commits ahead, zero behind), whose immediate parent is
+`219278601251068b4f1d624d6ebce94922635c22`. Current main
+`cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d` is five commits ahead of
+990449c, zero behind. **11 of the 13 target files are unchanged between the
+adoption commit and current main**, including all affected tests and fixtures.
+
+- **#87 cancel-and-settle:** complete-write and settled-message guards, exact
+  active Send target, terminal-response settlement and bounded grace survive.
+  Current `child.rs` adds model configuration; the turn owner moved from
+  `process/mod.rs` to
+  [`process/run_turn.rs`](https://github.com/Proteus-harness/Proteus-core/blob/cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d/crates/proteus-core/src/core/agent_control/process/run_turn.rs).
+  Reading the moved body confirms target publication only after complete Send,
+  common interruption settlement, fatal-error kill and budget reset. New model
+  selection occurs before Send, not in place of these controls.
+- **#88 input identity:** the app-server still allocates a fresh UUID per pending
+  entry; process forwarding retains the original child request ID for the
+  reply. Concurrent identical local IDs, completed-generation/stale replies and
+  cancellation of one sibling retain their proposed regression assertions.
+- **#89 descendant origins:** physical root and durable session remain one
+  identity; only that root projects to the logical child. Descendant
+  thread/turn/execution and label survive ordinary forwarding and settlement.
+  Resume/rotation and cancellation-origin assertions remain unchanged.
+
+All **seven new test functions** remain unchanged: two deadline tests, three
+queue-identity tests and two descendant-origin tests. Changes to existing tests
+and both Python peer fixtures are retained too. Assertions were read, including
+exact Cancel target, same-PID resume, refused pooling, sibling preservation and
+origin attribution. The stop-reading test still does not independently isolate
+the partial-frame guard from subsequent kill; that guard was checked in source.
+Independent read-only review repeated the chain comparison and found no blocker.
+
+**Background routing remains outside this adoption result.** Active-turn event
+forwarding is not an independent dispatcher for idle peers. No new delivery
+experiment was run; call-ID-only projection, idle draining, descendant teardown,
+worktree naming and recovery are not closed by this comparison. Role timeout
+plus grace is not one strict wall-clock deadline, and fallback kills the direct
+peer without guaranteeing every OS descendant is stopped.
+
+**No Cargo/Rust build, project test, Python fixture, process/HTTP scenario, cold
+history run, native UI or benchmark was executed.** Exact-current-head GitHub
+check-runs, commit statuses and Actions runs are empty, not PASS. The packages'
+historical 35, 16+35 and 63 scoped counts overlap and are not new or additive
+passes. No upstream source, consumer pin, binary or active workflow was changed.
 
 ### Extensions source reconciliation, 2026-11-16
 
