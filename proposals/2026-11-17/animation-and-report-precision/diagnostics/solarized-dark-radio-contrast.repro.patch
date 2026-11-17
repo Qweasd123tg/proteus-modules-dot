@@ -1,0 +1,29 @@
+diff --git a/src/ui/theme/palettes/contrast_tests.rs b/src/ui/theme/palettes/contrast_tests.rs
+index 42698d2..6137fc0 100644
+--- a/src/ui/theme/palettes/contrast_tests.rs
++++ b/src/ui/theme/palettes/contrast_tests.rs
+@@ -417,3 +417,24 @@ fn custom_chat_caption_role_is_optional_and_does_not_change_settings_labels() {
+         );
+     }
+ }
++
++#[::core::prelude::v1::test]
++fn radio_card_descriptions_are_readable_at_rest_on_hover_and_when_selected() {
++    // radio_card paints muted_foreground on group_box, or on the card with
++    // its list hover/active layer. The schema caps list_active alpha at 0.2.
++    for source in sources() {
++        let set: ThemeSet = serde_json::from_str(source).unwrap();
++        for config in set.themes {
++            let name = config.name.to_string();
++            let mut theme = Theme::default();
++            theme.apply_config(&Rc::new(config));
++            for (state, fill) in [
++                ("rest", theme.group_box),
++                ("hover", theme.group_box.blend(theme.list_hover)),
++                ("selected", theme.group_box.blend(theme.list_active)),
++            ] {
++                assert_readable(&name, state, theme.muted_foreground, fill.into());
++            }
++        }
++    }
++}
