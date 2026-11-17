@@ -1,0 +1,27 @@
+diff --git a/model/model-pack/src/adapters/config_schema/tests.rs b/model/model-pack/src/adapters/config_schema/tests.rs
+index cbb51927c2eecdcd2b0daa678f72a813038a1e9f..a8fab9b08f42c1c1f6c449b7e4aea00cdb2c43c1 100644
+--- a/model/model-pack/src/adapters/config_schema/tests.rs
++++ b/model/model-pack/src/adapters/config_schema/tests.rs
+@@ -59,18 +59,14 @@ fn flat_capability_values_remain_visible_as_nested_defaults_until_overridden() {
+         config[key] = json!(true);
+     }
+     let fields = schema_fields(&config);
++    let nested = capability_fields(&fields);
+     for key in CAPABILITY_KEYS {
+-        assert_eq!(
+-            field(capability_fields(&fields), key).default,
+-            Some(json!(true))
+-        );
++        assert_eq!(field(nested, key).default, Some(json!(true)));
+     }
+     let defaults = schema_fields(&json!({"implementation":"openai_codex"}));
++    let nested_defaults = capability_fields(&defaults);
+     for key in CAPABILITY_KEYS {
+-        assert_eq!(
+-            field(capability_fields(&defaults), key).default,
+-            Some(json!(false))
+-        );
++        assert_eq!(field(nested_defaults, key).default, Some(json!(false)));
+     }
+ }
+ 
