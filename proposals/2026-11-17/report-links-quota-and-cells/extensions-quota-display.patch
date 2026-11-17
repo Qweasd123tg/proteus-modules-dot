@@ -1,0 +1,117 @@
+--- a/packages/quota/src/describe.rs
++++ b/packages/quota/src/describe.rs
+@@ -14,6 +14,17 @@
+     (100. - used).clamp(0., 100.)
+ }
+ 
++/// Extra text only when the reported percentage actually exceeds the limit.
++pub fn overage(used: f64) -> String {
++    if used <= 100. {
++        return String::new();
++    }
++    if used < 100.1 {
++        return " · сверх лимита <0,1%".to_owned();
++    }
++    format!(" · сверх лимита {}%", number(used - 100.))
++}
++
+ pub fn duration(seconds: Option<i64>, fallback: &str) -> String {
+     let Some(seconds) = seconds else {
+         return match fallback {
+@@ -89,8 +100,9 @@
+             let label = duration(seconds, window.str("id"));
+             let reset = reset_label(window.f64("resets_at"), now);
+             lines.push(format!(
+-                "{name} · {label}: осталось {}% · {reset}",
+-                number(left)
++                "{name} · {label}: осталось {}%{} · {reset}",
++                number(left),
++                overage(used)
+             ));
+         }
+     }
+--- a/packages/quota/src/view.rs
++++ b/packages/quota/src/view.rs
+@@ -3,7 +3,7 @@
+ use proteus_extension::ui::{Node, card, kv, note, progress, text};
+ use proteus_extension::{Value, ValueExt, local_time};
+ 
+-use crate::describe::{duration, number, remaining, reset_label};
++use crate::describe::{duration, number, overage, remaining, reset_label};
+ 
+ pub fn render(snapshot: &Value, now: f64) -> Vec<Value> {
+     let mut children = Vec::new();
+@@ -34,8 +34,9 @@
+             }
+             windows.push(
+                 text(format!(
+-                    "Осталось {}% · {}",
++                    "Осталось {}%{} · {}",
+                     number(left),
++                    overage(used),
+                     reset_label(window.f64("resets_at"), now)
+                 ))
+                 .with("tone", "muted"),
+@@ -72,7 +73,7 @@
+     let used = value.f64("used")?;
+     let limit = value.f64("limit")?;
+     let unit = value.opt_str("unit")?;
+-    let format = |n: f64| format!("{n:.2} {unit}").replace('.', ",");
++    let format = |n: f64| format!("{n:.2} {unit}").replacen('.', ",", 1);
+     Some(vec![
+         ("Потрачено", format(used)),
+         ("Лимит", format(limit)),
+@@ -104,4 +105,53 @@
+         assert!(!rendered.contains("Сброс 1970"));
+         assert_eq!(amount(&Value::Null), None);
+     }
++
++    #[test]
++    fn valid_percentage_overage_remains_visible_in_both_quota_surfaces() {
++        let snapshot = |used: f64| {
++            json!({"observed_at": 1_700_000_000,
++        "buckets": [{"id":"shared","windows":[{"id":"weekly","used_percent": used}]}]})
++        };
++        for (used, expected) in [
++            (99.0, "1%"),
++            (100.0, "0%"),
++            (100.04, "0% · сверх лимита <0,1%"),
++            (100.1, "0% · сверх лимита 0,1%"),
++            (125.0, "0% · сверх лимита 25%"),
++            (127.5, "0% · сверх лимита 27,5%"),
++        ] {
++            let data = snapshot(used);
++            let (left, lines) = crate::describe::describe(&data, 1_700_000_000.);
++            assert_eq!(left, Some((100.0_f64 - used).max(0.0)));
++            assert_eq!(
++                lines[0],
++                format!("shared · 7 дн.: осталось {expected} · Время сброса не указано")
++            );
++            let nodes = render(&data, 1_700_000_000.);
++            let children = &nodes[0]["children"];
++            assert_eq!(children[0]["type"], "progress");
++            assert_eq!(children[0]["value"], used.min(100.0));
++            assert_eq!(children[0]["max"], 100.0);
++            assert_eq!(
++                children[1]["text"],
++                format!("Осталось {expected} · Время сброса не указано")
++            );
++        }
++    }
++
++    #[test]
++    fn amount_localizes_only_the_number_not_the_unit() {
++        for unit in ["USD", "руб.", "усл. ед.", "USD.h"] {
++            let value = json!({"used":12.5,"limit":50.0,"unit":unit});
++            let rows = amount(&value).unwrap();
++            assert_eq!(
++                rows,
++                vec![
++                    ("Потрачено", format!("12,50 {unit}")),
++                    ("Лимит", format!("50,00 {unit}")),
++                    ("Осталось", format!("37,50 {unit}"))
++                ]
++            );
++        }
++    }
+ }
