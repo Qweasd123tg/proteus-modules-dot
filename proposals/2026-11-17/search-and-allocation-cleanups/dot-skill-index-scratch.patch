@@ -1,0 +1,147 @@
+diff --git a/research/agent-architectures-20261028/modules/skill-index/src/lib.rs b/research/agent-architectures-20261028/modules/skill-index/src/lib.rs
+index 77170d4..ecd2b90 100644
+--- a/research/agent-architectures-20261028/modules/skill-index/src/lib.rs
++++ b/research/agent-architectures-20261028/modules/skill-index/src/lib.rs
+@@ -279,13 +279,15 @@ impl SkillIndex {
+         let mut terms: Vec<BTreeMap<String, u8>> = Vec::with_capacity(facts.len());
+         let mut coverages = Vec::with_capacity(facts.len());
+ 
++        let mut token = String::new(); // One bounded scratch buffer per build.
++
+         // Metadata for ALL skills goes first: early body entries cannot starve
+         // later metadata. Metadata budget failure rejects the whole new index.
+         for fact in &ordered {
+             let mut map = BTreeMap::new();
+             let mut coverage = DocumentCoverage::default();
+             for (text, field) in [(fact.name, NAME), (fact.description, DESCRIPTION)] {
+-                let omitted = walk_tokens(text, true, |token| {
++                let omitted = walk_tokens(text, true, &mut token, |token| {
+                     if insert_term(&mut map, token, field, limits, &mut statistics) {
+                         Ok(())
+                     } else {
+@@ -320,7 +322,7 @@ impl SkillIndex {
+             statistics.body_prefix_bytes += end;
+             let complete = body.complete && end == body.text.len();
+             let mut term_limited = false;
+-            let omitted = walk_tokens(&body.text[..end], complete, |token| {
++            let omitted = walk_tokens(&body.text[..end], complete, &mut token, |token| {
+                 if !insert_term(map, token, BODY, limits, &mut statistics) {
+                     term_limited = true;
+                 }
+@@ -380,7 +382,7 @@ impl SkillIndex {
+             return Err(Error::DuplicateCurrentId);
+         }
+         let mut query_terms = BTreeMap::new();
+-        let omitted = walk_tokens(query, true, |token| {
++        let omitted = walk_tokens(query, true, &mut String::new(), |token| {
+             if !query_terms.contains_key(token) {
+                 if query_terms.len() == MAX_QUERY_TERMS { return Err(Error::TooManyQueryTerms); }
+                 query_terms.insert(token.to_owned(), ());
+@@ -468,9 +470,11 @@ fn insert_term(
+ fn walk_tokens(
+     text: &str,
+     final_token_complete: bool,
++    token: &mut String,
+     mut visit: impl FnMut(&str) -> Result<(), Error>,
+ ) -> Result<usize, Error> {
+-    let mut token = String::with_capacity(MAX_TOKEN_BYTES);
++    token.clear();
++    token.reserve(MAX_TOKEN_BYTES);
+     let mut too_long = false;
+     let mut omitted = 0;
+     for ch in text.chars() {
+@@ -485,7 +489,7 @@ fn walk_tokens(
+                 }
+             } else {
+                 if too_long { omitted += 1; }
+-                else if !token.is_empty() { visit(&token)?; }
++                else if !token.is_empty() { visit(token)?; }
+                 token.clear();
+                 too_long = false;
+             }
+@@ -493,7 +497,7 @@ fn walk_tokens(
+     }
+     if final_token_complete {
+         if too_long { omitted += 1; }
+-        else if !token.is_empty() { visit(&token)?; }
++        else if !token.is_empty() { visit(token)?; }
+     }
+     Ok(omitted)
+ }
+diff --git a/research/agent-architectures-20261028/modules/skill-index/tests/lexical_boundaries.rs b/research/agent-architectures-20261028/modules/skill-index/tests/lexical_boundaries.rs
+new file mode 100644
+index 0000000..c637ada
+--- /dev/null
++++ b/research/agent-architectures-20261028/modules/skill-index/tests/lexical_boundaries.rs
+@@ -0,0 +1,71 @@
++use proteus_bounded_skill_index_prototype::{
++    BodyExcerpt, CurrentSkill, Error, Limits, SkillFacts, SkillIndex, SnapshotKey,
++};
++
++#[test]
++fn tokenize_fields_independently_without_leaking_incomplete_words() {
++    let key = SnapshotKey {
++        binding_epoch: 1,
++        catalog_revision: 2,
++    };
++    let long = "X".repeat(65);
++    let first = SkillFacts {
++        id: "a",
++        source_id: "demo",
++        sha256: [1; 32],
++        name: "İ",
++        description: &long,
++        body: Some(BodyExcerpt {
++            text: "shown hidden",
++            complete: false,
++        }),
++    };
++    let second = SkillFacts {
++        id: "b",
++        source_id: "demo",
++        sha256: [2; 32],
++        name: "Beta",
++        description: "second",
++        body: Some(BodyExcerpt {
++            text: "visible",
++            complete: true,
++        }),
++    };
++    let index = SkillIndex::build(key, &[second, first], Limits::default()).unwrap();
++    let current = [first, second].map(|f| CurrentSkill {
++        id: f.id,
++        source_id: f.source_id,
++        sha256: f.sha256,
++    });
++    for (query, id, weight) in [
++        ("i", "a", 4),
++        ("shown", "a", 1),
++        ("beta", "b", 4),
++        ("second", "b", 2),
++        ("visible", "b", 1),
++    ] {
++        let result = index.search(key, &current, query, 2).unwrap();
++        assert_eq!(result.hits.len(), 1, "{query}");
++        assert_eq!(
++            (result.hits[0].id, result.hits[0].score.field_weight),
++            (id, weight)
++        );
++    }
++    for absent in ["hidden", "hiddenvisible", "secondshown", &"x".repeat(64)] {
++        assert!(
++            index
++                .search(key, &current, absent, 2)
++                .unwrap()
++                .hits
++                .is_empty(),
++            "{absent}"
++        );
++    }
++    let partial = index.search(key, &current, "shown", 2).unwrap().hits[0].coverage;
++    assert!(partial.body_partial);
++    assert_eq!(partial.metadata_long_tokens_omitted, 1);
++    assert_eq!(
++        index.search(key, &current, &long, 2).unwrap_err(),
++        Error::QueryTokenTooLong
++    );
++}
