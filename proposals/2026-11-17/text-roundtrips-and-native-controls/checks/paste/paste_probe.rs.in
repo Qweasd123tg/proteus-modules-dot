@@ -1,0 +1,71 @@
+#![allow(dead_code)]
+use std::alloc::{GlobalAlloc,Layout,System};
+use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+struct Counter;
+static TRACK:AtomicBool=AtomicBool::new(false);static CALLS:AtomicUsize=AtomicUsize::new(0);static BYTES:AtomicUsize=AtomicUsize::new(0);
+fn charge(n:usize){if TRACK.load(Ordering::Relaxed){CALLS.fetch_add(1,Ordering::Relaxed);BYTES.fetch_add(n,Ordering::Relaxed);}}
+unsafe impl GlobalAlloc for Counter{
+ unsafe fn alloc(&self,l:Layout)->*mut u8{charge(l.size());unsafe{System.alloc(l)}}
+ unsafe fn dealloc(&self,p:*mut u8,l:Layout){unsafe{System.dealloc(p,l)}}
+ unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8{charge(n);unsafe{System.realloc(p,l,n)}}
+}
+#[global_allocator] static A:Counter=Counter;
+mod input{
+ use std::ops::Range;use super::*;
+ pub type Selection=Range<usize>;
+ mod auto_close {pub type AutoClosedPairs=();}
+ mod inline_tokens {#[derive(Clone,Debug,PartialEq)] pub struct TokenDelta;}
+ mod cursor {#[derive(Clone,Copy,Debug,PartialEq)] pub struct CursorSelection {pub start:usize,pub end:usize}}
+ mod change { include!("change.rs"); }
+ mod undo_manager { include!("undo_manager.rs"); }
+ use cursor::CursorSelection;use undo_manager::{EditIntent,UndoManager};
+ struct Window;struct Context<T>(std::marker::PhantomData<T>);struct ClipboardItem(Option<String>);
+ impl ClipboardItem{fn text(&self)->Option<String>{self.0.clone()}}
+ struct Selections(Vec<CursorSelection>);impl Selections{fn is_single(&self)->bool{self.0.len()==1}fn merge_overlapping(&mut self){}fn len(&self)->usize{self.0.len()}fn iter(&self)->std::slice::Iter<'_,CursorSelection>{self.0.iter()}}
+ struct State{selections:Selections,undo_manager:UndoManager,multi:bool,doc:String,probe:bool,dispatched:usize}
+ impl State{
+ fn is_multi_line(&self)->bool{self.multi}
+ fn cursor(&self)->usize{self.selections.0[0].end}
+ fn scroll_to(&mut self,_:usize,_:Option<()>,_:&mut Context<Self>){}
+ fn replace_text_in_range_silent(&mut self,_:Option<Range<usize>>,s:&str,w:&mut Window,c:&mut Context<Self>){if self.probe {self.dispatched+=1;return;}let e:Vec<_>=self.selections.iter().map(|c|(c.start..c.end,s.to_owned())).collect();self.replace_text_in_ranges(&e,w,c);}
+ fn replace_text_in_ranges(&mut self,edits:&[(Range<usize>,String)],_:&mut Window,_:&mut Context<Self>){
+  self.dispatched+=1;if self.probe{return;}
+  let intent=self.undo_manager.take_pending_intent().unwrap(); assert_eq!(intent,EditIntent::Atomic);
+  let mut es=edits.to_vec();es.sort_by_key(|e|std::cmp::Reverse(e.0.start));let grouped=es.len()>1;
+  if grouped{self.undo_manager.begin_transaction();}
+  let mut recorded=false;for (r,s) in &es{
+   let ch=change::Change::new(r.clone(),&self.doc[r.clone()],r.start..r.start+s.len(),s);
+   self.doc.replace_range(r.clone(),s);recorded|=self.undo_manager.record_transaction(ch,intent);
+  }
+  if grouped{self.undo_manager.commit_transaction();}
+  let before=self.selections.0.clone();let mut d=0isize;let mut after=Vec::new();for (r,s) in es.iter().rev(){
+   let pos=(r.start as isize+d) as usize+s.len();after.push(CursorSelection{start:pos,end:pos});d+=s.len() as isize-r.len() as isize;
+  }
+  if recorded {self.undo_manager.record_selections(before,after.clone());}self.selections.0=after;
+ }
+ @INSERT@
+ }
+ fn split_oracle(s:&str)->Vec<&str>{let bytes=s.as_bytes();let mut beg=0;let mut out=Vec::new();
+  for (i,&b) in bytes.iter().enumerate(){if b==b'\n' {let end=if i>beg&&bytes[i-1]==b'\r'{i-1}else{i};out.push(&s[beg..end]);beg=i+1;}}out.push(&s[beg..]);out}
+ fn state(n:usize,selected:bool)->State{let mut d=String::new();let mut v=Vec::new();for i in 0..n{let a=d.len();d.push_str("猫");let b=if selected{d.len()}else{a};v.push(CursorSelection{start:a,end:b});d.push(char::from(b'1'+i as u8));d.push('\n');}v.reverse();State{selections:Selections(v),undo_manager:UndoManager::new(),multi:true,doc:d,probe:false,dispatched:0}}
+ fn result(d:&str,sel:&[CursorSelection],s:&str)->String{let mut after=String::new();let mut prev=0;let mut v=sel.to_vec();v.sort_by_key(|x|x.start);let f=split_oracle(s);for (i,r) in v.iter().enumerate(){after.push_str(&d[prev..r.start]);after.push_str(if f.len()==v.len()&&v.len()>1{f[i]}else{s});prev=r.end;}after.push_str(&d[prev..]);after}
+ pub fn run(){let mut strings=vec![String::new(),"A\r\nБ".into(),"A\r\nБ\nC".into(),"x\r\r\ny\r".into()];let mut layer=vec![String::new()];for _ in 0..4{layer=layer.iter().flat_map(|s|["A","\r","\n","я","🦀"].iter().map(move |c|format!("{s}{c}"))).collect();strings.extend_from_slice(&layer);}
+  strings.sort();strings.dedup();
+  let mut tot=0;let mut wrong=0;let mut undos=0;let mut controls=0;
+  for s in &strings {for n in 1..=5{for selected in [false,true]{let mut st=state(n,selected);let d=st.doc.clone();let sel=st.selections.0.clone();let expected=if s.is_empty(){d.clone()}else{result(&d,&sel,s)};let mut cx=Context(std::marker::PhantomData);st.insert_clipboard(ClipboardItem(Some(s.clone())),&mut Window,&mut cx);
+  let got=st.doc.clone();tot+=1;
+  if got!=expected{wrong+=1;assert!(n>1&&s.contains("\r\n")&&split_oracle(s).len()==n);}else if n==1||!s.contains("\r\n")||split_oracle(s).len()!=n{controls+=1;}
+  if got!=d{
+   let replay=st.undo_manager.undo().expect("one undo");for ch in replay.changes{st.doc.replace_range(ch.new_range,&ch.old_text);}assert_eq!(st.doc,d);assert_eq!(replay.selections.as_deref(),Some(sel.as_slice()));assert!(st.undo_manager.undo().is_none());let redo=st.undo_manager.redo().unwrap();for ch in redo.changes{st.doc.replace_range(ch.old_range,&ch.new_text);}assert_eq!(st.doc,got);undos+=1;
+  }
+  }}}
+  println!("native matrix={tot} incorrect text={wrong}, not-affected controls={controls}, changed pastes restoring original text/selections in one real UndoManager transaction and redoing={undos}");
+  if cfg!(candidate){assert_eq!(wrong,0);}else{assert!(wrong>0);}
+  for n in [1,2]{let mut st=state(n,false);st.probe=true;let mut cx=Context(std::marker::PhantomData);
+   let input=ClipboardItem(Some("x\n".repeat(10_000)));CALLS.store(0,Ordering::Relaxed);BYTES.store(0,Ordering::Relaxed);TRACK.store(true,Ordering::Relaxed);
+   st.insert_clipboard(input,&mut Window,&mut cx);TRACK.store(false,Ordering::Relaxed);let (a,b)=(CALLS.load(Ordering::Relaxed),BYTES.load(Ordering::Relaxed));println!("20,000 byte synthetic paste ({n} cursors, fallback): {a} allocation/reallocation calls; {b} bytes requested cumulatively (not live bytes), including one cloned clipboard string; replacement sink disabled.");
+   if cfg!(candidate){assert_eq!((a,b),(1,20000));}else{assert!(a>=10001);}
+  }
+ }
+}
+fn main(){input::run();}
