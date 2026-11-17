@@ -1,0 +1,33 @@
+--- a/src/ui/tabs/arrange.rs
++++ b/src/ui/tabs/arrange.rs
+@@ -112,9 +112,7 @@
+     });
+     STATE.with_borrow_mut(|state| {
+         let next = if reach.contains(&position) {
+-            let others = others(pane, dragging);
+-            let index = others
+-                .iter()
++            let index = others(pane, dragging)
+                 .filter(|id| {
+                     state
+                         .bounds
+@@ -143,16 +141,12 @@
+         Target::At(at, index) if at == pane.id => Some(index),
+         _ => None,
+     })?;
+-    Some(others(pane, dragging).get(index).cloned())
++    Some(others(pane, dragging).nth(index).cloned())
+ }
+ 
+ /// The tabs of `pane` other than the dragged one, in order.
+-pub(super) fn others(pane: &Pane, dragging: &str) -> Vec<String> {
+-    pane.tabs
+-        .iter()
+-        .filter(|tab| *tab != dragging)
+-        .cloned()
+-        .collect()
++fn others<'a>(pane: &'a Pane, dragging: &'a str) -> impl Iterator<Item = &'a String> {
++    pane.tabs.iter().filter(move |tab| tab.as_str() != dragging)
+ }
+ 
+ /// Keeps a pinned tab among the pinned ones and an unpinned one after them,
