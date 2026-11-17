@@ -1,18 +1,24 @@
 # Proteus: bounded integration plan for PR86–154
 
-## Current integration decision, refreshed 2026-11-16
+## Current integration decision, refreshed 2026-11-17
 
 **Do not use the historical order below as an apply queue.** Upstream has already
 adopted much of it. The original 2026-11-15 plan is retained below as historical
 context; this section supersedes its refs, pending-work status and recommended
 application order, not its historical evidence.
 
-Fresh main refs were checked against the published patch targets:
+The 2026-11-17 adoption rows below supersede pending status for those findings.
+The earlier source reconciliations retain their dated evidence and refs; their
+source-only conclusions are not new runtime results. No frozen proposals,
+receipts, benchmark runs or history were rewritten.
+
+The prior 2026-11-16 reconciliation checked these main refs against the
+published patch targets:
 - Core: `cdf4aa5c1286f4d4dac31e7b7e52fccf3d1a3f4d`.
 - Modules: `b7e3ca3c23b9440c8c1a9e1d15386d02ef8586c7`.
 - Desktop: `79499f2d639a3185384bed75f29b6919b811fe7c`.
 - Extensions: `ae6479c5accc404d5a635fdeff1397a8b3016416`.
-- Delivery before this documentation update: `f113e3848ba41870fa81e957c4f54bd3f94e3510`, through #167.
+- Delivery before that reconciliation: `f113e3848ba41870fa81e957c4f54bd3f94e3510`, through #167.
 
 ### Already adopted: do not reapply historical assemblies
 
@@ -32,10 +38,35 @@ Fresh main refs were checked against the published patch targets:
 | #160 settings | Desktop [84923bc](https://github.com/Proteus-harness/Proteus-desktop/commit/84923bcd0c73843b1a04a2f47de658afa697beec), with adaptations | Review current behavior rather than reapply |
 | #162 reporting | Core [55206ae](https://github.com/Proteus-harness/Proteus-core/commit/55206ae5e7d8d3fd8876e1dd345a577194f6d523); complete reverse-check succeeds | Do not replay or reinterpret historical scores |
 | #164 portable compatibility | Desktop [48aa785](https://github.com/Proteus-harness/Proteus-desktop/commit/48aa78530460c54a5151106c8bdbb3faf3a399aa); both alternatives reverse-check | Apply neither alternative again |
+| #169 atomic portable archive | Desktop [968c024](https://github.com/Proteus-harness/Proteus-desktop/commit/968c024f5ff1d9fdc8511f0c80221213efc86dd6) | Adopted: failed packaging preserves the previous archive; 8 serialization and 134 release Python tests passed |
+| #170 evaluation cohort | Core [2a9f7e7](https://github.com/Proteus-harness/Proteus-core/commit/2a9f7e7a3e9397493e81821e3a5a1054a8e9bcc0) | Adopted: counts and reports use one selected cohort; 12 synthetic Python tests passed; historical reports were not regenerated |
+| #171 child-local model scope + #177 inline settings ownership | Core [2349ba9](https://github.com/Proteus-harness/Proteus-core/commit/2349ba98cea5715b6093036c097303830492f55b) | Adopted together with adaptations; 39 config + 48 ConfigBuilder tests passed (87 unique); no DTO change |
+| #176 JavaScript ContextChunk projection | Modules [749101b](https://github.com/Proteus-harness/Proteus-modules/commit/749101b6fd5d7c2540445605d91e2d7a7a44d6d4) | Adopted: source and render mode survive Pi/OpenCode projection; 2 regressions failed before the fix, then 85 Node and 23 Python checks passed |
+| #178 Anthropic text-block ownership | Modules [eb12dd5](https://github.com/Proteus-harness/Proteus-modules/commit/eb12dd5a0d4f2cc65cc0f69d303e778656eaf455) | Adopted: each text block owns its stream filter; 3 regressions failed before the fix, then 66 Anthropic tests passed, including 13 stream tests; 4 local HTTP/SSE scenarios passed |
 
-These are source-adoption findings, not new runtime acceptance. Adapted tests,
-formatting and later development mean an unsuccessful reverse-check alone does
-not establish that a fix is missing.
+The older rows are source-adoption findings, not new runtime acceptance. The
+2026-11-17 rows record the integration's focused checks; these were not rerun by
+this documentation update. Adapted tests, formatting and later development mean
+an unsuccessful reverse-check alone does not establish that a fix is missing.
+
+For #176, the Python checks include the real installer entrypoint and copied-source
+import closure using cached dependency trees; npm was mocked. They do not prove
+a fresh dependency install. For #169, the actual candidate archive was
+325,857,205 bytes; gzip/tar verification covered 58,480 members and SHA-256
+verification covered 39 packaged binaries. Native remained at its earlier
+build and was not rebuilt. No external provider or paid inference was used;
+the installed CLI's child-only alias check used a local fake model and inspected
+the child's canonical `ModelRequest`.
+
+**Current triage:** #175 qualification is reflected only for adopted #171;
+its earlier #167 candidate was not reapplied. #179 remains coordinated-rollout /
+mixed-version **HOLD**. #180 qualifies the existing #165 terminal-reader cut;
+it is not another adopted optimization. #181–183 remain unadopted proposals.
+The other #165/#166 cuts and gates below retain their prior status.
+
+Modules [3230a70](https://github.com/Proteus-harness/Proteus-modules/commit/3230a7039bd702dd0c37f2fd6ebd61deb2cf9473)
+clarifies local versus remote Codex compaction availability. It adds no remote
+compaction implementation or account-entitlement proof.
 
 ### PR #86 source reconciliation, 2026-11-16
 
