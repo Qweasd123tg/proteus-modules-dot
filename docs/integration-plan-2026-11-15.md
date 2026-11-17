@@ -68,6 +68,36 @@ Modules [3230a70](https://github.com/Proteus-harness/Proteus-modules/commit/3230
 clarifies local versus remote Codex compaction availability. It adds no remote
 compaction implementation or account-entitlement proof.
 
+### Native Codex compaction implementation, 2026-11-17
+
+The later implementation is a separate adoption from that documentation-only
+commit. Current integration refs are Core
+[1df6d10](https://github.com/Proteus-harness/Proteus-core/commit/1df6d1024fdda08e4856326bfa8428ecf30a10d4),
+Modules [ca1984e](https://github.com/Proteus-harness/Proteus-modules/commit/ca1984e74142f7fb6b4bbe2470c4a0b43ed39157)
+and Desktop [955d922](https://github.com/Proteus-harness/Proteus-desktop/commit/955d922ef6a1ce8f96cdbd6352d412e6131f4bf3)
+(supply pins only; Native and Extensions unchanged).
+Core includes API `59da60a`, fixture synchronization `821d17a` and configured-hook
+retention `12456d4`; Modules includes adapter `812f079`, hook `b9104b8`, pre-turn
+tool reuse `4d00717` and SDK/JavaScript rollout `ca1984e`.
+
+Remote compaction uses a typed model operation and host-owned capability through
+the existing bound model callback. Unsupported models retain local summarization;
+a remote failure does not silently select that fallback. Checkpoints remain opaque
+through history and replay. The coordinated versions are model/v14, hook/v7,
+workflow/v21 and tool/v7. Checkpoint token sizing remains a conservative generic
+payload estimate, rather than exact parity with the native encrypted-item heuristic.
+
+Recorded integration checks: Core **1284 passed / 0 failed / 6 ignored**; Modules
+**805 passed / 0 failed / 1 ignored**, plus 23 Python and 33 Node checks. Another
+148 unique JavaScript cases were covered across a 147-pass full run and a focused
+six-case process rerun. Debug CLI evidence covers two compactions and three
+samplings, matching tools/base instructions, cold resume with one patch effect,
+and matched replay comparison with source history/output unchanged. These results
+are not a new test run by this documentation update. Release packaging and the
+live installed-stack check are still in progress; no completed delivery, universal
+account access or full native parity is claimed. The #179 HOLD and unadopted
+#181–183 decisions above remain unchanged.
+
 ### PR #86 source reconciliation, 2026-11-16
 
 **Both #86 source changes are already adopted; do not reapply either historical
