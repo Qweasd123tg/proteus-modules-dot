@@ -1,0 +1,67 @@
+--- a/crates/proteus-core/src/core/topology_render/table.rs
++++ b/crates/proteus-core/src/core/topology_render/table.rs
+@@ -1,3 +1,5 @@
++use std::fmt::Write as _;
++
+ use crate::core::TopologySnapshot;
+ 
+ use super::helpers::{module_source_label, yes_no};
+@@ -60,10 +62,7 @@
+ }
+ 
+ fn render_table<const N: usize>(headers: [&str; N], rows: &[[String; N]]) -> String {
+-    let mut widths = headers
+-        .iter()
+-        .map(|header| header.chars().count())
+-        .collect::<Vec<_>>();
++    let mut widths = headers.map(|header| header.chars().count());
+     for row in rows {
+         for (index, cell) in row.iter().enumerate() {
+             widths[index] = widths[index].max(cell.chars().count());
+@@ -71,26 +70,31 @@
+     }
+ 
+     let mut rendered = String::new();
+-    rendered.push_str(&render_table_row(&headers.map(str::to_owned), &widths));
++    push_table_row(&mut rendered, &headers, &widths);
+     rendered.push('\n');
+-    rendered.push_str(
+-        &widths
+-            .iter()
+-            .map(|width| "-".repeat(*width))
+-            .collect::<Vec<_>>()
+-            .join("  "),
+-    );
++    for (index, &width) in widths.iter().enumerate() {
++        if index != 0 {
++            rendered.push_str("  ");
++        }
++        rendered.extend(std::iter::repeat_n('-', width));
++    }
+     for row in rows {
+         rendered.push('\n');
+-        rendered.push_str(&render_table_row(row, &widths));
++        push_table_row(&mut rendered, row, &widths);
+     }
+     rendered
+ }
+ 
+-fn render_table_row<const N: usize>(row: &[String; N], widths: &[usize]) -> String {
+-    row.iter()
+-        .enumerate()
+-        .map(|(index, cell)| format!("{cell:width$}", width = widths[index]))
+-        .collect::<Vec<_>>()
+-        .join("  ")
++fn push_table_row<const N: usize>(
++    out: &mut String,
++    row: &[impl AsRef<str>; N],
++    widths: &[usize; N],
++) {
++    for (index, (cell, &width)) in row.iter().zip(widths).enumerate() {
++        if index != 0 {
++            out.push_str("  ");
++        }
++        let cell = cell.as_ref();
++        write!(out, "{cell:width$}").expect("writing to a String cannot fail");
++    }
+ }
