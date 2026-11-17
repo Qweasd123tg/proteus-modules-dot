@@ -83,9 +83,9 @@ tool reuse `4d00717` and SDK/JavaScript rollout `ca1984e`.
 Remote compaction uses a typed model operation and host-owned capability through
 the existing bound model callback. Unsupported models retain local summarization;
 a remote failure does not silently select that fallback. Checkpoints remain opaque
-through history and replay. The coordinated versions are model/v14, hook/v7,
-workflow/v21 and tool/v7. Checkpoint token sizing remains a conservative generic
-payload estimate, rather than exact parity with the native encrypted-item heuristic.
+through history and replay. The initial coordinated versions were model/v14,
+hook/v7, workflow/v21 and tool/v7. That delivery used a conservative generic
+checkpoint payload estimate; the follow-up below replaces it.
 
 Recorded integration checks: Core **1284 passed / 0 failed / 6 ignored**; Modules
 **805 passed / 0 failed / 1 ignored**, plus 23 Python and 33 Node checks. Another
@@ -106,6 +106,44 @@ requests. This proves that configured account/model path, not universal account
 access or full native parity. The original benchmark runtime and immutable inputs
 remained unchanged. The #179 HOLD and unadopted #181–183 decisions above remain
 unchanged.
+
+### Encrypted checkpoint sizing follow-up, 2026-11-17
+
+The provider-local estimator now follows the pinned Codex encrypted-item
+heuristic: UTF-8 ciphertext bytes × 3 / 4, saturating subtraction of 650,
+then ceiling division by 4. Wrapper/id/status fields do not count, base64 is
+not decoded, and zero remains zero. A 3,172-byte checkpoint contributes
+433 tokens. The previous opaque format and persisted payload remain unchanged.
+
+The generic optional model feature is `model.input_estimate.v1`; its handler
+returns `None` when unsupported and a partial typed map for recognized parts.
+Hook/v8 exposes it to preparation without inference or credentials. Model/v14,
+workflow/v21 and tool/v7 remain unchanged. Only the provider adapter recognizes
+the OpenAI format; Core, hook and workflow consume generic estimates.
+
+The correction covers trigger, preflight and the existing context category.
+Cold histories without usage count the checkpoint; ordinary observed usage
+already includes it and takes precedence over the estimate. Compaction billing
+usage does not stand in for the resulting checkpoint size. Other canonical
+items still use the existing estimator; this does not establish exact tokenizer
+parity for the complete request.
+
+Adopted source refs: Core `524c99cafcc4b307a9b98ed4da54d37f569fd8c0`,
+Modules `99039de4ad83044778efd6a3f2b035a7136ed6f9`; the Modules SDK pin is
+`d6939cad236fe64aed6856a98f8251675636aeb3`. The Modules full gate passed
+829 Rust, 23 Python and 33 Node checks; another 148 JavaScript cases passed.
+Core's full gate had 1,295 passes and one stale callback-authority fixture;
+that fixture was corrected and its exact target passed, with no unresolved
+failure. The async API cleanup also passed its focused Core checks.
+
+Installed release CLI evidence covers three cold-resume threshold cases:
+estimated checkpoint with trigger 400 compacts, trigger 700 skips, and observed
+usage with trigger 400 skips without charging the checkpoint again. Each case
+writes the patch once and matches replay with the source journal unchanged and
+no extra HTTP request. A separate installed model process verifies five local
+vectors including zero and UTF-8, partial unknown-format handling and three
+malformed-input errors. These checks made no paid model requests. The previous
+live Compact → Complete evidence remains a separate, earlier transport check.
 
 ### PR #86 source reconciliation, 2026-11-16
 
