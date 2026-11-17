@@ -1,0 +1,161 @@
+diff --git a/crates/proteus-contracts/src/domain/hosted_tool.rs b/crates/proteus-contracts/src/domain/hosted_tool.rs
+index 23694a6..b2825f7 100644
+--- a/crates/proteus-contracts/src/domain/hosted_tool.rs
++++ b/crates/proteus-contracts/src/domain/hosted_tool.rs
+@@ -177,7 +177,9 @@ impl WebSearchSource {
+ #[serde(deny_unknown_fields)]
+ #[non_exhaustive]
+ pub struct FileSearchResult {
+-    pub file_id: String,
++    /// Provider file identity, when supplied. Result metadata can exist without
++    /// it; the containing hosted activity keeps its own required identity.
++    pub file_id: Option<String>,
+     pub filename: Option<String>,
+     pub score: Option<f64>,
+     pub text: Option<String>,
+@@ -186,14 +188,14 @@ pub struct FileSearchResult {
+ 
+ impl FileSearchResult {
+     pub fn new(
+-        file_id: impl Into<String>,
++        file_id: Option<String>,
+         filename: Option<String>,
+         score: Option<f64>,
+         text: Option<String>,
+         attributes: serde_json::Value,
+     ) -> Self {
+         Self {
+-            file_id: file_id.into(),
++            file_id,
+             filename,
+             score,
+             text,
+diff --git a/crates/proteus-contracts/tests/file_search_result.rs b/crates/proteus-contracts/tests/file_search_result.rs
+new file mode 100644
+index 0000000..155f393
+--- /dev/null
++++ b/crates/proteus-contracts/tests/file_search_result.rs
+@@ -0,0 +1,85 @@
++//! The file identity is optional result metadata, not the hosted activity ID.
++use proteus_contracts::{
++    domain::{FileSearchResult, HostedToolActivity, HostedToolStatus},
++    model_standard::{
++        CanonicalMessage, CanonicalModelResponse, ContentPart, FinishReason, MessageRole,
++    },
++};
++use serde_json::{Value, json};
++
++fn result() -> Value {
++    json!({
++        "filename": "architecture.md", "score": 0.9, "text": "Core owns DTOs.",
++        "attributes": {"kind": "design"},
++    })
++}
++
++#[test]
++fn known_file_identity_keeps_existing_canonical_json() {
++    for id in ["file-1", ""] {
++        let mut raw = result();
++        raw["file_id"] = json!(id);
++        let decoded: FileSearchResult = serde_json::from_value(raw.clone()).unwrap();
++        assert_eq!(serde_json::to_value(decoded).unwrap(), raw);
++    }
++}
++
++#[test]
++fn optional_file_identity_survives_canonical_response_round_trip() {
++    for id in [None, Some(Value::Null)] {
++        let mut raw = result();
++        if let Some(id) = id {
++            raw["file_id"] = id;
++        }
++        let activity: HostedToolActivity = serde_json::from_value(json!({
++            "kind": "file_search", "id": "search-1", "status": HostedToolStatus::Completed,
++            "queries": ["architecture"], "results": [raw],
++        }))
++        .expect("a result may lack its own file identity");
++        let response = CanonicalModelResponse::from_messages(
++            vec![CanonicalMessage::new(
++                MessageRole::Assistant,
++                vec![
++                    ContentPart::HostedToolActivity { activity },
++                    ContentPart::Text {
++                        text: "Answer remains available.".to_owned(),
++                    },
++                ],
++            )],
++            vec![],
++            FinishReason::Stop,
++        );
++        let encoded = serde_json::to_string(&response).unwrap();
++        let restored: CanonicalModelResponse = serde_json::from_str(&encoded).unwrap();
++        assert_eq!(restored, response);
++        let ContentPart::HostedToolActivity { activity } = &restored.messages[0].parts[0].payload
++        else {
++            panic!("hosted activity missing");
++        };
++        let activity = serde_json::to_value(activity).unwrap();
++        assert_eq!(activity["id"], "search-1");
++        assert!(activity["results"][0].get("file_id").is_some());
++        assert!(activity["results"][0]["file_id"].is_null());
++        assert_eq!(activity["results"][0]["filename"], raw["filename"]);
++        assert_eq!(activity["results"][0]["score"], raw["score"]);
++        assert_eq!(activity["results"][0]["text"], raw["text"]);
++        assert_eq!(activity["results"][0]["attributes"], raw["attributes"]);
++        assert_eq!(
++            restored.messages[0].display_text(),
++            "Answer remains available."
++        );
++    }
++}
++
++#[test]
++fn file_identity_stays_typed_and_result_stays_strict() {
++    for invalid in [json!(1), json!(true), json!([]), json!({})] {
++        let mut raw = result();
++        raw["file_id"] = invalid;
++        assert!(serde_json::from_value::<FileSearchResult>(raw).is_err());
++    }
++    let mut raw = result();
++    raw["file_id"] = json!("file-1");
++    raw["unexpected"] = json!(true);
++    assert!(serde_json::from_value::<FileSearchResult>(raw).is_err());
++}
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+index f080c46..a1fb429 100644
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -448,7 +448,7 @@ mod tests {
+                         status: HostedToolStatus::Completed,
+                         queries: vec!["architecture".to_owned()],
+                         results: vec![FileSearchResult::new(
+-                            "file-1",
++                            Some("file-1".to_owned()),
+                             Some("architecture.pdf".to_owned()),
+                             Some(0.9),
+                             None,
+diff --git a/docs/architecture/canonical-turn-data.md b/docs/architecture/canonical-turn-data.md
+index 813ed39..bf97c33 100644
+--- a/docs/architecture/canonical-turn-data.md
++++ b/docs/architecture/canonical-turn-data.md
+@@ -96,6 +96,20 @@ provider-side execution и сохраняются в journal/transcript/eval pro
+ `CanonicalPart` явно закрепляет их provenance/scope; угадывать hosted execution
+ по provider metadata или тексту ответа нельзя.
+ 
++`FileSearchResult.file_id` — необязательный идентификатор файла внутри
++результата поиска. Если provider его не передал, canonical result сохраняет
++`None`, остальные metadata и позицию в списке: пустой ID не выдумывается,
++результат не отбрасывается. Это не идентификатор самой hosted activity и не
++`Citation::File.file_id`; их обязательность не меняется. Canonical JSON
++записывает отсутствие как `null`, как у остальных optional result fields;
++missing/null читаются как `None`, строка — как `Some` без нормализации.
++
++Это согласованное изменение чернового DTO. Producer и typed consumers
++обновляются вместе; новый результат без ID нельзя передавать старому
++consumer с обязательным `String`. Существующие строковые ID читаются без
++перезаписи истории. Отдельного migration shim или dual-read формата нет;
++откат reader после сохранения новых null-ID не является совместимым.
++
+ ## Формат Journal
+ 
+ Одна JSONL-строка — один строгий record с общим envelope:

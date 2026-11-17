@@ -1,0 +1,200 @@
+diff --git a/docs/reference.md b/docs/reference.md
+index 719da78..87e9139 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -26,6 +26,21 @@ feature не мешает обязательным describe/stream. Корнев
+ описательные `_meta` с авторскими ключами `namespace/name`; данные не меняют
+ slot authority.
+ 
++## OpenAI File Search Results
++
++OpenAI adapter сохраняет provider-hosted search results как canonical
++`HostedToolActivity::FileSearch`. У отдельного результата `file_id`
++необязателен: отсутствие становится `None`, metadata и порядок результатов
++сохраняются без выдуманного ID или удаления строки. Явный provider `null` и
++нестроковое значение по-прежнему отклоняются; это не расширение схемы
++`file_id?: string` до nullable. Идентификатор самой activity остаётся
++обязательным, как и идентификатор файла в citation.
++
++Изменение требует согласованного Core `FileSearchResult.file_id: Option<String>`.
++Старый mandatory-String consumer не понимает canonical null-ID; смешанная
++поставка старого host и нового adapter не квалифицирована. Native OpenCode и
++Pi adapters этим изменением не затрагиваются.
++
+ ## Native OpenCode Model
+ 
+ `model/opencode-provider` экспортирует `model/opencode` (`v13`) через
+diff --git a/model/model-pack/src/adapters/openai/response.rs b/model/model-pack/src/adapters/openai/response.rs
+index c31ce51..06c867f 100644
+--- a/model/model-pack/src/adapters/openai/response.rs
++++ b/model/model-pack/src/adapters/openai/response.rs
+@@ -9,6 +9,9 @@ use crate::model_standard::{
+ 
+ #[path = "response/item.rs"]
+ mod item;
++#[cfg(test)]
++#[path = "response/file_search_result_tests.rs"]
++mod file_search_result_tests;
+ pub(super) use item::{parse_message_phase, parse_output_item};
+ 
+ pub(super) fn from_openai_response(response: Value) -> Result<CanonicalModelResponse> {
+diff --git a/model/model-pack/src/adapters/openai/response/file_search_result_tests.rs b/model/model-pack/src/adapters/openai/response/file_search_result_tests.rs
+new file mode 100644
+index 0000000..793cbd2
+--- /dev/null
++++ b/model/model-pack/src/adapters/openai/response/file_search_result_tests.rs
+@@ -0,0 +1,128 @@
++//! Responses Result.file_id is optional; the hosted activity ID is not.
++use super::*;
++use crate::{domain::HostedToolActivity, model_standard::ModelStreamEvent};
++use serde_json::json;
++
++fn response_fixture(results: Value) -> Value {
++    json!({
++        "status": "completed", "output": [{
++            "type": "file_search_call", "id": "search-1", "status": "completed",
++            "queries": ["architecture"], "results": results,
++        }, {
++            "id": "answer-1", "type": "message", "role": "assistant",
++            "content": [{"type": "output_text", "text": "Core owns the public DTO."}],
++        }],
++        "usage": {"input_tokens": 12, "output_tokens": 3},
++    })
++}
++
++fn assert_result(response: &CanonicalModelResponse, raw: &Value) {
++    assert_eq!(response.messages.len(), 2);
++    let ContentPart::HostedToolActivity {
++        activity: HostedToolActivity::FileSearch { id, results, .. },
++    } = &response.messages[0].parts[0].payload
++    else {
++        panic!("file-search activity missing");
++    };
++    assert_eq!(id, "search-1");
++    assert_eq!(results.len(), 4);
++    assert_eq!(results[0].file_id.as_deref(), Some("file-1"));
++    assert_eq!(results[1].file_id, None);
++    assert_eq!(results[1].filename.as_deref(), Some("architecture.md"));
++    assert_eq!(results[1].score, Some(0.9));
++    assert_eq!(results[1].text.as_deref(), Some("Core owns DTOs."));
++    assert_eq!(results[1].attributes, json!({"kind": "design"}));
++    assert_eq!(results[2].file_id.as_deref(), Some(""));
++    assert_eq!(results[3].file_id, None);
++    assert_eq!(results[3].filename, None);
++    assert_eq!(results[3].text, None);
++    assert_eq!(
++        response.messages[1].display_text(),
++        "Core owns the public DTO."
++    );
++    assert_eq!(response.finish_reason, FinishReason::Stop);
++    assert!(response.tool_calls.is_empty());
++    assert_eq!(&response.provider_metadata, raw);
++    let usage = response.usage.as_ref().unwrap();
++    assert_eq!((usage.input_tokens, usage.output_tokens), (12, 3));
++}
++
++#[test]
++fn file_search_result_optional_id_preserves_order_metadata_and_both_response_paths() {
++    use super::super::stream_state::OpenAiStreamState;
++    let raw = response_fixture(json!([
++        {"file_id": "file-1"},
++        {"filename": "architecture.md", "score": 0.9, "text": "Core owns DTOs.",
++            "attributes": {"kind": "design"}},
++        {"file_id": ""},
++        {},
++    ]));
++    assert_result(&from_openai_response(raw.clone()).unwrap(), &raw);
++    let mut state = OpenAiStreamState::default();
++    let item_events = state.translate(
++        &json!({
++            "type": "response.output_item.done", "output_index": 0,
++            "item": raw["output"][0],
++        })
++        .to_string(),
++    );
++    let [ModelStreamEvent::MessageCompleted { message }] = item_events.as_slice() else {
++        panic!("completed hosted item missing: {item_events:?}");
++    };
++    let final_events = state.translate(
++        &json!({
++            "type": "response.completed", "response": raw,
++        })
++        .to_string(),
++    );
++    let [ModelStreamEvent::Response { response }] = final_events.as_slice() else {
++        panic!("completed response missing: {final_events:?}");
++    };
++    assert_result(response, &raw);
++    assert_eq!(response.messages[0].id, message.id);
++    assert_eq!(
++        response.messages[0].parts[0].payload,
++        message.parts[0].payload
++    );
++}
++
++#[test]
++fn file_search_result_empty_or_absent_results_keep_existing_behavior() {
++    for results in [None, Some(Value::Null), Some(json!([]))] {
++        let mut raw = response_fixture(results.clone().unwrap_or(Value::Null));
++        if results.is_none() {
++            raw["output"][0].as_object_mut().unwrap().remove("results");
++        }
++        let response = from_openai_response(raw).unwrap();
++        let ContentPart::HostedToolActivity {
++            activity:
++                HostedToolActivity::FileSearch {
++                    results: decoded, ..
++                },
++        } = &response.messages[0].parts[0].payload
++        else {
++            panic!("missing activity");
++        };
++        assert!(decoded.is_empty());
++        assert_eq!(
++            response.messages[1].display_text(),
++            "Core owns the public DTO."
++        );
++    }
++}
++
++#[test]
++fn file_search_result_provider_id_remains_optional_string_not_nullable_or_untyped() {
++    for id in [Value::Null, json!(false), json!(1), json!([]), json!({})] {
++        let raw = response_fixture(json!([{"file_id": id}]));
++        assert!(from_openai_response(raw).is_err());
++    }
++    let mut raw = response_fixture(json!([]));
++    raw["output"][0].as_object_mut().unwrap().remove("id");
++    assert!(
++        from_openai_response(raw)
++            .unwrap_err()
++            .to_string()
++            .contains("file_search_call missing string field 'id'")
++    );
++}
+diff --git a/model/model-pack/src/adapters/openai/response/item.rs b/model/model-pack/src/adapters/openai/response/item.rs
+index 0e564e6..850c207 100644
+--- a/model/model-pack/src/adapters/openai/response/item.rs
++++ b/model/model-pack/src/adapters/openai/response/item.rs
+@@ -286,7 +286,7 @@ fn parse_file_search_results(value: Option<&Value>) -> Result<Vec<FileSearchResu
+                 })
+                 .transpose()?;
+             Ok(FileSearchResult::new(
+-                required_string(result, "file_id", "file_search result")?,
++                optional_string(result, "file_id", "file_search result")?,
+                 optional_string(result, "filename", "file_search result")?,
+                 score,
+                 optional_string(result, "text", "file_search result")?,
+diff --git a/model/model-pack/src/adapters/openai/tests.rs b/model/model-pack/src/adapters/openai/tests.rs
+index f3026ce..6ecb1c7 100644
+--- a/model/model-pack/src/adapters/openai/tests.rs
++++ b/model/model-pack/src/adapters/openai/tests.rs
+@@ -958,7 +958,7 @@ fn response_preserves_hosted_activity_results_and_citations() {
+             && matches!(
+                 results.as_slice(),
+                 [FileSearchResult { file_id, score: Some(score), .. }]
+-                    if file_id == "file_1" && (*score - 0.91).abs() < f64::EPSILON
++                    if file_id.as_deref() == Some("file_1") && (*score - 0.91).abs() < f64::EPSILON
+             )
+     ));
+     assert!(matches!(
