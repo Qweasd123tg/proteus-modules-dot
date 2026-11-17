@@ -22,3 +22,10 @@ runtime validation. Ни upstream integration, ни performance win не зая�
 [План дедупликации](TEST-DEDUP-PLAN.md) не разрешает массовое удаление тестов
 или переписывание исторического evidence. Parser private API и сдвиг одного
 test oracle, а также свежие source/pin изменения подробно раскрыты в отчёте.
+
+## Позднейшая узкая квалификация
+
+[2026-11-17: Rust before/after для single-terminal-reader](QUALIFICATION-2026-11-17.md):
+те же 17 существующих pure tests PASS до/после и в независимом повторе.
+Это отдельное дополнение к историческому source-only evidence выше, только для
+одного unchanged patch; не весь batch и не upstream integration.
