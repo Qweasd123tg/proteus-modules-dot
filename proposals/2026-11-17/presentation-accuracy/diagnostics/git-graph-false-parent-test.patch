@@ -1,0 +1,29 @@
+--- a/packages/git/src/graph.rs
++++ b/packages/git/src/graph.rs
+@@ -437,4 +437,26 @@
+         assert!(rows[2].up.contains(&segment(1, 0, 1)));
+         assert!(rows[2].up.contains(&segment(0, 0, 0)));
+     }
++
++    #[test]
++    fn independent_parent_edges_do_not_merge_on_a_dot_free_lane() {
++        let rows = layout(&[
++            ("a", vec!["e"]),
++            ("b", vec!["e"]),
++            ("c", vec!["d", "g"]),
++            ("d", vec![]),
++            ("e", vec!["f", "g"]),
++            ("f", vec![]),
++            ("g", vec![]),
++        ]);
++        // After c, b→e and c→g have the same color. They must still be
++        // distinguishable in row d; otherwise b also appears connected to g.
++        let distinct: std::collections::BTreeSet<_> = rows[3]
++            .down
++            .iter()
++            .filter(|s| s.color == rows[1].color)
++            .map(|s| s.from)
++            .collect();
++        assert_eq!(distinct.len(), 2);
++    }
+ }
