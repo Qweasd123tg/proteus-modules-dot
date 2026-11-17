@@ -1,0 +1,127 @@
+diff --git a/components/model-runtime-js/context.mjs b/components/model-runtime-js/context.mjs
+new file mode 100644
+--- /dev/null
++++ b/components/model-runtime-js/context.mjs
+@@ -0,0 +1,7 @@
++// Canonical ContextChunk projection shared by JavaScript model adapters.
++// Core validates render_mode; provider metadata never selects the envelope.
++export function contextText(chunk) {
++    if (chunk.render_mode === "verbatim") return chunk.content;
++    const path = chunk.path == null ? "" : ` (${chunk.path})`;
++    return `Context from ${chunk.source}${path}:\n${chunk.content}`;
++}
+diff --git a/components/pi-runtime-js/messages.mjs b/components/pi-runtime-js/messages.mjs
+--- a/components/pi-runtime-js/messages.mjs
++++ b/components/pi-runtime-js/messages.mjs
+@@ -1,3 +1,5 @@
++import { contextText } from "../model-runtime-js/context.mjs";
++
+ export function piContent(result) {
+     const content = [];
+     if (result.output || result.error)
+@@ -32,13 +34,7 @@
+         for (const [i, { payload }] of message.parts.entries()) {
+             if (payload.Text) content.push({ type: "text", text: payload.Text.text });
+             else if (payload.Context) {
+-                const c = payload.Context.chunk;
+-                const text =
+-                    c.render_mode === "verbatim"
+-                        ? c.content
+-                        : `Context from ${c.source}${c.path ? " (" + c.path + ")" : ""}:
+-${c.content}`;
+-                content.push({ type: "text", text });
++                content.push({ type: "text", text: contextText(payload.Context.chunk) });
+             } else if (payload.ToolCall) {
+                 const { id, name, args } = payload.ToolCall.call;
+                 names.set(id, name);
+diff --git a/model/opencode-provider/messages.mjs b/model/opencode-provider/messages.mjs
+--- a/model/opencode-provider/messages.mjs
++++ b/model/opencode-provider/messages.mjs
+@@ -1,6 +1,7 @@
+ // Pure model/v13 -> @opencode/ai bridge. Agent prompts, model selection,
+ // authentication and provider variants belong to their own slots.
+ import { readFile } from 'node:fs/promises';
++import { contextText } from '../../components/model-runtime-js/context.mjs';
+ import { LLM, Media } from '../../workflow/opencode-runtime/node_modules/@opencode/ai/dist/index.js';
+ 
+ function unsupported(message) {
+@@ -80,7 +81,7 @@
+             const payload = message.parts[index].payload;
+             let native;
+             if (payload.Text) native = { type: 'text', text: payload.Text.text };
+-            else if (payload.Context) native = { type: 'text', text: payload.Context.chunk.content };
++            else if (payload.Context) native = { type: 'text', text: contextText(payload.Context.chunk) };
+             else if (payload.FileRef && payload.FileRef.content != null)
+                 native = { type: 'text', text: payload.FileRef.content };
+             else if (payload.Image) native = await imagePart(payload.Image.image, signal);
+diff --git a/model/opencode-provider/tests/io.test.mjs b/model/opencode-provider/tests/io.test.mjs
+--- a/model/opencode-provider/tests/io.test.mjs
++++ b/model/opencode-provider/tests/io.test.mjs
+@@ -31,7 +31,8 @@
+     const input = request({
+         instructions: [{ kind: 'Developer', text: 'first', priority: 20 }, { kind: 'System', text: 'second', priority: 0 }],
+         messages: [message('Developer', [text('chronological instruction')]), message('User', [text('A'),
+-            { Context: { chunk: { content: 'untrusted context' } } }, text('B')])],
++            { Context: { chunk: { source: 'fixture', path: null, content: 'untrusted context',
++                render_mode: 'verbatim', score: null, metadata: null } } }, text('B')])],
+     });
+     const output = await toNativeRequest(input, model);
+     assert.ok(output instanceof LLMRequest);
+@@ -45,6 +46,28 @@
+     assert.equal(output.providerOptions, undefined);
+     assert.equal(output.cache, 'none');
+     assert.equal(output.toolChoice.type, 'auto');
++});
++
++
++test('context rendering follows canonical mode without changing request data or part order', async () => {
++    const chunks = [
++        { source: 'search', path: null, content: 'found', render_mode: 'source_annotated', metadata: { render_mode: 'verbatim' } },
++        { source: 'memory', path: 'src/δ.rs', content: 'line 1\r\nline 2\n', render_mode: 'source_annotated', metadata: null },
++        { source: 'empty-path', path: '', content: 'value', render_mode: 'source_annotated', metadata: null },
++        { source: 'empty-content', path: null, content: '', render_mode: 'source_annotated', metadata: null },
++        { source: 'private-label', path: 'private-path', content: 'exact\r\n  text\n', render_mode: 'verbatim', metadata: { render_mode: 'source_annotated' } },
++        { source: 'empty-verbatim', path: null, content: '', render_mode: 'verbatim', metadata: null },
++    ].map(chunk => ({ ...chunk, score: null }));
++    const expected = ['Context from search:\nfound', 'Context from memory (src/δ.rs):\nline 1\r\nline 2\n',
++        'Context from empty-path ():\nvalue', 'Context from empty-content:\n', 'exact\r\n  text\n', ''];
++    const input = request({ messages: [message('User', [text('before'),
++        ...chunks.map(chunk => ({ Context: { chunk } })), text('after')])] });
++    const original = structuredClone(input);
++    for (const chunk of chunks) Object.freeze(chunk);
++    const output = await toNativeRequest(input, model);
++    assert.ok(Schema.is(LLMRequest)(output));
++    assert.deepEqual(output.messages[0].content.map(item => item.text), ['before', ...expected, 'after']);
++    assert.deepEqual(input, original);
+ });
+ 
+ test('sampling and explicit output limit map once without a fallback token cap', async () => {
+diff --git a/tool/pi-tools/tests/context-rendering.test.mjs b/tool/pi-tools/tests/context-rendering.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/tool/pi-tools/tests/context-rendering.test.mjs
+@@ -0,0 +1,24 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { piMessages } from "../../../components/pi-runtime-js/messages.mjs";
++
++test("Pi preserves canonical context mode, source, optional path and exact content", () => {
++    const chunks = [
++        { source: "search", path: null, content: "found", render_mode: "source_annotated", metadata: { render_mode: "verbatim" } },
++        { source: "memory", path: "src/δ.rs", content: "line 1\r\nline 2\n", render_mode: "source_annotated", metadata: null },
++        { source: "empty-path", path: "", content: "value", render_mode: "source_annotated", metadata: null },
++        { source: "empty-content", path: null, content: "", render_mode: "source_annotated", metadata: null },
++        { source: "private-label", path: "private-path", content: "exact\r\n  text\n", render_mode: "verbatim", metadata: { render_mode: "source_annotated" } },
++        { source: "empty-verbatim", path: null, content: "", render_mode: "verbatim", metadata: null },
++    ].map(chunk => ({ ...chunk, score: null }));
++    const expected = ["Context from search:\nfound", "Context from memory (src/δ.rs):\nline 1\r\nline 2\n",
++        "Context from empty-path ():\nvalue", "Context from empty-content:\n", "exact\r\n  text\n", ""];
++    const input = [{ id: "user", role: "User", phase: null, name: null, tool_call_id: null, metadata: null,
++        parts: [{ payload: { Text: { text: "before" } } },
++            ...chunks.map(chunk => ({ payload: { Context: { chunk } } })),
++            { payload: { Text: { text: "after" } } }] }];
++    const original = structuredClone(input);
++    for (const chunk of chunks) Object.freeze(chunk);
++    assert.deepEqual(piMessages(input, {})[0].content.map(item => item.text), ["before", ...expected, "after"]);
++    assert.deepEqual(input, original);
++});
