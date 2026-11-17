@@ -1,0 +1,95 @@
+#![allow(dead_code,unused_variables)]
+extern crate self as gpui_kit;
+pub type Pixels = f32;
+pub const fn px(n:f32)->Pixels{n}
+#[derive(Clone, Copy)] pub struct Point<T>{pub x:T,pub y:T}
+#[derive(Clone, Copy)] pub struct Size<T>{pub width:T,pub height:T}
+#[derive(Clone, Copy)] pub struct Bounds<T>{pub origin:Point<T>,pub size:Size<T>}
+pub struct Edges<T>{pub top:T,pub right:T,pub bottom:T,pub left:T}
+pub fn point<T>(x:T,y:T)->Point<T>{Point{x,y}}
+pub fn size<T>(width:T,height:T)->Size<T>{Size{width,height}}
+impl<T> Bounds<T>{pub fn new(origin:Point<T>,size:Size<T>)->Self{Self{origin,size}}}
+impl Bounds<f32>{
+ fn center(self)->Point<f32>{point(self.origin.x+self.size.width/2.,self.origin.y+self.size.height/2.)}
+ fn extend(self,e:Edges<f32>)->Self{Self::new(point(self.origin.x-e.left,self.origin.y-e.top),size(self.size.width+e.left+e.right,self.size.height+e.top+e.bottom))}
+ fn contains(&self,p:&Point<f32>)->bool{p.x>=self.origin.x&&p.x<=self.origin.x+self.size.width&&p.y>=self.origin.y&&p.y<=self.origin.y+self.size.height}
+}
+pub struct App{pub drag:Option<&'static str>}
+pub struct Window(pub usize);impl Window{fn refresh(&mut self){self.0+=1;}}
+pub mod preferences {
+ #[derive(Clone,Copy,PartialEq,Debug)] pub enum BadgePlace{HeaderStart,HeaderEnd,RailStart,RailEnd,ComposerStart,ComposerEnd}
+ impl BadgePlace {pub fn is_rail(self)->bool{matches!(self,Self::RailStart|Self::RailEnd)}}
+}
+pub mod ui{
+ pub mod drag{pub fn current(cx:&crate::App)->Option<&str>{cx.drag}}
+ pub mod prefs{pub fn scale(_: &crate::App)->f32{1.}}
+ pub mod extensions{use crate::preferences::BadgePlace;
+ pub fn badge_ids()->Vec<&'static str>{vec!["a","b","c","header-only"]}
+ pub fn find(id:&str)->Option<&str>{badge_ids().into_iter().find(|known| *known==id)}
+ pub fn fits(place:BadgePlace,id:&str)->bool{id!="header-only"||place==BadgePlace::HeaderStart}}
+ pub mod badges{
+ use crate::*;use crate::preferences::BadgePlace;use BadgePlace::*;
+ #[path="@ARRANGE@"] mod arrange;
+ include!("@ORDER@");
+ #[cfg(candidate)] type Owner=arrange::BadgeArrangement;
+ #[cfg(not(candidate))] type Owner=();
+ macro_rules! call{($fn:ident,$owner:expr,$($args:expr),+)=>{{
+  #[cfg(candidate)] let val=arrange::$fn($owner,$($args),+);
+  #[cfg(not(candidate))] let val=arrange::$fn($($args),+);
+  val
+ }};}
+ fn rect(place:BadgePlace,s:f32,span:f32)->Bounds<f32>{
+  if place.is_rail(){Bounds::new(point(0.,s),size(20.,span))}
+  else{Bounds::new(point(s,0.),size(span,20.))}
+ }
+ fn paint(owner:&Owner,place:BadgePlace,shift:f32){
+  for (id,x,w) in [("a",110.,if shift==0.{20.}else{34.}),("b",20.,20.),("c",60.,20.)]{
+   call!(record,owner,id,rect(place,x+shift,w));
+  }
+ }
+ fn at(place:BadgePlace,x:f32)->Point<f32>{if place.is_rail(){point(10.,x)}else{point(x,10.)}}
+ fn expected(p:f32)->Option<usize>{if !(-19.0..=169.).contains(&p){None}else if p<=30.{Some(0)}else if p<=70.{Some(1)}else{Some(2)}}
+ fn saved(index:usize)->Vec<String>{
+   let others=["b","c"]; struct DraggedBadge{id:&'static str}
+   let dragged=DraggedBadge{id:"a"};
+   let before = others.iter().copied().filter(|id| *id != dragged.id).nth(index);
+   let mut saved=vec!["b".into(),"c".into(),"a".into()];
+   move_before(&mut saved,&["a","b","c"],dragged.id,before);
+   saved
+ }
+ pub fn run(){
+  let places=[HeaderStart,HeaderEnd,ComposerStart,ComposerEnd,RailStart,RailEnd];
+  let positions=[-21.,-19.,0.,29.,30.,31.,50.,69.,70.,71.,130.,169.,171.];
+  let mut tested=[0usize;2];let mut mismatches=[0usize;2]; let mut widths=[0usize;2];let mut state_mismatches=0;
+  for place in places {for multi in [false,true] {for x in positions{
+    let a=Owner::default();let b=Owner::default();let ids=["b","c","a"];let others=["b","c"];let mut win=Window(0);
+    let off=App{drag:None};let on=App{drag:Some("badge:a")};
+    call!(frame,&a,place,&ids,&off);call!(frame,&b,place,&ids,&off);
+    let fa=call!(frame,&a,place,&ids,&on);assert_eq!(fa.open_gap,Some(2));assert!(!fa.hovered);
+    if multi{call!(frame,&b,place,&ids,&on);}
+    paint(&a,place,0.);if multi{paint(&b,place,180.);}
+    let view=call!(frame,&a,place,&ids,&on);assert_eq!(view.dragging,Some("a"));
+    let i=multi as usize;tested[i]+=1;widths[i]+=usize::from(view.gap_length!=20.);
+    call!(hover,&a,place,&others,rect(place,0.,150.),at(place,x),&mut win);
+    let got=call!(drop_index,&a,place);mismatches[i]+=usize::from(got!=expected(x));
+    if place==HeaderStart&&x==50.{println!("{} window(s), after A{} paint; A x50: index {:?}; order {:?}",if multi{2}else{1},if multi{" then B"}else{""},got,saved(got.unwrap()));}
+    if multi {
+      let before=got;call!(hover,&b,place,&others,rect(place,180.,150.),at(place,290.),&mut win);
+      state_mismatches+=usize::from(call!(drop_index,&a,place)!=before);
+    }
+  }}}
+  assert_eq!(mismatches[0],0);assert_eq!(widths[0],0);
+  println!("one-owner slot mismatches {}/{}; B-painted-last slot mismatches {}/{}; wrong gap lengths (one, two): {:?}; A target overwritten by B hover {}/{}",mismatches[0],tested[0],mismatches[1],tested[1],widths,state_mismatches,tested[1]);
+  if cfg!(candidate){assert_eq!((mismatches[1],widths[1],state_mismatches),(0,0,0));}else{assert!(mismatches[1]>0&&widths[1]>0&&state_mismatches>0);}
+  for (place,id) in [(HeaderStart,"other:a"),(HeaderStart,"badge:unregistered"),(RailStart,"badge:header-only")] {
+   let a=Owner::default();let mut w=Window(0);let ids=["b","c"];
+   call!(frame,&a,place,&ids,&App{drag:None});
+   assert!(call!(frame,&a,place,&ids,&App{drag:Some(id)}).dragging.is_none());
+   call!(hover,&a,place,&ids,rect(place,0.,150.),at(place,50.),&mut w);
+   assert!(call!(drop_index,&a,place).is_none());
+  }
+  println!("3/3 unrelated / unknown / unsupported source controls");
+ }
+ }
+}
+fn main(){ui::badges::run();}

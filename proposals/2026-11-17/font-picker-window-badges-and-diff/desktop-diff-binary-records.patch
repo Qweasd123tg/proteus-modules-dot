@@ -1,0 +1,137 @@
+--- a/crates/diff/src/parse.rs
++++ b/crates/diff/src/parse.rs
+@@ -5,6 +5,7 @@
+     let (mut old, mut new) = (None, None);
+     let (mut hunk, mut envelope) = (false, false);
+     let mut remaining = None;
++    let mut binary = BinaryPart::Outside;
+     let mut input = patch.split_inclusive('\n').peekable();
+     while let Some(raw) = input.next() {
+         let line = raw.trim_end_matches(['\r', '\n']);
+@@ -22,6 +23,7 @@
+             && !envelope
+             && (!hunk || remaining == Some((0, 0)))
+             && (files.is_empty()
++                || matches!(binary, BinaryPart::Header)
+                 || hunk
+                 || files.last().is_some_and(|file: &File| {
+                     file.patch.starts_with("--- ")
+@@ -72,6 +74,7 @@
+             new = (file.status == "added").then_some(1);
+             old = None;
+             hunk = envelope;
++            binary = BinaryPart::Outside;
+             remaining = None;
+             files.push(file);
+             continue;
+@@ -84,6 +87,9 @@
+         }
+         let file = files.last_mut().expect("a file was started");
+         file.patch.push_str(raw);
++        if binary.hide(line) {
++            continue;
++        }
+         if let Some(target) = line.strip_prefix("*** Move to: ") {
+             file.old_path = Some(std::mem::replace(&mut file.path, target.into()));
+             file.status = "renamed".into();
+@@ -125,6 +131,9 @@
+         } else if !hunk && line.starts_with("deleted file mode ") {
+             file.status = "deleted".into();
+         } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
++            if line == "GIT binary patch" {
++                binary = BinaryPart::Header;
++            }
+             file.note("Двоичный файл");
+         } else if line.starts_with("\\ No newline at end of file") {
+             if let Some(line) = file
+@@ -177,6 +186,40 @@
+     files
+ }
+ 
++// Git can include forward and reverse records. Keep their exact bytes in
++// File::patch; neither their headers nor their encoded lines are source rows.
++enum BinaryPart {
++    Outside,
++    Header,
++    Body,
++}
++
++impl BinaryPart {
++    fn hide(&mut self, line: &str) -> bool {
++        match self {
++            Self::Outside => false,
++            Self::Header => {
++                let count = line
++                    .strip_prefix("literal ")
++                    .or_else(|| line.strip_prefix("delta "));
++                if count.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
++                    *self = Self::Body;
++                    true
++                } else {
++                    *self = Self::Outside;
++                    false
++                }
++            }
++            Self::Body => {
++                if line.is_empty() {
++                    *self = Self::Header;
++                }
++                true
++            }
++        }
++    }
++}
++
+ #[derive(Clone, Copy)]
+ struct Positions {
+     old: usize,
+--- a/crates/diff/src/tests.rs
++++ b/crates/diff/src/tests.rs
+@@ -136,3 +136,47 @@
+         input
+     );
+ }
++
++#[test]
++fn git_binary_body_is_copyable_without_becoming_display_rows() {
++    // Git's literal patch for adding a two-by-two PNG.
++    let image = r#"diff --git a/after/tile.png b/after/tile.png
++new file mode 100644
++index 0000000000000000000000000000000000000000..26abf04982d6d6afd6f8a8e34d2f2b3672ffbd08
++GIT binary patch
++literal 73
++zcmeAS@N?(olHy`uVBq!ia0vp^Od!kwBL7~QRScvAJY5_^D&{2bxGBx=!Xv=NVBEwm
++UnkiN?7bwTz>FVdQ&MBb@0RKb}>i_@%
++
++literal 0
++HcmV?d00001
++
++"#;
++    let text = "diff --git a/name b/name\n--- a/name\n+++ b/name\n@@ -1 +1 @@\n-old\n+new\n";
++    let files = parse(&format!("{image}{text}"), &[]);
++    assert_eq!(files.len(), 2);
++    let file = &files[0];
++    assert_eq!(file.path, "after/tile.png");
++    assert_eq!(file.status, "added");
++    assert_eq!(file.patch, image);
++    assert_eq!((file.added, file.removed), (0, 0));
++    assert_eq!(file.unified, [0]);
++    assert_eq!(file.pairs, [Pair::Full(0)]);
++    assert_eq!(file.lines[0].kind, Kind::Note);
++    assert_eq!(file.lines[0].text, "Двоичный файл");
++    assert_eq!(files[1].patch, text);
++    assert_eq!((files[1].added, files[1].removed), (1, 1));
++
++    // A finished binary record must not hide unrelated annotations.
++    let footer = "-- \n2.52.0\n";
++    let with_footer = format!("{image}{footer}");
++    let file = &parse(&with_footer, &[])[0];
++    assert_eq!(file.patch, with_footer);
++    assert_eq!(
++        file.lines
++            .iter()
++            .map(|l| l.text.as_str())
++            .collect::<Vec<_>>(),
++        ["Двоичный файл", "-- ", "2.52.0"]
++    );
++}
