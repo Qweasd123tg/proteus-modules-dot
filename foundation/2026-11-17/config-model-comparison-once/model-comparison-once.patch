@@ -1,0 +1,65 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/persistence.rs b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+index 34dcb73..97aa7ec 100644
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -122,14 +122,15 @@ pub(super) async fn persist_config_builder_with_components(
+     }
+ 
+     let baseline = source_baseline(path).await?;
+-    if model_source_changed(config, baseline.as_ref())?.0
++    let model_changes = model_source_changed(config, baseline.as_ref())?;
++    if model_changes.0
+         && doc.get("model").is_none()
+         && doc.get("active_provider").is_none()
+         && let Some(outer) = &mut outer
+     {
+         super::inline_source::remove_selected_role_model(outer, &selection)?;
+     }
+-    persist_toml_model_source(&mut doc, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_toml_model_source(&mut doc, config, model_changes, !selection.is_empty())?;
+     if doc
+         .get("permissions")
+         .is_none_or(|item| !item.is_table_like())
+@@ -278,7 +279,8 @@ async fn persist_json_profile(
+         Err(error) => return Err(error.into()),
+     };
+     let baseline = source_baseline(path).await?;
+-    if model_source_changed(config, baseline.as_ref())?.0 && !selection.is_empty() {
++    let model_changes = model_source_changed(config, baseline.as_ref())?;
++    if model_changes.0 && !selection.is_empty() {
+         let child = crate::core::selected_config_value_mut(&mut document, &selection)?;
+         if child.get("model").is_none() && child.get("active_provider").is_none() {
+             let (name, parents) = selection.split_last().unwrap();
+@@ -301,7 +303,7 @@ async fn persist_json_profile(
+     let root = crate::core::selected_config_value_mut(&mut document, &selection)?
+         .as_object_mut()
+         .context("config JSON root must be an object")?;
+-    persist_json_model_source(root, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_json_model_source(root, config, model_changes, !selection.is_empty())?;
+     let omit_model_settings = !selection.is_empty()
+         && omitted_model_settings_unchanged(
+             config,
+@@ -382,10 +384,9 @@ fn model_source_changed(config: &AppConfig, baseline: Option<&AppConfig>) -> Res
+ fn persist_toml_model_source(
+     document: &mut toml_edit::DocumentMut,
+     config: &AppConfig,
+-    baseline: Option<&AppConfig>,
++    (choice_changed, presets_changed): (bool, bool),
+     inline: bool,
+ ) -> Result<()> {
+-    let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
+     let named = document.get("models").is_some() || document.get("model").is_some();
+     let had_providers = document.get("providers").is_some();
+     // Unrelated edits must not turn the loader's inherited bootstrap choice
+@@ -426,10 +427,9 @@ fn persist_toml_model_source(
+ fn persist_json_model_source(
+     source: &mut serde_json::Map<String, Value>,
+     config: &AppConfig,
+-    baseline: Option<&AppConfig>,
++    (choice_changed, presets_changed): (bool, bool),
+     inline: bool,
+ ) -> Result<()> {
+-    let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
+     let source_has_choice = source.contains_key("model") || source.contains_key("active_provider");
+     let named = source.contains_key("models") || source.contains_key("model");
+     let had_providers = source.contains_key("providers");
