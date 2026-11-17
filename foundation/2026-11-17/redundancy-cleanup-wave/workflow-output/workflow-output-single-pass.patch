@@ -1,0 +1,68 @@
+diff --git a/workflow/coding-workflow/src/output_text.rs b/workflow/coding-workflow/src/output_text.rs
+index f66fea4..a402141 100644
+--- a/workflow/coding-workflow/src/output_text.rs
++++ b/workflow/coding-workflow/src/output_text.rs
+@@ -56,7 +56,7 @@ fn tool_result_summary(result: &ToolResult) -> String {
+     let mut parts = Vec::new();
+     let output = result.output.trim();
+     if !output.is_empty() {
+-        parts.push(output.to_owned());
++        parts.push(output);
+     }
+     if let Some(error) = result
+         .error
+@@ -64,14 +64,15 @@ fn tool_result_summary(result: &ToolResult) -> String {
+         .map(str::trim)
+         .filter(|error| !error.is_empty())
+     {
+-        parts.push(error.to_owned());
++        parts.push(error);
+     }
+     parts.join("\n")
+ }
+ 
+ fn truncate_chars(text: &str, limit: usize) -> String {
+-    let mut truncated = text.chars().take(limit).collect::<String>();
+-    if text.chars().count() > limit {
++    let mut chars = text.chars();
++    let mut truncated = chars.by_ref().take(limit).collect::<String>();
++    if chars.next().is_some() {
+         truncated.push_str("\n[truncated]");
+     }
+     truncated
+diff --git a/workflow/coding-workflow/src/tests/output_helpers.rs b/workflow/coding-workflow/src/tests/output_helpers.rs
+index 689de9e..ca6e0b4 100644
+--- a/workflow/coding-workflow/src/tests/output_helpers.rs
++++ b/workflow/coding-workflow/src/tests/output_helpers.rs
+@@ -63,3 +63,31 @@ fn estimates_tokens_from_text_context_and_tool_results() {
+ 
+     assert_eq!(estimate_message_tokens(&messages), Some(4));
+ }
++
++#[test]
++fn empty_final_output_truncates_tool_summary_at_unicode_scalar_boundary() {
++    let message = CanonicalMessage::new(MessageRole::Assistant, Vec::new());
++    for unit in ["x", "🦀"] {
++        for length in [1_999, 2_000, 2_001] {
++            let result = ToolResult::ok(
++                proteus_contracts::domain::new_call_id(),
++                unit.repeat(length),
++            );
++            let messages = vec![CanonicalMessage::new(
++                MessageRole::Tool,
++                vec![ContentPart::ToolResult { result }],
++            )];
++            let suffix = if length > 2_000 { "\n[truncated]" } else { "" };
++            let expected = format!(
++                "Model returned an empty final response after the last tool call.\n\nLast tool result:\n{}{suffix}",
++                unit.repeat(length.min(2_000)),
++            );
++
++            assert_eq!(
++                output_text(&message, &messages),
++                expected,
++                "{unit} {length}"
++            );
++        }
++    }
++}

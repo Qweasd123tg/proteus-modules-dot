@@ -9,6 +9,7 @@ from qualify_diff import HERE, inspect_output, validate_expected
 SOURCE = Path("/qualification/source")
 TARGET = Path("/qualification/evidence/target")
 EXPECTED = json.loads((HERE / "expected.json").read_text())
+validate_expected(EXPECTED)
 
 
 def messages(fresh=False):
@@ -53,9 +54,6 @@ def transcript(records=None, names=None, summary=None):
 
 
 class TranscriptTests(unittest.TestCase):
-    def setUp(self):
-        validate_expected(EXPECTED)
-
     def inspect(self, **kwargs):
         return inspect_output(transcript(**kwargs), SOURCE, TARGET, EXPECTED)
 
