@@ -90,13 +90,22 @@ payload estimate, rather than exact parity with the native encrypted-item heuris
 Recorded integration checks: Core **1284 passed / 0 failed / 6 ignored**; Modules
 **805 passed / 0 failed / 1 ignored**, plus 23 Python and 33 Node checks. Another
 148 unique JavaScript cases were covered across a 147-pass full run and a focused
-six-case process rerun. Debug CLI evidence covers two compactions and three
+six-case process rerun. Debug and installed release CLI evidence covers two compactions and three
 samplings, matching tools/base instructions, cold resume with one patch effect,
 and matched replay comparison with source history/output unchanged. These results
-are not a new test run by this documentation update. Release packaging and the
-live installed-stack check are still in progress; no completed delivery, universal
-account access or full native parity is claimed. The #179 HOLD and unadopted
-#181–183 decisions above remain unchanged.
+are not a new test run by this documentation update.
+
+The selected release delivery is complete: Core and 18 Rust modules were rebuilt;
+Native, context-pack and Extensions were retained. Full gzip/tar verification
+covered 58,480 members and 39 binary hashes in a 326,187,957-byte archive
+(`0fe4be28a0ee79b1fbc3e1b025003f421ae3a70db03024d321652050cd48bda9`).
+The installed CLI also completed a live `gpt-6.1-sol` Compact → Complete turn:
+one checkpoint was persisted and replayed, the exact synthetic marker was returned,
+and provider usage was 376 input + 76 output tokens across two successful model
+requests. This proves that configured account/model path, not universal account
+access or full native parity. The original benchmark runtime and immutable inputs
+remained unchanged. The #179 HOLD and unadopted #181–183 decisions above remain
+unchanged.
 
 ### PR #86 source reconciliation, 2026-11-16
 
