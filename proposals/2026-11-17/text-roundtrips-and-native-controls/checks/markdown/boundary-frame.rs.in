@@ -1,0 +1,53 @@
+#![allow(dead_code)]
+#[derive(Clone, Copy, Default)] enum ColumnumnAlign { #[default] None, Left, Center, Right }
+struct Paragraph(String);
+impl Paragraph { fn selected_source(&self)->String { self.0.clone() } }
+struct TableCell {children:Paragraph}
+struct TableRow {children:Vec<TableCell>}
+struct Table {children:Vec<TableRow>,column_aligns:Vec<ColumnumnAlign>}
+impl Table {fn column_align(&self,i:usize)->ColumnumnAlign{self.column_aligns.get(i).copied().unwrap_or_default()}}
+fn table(rows:&[&[&str]])->Table {Table{children:rows.iter().map(|r|TableRow{children:r.iter().map(|v|TableCell{children:Paragraph((*v).into())}).collect()}).collect(),column_aligns:vec![ColumnumnAlign::Left,ColumnumnAlign::Right]}}
+
+#[derive(Clone,Copy,PartialEq)] enum StateName{GfmTableHeadRowBreak,GfmTableHeadRowData,GfmTableHeadRowEscape,GfmTableBodyRowBreak,GfmTableBodyRowData,GfmTableBodyRowEscape}
+enum State{Retry(StateName),Next(StateName)} enum Name{Data}
+struct Tokenizer<'a>{ bytes:&'a [u8], n:usize,current:Option<u8> }
+impl<'a> Tokenizer<'a>{
+ fn new(bytes:&'a[u8])->Self{Self{bytes,n:0,current:bytes.first().copied()}}
+ fn consume(&mut self){self.n+=1;self.current=self.bytes.get(self.n).copied()}
+ fn exit(&mut self,_:Name){}
+}
+//ACTUAL_LEXER
+// Run ONLY the exact upstream per-cell tokenization states. No model of inline
+// parsing or nearest complete table/HTML is claimed; whitespace is excluded.
+fn boundaries(cell:&str,head:bool)->Vec<usize>{
+ use StateName::*;let initial=if head{GfmTableHeadRowData}else{GfmTableBodyRowData};
+ let mut t=Tokenizer::new(cell.as_bytes());let mut state=initial;let mut bars=vec![];
+ while let Some(b)=t.current {
+  match state {
+   GfmTableHeadRowBreak|GfmTableBodyRowBreak=> {if b==b'|' {bars.push(t.n);} else {assert_eq!(b,b' ');}t.consume();state=initial;}
+   _=>{let st=match state{
+    GfmTableHeadRowData=>head_row_data(&mut t),GfmTableBodyRowData=>body_row_data(&mut t),
+    GfmTableHeadRowEscape=>head_row_escape(&mut t),GfmTableBodyRowEscape=>body_row_escape(&mut t),
+    _=>unreachable!()};state=match st{State::Next(s)|State::Retry(s)=>s};}
+  }
+ }bars
+}
+//ACTUAL_SERIALIZER
+fn main(){
+ let mut total=0;
+ for head in [true,false] {for pos in 0..2 {for style in ["","`","**"] {for n in 0..=8 {
+   for core in [format!("x{}|y","\\".repeat(n)),format!("x{}||{}|y","\\".repeat(n),"\\".repeat(8-n)),format!("|x{}|","\\".repeat(n))]{
+    let p=format!("{style}{core}{style}");
+    let mut cells=[["HEAD","OTHER"],["main","END"]];
+    let row=usize::from(!head);cells[row][pos]=&p;
+    let src=table_selected_source(&table(&[&cells[0],&cells[1]]));
+    let line=src.lines().nth(if head {0}else{2}).unwrap();
+    let intact=boundaries(line,head);
+    assert_eq!(intact.len(),3,"table lost a column: {line:?}");
+    assert_eq!(intact[0],0);assert_eq!(intact[2],line.len()-1);
+    let adjacent=if pos==0{&line[intact[1]+1..intact[2]]}else{&line[intact[0]+1..intact[1]]};
+    assert_eq!(adjacent.trim(),cells[row][1-pos]);
+    total+=1;
+ }}}}}
+ println!("{total} header/body x positions x plain/code/strong x 0–8 backslashes x three pipe patterns: all expected original boundaries retained; adjacent cells unchanged.");
+}

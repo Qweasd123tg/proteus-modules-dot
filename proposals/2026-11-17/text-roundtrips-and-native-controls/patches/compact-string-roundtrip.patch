@@ -1,0 +1,41 @@
+--- a/src/settings/schema.rs
++++ b/src/settings/schema.rs
+@@ -126,8 +126,11 @@
+ 
+ pub fn format_value(format: TextFormat, value: &Value) -> String {
+     match (format, value) {
++        // Leave strings bare only when re-reading them preserves their value.
+         (TextFormat::Value, Value::String(text))
+-            if serde_json::from_str::<Value>(text).is_err() =>
++            if !text.is_empty()
++                && text.trim() == text
++                && serde_json::from_str::<Value>(text).is_err() =>
+         {
+             text.clone()
+         }
+@@ -197,3 +200,25 @@
+         },
+     }
+ }
++
++#[cfg(test)]
++mod value_roundtrip_tests {
++    use super::*;
++
++    #[test]
++    fn compact_json_text_preserves_strings_on_the_next_edit() {
++        let format = TextFormat::Value;
++        for text in [
++            "",
++            " ",
++            "\u{202f}°C",
++            "Итого: ",
++            "\u{202f}42\u{202f}",
++            "\u{202f}null\u{202f}",
++        ] {
++            let original = Value::String(text.into());
++            let shown = format_value(format, &original);
++            assert_eq!(parse_text(format, &shown), Ok(Some(original)), "{text:?}");
++        }
++    }
++}
