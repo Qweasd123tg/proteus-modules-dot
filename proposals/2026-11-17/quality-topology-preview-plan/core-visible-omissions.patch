@@ -1,0 +1,50 @@
+--- a/crates/proteus-core/src/core/topology_render/map.rs
++++ b/crates/proteus-core/src/core/topology_render/map.rs
+@@ -94,8 +94,12 @@
+     if dangling.is_empty() {
+         out.push_str("  (none)\n");
+     } else {
+-        for node in dangling.into_iter().take(24) {
++        let (visible, omitted) = dangling.split_at(dangling.len().min(24));
++        for node in visible {
+             out.push_str(&format!("  - {node}\n"));
++        }
++        if !omitted.is_empty() {
++            out.push_str(&format!("  ... and {} more\n", omitted.len()));
+         }
+     }
+ 
+--- a/crates/proteus-core/src/core/topology_render.rs
++++ b/crates/proteus-core/src/core/topology_render.rs
+@@ -10,3 +10,18 @@
+ pub use mermaid::render_topology_mermaid;
+ pub use runtime::{render_topology_runtime_mermaid, render_topology_runtime_path};
+ pub use table::render_topology_table;
++
++#[test]
++fn map_reports_how_many_dangling_nodes_were_omitted() {
++    use crate::core::{ToolTopology, TopologySnapshot};
++
++    let mut snapshot = TopologySnapshot::default();
++    for i in 0..24 {
++        snapshot.tools.push(ToolTopology {
++            name: i.to_string(),
++            ..Default::default()
++        });
++    }
++    // 24 инструмента плюс «config» и «tools»: за пределом списка остались два узла.
++    assert!(render_topology_map(&snapshot).contains("\n  ... and 2 more\n"));
++}
+--- a/docs/guides/inspect.md
++++ b/docs/guides/inspect.md
+@@ -41,7 +41,9 @@
+ - markdown — отчёт, который можно сохранить или передать;
+ - mermaid — полная схема в формате Mermaid;
+ - runtime — короткий путь выполнения хода;
+-- map — текстовая карта подключений.
++- map — текстовая карта подключений. В разделе `Dangling nodes` показаны
++  первые 24 несвязанных узла; если их больше, последняя строка сообщает,
++  сколько имён не показано.
+ 
+ `inspect topology` собирает список доступных реализаций и инструментов,
+ но не отправляет запросы модели. Описания запуска и подключения к слотам

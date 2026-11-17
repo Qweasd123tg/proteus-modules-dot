@@ -1,0 +1,23 @@
+--- a/crates/proteus-core/src/core/topology_render/map.rs
++++ b/crates/proteus-core/src/core/topology_render/map.rs
+@@ -172,17 +172,8 @@
+         nodes.insert(format!("tool:{}", tool.name));
+     }
+     for edge in &snapshot.edges {
+-        nodes.insert(edge.from.clone());
+-        nodes.insert(edge.to.clone());
++        nodes.remove(&edge.from);
++        nodes.remove(&edge.to);
+     }
+-
+-    let mut connected = BTreeSet::new();
+-    for edge in &snapshot.edges {
+-        connected.insert(edge.from.clone());
+-        connected.insert(edge.to.clone());
+-    }
+-    nodes
+-        .into_iter()
+-        .filter(|node| !connected.contains(node))
+-        .collect()
++    nodes.into_iter().collect()
+ }
