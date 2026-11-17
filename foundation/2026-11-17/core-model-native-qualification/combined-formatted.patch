@@ -1,0 +1,316 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/persistence.rs b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+index 34dcb73..0054343 100644
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -129,7 +129,13 @@ pub(super) async fn persist_config_builder_with_components(
+     {
+         super::inline_source::remove_selected_role_model(outer, &selection)?;
+     }
+-    persist_toml_model_source(&mut doc, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_toml_model_source(
++        &mut doc,
++        config,
++        baseline.as_ref(),
++        !selection.is_empty(),
++        AppConfig::inherited_model_choice_key(path)?,
++    )?;
+     if doc
+         .get("permissions")
+         .is_none_or(|item| !item.is_table_like())
+@@ -301,7 +307,13 @@ async fn persist_json_profile(
+     let root = crate::core::selected_config_value_mut(&mut document, &selection)?
+         .as_object_mut()
+         .context("config JSON root must be an object")?;
+-    persist_json_model_source(root, config, baseline.as_ref(), !selection.is_empty())?;
++    persist_json_model_source(
++        root,
++        config,
++        baseline.as_ref(),
++        !selection.is_empty(),
++        AppConfig::inherited_model_choice_key(path)?,
++    )?;
+     let omit_model_settings = !selection.is_empty()
+         && omitted_model_settings_unchanged(
+             config,
+@@ -384,8 +396,16 @@ fn persist_toml_model_source(
+     config: &AppConfig,
+     baseline: Option<&AppConfig>,
+     inline: bool,
++    inherited_choice: Option<&str>,
+ ) -> Result<()> {
+     let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
++    if let Some(key) = inherited_choice {
++        validate_inherited_model_edit(config, choice_changed, presets_changed)?;
++        if choice_changed {
++            document[key] = toml_edit::value(config.active_provider.as_ref().unwrap().clone());
++        }
++        return Ok(());
++    }
+     let named = document.get("models").is_some() || document.get("model").is_some();
+     let had_providers = document.get("providers").is_some();
+     // Unrelated edits must not turn the loader's inherited bootstrap choice
+@@ -428,8 +448,19 @@ fn persist_json_model_source(
+     config: &AppConfig,
+     baseline: Option<&AppConfig>,
+     inline: bool,
++    inherited_choice: Option<&str>,
+ ) -> Result<()> {
+     let (choice_changed, presets_changed) = model_source_changed(config, baseline)?;
++    if let Some(key) = inherited_choice {
++        validate_inherited_model_edit(config, choice_changed, presets_changed)?;
++        if choice_changed {
++            source.insert(
++                key.into(),
++                Value::String(config.active_provider.as_ref().unwrap().clone()),
++            );
++        }
++        return Ok(());
++    }
+     let source_has_choice = source.contains_key("model") || source.contains_key("active_provider");
+     let named = source.contains_key("models") || source.contains_key("model");
+     let had_providers = source.contains_key("providers");
+@@ -455,3 +486,22 @@ fn persist_json_model_source(
+     }
+     Ok(())
+ }
++
++// An additive wrapper cannot delete an inherited selection or safely replace a
++// catalogue's representation. Reject these edits before any atomic_write rather
++// than publish source which normalizes differently (or cannot be reloaded).
++fn validate_inherited_model_edit(
++    config: &AppConfig,
++    choice_changed: bool,
++    presets_changed: bool,
++) -> Result<()> {
++    anyhow::ensure!(
++        !presets_changed,
++        "edit the included model catalogue at its owning source"
++    );
++    anyhow::ensure!(
++        !choice_changed || config.active_provider.is_some(),
++        "cannot remove an inherited model selection from an additive include wrapper"
++    );
++    Ok(())
++}
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+index 2cf3a59..cef6810 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+@@ -157,3 +157,55 @@ async fn directory_overlay_keeps_named_selection_without_freezing_the_shared_cat
+         assert_eq!(loaded.active_model_config().unwrap().model, model);
+     }
+ }
++
++// File includes retain their choice and catalogue spellings independently.
++#[tokio::test]
++async fn file_include_model_edits_remain_reloadable_without_rewriting_base() {
++    for extension in ["toml", "json"] {
++        for choice_key in ["model", "active_provider"] {
++            for catalogue_key in ["models", "providers"] {
++                let home = tempfile::tempdir().unwrap();
++                let base_name = format!("base.{extension}");
++                let base = home.path().join(&base_name);
++                let wrapper = home.path().join(format!("agent.{extension}"));
++                let mut initial = serde_json::json!({
++                    "module_config": {"model": {"fake": {"implementation": "fake"}}}
++                });
++                initial[choice_key] = "main".into();
++                initial[catalogue_key] = serde_json::json!({
++                    "main": {"provider": "fake", "model": "large"},
++                    "budget": {"provider": "fake", "model": "small"}
++                });
++                write(&base, &initial).await;
++                write(&wrapper, &serde_json::json!({"include": base_name})).await;
++                let original_base = tokio::fs::read(&base).await.unwrap();
++                for expected in ["main", "budget", "main"] {
++                    let mut config = AppConfig::load(Some(&wrapper)).await.unwrap();
++                    config.permissions.mode = PermissionMode::Auto;
++                    config.active_provider = Some(expected.into());
++                    persist_config_builder(&wrapper, &config).await.unwrap();
++                    let loaded = AppConfig::load(Some(&wrapper))
++                        .await
++                        .unwrap_or_else(|error| {
++                            panic!("reload {extension}/{choice_key}/{catalogue_key}: {error:#}")
++                        });
++                    assert_eq!(loaded.active_provider.as_deref(), Some(expected));
++                    assert_eq!(tokio::fs::read(&base).await.unwrap(), original_base);
++                    let saved = read(&wrapper).await;
++                    assert_eq!(saved["include"], base_name);
++                    assert!(saved.get("models").is_none() && saved.get("providers").is_none());
++                }
++                let saved_bytes = tokio::fs::read(&wrapper).await.unwrap();
++                let mut config = AppConfig::load(Some(&wrapper)).await.unwrap();
++                config.active_provider = None;
++                assert!(persist_config_builder(&wrapper, &config).await.is_err());
++                assert_eq!(tokio::fs::read(&wrapper).await.unwrap(), saved_bytes);
++                let mut config = AppConfig::load(Some(&wrapper)).await.unwrap();
++                config.providers.get_mut("main").unwrap().model = "changed".into();
++                assert!(persist_config_builder(&wrapper, &config).await.is_err());
++                assert_eq!(tokio::fs::read(&wrapper).await.unwrap(), saved_bytes);
++                assert_eq!(tokio::fs::read(&base).await.unwrap(), original_base);
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/config/loading.rs b/crates/proteus-core/src/core/config/loading.rs
+index 1f619f9..5cffe61 100644
+--- a/crates/proteus-core/src/core/config/loading.rs
++++ b/crates/proteus-core/src/core/config/loading.rs
+@@ -54,6 +54,49 @@ impl AppConfig {
+             .await
+     }
+ 
++    /// For a plain include wrapper, retain the inherited choice spelling before
++    /// model normalization erases it. Inline sources and managed overlays have
++    /// distinct ownership rules and are deliberately excluded.
++    pub(crate) fn inherited_model_choice_key(path: &Path) -> Result<Option<&'static str>> {
++        if !config_selection(path)?.is_empty() {
++            return Ok(None);
++        }
++        let physical = physical_config_path(path);
++        if !physical.is_file()
++            || physical.file_name().and_then(|name| name.to_str())
++                == Some(super::CONFIG_BUILDER_OVERLAY)
++        {
++            return Ok(None);
++        }
++        let mut local = load_config_value(&physical)?;
++        let includes = take_config_includes(&mut local)?;
++        if includes.is_empty()
++            || ["models", "providers"]
++                .iter()
++                .any(|key| local.get(*key).is_some())
++        {
++            return Ok(None);
++        }
++        let base_dir = physical.parent().unwrap_or_else(|| Path::new("."));
++        let mut value = Value::Object(Map::new());
++        let mut inputs = ConfigInputs::default();
++        for include in includes {
++            let included = load_config_path_value(
++                &resolve_config_include(base_dir, &include),
++                &mut BTreeSet::new(),
++                &mut inputs,
++            )?;
++            merge_config_value(&mut value, included);
++        }
++        Ok(if value.get("model").is_some() {
++            Some("model")
++        } else if value.get("active_provider").is_some() {
++            Some("active_provider")
++        } else {
++            None
++        })
++    }
++
+     pub async fn resolve_config_path(path: Option<&Path>) -> Result<Option<PathBuf>> {
+         match path {
+             Some(path) => Ok(Some(resolve_explicit_config_path(path).await?)),
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index a0a86f9..2817365 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -181,14 +181,7 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+         let choice = role.remove("model");
+         let role_explicit = choice.as_ref().is_some_and(|value| !value.is_null());
+         let role_choice = match choice {
+-            Some(Value::String(name)) => Some((
+-                name.clone(),
+-                scope
+-                    .presets
+-                    .get(&name)
+-                    .with_context(|| format!("unknown model alias {name:?}"))?
+-                    .to_model_config()?,
+-            )),
++            Some(Value::String(name)) => Some(name),
+             Some(Value::Null) | None => None,
+             Some(value) => {
+                 let model: ModelConfig =
+@@ -203,7 +196,7 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+                 !(role_explicit && child_explicit),
+                 "agent role must choose model either on the role or in its config"
+             );
+-            if let Some((name, _)) = &role_choice {
++            if let Some(name) = &role_choice {
+                 child
+                     .as_object_mut()
+                     .unwrap()
+@@ -216,7 +209,12 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+                     serde_json::to_value(child_scope.selected_model()?)?,
+                 );
+             }
+-        } else if let Some((_, model)) = role_choice {
++        } else if let Some(name) = role_choice {
++            let model = scope
++                .presets
++                .get(&name)
++                .with_context(|| format!("unknown model alias {name:?}"))?
++                .to_model_config()?;
+             role.insert("model".into(), serde_json::to_value(model)?);
+         }
+     }
+diff --git a/crates/proteus-core/src/core/config/models_tests.rs b/crates/proteus-core/src/core/config/models_tests.rs
+index 5b5654f..8573e83 100644
+--- a/crates/proteus-core/src/core/config/models_tests.rs
++++ b/crates/proteus-core/src/core/config/models_tests.rs
+@@ -174,3 +174,60 @@ fn shared_transport_does_not_replace_an_explicit_child_route() {
+         "local"
+     );
+ }
++
++#[test]
++fn inline_role_choice_resolves_in_its_child_catalogue() {
++    let mut inline_choice = source();
++    inline_choice["agent_control"]["roles"] = json!([{
++        "name": "local", "description": "local model",
++        "config": {
++            "model": "child-only",
++            "models": {"child-only": {"provider": "fake", "model": "local-small", "effort": "low"}}
++        }
++    }]);
++    let mut role_choice = inline_choice.clone();
++    let role = &mut role_choice["agent_control"]["roles"][0];
++    let choice = role["config"]
++        .as_object_mut()
++        .unwrap()
++        .remove("model")
++        .unwrap();
++    role["model"] = choice;
++    normalize_model_sources(&mut inline_choice).unwrap();
++    normalize_model_sources(&mut role_choice).unwrap();
++    assert_eq!(role_choice, inline_choice);
++    assert_eq!(
++        role_choice["agent_control"]["roles"][0]["model"]["model"],
++        "local-small"
++    );
++}
++
++#[test]
++fn external_role_choice_still_requires_a_parent_alias() {
++    let mut value = source();
++    value["agent_control"]["roles"] = json!([{
++        "name": "external", "description": "external model", "config": "external.toml",
++        "model": "child-only"
++    }]);
++    assert!(
++        normalize_model_sources(&mut value)
++            .unwrap_err()
++            .to_string()
++            .contains("unknown model alias")
++    );
++}
++
++#[test]
++fn inline_role_choice_keeps_child_shadowing_of_parent_alias() {
++    let mut value = source();
++    value["agent_control"]["roles"] = json!([{
++        "name": "shadow", "description": "local shadow", "model": "primary",
++        "config": {"models": {"primary": {"provider": "fake", "model": "local-small"}}}
++    }]);
++    normalize_model_sources(&mut value).unwrap();
++    assert_eq!(
++        value["agent_control"]["roles"][0]["model"]["model"],
++        "local-small"
++    );
++    assert_eq!(value["providers"]["primary"]["model"], "large");
++}
