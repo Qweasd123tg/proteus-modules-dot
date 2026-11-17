@@ -1,0 +1,52 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+index 2cf3a59..9758e9a 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+@@ -157,3 +157,47 @@ async fn directory_overlay_keeps_named_selection_without_freezing_the_shared_cat
+         assert_eq!(loaded.active_model_config().unwrap().model, model);
+     }
+ }
++
++#[tokio::test]
++async fn unrelated_inline_save_does_not_capture_inherited_model_settings_beside_local_settings() {
++    let mut failures = Vec::new();
++    for extension in ["toml", "json"] {
++        let home = tempfile::tempdir().unwrap();
++        let path = home.path().join(format!("agent.{extension}"));
++        let mut initial = source();
++        initial["models"]["other"] = serde_json::json!({"provider": "other", "model": "second"});
++        initial["module_config"]["model"]["other"] = serde_json::json!({"marker": "parent-before"});
++        initial["agent_control"]["roles"][0]["config"]["module_config"] =
++            serde_json::json!({"model": {"fake": {"implementation": "child-local"}}});
++        write(&path, &initial).await;
++        let reference = crate::core::config_reference(&path, "inherit").unwrap();
++        let mut child = AppConfig::load(Some(&reference)).await.unwrap();
++        assert_eq!(
++            child.module_config["model"]["other"]["marker"],
++            "parent-before"
++        );
++        child.tools.enabled = vec!["read_file".into(), "list_dir".into()];
++        persist_config_builder(&reference, &child).await.unwrap();
++        let mut saved = read(&path).await;
++        let local = &saved["agent_control"]["roles"][0]["config"]["module_config"]["model"];
++        assert_eq!(local["fake"]["implementation"], "child-local");
++        if local.get("other").is_some() {
++            failures.push(format!("{extension} captured inherited settings: {local}"));
++        }
++        saved["module_config"]["model"]["other"]["marker"] = "parent-after".into();
++        write(&path, &saved).await;
++        let reloaded = AppConfig::load(Some(&reference)).await.unwrap();
++        if reloaded.module_config["model"]["other"]["marker"] != "parent-after" {
++            failures.push(format!(
++                "{extension} blocked parent update: {}",
++                reloaded.module_config["model"]["other"]
++            ));
++        }
++        assert_eq!(
++            reloaded.module_config["model"]["fake"]["implementation"],
++            "child-local"
++        );
++        assert_eq!(reloaded.tools.enabled, ["read_file", "list_dir"]);
++    }
++    assert!(failures.is_empty(), "{}", failures.join("\n"));
++}
