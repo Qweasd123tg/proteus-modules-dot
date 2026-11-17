@@ -1,0 +1,146 @@
+diff --git a/tool/plan-tool/src/lib.rs b/tool/plan-tool/src/lib.rs
+index 269d476..8904d10 100644
+--- a/tool/plan-tool/src/lib.rs
++++ b/tool/plan-tool/src/lib.rs
+@@ -102,16 +102,16 @@ enum PlanStepStatus {
+ }
+ 
+ fn invoke_impl(call_json: &str) -> Result<String, String> {
+-    let call: Value = serde_json::from_str(call_json)
++    let mut call: Value = serde_json::from_str(call_json)
+         .map_err(|error| format!("invalid ToolCall JSON: {error}"))?;
+     let call_id = call
+         .get("id")
+         .and_then(Value::as_str)
+         .unwrap_or("")
+         .to_owned();
+-    let args = call.get("args").cloned().unwrap_or(Value::Null);
++    let args = call.get_mut("args").map(Value::take).unwrap_or(Value::Null);
+ 
+-    match validate_plan(&args) {
++    match validate_plan(args) {
+         Ok(plan_args) => {
+             let counts = status_counts(&plan_args.plan);
+             let result = json!({
+@@ -165,8 +165,8 @@ fn status_counts(steps: &[PlanStep]) -> StatusCounts {
+     counts
+ }
+ 
+-fn validate_plan(args: &Value) -> Result<PlanArgs, String> {
+-    serde_json::from_value(args.clone()).map_err(|error| {
++fn validate_plan(args: Value) -> Result<PlanArgs, String> {
++    serde_json::from_value(args).map_err(|error| {
+         format!("plan entries must be {{step, status: pending|in_progress|completed}}: {error}")
+     })
+ }
+@@ -188,21 +188,33 @@ mod tests {
+ 
+     #[test]
+     fn accepts_valid_plan_and_reports_counts() {
+-        let result = invoke(json!({
+-            "explanation": "starting",
++        let args = json!({
++            "explanation": "  начало\n",
+             "plan": [
+-                { "step": "Read the failing test", "status": "completed" },
++                { "step": "Read \"test\" at C:\\repo\n", "status": "completed" },
+                 { "step": "Fix the parser", "status": "in_progress" },
+                 { "step": "Run the suite", "status": "pending" }
+             ]
+-        }));
++        });
++        let result = invoke(args.clone());
+ 
+-        assert_eq!(result["ok"], true);
+-        assert_eq!(result["metadata"]["completed"], 1);
+-        assert_eq!(result["metadata"]["in_progress"], 1);
+-        assert_eq!(result["metadata"]["pending"], 1);
+-        assert_eq!(result["metadata"]["plan"][1]["status"], "in_progress");
+-        assert_eq!(result["output"], "Plan updated");
++        assert_eq!(
++            result,
++            json!({
++                "call_id": "call_plan",
++                "ok": true,
++                "output": "Plan updated",
++                "content": [],
++                "error": null,
++                "metadata": {
++                    "plan": args["plan"],
++                    "explanation": args["explanation"],
++                    "completed": 1,
++                    "in_progress": 1,
++                    "pending": 1
++                }
++            })
++        );
+     }
+ 
+     #[test]
+@@ -259,19 +271,54 @@ mod tests {
+ 
+     #[test]
+     fn rejects_bad_status_and_unknown_fields() {
++        for (args, problem) in [
++            (
++                json!({ "plan": [{ "step": "a", "status": "done" }] }),
++                "unknown variant `done`, expected one of `pending`, `in_progress`, `completed`",
++            ),
++            (
++                json!({ "plan": [{ "step": "a", "status": "pending", "extra": true }] }),
++                "unknown field `extra`, expected `step` or `status`",
++            ),
++            (
++                json!({ "plan": [], "unexpected": true }),
++                "unknown field `unexpected`, expected `explanation` or `plan`",
++            ),
++        ] {
++            assert_eq!(
++                invoke(args),
++                json!({
++                    "call_id": "call_plan",
++                    "ok": false,
++                    "output": "",
++                    "content": [],
++                    "error": format!("plan entries must be {{step, status: pending|in_progress|completed}}: {problem}"),
++                    "metadata": {}
++                })
++            );
++        }
++
++        for (call, call_id) in [
++            (r#"{"id":"missing"}"#, "missing"),
++            (r#"{"id":42,"args":null}"#, ""),
++            ("false", ""),
++        ] {
++            let result: Value = serde_json::from_str(&invoke_impl(call).unwrap()).unwrap();
++            assert_eq!(
++                result,
++                json!({
++                    "call_id": call_id,
++                    "ok": false,
++                    "output": "",
++                    "content": [],
++                    "error": "plan entries must be {step, status: pending|in_progress|completed}: invalid type: null, expected struct PlanArgs",
++                    "metadata": {}
++                })
++            );
++        }
+         assert_eq!(
+-            invoke(json!({ "plan": [{ "step": "a", "status": "done" }] }))["ok"],
+-            false
+-        );
+-        assert_eq!(
+-            invoke(json!({
+-                "plan": [{ "step": "a", "status": "pending", "extra": true }]
+-            }))["ok"],
+-            false
+-        );
+-        assert_eq!(
+-            invoke(json!({ "plan": [], "unexpected": true }))["ok"],
+-            false
++            invoke_impl("{").unwrap_err(),
++            "invalid ToolCall JSON: EOF while parsing an object at line 1 column 1"
+         );
+     }
+ }
