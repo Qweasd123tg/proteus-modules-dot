@@ -1,0 +1,94 @@
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -160,21 +160,22 @@
+     }
+     doc["agent_control"]["surface"] = toml_edit::value(config.agent_control.surface.as_str());
+ 
+-    let omit_model_settings = !selection.is_empty()
+-        && omitted_model_settings_unchanged(
+-            config,
+-            baseline.as_ref(),
+-            doc.get("module_config")
+-                .and_then(|item| item.get("model"))
+-                .is_some(),
+-        );
++    let preserve_model_settings =
++        !selection.is_empty() && model_settings_unchanged(config, baseline.as_ref());
+     let mut module_config_doc = module_config_toml_document(&config.module_config)?;
+-    if omit_model_settings {
++    if preserve_model_settings {
+         if let Some(table) = module_config_doc
+             .get_mut("module_config")
+             .and_then(toml_edit::Item::as_table_like_mut)
+         {
+-            table.remove("model");
++            match doc.get("module_config").and_then(|item| item.get("model")) {
++                Some(local) => {
++                    table.insert("model", local.clone());
++                }
++                None => {
++                    table.remove("model");
++                }
++            }
+         }
+     }
+     if let Some(item) = module_config_doc.as_table().get("module_config") {
+@@ -302,20 +303,28 @@
+         .as_object_mut()
+         .context("config JSON root must be an object")?;
+     persist_json_model_source(root, config, baseline.as_ref(), !selection.is_empty())?;
+-    let omit_model_settings = !selection.is_empty()
+-        && omitted_model_settings_unchanged(
+-            config,
+-            baseline.as_ref(),
++    let preserve_model_settings =
++        !selection.is_empty() && model_settings_unchanged(config, baseline.as_ref());
++    let local_model_settings = preserve_model_settings
++        .then(|| {
+             root.get("module_config")
+                 .and_then(|item| item.get("model"))
+-                .is_some(),
+-        );
++                .cloned()
++        })
++        .flatten();
+     for key in ["modules", "module_config", "addons"] {
+         root.insert(key.into(), next[key].clone());
+     }
+-    if omit_model_settings {
++    if preserve_model_settings {
+         if let Some(settings) = root.get_mut("module_config").and_then(Value::as_object_mut) {
+-            settings.remove("model");
++            match local_model_settings {
++                Some(local) => {
++                    settings.insert("model".into(), local);
++                }
++                None => {
++                    settings.remove("model");
++                }
++            }
+         }
+     }
+     for (section, keys) in [
+@@ -358,15 +367,12 @@
+     AppConfig::load(Some(path)).await.map(Some)
+ }
+ 
+-fn omitted_model_settings_unchanged(
+-    config: &AppConfig,
+-    baseline: Option<&AppConfig>,
+-    source_has_model_settings: bool,
+-) -> bool {
+-    !source_has_model_settings
+-        && baseline.is_some_and(|baseline| {
+-            config.module_config.get("model") == baseline.module_config.get("model")
+-        })
++// Preserve the authored child table, including a partial table or its absence.
++// Effective settings also contain parent-owned entries and are not source edits.
++fn model_settings_unchanged(config: &AppConfig, baseline: Option<&AppConfig>) -> bool {
++    baseline.is_some_and(|baseline| {
++        config.module_config.get("model") == baseline.module_config.get("model")
++    })
+ }
+ 
+ fn model_source_changed(config: &AppConfig, baseline: Option<&AppConfig>) -> Result<(bool, bool)> {
