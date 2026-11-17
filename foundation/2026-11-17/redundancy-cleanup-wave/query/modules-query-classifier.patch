@@ -1,0 +1,108 @@
+diff --git a/context/context-pack/src/search_queries.rs b/context/context-pack/src/search_queries.rs
+index 5283d18..a1b796e 100644
+--- a/context/context-pack/src/search_queries.rs
++++ b/context/context-pack/src/search_queries.rs
+@@ -9,15 +9,10 @@ pub(crate) fn extract_search_queries(task: &str) -> Vec<String> {
+         let normalized = token.to_ascii_lowercase();
+         let looks_code_like = token.contains('_')
+             || token.contains('-')
+-            || token.chars().any(|ch| ch.is_ascii_uppercase())
+-            || token.ends_with(".rs")
+-            || token.ends_with(".toml")
+-            || token.ends_with(".md")
+-            || token.ends_with(".json");
+-        let looks_domain_relevant = REPO_SEARCH_ALLOWLIST.contains(&normalized.as_str())
+-            || (token.len() >= 4
+-                && token.chars().all(|ch| ch.is_ascii_lowercase())
+-                && !REPO_SEARCH_STOPWORDS.contains(&normalized.as_str()));
++            || token.chars().any(|ch| ch.is_ascii_uppercase());
++        let looks_domain_relevant = token.len() >= 4
++            && token.chars().all(|ch| ch.is_ascii_lowercase())
++            && !REPO_SEARCH_STOPWORDS.contains(&normalized.as_str());
+         if (looks_code_like || looks_domain_relevant) && seen.insert(normalized.clone()) {
+             queries.push(token.to_owned());
+         }
+@@ -34,32 +29,6 @@ pub(crate) fn extract_search_queries(task: &str) -> Vec<String> {
+     queries
+ }
+ 
+-const REPO_SEARCH_ALLOWLIST: &[&str] = &[
+-    "agent",
+-    "approval",
+-    "cancel",
+-    "config",
+-    "context",
+-    "event",
+-    "history",
+-    "memory",
+-    "model",
+-    "module",
+-    "patch",
+-    "module",
+-    "policy",
+-    "provider",
+-    "runtime",
+-    "search",
+-    "session",
+-    "shell",
+-    "stdio",
+-    "tool",
+-    "tools",
+-    "transport",
+-    "workflow",
+-];
+-
+ const REPO_SEARCH_STOPWORDS: &[&str] = &[
+     "about", "after", "also", "before", "between", "could", "does", "done", "from", "have", "into",
+     "just", "like", "more", "need", "only", "over", "should", "some", "that", "then", "there",
+diff --git a/context/context-pack/src/tests.rs b/context/context-pack/src/tests.rs
+index f2e76de..467f762 100644
+--- a/context/context-pack/src/tests.rs
++++ b/context/context-pack/src/tests.rs
+@@ -308,6 +308,20 @@ fn extract_search_queries_keeps_domain_lowercase_terms() {
+     let queries = extract_search_queries("почему approval не работает где shell policy?");
+ 
+     assert_eq!(queries, vec!["approval", "shell", "policy"]);
++    for (task, expected) in [
++        (
++            "tool tools stdio module",
++            vec!["tool", "tools", "stdio", "module"],
++        ),
++        ("Parser.rs config.toml", vec!["Parser", "config", "toml"]),
++        ("guide.md data.json", vec!["guide", "data", "json"]),
++        (
++            "_API_ -code-mode- adapter",
++            vec!["API", "code-mode", "adapter"],
++        ),
++    ] {
++        assert_eq!(extract_search_queries(task), expected, "{task}");
++    }
+ }
+ 
+ #[test]
+@@ -315,6 +329,16 @@ fn extract_search_queries_skips_common_lowercase_stopwords() {
+     let queries = extract_search_queries("what should this context workflow inspect");
+ 
+     assert_eq!(queries, vec!["context", "workflow", "inspect"]);
++    assert_eq!(extract_search_queries("123 a to io tool"), vec!["tool"]);
++    assert_eq!(
++        extract_search_queries("what should this"),
++        vec!["what should this"]
++    );
++    assert!(extract_search_queries(" \n\t").is_empty());
++    assert_eq!(
++        extract_search_queries(&"я".repeat(81)),
++        vec!["я".repeat(80)]
++    );
+ }
+ 
+ #[test]
+@@ -322,4 +346,8 @@ fn extract_search_queries_dedupes_case_insensitively() {
+     let queries = extract_search_queries("Workflow workflow ToolSafety tool_safety");
+ 
+     assert_eq!(queries, vec!["Workflow", "ToolSafety", "tool_safety"]);
++    assert_eq!(
++        extract_search_queries("Config config Config.rs config.toml workflow schema extra"),
++        vec!["Config", "toml", "workflow", "schema"]
++    );
+ }
