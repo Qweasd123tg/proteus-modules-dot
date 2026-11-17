@@ -1,0 +1,74 @@
+{
+  "date": "2026-11-17",
+  "toolchain": {
+    "rustc": "1.95.0",
+    "cargo": "1.95.0",
+    "platform": "x86_64-unknown-linux-gnu"
+  },
+  "baseline_red": {
+    "test_set": "first three block_tests regressions",
+    "passed": 0,
+    "failed": 3,
+    "expected_failure": true,
+    "production_ref": "b7e3ca3c23b9440c8c1a9e1d15386d02ef8586c7"
+  },
+  "final_stream_tests": {
+    "command": "python3 scripts/test.py -p model-pack --lib adapters::anthropic::stream:: --offline",
+    "passed": 13,
+    "failed": 0,
+    "filtered": 177,
+    "independent_repeat": {
+      "passed": 13,
+      "failed": 0,
+      "filtered": 177
+    }
+  },
+  "existing_pure_tests": {
+    "command": "python3 scripts/test.py -p model-pack --lib adapters::anthropic::tests:: --offline -- --skip provider_config",
+    "passed": 26,
+    "failed": 0,
+    "filtered": 163,
+    "note": "Ran before final test-only additions; production semantics identical. No HTTP I/O."
+  },
+  "patch_validation": {
+    "strict_apply": true,
+    "candidate_file_bytes_match": 3,
+    "strict_reverse": true,
+    "clean_baseline_restored": true
+  },
+  "formatting": {
+    "git_diff_check": "PASS",
+    "rustfmt_new_test_file": "PASS",
+    "whole_workspace_fmt": "NOT RUN"
+  },
+  "not_run": [
+    "full workspace tests",
+    "HTTP transport tests",
+    "live provider inference",
+    "authentication fixtures",
+    "process/security scopes",
+    "Core tests",
+    "Desktop/UI",
+    "portable/package install",
+    "hosted CI",
+    "performance measurements"
+  ],
+  "scope": "Pure in-memory request/response/state tests only. Pinned Core dependency compiled, not its test suite. Upstream repositories/pins/installations unchanged.",
+  "behavior_notes": [
+    "text_delta without a text owner is now ignored",
+    "filters retain per-text-block state rather than one per-message state",
+    "batch/stream incomplete-marker policies remain distinct",
+    "priority policy unresolved and unchanged"
+  ],
+  "clippy": {
+    "command": "cargo clippy -p model-pack --lib --offline --locked --no-deps",
+    "exit_code": 0,
+    "warnings": 4,
+    "warning_paths": [
+      "model/model-pack/src/adapters/openai/codex_config.rs",
+      "model/model-pack/src/adapters/openai/codex_quota.rs",
+      "model/model-pack/src/adapters/openai/stream_state.rs"
+    ],
+    "note": "Warnings are outside edited paths; no warning-free clippy claim. No tests or auth/network actions executed by this check."
+  }
+}
