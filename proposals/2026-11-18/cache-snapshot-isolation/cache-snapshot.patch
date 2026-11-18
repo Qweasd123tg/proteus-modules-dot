@@ -1,0 +1,109 @@
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 3bebbdbe5d92fdcb349a7ca57124dd22397bf544..08c54a583045ae5f09e76358c36b1d69a427a7bc 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -65,11 +65,8 @@ impl State {
+             Ok(dir) if dir.is_dir() => dir,
+             _ => return Ok(SessionStorageResponse::CacheWritten { etag: None }),
+         };
+-        let current = self.snapshot(session.clone())?;
+-        let matches = same_prefix(&current, &source);
+-        self.snapshots.remove(&current.snapshot_id);
+-        self.snapshot_order.retain(|id| id != &current.snapshot_id);
+-        if !matches {
++        let current = self.prepare_snapshot(session.clone())?.identity;
++        if !same_prefix(&current, &source) {
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+         let cache = Cache { source, value };
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 0205b5221352f3eeeb8e885afbc4589394af1daa..24ef671de1d69fa22f1861fe1d9b0e6b01d85f4f 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -19,7 +19,7 @@ impl State {
+         self.prefix_order.push_back(session.clone());
+         self.prefixes.insert(session, cache);
+     }
+-    pub(super) fn snapshot(&mut self, session: SessionLocator) -> Result<StorageSnapshot> {
++    pub(super) fn prepare_snapshot(&mut self, session: SessionLocator) -> Result<SnapshotState> {
+         let dir = self.checked_path(&session)?;
+         let stamps = catalog::source_stamp(&dir, self.kind)?;
+         let cached = self
+@@ -66,6 +66,11 @@ impl State {
+             content_sha256: source.fingerprint().to_owned(),
+         };
+         source.reset()?;
++        SnapshotState::new(identity, source, verified)
++    }
++    pub(super) fn snapshot(&mut self, session: SessionLocator) -> Result<StorageSnapshot> {
++        let prepared = self.prepare_snapshot(session)?;
++        let identity = prepared.identity.clone();
+         while self.snapshots.len() >= MAX_SNAPSHOTS {
+             if let Some(id) = self.snapshot_order.pop_front() {
+                 self.snapshots.remove(&id);
+@@ -74,10 +79,7 @@ impl State {
+             }
+         }
+         self.snapshot_order.push_back(identity.snapshot_id.clone());
+-        self.snapshots.insert(
+-            identity.snapshot_id.clone(),
+-            SnapshotState::new(identity.clone(), source, verified)?,
+-        );
++        self.snapshots.insert(identity.snapshot_id.clone(), prepared);
+         Ok(identity)
+     }
+     pub(super) fn read_model_context_before_turn(
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+index 7a2ff0893f544075d804cde08050b391d619b8c7..55c0c2f569408891d3701b1079a87ee5ad89c34c 100644
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -134,6 +134,49 @@ fn cache_is_disposable_source_bound_and_does_not_acquire_writer() {
+     }
+ }
+ 
++#[test]
++fn cache_writes_leave_public_snapshot_handles_alone() {
++    for kind in backends() {
++        for stale in [false, true] {
++            let mut f = Fixture::new(kind);
++            f.append(vec![text("before")]);
++            let mut held = vec![f.snapshot()];
++            f.append(vec![text("after")]);
++            held.extend((1..32).map(|_| f.snapshot()));
++
++            let source = if stale { &held[0] } else { &held[31] };
++            let SessionStorageResponse::CacheWritten { etag } = f
++                .service
++                .execute(SessionStorageRequest::WriteCache {
++                    session: f.descriptor.session.clone(),
++                    key: "view.head".into(),
++                    source: source.clone(),
++                    value: serde_json::json!("cached"),
++                })
++                .unwrap()
++            else {
++                panic!("expected a cache write result");
++            };
++            assert_eq!(etag.is_some(), !stale);
++            for (i, snapshot) in held.iter().enumerate() {
++                let state = f.conversation(snapshot.clone(), StorageHistoryPoint::Current);
++                assert_eq!(state.messages.len(), if i == 0 { 1 } else { 2 });
++            }
++
++            let extra = f.snapshot();
++            let release = |snapshot| {
++                f.service
++                    .execute(SessionStorageRequest::ReleaseSnapshot { snapshot })
++            };
++            let error = release(held.remove(0)).unwrap_err();
++            assert!(error.to_string().contains("snapshot handle expired or unknown"));
++            for snapshot in held.into_iter().chain([extra]) {
++                release(snapshot).unwrap();
++            }
++        }
++    }
++}
++
+ #[test]
+ fn metadata_imports_old_filename_once_and_deletion_does_not_resurrect_it() {
+     for kind in backends() {
