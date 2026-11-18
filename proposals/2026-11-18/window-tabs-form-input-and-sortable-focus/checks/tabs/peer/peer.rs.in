@@ -1,0 +1,48 @@
+#![allow(dead_code,unused_imports,unused_variables)]
+use std::cell::RefCell;
+type Pixels=f32; const fn px(x:f32)->f32{x}
+#[derive(Clone,Copy,Default)] struct Point<T>{x:T,y:T}
+#[derive(Clone,Copy,Default)] struct Size<T>{width:T,height:T}
+#[derive(Clone,Copy,Default)] struct Bounds<T>{origin:Point<T>,size:Size<T>}
+#[derive(Clone,Copy,Default)] struct Edges<T>{top:T,bottom:T,left:T,right:T}
+impl Bounds<f32>{fn extend(mut self,e:Edges<f32>)->Self{self.origin.y-=e.top;self.size.height+=e.top+e.bottom;self}fn contains(&self,p:&Point<f32>)->bool{p.x>=self.origin.x&&p.x<=self.origin.x+self.size.width&&p.y>=self.origin.y&&p.y<=self.origin.y+self.size.height}fn center(&self)->Point<f32>{Point{x:self.origin.x+self.size.width/2.,y:self.origin.y+self.size.height/2.}}}
+#[derive(Clone)]struct Pane{tabs:Vec<String>,pinned:usize,id:usize} type PaneId=usize;
+struct TabLayout(Vec<String>);impl TabLayout{fn contains(&self,id:&str)->bool{self.0.iter().any(|x|x==id)}}
+struct App {drag:Option<String>} struct Window(usize);impl Window{fn refresh(&mut self){self.0+=1}}
+mod prefs{use super::*;pub(super) fn scale(_: &App)->f32{1.}}
+mod drag{use super::*;pub(super) fn current(a:&App)->Option<&str>{a.drag.as_deref()}}
+mod arrange {use super::*;
+/*SOURCE*/
+/*BOUNDARY*/
+}
+use arrange::*;
+fn main(){
+ let mut checks=0;let mut broken=0;
+ for center in [0f32,50.,100.,150.] {for offset in [-150f32,200.] {for after_hover in [false,true] {
+ let h=/*NEW*/;let k=/*NEW*/;
+ let mut a=App{drag:Some("tab:source".to_owned())};let mut w=Window(0);
+ let pane=Pane{id:1,tabs:["source","common","next"].map(String::from).into(),pinned:0};let other=Pane{id:1,tabs:["b","common","aux"].map(String::from).into(),pinned:0};let la=TabLayout(pane.tabs.clone());let lb=TabLayout(other.tabs.clone());
+ let rect=|x,w|Bounds{origin:Point{x,y:0.},size:Size{width:w,height:24.}};
+ let use_b=|| {let b=frame(/*B*/&other,&lb,&a);assert!(b.dragging.is_none()); record(/*B*/"common",rect(offset,30.));};
+ frame(/*A*/&pane,&la,&a);
+ record(/*A*/"source",rect(0.,35.));record(/*A*/"common",rect(30.,40.));record(/*A*/"next",rect(100.,50.));
+ let f=frame(/*A*/&pane,&la,&a);assert_eq!(f.gap_width,35.);
+ if !after_hover{use_b();}
+ hover(/*A*/&pane,"source",false,rect(0.,190.),Point{x:center,y:15.},&mut w);
+ if after_hover{use_b();}
+ let expected=if center<=50.{Some("common".into())}else if center<=125.{Some("next".into())}else{None};
+ let got=drop_before(/*A*/&pane,"source");checks+=1;if got!=Some(expected){broken+=1;}
+ // Ending the drag and a new frame reset A. Does not require B to render.
+ a.drag=None;let idle=frame(/*A*/&pane,&la,&a);assert!(idle.dragging.is_none());
+ /*RESET*/
+ }}}
+ println!("shared App, disjoint source IDs, same numeric pane and common tab ID, 16 interleavings/coordinates: {broken}/{checks} incorrect A drops");
+ if cfg!(candidate){assert_eq!(broken,0)}else{assert!(broken>0)}
+ let h=/*NEW*/;let k=/*NEW*/;let same=App{drag:Some("tab:twice".into())};
+ let p=Pane{id:1,tabs:vec!["twice".into()],pinned:0};
+ let a=frame(/*A*/&p,&TabLayout(p.tabs.clone()),&same);
+ let b=frame(/*B*/&p,&TabLayout(p.tabs.clone()),&same);
+ assert_eq!(a.dragging.as_deref(),Some("twice"));assert_eq!(b.dragging.as_deref(),Some("twice"));
+ println!("same source ID in both layouts: both still accept the App-wide drag; no window-origin identity fix claimed.");
+ /*LIFETIME*/
+}

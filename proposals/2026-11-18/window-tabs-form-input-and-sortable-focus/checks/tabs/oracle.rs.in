@@ -1,0 +1,44 @@
+type Store=arrange::TabArrangement;
+impl Store{
+ fn frame(&self,p:&Pane,l:&TabLayout,a:&App)->arrange::Frame{arrange::frame(PARAM,p,l,a)}
+ fn rec(&self,id:&str,x:f32){arrange::record(PARAM,id,bounds(x,40.))}
+ fn hover(&self,p:&Pane,pinned:bool,x:f32,w:&mut Window){arrange::hover(PARAM,p,"drag",pinned,bounds(0.,400.),Point{x,y:10.},w)}
+ fn drop(&self,p:&Pane)->Option<Option<String>>{arrange::drop_before(PARAM,p,"drag")}
+}
+fn bounds(x:f32,width:f32)->Bounds<f32>{Bounds{origin:Point{x,y:0.},size:Size{width,height:30.}}}
+fn pane(id:u32,ids:&[&str],pinned:usize)->Pane{Pane{id,tabs:ids.iter().map(|s|s.to_string()).collect(),pinned}}
+pub(super) fn check(){
+let mut counts=[[0usize;2];5];
+for cross_pane in [false,true]{
+ for duplicate_other in [false,true]{
+  for shared_pane_id in [false,true]{
+   for pinned in [false,true]{
+    for x in [10.,35.,75.,95.,135.,170.,190.,265.]{
+     for sequence in 0..5 {
+      let a=Store::default();let b=Store::default();let mut wa=Window::default();
+      let d=if cross_pane {pane(1,&["pin","a","b"],1)} else if pinned {pane(0,&["drag","pin","a","b"],2)} else {pane(0,&["pin","drag","a","b"],1)};
+      let other=pane(if shared_pane_id{d.id}else{8},&[if duplicate_other{"a"}else{"B-only"},"B2"],0);
+      let la=TabLayout(vec!["drag".into(),"pin".into(),"a".into(),"b".into()]);let lb=TabLayout(other.tabs.clone());
+      let idle=App(None);let active=App(Some("tab:drag"));a.frame(&d,&la,&idle);b.frame(&other,&lb,&idle);
+      for (i,id) in ["pin","a","b"].iter().enumerate(){a.rec(id,60.*i as f32);}a.rec("drag",180.);
+      let f=a.frame(&d,&la,&active);assert_eq!(f.dragging.as_deref(),Some("drag"));
+      let paint_b=|b:&Store|{assert!(b.frame(&other,&lb,&active).dragging.is_none());for id in &other.tabs{b.rec(id,350.);}};
+      if sequence==2 {paint_b(&b);} // B paints before A's last hover.
+      if sequence==3 && duplicate_other {b.rec("a",350.);} // completed prepaint at different coords
+      a.hover(&d,pinned,x,&mut wa);
+      match sequence {1=>paint_b(&b),4=>{paint_b(&b);a.frame(&d,&la,&active);},_=>{}}
+      let seen=a.drop(&d);
+      let ideal=[20.,80.,140.].iter().filter(|&&center|center<x).count();let ix=if pinned{ideal.min(1)}else{ideal.max(1)};
+      let want=Some(["pin","a","b"].get(ix).map(|s|s.to_string()));
+      counts[sequence][0]+=1;if seen!=want{counts[sequence][1]+=1;}
+      a.hover(&d,pinned,420.,&mut wa);assert_eq!(a.drop(&d),None); // outside is still not a drop
+     }
+    }
+   }
+  }
+ }
+}
+for (name,[total,bad]) in ["A alone","A hover, B frame, A release","B frame before last hover","B other tab prepaint before hover","A hover, B frame, A frame, A release"].iter().zip(counts){println!("{name}: {bad}/{total} wrong");}
+let n:usize=counts.iter().map(|d|d[1]).sum();println!("{} / {} wrong",n,counts.iter().map(|d|d[0]).sum::<usize>());if n>0{std::process::exit(1)}
+}}
+fn main(){ui::check();}

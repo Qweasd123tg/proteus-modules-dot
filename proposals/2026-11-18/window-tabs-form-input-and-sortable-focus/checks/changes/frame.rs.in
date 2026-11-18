@@ -1,0 +1,72 @@
+#![allow(dead_code)]
+extern crate self as proteus_extension;
+use std::{collections::HashSet,marker::PhantomData};
+pub use serde_json::{Value,json};
+mod val{/*VALUE*/}
+use val::ValueExt;
+mod model{use super::*;/*MODEL*/}
+use model::{Group,Section,Staging};
+pub mod ui{use super::*;/*SDK*/}
+use ui::stats;
+trait Node:Sized{fn with(self,k:&str,v:impl Into<Value>)->Self;}
+impl Node for Value{fn with(mut self,k:&str,v:impl Into<Value>)->Self{self[k]=v.into();self}}
+mod panel{
+use super::*; /*HELPERS*/
+fn entry_menu(_:&Value)->Vec<Value>{vec![]}
+ /*ROWS*/
+}
+#[derive(Default)]struct Changes{selected:Option<String>}
+impl Changes{fn select(&mut self,identity:&str,entries:&[Value]){/*REC*/}}
+#[derive(Clone,Copy,PartialEq,Eq)]enum Kind{Header,Item}
+#[derive(Clone)]struct Row{id:String,kind:Kind,depth:usize,expanded:Option<bool>,selected:bool}
+impl Row{/*HEADER*/}
+struct KeyDownEvent{keystroke:Stroke}struct Stroke{key:String}
+struct List;impl List{fn scroll_to_reveal_item(&mut self,_:usize){}}
+struct Context<T>{mark:PhantomData<T>,last:Option<(String,&'static str)>}
+impl<T>Context<T>{fn stop_propagation(&mut self){}fn notify(&mut self){}}
+type App=Context<Tree>;
+struct Tree{rows:Vec<Row>,cursor:usize,list:List}
+impl Tree{
+ fn replace(&mut self,rows:Vec<Row>){/*RECON*/self.rows=rows;self.cursor=self.step(self.cursor,1);}
+ fn act_at(&self,i:usize,event:&'static str,cx:&mut App){cx.last=self.rows.get(i).map(|r|(r.id.clone(),event))}
+ /*TREE*/
+ fn enter(&mut self)->String{let mut c=Context{mark:PhantomData,last:None};self.key(&KeyDownEvent{keystroke:Stroke{key:"enter".into()}},&mut c);let(id,e)=c.last.unwrap();assert_eq!(e,"open");id}
+}
+fn rows(entries:&[Value],g:Group,hidden:&[&'static str],s:Option<&str>)->Vec<Row>{
+ panel::change_rows(entries,g,&hidden.iter().copied().collect(),s).iter().map(|v|Row{id:v.str("id").into(),kind:if v.str("kind")=="header"{Kind::Header}else{Kind::Item},depth:v["depth"].as_u64().unwrap() as usize,expanded:v["expanded"].as_bool(),selected:v.bool("selected")}).collect()
+}
+fn chosen(rs:&[Row])->Vec<String>{rs.iter().filter(|r|r.selected).map(|r|r.id.clone()).collect()}
+fn e(p:&str,status:&str,s:bool,u:bool)->Value{json!({"path":p,"status":status,"staged":s,"unstaged":u})}
+fn main(){
+ let(mut n,mut dbl,mut wrong,mut control,mut gone)=(0,0,0,0,0);
+ for base in ["notes","список.md","file:notes","assets/notes v2","папка/α.md","report:part"]{
+ for (g,ns,s,u) in [(Group::Status,"file",true,false),(Group::Staging,"staged",true,false),(Group::Staging,"unstaged",false,true)]{
+ let id=format!("{ns}:{base}");let alias=format!("{ns}:{id}");
+ for alias_first in [true,false]{
+ let primary=e(base,"modified",s,u);let other=e(&id,"modified",s,u);
+ let entries=if alias_first{vec![other.clone(),primary]}else{vec![primary,other.clone()]};
+ let mut store=Changes::default();store.select(&id,&entries);assert_eq!(store.selected.as_deref(),Some(id.as_str()));
+ let mut tree=Tree{rows:rows(&entries,g,&[],None),cursor:0,list:List};
+ tree.cursor=tree.rows.iter().position(|r|r.id==id).unwrap(); // target of the original row click
+ tree.replace(rows(&entries,g,&[],store.selected.as_deref()));
+ let marks=chosen(&tree.rows);assert_eq!(marks.len(),2);assert!(marks.contains(&id)&&marks.contains(&alias));dbl+=1;
+ let next=tree.enter();assert_eq!(next,if alias_first{&alias}else{&id}.as_str());
+ if next!=id{wrong+=1;}
+ if alias_first&&base=="notes"{println!("{g:?} stored={id:?}; selected={marks:?}; Enter=open({next:?}); decoded path={:?}",panel::row_path(&next));}
+ let without_target=rows(&[other],g,&[],Some(&id));assert_eq!(chosen(&without_target),vec![alias.clone()]);gone+=1;
+ // Two different intents use identical selection bytes and input rows; no precedence can serve both.
+ assert_ne!(id,alias);assert_eq!(panel::row_path(&id),base);assert_eq!(panel::row_path(&alias),id);
+ let unique=vec![e(base,"modified",s,u)];
+ for raw in [&id, &base.to_owned()]{
+   assert_eq!(chosen(&rows(&unique,g,&[],Some(raw))),vec![id.clone()]);control+=1;
+ }
+ n+=1;
+ }}}
+ let staged_only=e("notes","modified",true,false);let raw_alias=e("staged:notes","modified",false,true);
+ let hidden=rows(&[staged_only,raw_alias],Group::Staging,&["staged"],Some("staged:notes"));
+ assert_eq!(chosen(&hidden),vec!["unstaged:staged:notes".to_owned()]);
+ let partial=vec![e("notes","modified",true,true)];
+ assert_eq!(chosen(&rows(&partial,Group::Staging,&[],Some("notes"))),vec!["staged:notes","unstaged:notes"]);
+ assert_eq!(chosen(&rows(&partial,Group::Staging,&[],Some("unstaged:notes"))),vec!["unstaged:notes"]);
+ println!("source only, no production patch: ambiguity={n}, selected-two-distinct-files={dbl}, wrong recorded Enter target={wrong}, wrong remaining file marked after target removal={gone}, unique encoded/raw controls={control}, hidden-section=1, partial-stage controls=2");
+}
