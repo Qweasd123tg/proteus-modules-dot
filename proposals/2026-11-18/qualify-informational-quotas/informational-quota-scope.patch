@@ -1,0 +1,82 @@
+--- a/packages/quota/src/describe.rs
++++ b/packages/quota/src/describe.rs
+@@ -1,6 +1,9 @@
+ //! Badge lines of a quota snapshot (`GET /model/quota`).
+ 
+ use proteus_extension::{Value, ValueExt, local_time};
++
++pub const INFORMATIONAL_SCOPE: &str =
++    "Справочный лимит: неизвестно, действует ли он для текущей модели.";
+ 
+ /// One decimal without a trailing zero, with a decimal comma: `7,5`, `80`.
+ pub fn number(value: f64) -> String {
+@@ -72,6 +75,9 @@
+             .opt_str("name")
+             .filter(|name| !name.is_empty())
+             .unwrap_or(bucket.str("id"));
++        if bucket.bool("informational") {
++            lines.push(format!("{name}: {INFORMATIONAL_SCOPE}"));
++        }
+         if bucket.at("limit_reached").as_bool() == Some(true) {
+             lines.push(format!("{name}: лимит исчерпан"));
+         } else if bucket.at("allowed").as_bool() == Some(false) {
+--- a/packages/quota/src/view.rs
++++ b/packages/quota/src/view.rs
+@@ -44,7 +44,12 @@
+         if windows.is_empty() {
+             windows.push(note("Провайдер не сообщил окна лимита"));
+         }
+-        children.push(card(Some(name), windows));
++        // Keep the scope on the existing title: one more widget per bucket
++        // would shrink the set of snapshots that fit the client's node budget.
++        let scoped = bucket
++            .bool("informational")
++            .then(|| format!("{name} · {}", crate::describe::INFORMATIONAL_SCOPE));
++        children.push(card(Some(scoped.as_deref().unwrap_or(name)), windows));
+     }
+     for notice in snapshot.list("notices").iter().filter_map(Value::as_str) {
+         children.push(note(notice).with("tone", "warning"));
+@@ -86,6 +91,43 @@
+     use proteus_extension::json;
+ 
+     #[test]
++    fn informational_bucket_explains_scope_without_hiding_reported_status() {
++        use crate::describe::{INFORMATIONAL_SCOPE, describe};
++        let sample = |informational| {
++            json!({"observed_at": 1, "buckets": [
++                {"id":"primary", "windows":[{"id":"daily","used_percent":25}]},
++                {"id":"shared","informational":informational,"limit_reached":true,"windows":[]}
++            ]})
++        };
++        for informational in [false, true] {
++            let snapshot = sample(informational);
++            let (remaining, lines) = describe(&snapshot, 1.);
++            assert_eq!(remaining, Some(75.));
++            assert_eq!(
++                lines.contains(&format!("shared: {INFORMATIONAL_SCOPE}")),
++                informational
++            );
++            assert!(lines.contains(&"shared: лимит исчерпан".to_owned()));
++            let cards = render(&snapshot, 1.);
++            let shared = &cards[1]["children"];
++            let expected = if informational {
++                format!("shared · {INFORMATIONAL_SCOPE}")
++            } else {
++                "shared".to_owned()
++            };
++            assert_eq!(cards[1]["title"], expected);
++            assert_eq!(shared.as_array().unwrap().len(), 1);
++            assert!(
++                shared
++                    .as_array()
++                    .unwrap()
++                    .iter()
++                    .any(|node| node["text"] == "Лимит исчерпан")
++            );
++        }
++    }
++
++    #[test]
+     fn reports_amounts_notices_and_unknown_reset_without_inventing_values() {
+         let snapshot = json!({"observed_at":1700000000,"notices":["Budgets Read required"],"buckets":[
+             {"id":"shared","name":"Общий лимит","windows":[{"id":"monthly","used_percent":20}]},

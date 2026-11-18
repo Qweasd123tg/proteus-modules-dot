@@ -1,0 +1,58 @@
+extern crate self as proteus_extension;
+pub use serde_json::{json, Value};
+pub fn local_time(_:f64)->String { "fixed".into() }
+pub trait ValueExt{
+ fn at(&self,k:&str)->&Value;fn opt_str(&self,k:&str)->Option<&str>;fn str(&self,k:&str)->&str;fn i64(&self,k:&str)->Option<i64>;fn f64(&self,k:&str)->Option<f64>;fn bool(&self,k:&str)->bool;fn list(&self,k:&str)->&[Value];
+}
+impl ValueExt for Value {
+ fn at(&self,k:&str)->&Value{&self[k]}fn opt_str(&self,k:&str)->Option<&str>{self[k].as_str()}fn str(&self,k:&str)->&str{self.opt_str(k).unwrap_or_default()}fn i64(&self,k:&str)->Option<i64>{self[k].as_i64()}fn f64(&self,k:&str)->Option<f64>{self[k].as_f64()}fn bool(&self,k:&str)->bool{self[k].as_bool().unwrap_or(false)}fn list(&self,k:&str)->&[Value]{self[k].as_array().map(Vec::as_slice).unwrap_or_default()}
+}
+pub mod ui { use super::*;
+pub trait Node{fn with(self,k:&str,v:impl Into<Value>)->Value;}
+impl Node for Value{fn with(mut self,k:&str,v:impl Into<Value>)->Value{self[k]=v.into();self}}
+pub fn text(s:impl AsRef<str>)->Value{json!({"type":"text","text":s.as_ref()})}
+pub fn note(s:impl AsRef<str>)->Value{json!({"type":"note","text":s.as_ref()})}
+pub fn card(t:Option<&str>,children:Vec<Value>)->Value{json!({"type":"card","title":t,"children":children})}
+pub fn kv(rows:Vec<(&str,String)>)->Value{json!({"type":"kv","rows":rows})}pub fn progress(v:f64,m:f64)->Value{json!({"type":"progress","value":v,"max":m})}
+}
+mod dto { /*DTO*/ }
+mod describe;mod view;
+const SCOPE:&str="Справочный лимит: неизвестно, действует ли он для текущей модели.";
+fn main(){
+ let phase=std::env::args().nth(1).unwrap();let has=phase.contains("mark");
+ let mut n=0;
+ for flag in [None,Some(false),Some(true)]{for enabled in [None,Some(false),Some(true)]{for reached in [None,Some(false),Some(true)]{
+ for used in [None,Some(0.),Some(25.),Some(100.),Some(125.)]{for other in [None,Some(false),Some(true)]{for order in [false,true]{
+ let make=|id:&str,amount:Option<f64>| if let Some(p)=amount {vec![json!({"id":id,"used_percent":p,"duration_seconds":3600,"resets_at":null, "amount":{"used":1,"limit":2,"unit":"шт."}})]}else{vec![]};
+ let mut bucket=json!({"id":"aux","name":"Ресурс","allowed":enabled,"limit_reached":reached,"windows":make("w",used)});if let Some(f)=flag{bucket["informational"]=json!(f)}
+ let mut bs=vec![bucket];if let Some(f)=other{bs.push(json!({"id":"primary","name":"Основной","allowed":null,"limit_reached":null,"windows":make("w",Some(60.)),"informational":f}));}
+ if order{bs.reverse();}
+ let raw=json!({"observed_at":1,"plan":null,"credits":null,"buckets":bs,"notices":["test notice"]});
+ let typed:dto::ModelQuotaSnapshot=serde_json::from_value(raw).unwrap(); let snap=serde_json::to_value(&typed).unwrap();
+ let (remaining,mut lines)=describe::describe(&snap,1.);let mut cards=view::render(&snap,1.);
+ let mut ex:Option<f64>=None;
+ for (i,b)in typed.buckets.iter().enumerate(){
+ let name=b.name.as_ref().unwrap();
+ if !b.informational{for w in &b.windows{let left=(100.-w.used_percent).clamp(0.,100.);ex=Some(ex.map_or(left,|e|e.min(left)))}}
+ let annotation=format!("{name}: {SCOPE}");let expected=usize::from(b.informational&&has);
+ assert_eq!(lines.iter().filter(|l|**l==annotation).count(),expected);
+ let title=if expected==1{format!("{name} · {SCOPE}")}else{name.clone()};
+ assert_eq!(cards[i]["title"],title);assert!(!cards[i]["children"].as_array().unwrap().iter().any(|v|v["text"]==SCOPE));
+ if expected==1 {cards[i]["title"]=json!(name);lines.retain(|l|l!=&annotation);}
+ }
+ assert_eq!(remaining,ex);
+ println!("{}",json!([remaining,lines,cards]));n+=1;
+ }}}}}}
+ assert_eq!(n,810);
+ // Count returned widget roots and descendant objects only, not any outer host container.
+ fn count(v:&Value)->usize{usize::from(v.get("type").is_some())+v["children"].as_array().map_or(0,|a|a.iter().map(count).sum())}
+ for extras in 0..=2 {
+  let buckets:Vec<_>=(0..2499).map(|i|json!({"id":format!("b{i}"),"allowed":null,"name":null,"limit_reached":null,"windows":[],"informational": i%2==0})).collect();
+  let notices:Vec<_>=(0..extras).map(|i|format!("notice {i}")).collect();
+  let native:dto::ModelQuotaSnapshot=serde_json::from_value(json!({"observed_at":1,"plan":null,"credits":null,"buckets":buckets,"notices":notices})).unwrap();
+  let out=view::render(&serde_json::to_value(native).unwrap(),1.);
+  let count:usize=out.iter().map(count).sum();assert_eq!(count,4999+extras);
+  let labels=out.iter().filter(|v|v["title"].as_str().is_some_and(|s|s.ends_with(SCOPE))).count();assert_eq!(labels,if has{1250}else{0});
+  println!("returned_widget_count={count}");
+ }
+}

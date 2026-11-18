@@ -1,0 +1,20 @@
+extern crate self as proteus_extension;
+pub use serde_json::{Value,json};
+use std::io::{self,BufRead};
+mod dto{/*DTO*/}
+pub trait ValueExt {fn at(&self,k:&str)->&Value;fn opt_str(&self,k:&str)->Option<&str>;fn str(&self,k:&str)->&str;fn list(&self,k:&str)->&[Value];fn bool(&self,k:&str)->bool;fn i64(&self,k:&str)->Option<i64>;fn f64(&self,k:&str)->Option<f64>;}
+impl ValueExt for Value {fn at(&self,k:&str)->&Value{&self[k]}fn opt_str(&self,k:&str)->Option<&str>{self[k].as_str()}fn str(&self,k:&str)->&str{self.opt_str(k).unwrap_or("")}fn list(&self,k:&str)->&[Value]{self[k].as_array().map(Vec::as_slice).unwrap_or(&[])}fn bool(&self,k:&str)->bool{self[k].as_bool().unwrap_or(false)}fn i64(&self,k:&str)->Option<i64>{self[k].as_i64()}fn f64(&self,k:&str)->Option<f64>{self[k].as_f64()}}
+pub fn local_time(t:f64)->String{format!("T_{t}")} // deterministic sentinel, no clock or real account.
+pub mod ui {
+ use super::*;
+ pub trait Node{fn with(self,k:&str,v:impl Into<Value>)->Value;}
+ impl Node for Value{fn with(mut self,k:&str,v:impl Into<Value>)->Value{self[k]=v.into();self}}
+ pub fn card(title:Option<&str>,children:Vec<Value>)->Value{json!({"type":"card","title":title,"children":children})}
+ pub fn text(t:impl ToString)->Value{json!({"type":"text","text":t.to_string()})}
+ pub fn note(t:impl ToString)->Value{json!({"type":"note","text":t.to_string()})}
+ pub fn progress(value:f64,max:f64)->Value{json!({"type":"progress","value":value,"max":max})}
+ pub fn kv(rows:Vec<(&str,String)>)->Value{json!({"type":"kv","rows":rows})}
+}
+mod describe{/*DESC*/}
+mod view{/*VIEW*/}
+fn main(){for l in io::stdin().lock().lines(){let snap:dto::ModelQuotaSnapshot=serde_json::from_str(&l.unwrap()).unwrap();let j=serde_json::to_value(snap).unwrap();let (left,lines)=describe::describe(&j,100.);println!("{}",json!([left,lines,view::render(&j,100.)]));}}

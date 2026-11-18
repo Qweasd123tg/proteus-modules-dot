@@ -1,0 +1,51 @@
+extern crate self as proteus_extension;
+pub use serde_json::{Value,json};
+mod sdkvalue{/*VALUE*/}pub use sdkvalue::ValueExt;
+pub mod ui{use super::*;/*UI*/}
+mod dto{/*DTO*/}
+pub fn local_time(t:f64)->String{format!("fixture-time:{t}")}
+mod old{/*old*/}
+mod new{/*new*/}
+const SCOPE:&str="Справочный лимит: неизвестно, действует ли он для текущей модели.";
+fn main(){
+ let(mut docs,mut added,mut ordinary,mut only_info,mut neither,mut multiplicity)=(0,0,0,0,0,0);
+ for flag in 0..3{for another in [false,true]{for na in [Value::Null,json!("Общий бюджет A")]{for kind in 0..4{for status in 0..4{for money in [false,true]{
+  let name=na.as_str().unwrap_or("sample quota");let mut shared=json!({"id":"sample quota","name":na,"windows":[]});
+  if flag!=0 {shared["informational"]=json!(flag==2);}
+  if status!=0{shared["limit_reached"]=json!(status==1||status==3);shared["allowed"]=json!(status==2||status==3);}
+  for (ix,pc) in [12.5,99.,125.].into_iter().take(kind).enumerate(){
+   let mut w=json!({"id":format!("window{ix}"),"used_percent":pc,"duration_seconds":3600,"resets_at":1700010000});
+   if money{w["amount"]=json!({"used":1.25,"limit":3.5,"unit":"USD"});}
+   shared["windows"].as_array_mut().unwrap().push(w);}
+  let primary=json!({"id":"base","windows":[{"id":"primary","used_percent":25.0}]});let mut bs=vec![];if another{bs.push(primary.clone())}bs.push(shared.clone());
+  let raw=json!({"observed_at":1700000000,"buckets":bs,"plan":"Пример","notices":["Sample Notice"],"credits":{"available":true,"unlimited":false,"balance":"2.50"}});
+  let typed:dto::ModelQuotaSnapshot=serde_json::from_value(raw.clone()).unwrap();let canon=serde_json::to_value(&typed).unwrap();
+  assert_eq!(serde_json::from_value::<dto::ModelQuotaSnapshot>(canon.clone()).unwrap(),typed);docs+=1;
+  for wire in [&raw,&canon]{
+   let a=old::describe::describe(wire,1.);let b=new::describe::describe(wire,1.);let av=old::view::render(wire,1.);let mut bv=new::view::render(wire,1.);
+   assert_eq!(a.0,b.0);let mut lines=b.1.clone();
+   if flag==2{added+=1;let n=usize::from(another);let msg=format!("{name}: {SCOPE}");assert_eq!(lines.iter().filter(|s|s.as_str()==msg).count(),1);
+    let ix=lines.iter().position(|s|s==&msg).unwrap();assert_eq!(ix,1+n);lines.remove(ix);assert_eq!(bv[1+n]["title"],format!("{name} · {SCOPE}"));bv[1+n]["title"]=av[1+n]["title"].clone();
+   if !another{only_info+=1;assert_eq!(b.0,None);}else{assert_eq!(b.0,Some(75.));}
+    if kind==0&&status==0{neither+=1;assert!(av[1+n]["children"].as_array().unwrap().iter().any(|v|v["text"]=="Провайдер не сообщил окна лимита"));}
+   }else{ordinary+=1;}
+   assert_eq!(a.1,lines);assert_eq!(av,bv);
+  }
+ }}}}}}
+ // Multiple buckets, including repeated provider display names. Association must be by position, not by title.
+ for mask in 0..16{let mut buckets=vec![];for i in 0..4{buckets.push(json!({"id":format!("id{i}"),"name":"One name","informational":mask&(1<<i)!=0,"windows":[{"id":"w","used_percent":(i+1)*4}]}));}
+ let raw=json!({"observed_at":100,"buckets":buckets});let v:dto::ModelQuotaSnapshot=serde_json::from_value(raw.clone()).unwrap();let wire=serde_json::to_value(v).unwrap();
+ let cards=new::view::render(&wire,1.);let lines=new::describe::describe(&wire,1.).1;let mut pos=0;
+ for i in 0..4{let info=mask&(1<<i)!=0;assert_eq!(cards[i]["title"],if info{format!("One name · {SCOPE}")}else{"One name".to_owned()});
+ if info{assert_eq!(lines[pos],format!("One name: {SCOPE}"));pos+=1;}assert!(lines[pos].contains(&format!("осталось {}%",100-(i+1)*4)));pos+=1;multiplicity+=1;}
+ assert!(lines[pos].starts_with("Данные на "));}
+ // A repeated construction exactly at the client node budget. The count is a structural check, not a complete client validator.
+ fn nodes(v:&Value)->usize{1+v.get("children").and_then(Value::as_array).map_or(0,|a|a.iter().map(nodes).sum())}
+ // 2,498 cards * (card + fallback), plus 3 constant Text nodes and root Stack = 5,000.
+ let q=json!({"observed_at":1,"plan":"Sample","notices":["Info"],"buckets":(0..2498).map(|i|json!({"id":format!("b{i}"),"windows":[],"informational":true})).collect::<Vec<_>>()});
+ let typed:dto::ModelQuotaSnapshot=serde_json::from_value(q).unwrap();let wire=serde_json::to_value(typed).unwrap();
+ let total=|children:Vec<Value>|nodes(&json!({"type":"stack","children":children}));assert_eq!(total(old::view::render(&wire,1.)),5000);assert_eq!(total(new::view::render(&wire,1.)),5000);
+ println!("2,498 informational buckets: old and new both 5,000 nodes in the same synthetic enclosing Stack; no new node-budget regression.");
+ assert!(docs>0&&added>0&&ordinary>0&&neither>0&&only_info>0);
+ println!("{docs} typed snapshots, tested in declared and reserialized wire form: {added} informational projections gained exactly one named tooltip line and one qualified existing title, nothing else; card children and node count unchanged; {ordinary} explicit false/missing projections unchanged. {only_info} informational-only presentations kept unknown remaining, {neither} kept old no-window fallback. {multiplicity} repeated-title memberships checked independently.");
+}
