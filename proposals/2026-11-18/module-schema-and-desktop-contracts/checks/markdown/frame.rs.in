@@ -1,0 +1,58 @@
+use std::{ops::Range,collections::BTreeMap};
+use markdown::{to_mdast,ParseOptions,mdast::{Node,InlineCode}};
+#[derive(Clone)]struct SourceSegment{rendered:Range<usize>,source:Range<usize>,linear:bool}
+struct Span{start:usize,end:usize}
+fn decoded_entity(_:&str)->Option<(String,usize)>{unreachable!("literal code paths never decode entities")}
+@@map@@
+@@forward@@
+struct Index{source_map:Vec<SourceSegment>,text:String}
+impl Index{@@inverse@@}
+fn code(n:&Node)->Option<&InlineCode>{
+ if let Node::InlineCode(i)=n{return Some(i)} n.children()?.iter().find_map(code)
+}
+fn run(s:&str,base:usize,i:&InlineCode)->Index{
+ let p=i.position.as_ref().unwrap();let source=s;let seg=@@call@@;Index{source_map:seg,text:i.value.clone()}
+}
+#[derive(Default,Debug)]struct Counts{fixtures:usize,forward:usize,mapped:usize,inverse:usize,inverted:usize,syntax:usize,ignored:usize}
+fn main(){
+ let candidate=std::env::args().nth(1).unwrap()=="after";let mut c=Counts::default();
+ let mut example=None;
+ for ticks in 1usize..=6{let del="`".repeat(ticks);
+ for content in ["x","é","中文","a &amp; b",r"a\*b","  x  ","   ","`x`","`猫","`` x ``","x`x","x\ny","x\r\ny","x\ry","  α\nβ "," a\tZ "]{
+ let longest=content.split(|v|v!='`').map(str::len).max().unwrap_or(0);
+ if longest>=ticks{continue} // Valid unambiguous inline-code fence length.
+ for pad in [false,true]{
+ if !pad&&(content.starts_with('`')||content.ends_with('`')){continue}
+ let spacer=if pad{" "}else{""};
+ let body=format!("{spacer}{content}{spacer}");
+ let snip=format!("{del}{body}{del}");
+ for (left,right) in [("A "," B"),("**A "," B**"),("# A "," B"),("> A "," B"),("- A "," B")]{
+ if content.contains(['\n','\r']) && left!="A "{continue} // multi-line container fallback is tested separately.
+ let source=format!("{left}{snip}{right}");let ast=to_mdast(&source,&ParseOptions::gfm()).unwrap();
+ let i=code(&ast).unwrap();let p=i.position.as_ref().unwrap();assert_eq!(&source[p.start.offset..p.end.offset],snip);
+ // The byte oracle starts at the known literal interior, using the parser's actual decoded text only to distinguish optional padding.
+ let (extra,value)=if body.starts_with(' ') && body.ends_with(' ') && body.chars().any(|c|c!=' '){(1,&body[1..body.len()-1])}else{(0,body.as_str())};
+ assert_eq!(i.value,value,"{source:?}");
+ for base in [0,157]{
+ let idx=run(&source,base,i);let origin=base+left.len()+ticks+extra;
+ let bounds:Vec<_>=value.char_indices().map(|x|x.0).chain([value.len()]).collect();c.fixtures+=1;
+ for (j,&a) in bounds.iter().enumerate(){for &b in &bounds[j+1..]{
+  let wanted=origin+a..origin+b;let got=source_range_for_segments(&idx.source_map,a..b);c.forward+=1;c.mapped+=usize::from(got==Some(wanted.clone()));
+  let inverse=idx.range_for_source(&wanted);c.inverse+=1;c.inverted+=usize::from(inverse==Some(a..b));
+  if source=="A `` `x` `` B" && base==0 && a==0 && b==1 {example=Some((got,wanted,idx.range_for_source(&(left.len()..left.len()+ticks))));}
+ }}
+ for x in (base+p.start.offset..origin).chain(origin+value.len()..base+p.end.offset){c.syntax+=1;c.ignored+=usize::from(idx.range_for_source(&(x..x+1)).is_none())}
+ }
+ }}}}
+ let mut legacy=0;
+ // These bodies do not match literally because of continuation prefixes.
+ // Demand byte-for-byte agreement with the old fallback in both directions.
+ for s in ["> A `` first\n> next `` B","- A `` first\n  next `` B","> A `` first\n> next\n> last `` B","- A `` first\r\n  next `` B"]{
+ let ast=to_mdast(s,&ParseOptions::gfm()).unwrap();let i=code(&ast).unwrap();let p=i.position.as_ref().unwrap();
+ let raw=&s[p.start.offset..p.end.offset];assert!(!raw.contains(&i.value));
+ for base in [0,157]{let idx=run(s,base,i);let old=code_source_segments(s,&i.value,Some(Span{start:base+p.start.offset,end:base+p.end.offset}),base,false);
+ for a in 0..i.value.len(){for b in a+1..=i.value.len(){assert_eq!(source_range_for_segments(&idx.source_map,a..b),source_range_for_segments(&old,a..b));legacy+=1}}
+ }}
+ println!("{} {c:?}\nfirst visible literal backtick (got source, wanted source, opening delimiter→rendered): {:?}\nnoncontiguous container fallback: {legacy} legacy forward ranges unchanged",if candidate{"after"}else{"before"},example.unwrap());
+ if candidate{assert_eq!(c.forward,c.mapped);assert_eq!(c.inverse,c.inverted);assert_eq!(c.syntax,c.ignored)}else{assert!(c.forward>c.mapped && c.inverse>c.inverted && c.syntax>c.ignored)}
+}

@@ -1,0 +1,63 @@
+diff --git a/src/ui/settings/params.rs b/src/ui/settings/params.rs
+index b0b0bf6..9b92885 100644
+--- a/src/ui/settings/params.rs
++++ b/src/ui/settings/params.rs
+@@ -129,7 +129,7 @@ impl SettingsView {
+             let hint = schema
+                 .is_none()
+                 .then_some("Описание параметров недоступно. Настройки можно изменить в JSON.");
+-            return v_flex()
++            let editor = v_flex()
+                 .gap_1p5()
+                 .children(field.map(|field| self.text_area(&field.input, cx)))
+                 .children(
+@@ -142,8 +142,8 @@ impl SettingsView {
+                         .text_xs()
+                         .text_color(theme.muted_foreground)
+                         .child(hint)
+-                }))
+-                .into_any_element();
++                }));
++            return self.spotted(&super::spot::params_json(slot, module), editor, cx);
+         }
+         let schema = schema.expect("form mode needs a schema");
+         let rows = self.field_rows(
+diff --git a/src/ui/settings/search.rs b/src/ui/settings/search.rs
+index abe2f39..a808cd6 100644
+--- a/src/ui/settings/search.rs
++++ b/src/ui/settings/search.rs
+@@ -352,7 +352,18 @@ impl SettingsView {
+             return;
+         };
+         let scope = Scope { slot, module, page };
++        let first = finder.hits.len();
+         scope.fields(finder, &schema.fields, None, place, open);
++        if finder.hits.len() > first && self.is_json(slot, module) {
++            // All matching fields of this module share its single raw editor.
++            // Only the outer disclosures still exist in this presentation.
++            let anchor = spot::params_json(slot, module);
++            for (_, hit) in &mut finder.hits[first..] {
++                hit.place.push_str(" · JSON");
++                open.clone_into(&mut hit.target.open);
++                hit.target.spot = Some(anchor.clone());
++            }
++        }
+     }
+ 
+     fn search_addons(&self, addons: &AppAddonsSnapshot, finder: &mut Finder) {
+diff --git a/src/ui/settings/spot.rs b/src/ui/settings/spot.rs
+index 243460f..d0d3901 100644
+--- a/src/ui/settings/spot.rs
++++ b/src/ui/settings/spot.rs
+@@ -63,6 +63,11 @@ pub(super) fn field(path: &FieldPath) -> String {
+     format!("field:{}:{}:{}", path.slot, path.module, path.dotted())
+ }
+ 
++/// The one editor actually rendered instead of per-field controls in raw mode.
++pub(super) fn params_json(slot: &str, module: &str) -> String {
++    format!("params-json:{slot:?}:{module:?}")
++}
++
+ pub(super) fn row(title: &str) -> String {
+     format!("row:{title}")
+ }

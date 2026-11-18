@@ -1,0 +1,28 @@
+use std::cell::Cell;
+type Text=std::string::String;
+thread_local!{static CLONE:Cell<usize>=const{Cell::new(0)};}
+struct String(Text);
+impl Clone for String{fn clone(&self)->Self{CLONE.set(CLONE.get()+1);Self(self.0.clone())}}
+struct P{pinned:usize,tabs:Vec<String>}
+impl P{fn position(&self,id:&str)->Option<usize>{self.tabs.iter().position(|s|s.0==id)}}
+struct M(Vec<P>);
+impl M{
+ fn pane_of(&self,id:&str)->Option<usize>{self.0.iter().position(|p|p.position(id).is_some())}
+ fn pane(&self,id:usize)->Option<&P>{self.0.get(id)}
+ fn panes(&self)->Vec<&P>{self.0.iter().collect()}
+ @@FUN@@
+ fn flags(&self,id:&str)->(bool,bool){@@FLAGS@@}
+}
+fn k(pg:usize,i:usize)->Text{format!("pane{pg}:文書:{i:03}")}
+fn main(){
+ let mut cases=0;let mut before_flags=0;
+ // Distinct owned strings incl. valid unicode; empty, all pinned, missing/ghost, and four panes.
+ for size in [0,1,2,5,17]{for pin in 0..=size{for shift in [0,1,2,7]{let w=M((0..4).map(|pg|{let tabs=(0..size).map(|i|String(k(pg,(i+shift)%size.max(1)))).collect();P{pinned:(pin+pg).min(size),tabs}}).collect());
+ for pg in 0..4{for i in 0..=size{let id=k(pg,i);let owner=&w.0[pg];let pos=owner.tabs.iter().position(|s|s.0==id);
+ let mut others=Vec::new();let mut right=Vec::new();
+ if let Some(at)=pos{for (j,t) in owner.tabs.iter().enumerate(){if j>=owner.pinned && j!=at{others.push(t.0.as_str());if j>at{right.push(t.0.as_str())}}}}
+ CLONE.set(0);let expect=(!others.is_empty(),!right.is_empty());assert_eq!(w.flags(&id),expect);let old=others.len()+right.len();assert_eq!(CLONE.get(),if @@BEFORE@@{old}else{0});before_flags+=CLONE.get();
+ CLONE.set(0);let v=w.others(&id);let r=w.right_of(&id);assert_eq!(v.iter().map(|s|s.0.as_str()).collect::<Vec<_>>(),others);assert_eq!(r.iter().map(|s|s.0.as_str()).collect::<Vec<_>>(),right);assert_eq!(CLONE.get(),old);cases+=1;
+ }}}}}
+ println!("{cases} availability/order probes; {before_flags} cloned candidate IDs for the two menu flags. The owned bulk lists still clone one ID per returned element.");
+}

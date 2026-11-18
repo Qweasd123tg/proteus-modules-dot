@@ -1,0 +1,27 @@
+pub struct MarkdownParseContext<'a> {
+    source: &'a str,
+    offset: usize,
+}
+
+impl<'a> MarkdownParseContext<'a> {
+    pub(crate) fn new(source: &'a str, offset: usize) -> Self {
+        Self { source, offset }
+    }
+
+    /// Source text for the Markdown fragment currently being parsed.
+    pub fn source(&self) -> &'a str {
+        self.source
+    }
+
+    /// Byte offset of `source` in the full document when parsing an appended
+    /// fragment.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Source slice for a specific mdast node.
+    pub fn node_source(&self, node: &mdast::Node) -> Option<&'a str> {
+        let position = node.position()?;
+        self.source.get(position.start.offset..position.end.offset)
+    }
+}

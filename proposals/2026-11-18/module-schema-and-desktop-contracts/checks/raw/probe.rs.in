@@ -1,0 +1,91 @@
+#![allow(dead_code,unused_variables,private_interfaces)]
+use std::collections::{HashMap,HashSet};
+use std::marker::PhantomData;
+#[derive(Clone,Debug,PartialEq,Eq)]enum PageId{Slot(String)}
+#[derive(Clone,Debug)]struct ConfigSection{id:String,title:String,description:String}
+#[derive(Clone,Debug)]enum ConfigValueSchema{String{},Object{fields:Vec<ConfigField>},Enum{options:Vec<String>},Array{items:Box<ConfigValueSchema>}}
+#[derive(Clone,Debug)]struct ConfigField{key:String,title:String,description:String,value:ConfigValueSchema,section:Option<ConfigSection>,advanced:bool}
+struct Schema{fields:Vec<ConfigField>}
+type Key=(String,String);
+#[derive(Default)]struct ConfigBuilderSnapshot(HashMap<Key,Schema>);
+struct Info<'a>{schema:Option<&'a Schema>}
+fn module_info<'a>(s:&'a ConfigBuilderSnapshot,slot:&str,id:&str)->Option<Info<'a>>{s.0.get(&module_key(slot,id)).map(|sc|Info{schema:Some(sc)})}
+fn module_key(slot:&str,id:&str)->Key{(slot.to_string(),id.to_string())}
+#[derive(Clone,Debug,PartialEq,Eq,Hash)]
+struct FieldPath{slot:String,module:String,keys:Vec<String>}
+impl FieldPath{@@path@@}
+mod settings{use super::*;@@scope_key@@}
+@@editable@@
+mod spot{use super::*;@@destination@@ @@field_key@@ @@json_key@@}
+@@finder@@
+@@scope@@
+struct Theme{danger:bool,muted_foreground:bool}
+struct Context<T>(PhantomData<T>);
+impl<T> Context<T>{fn theme(&self)->Theme{Theme{danger:true,muted_foreground:false}}}
+#[derive(Default)]struct AnyElement{anchors:Vec<String>,text:Vec<String>}
+fn v_flex()->AnyElement{AnyElement::default()}fn div()->AnyElement{v_flex()}
+impl AnyElement{
+ fn gap_1p5(self)->Self{self}fn text_xs(self)->Self{self}fn text_color(self,_:bool)->Self{self}
+ fn child(mut self,s:impl Into<String>)->Self{self.text.push(s.into());self}
+ fn children(mut self,items:impl IntoIterator<Item=AnyElement>)->Self{for i in items{self.text.extend(i.text);self.anchors.extend(i.anchors);}self}
+ fn into_any_element(self)->Self{self}
+}
+fn card(r:Vec<AnyElement>,_:&Context<SettingsView>)->AnyElement{div().children(r)}
+struct RawField{input:String,error:Option<String>}
+#[derive(Default)]struct Editors{json:HashMap<Key,RawField>}
+struct Draft;impl Draft{fn module_config(&self,_:&str,_:&str)->Option<&()>{None}}
+struct SettingsView{snap:ConfigBuilderSnapshot,editors:Editors,draft:Draft,json:HashSet<Key>}
+impl SettingsView{
+ fn snapshot(&self)->Option<&ConfigBuilderSnapshot>{Some(&self.snap)}
+ fn text_area(&self,input:&String,_:&Context<Self>)->AnyElement{div().child(input)}
+ fn spotted(&self,k:&str,mut e:AnyElement,_:&Context<Self>)->AnyElement{e.anchors.push(k.into());e}
+ fn field_rows(&self,fields:&[ConfigField],p:impl Fn(&str)->FieldPath,_:Option<&()>,_:&str,cx:&Context<Self>)->Vec<AnyElement>{
+     self.rows_help(fields, &p,cx)}
+ fn rows_help(&self,fields:&[ConfigField],p:&dyn Fn(&str)->FieldPath,cx:&Context<Self>)->Vec<AnyElement>{
+     let mut r=vec![];for f in fields.iter().filter(|f|editable_field(f)){let path=p(&f.key);r.push(self.spotted(&spot::field(&path),div(),cx));if let ConfigValueSchema::Object{fields}=&f.value{r.extend(self.rows_help(fields,&|k|path.child(k),cx));}}r}
+ @@is_json@@
+ @@search_params@@
+ @@params_body@@
+}
+fn leaf(k:&str)->ConfigField{ConfigField{key:k.into(),title:format!("Paper {k}"),description:String::new(),value:ConfigValueSchema::String{},section:None,advanced:false}}
+fn schema()->Schema{
+ let mut size=leaf("size");size.section=Some(ConfigSection{id:"paper".into(),title:"Sheet".into(),description:String::new()});size.advanced=true;
+ let mut margin=leaf("margin");margin.advanced=true;margin.section=size.section.clone();
+ let mut paper=leaf("paper");paper.value=ConfigValueSchema::Object{fields:vec![size,margin]};
+ let mut layout=leaf("layout");layout.value=ConfigValueSchema::Object{fields:vec![paper]};
+ let mut unusable=leaf("empty");unusable.value=ConfigValueSchema::Enum{options:vec![]};
+ Schema{fields:vec![layout,leaf("independent"),unusable]}
+}
+fn main(){
+ let slot="presentation";let ids=["left","right"];let pg=PageId::Slot(slot.into());let mut checks=0;let mut bad=0;let mut wrong_anchor=0;let mut invisible_open=0;let mut unlabeled=0;
+ for mask in 0..4{for outer in [vec![],vec!["outer:pack".to_owned()],vec!["outer:pack".to_owned(),"item".to_owned()]]{for invalid in [false,true]{
+ let mut v=SettingsView{snap:Default::default(),editors:Default::default(),draft:Draft,json:Default::default()};let cx=Context(PhantomData);
+ for (i,id) in ids.iter().enumerate(){let k=module_key(slot,id);v.snap.0.insert(k.clone(),schema());if mask>>i &1==1{v.json.insert(k.clone());v.editors.json.insert(k,RawField{input:if invalid{"{ unfinished"}else{"{\"layout\":{}}"} .into(),error:invalid.then(||"not closed".into())});}}
+ for query in ["paper","SIZE","sheet","independent","empty","no-match"] {
+ let mut finder=Finder::new(query);
+ for id in ids{v.search_params(&v.snap,&mut finder,slot,id,&pg,id,&outer);}
+ let hits=finder.finish();
+ let expected_count=match query{"paper"=>10,"SIZE"=>2,"sheet"=>4,"independent"=>2,_=>0};
+ assert_eq!(hits.len(),expected_count);
+ let names=match query{"paper"=>vec!["layout","paper","size","margin","independent"],"SIZE"=>vec!["size"],"sheet"=>vec!["size","margin"],"independent"=>vec!["independent"],_=>vec![]};
+ let expected_order=ids.into_iter().flat_map(|id|names.iter().map(move|f|(id,*f))).collect::<Vec<_>>();
+ let observed_order=hits.iter().map(|h|(h.place.split(" · ").next().unwrap(),h.title.strip_prefix("Paper ").unwrap())).collect::<Vec<_>>();assert_eq!(observed_order,expected_order);
+ for h in hits {
+ let id=if h.place.starts_with("left"){"left"}else{"right"};let raw=v.json.contains(&module_key(slot,id));
+ let body=v.params_body(slot,id,&cx);
+ let target=h.target.spot.as_deref().unwrap();let reaches=body.anchors.iter().filter(|s|s.as_str()==target).count()==1;
+ let other=if id=="left"{"right"}else{"left"};assert!(!v.params_body(slot,other,&cx).anchors.contains(&target.to_owned()));
+ let field=h.title.strip_prefix("Paper ").unwrap();
+ let parent=match field{"size"|"margin"=>vec!["layout","layout.paper"],"paper"=>vec!["layout"],"independent"|"layout"=>vec![],_=>unreachable!()};
+ let mut exp=outer.clone();
+ if !raw{for name in &parent{exp.push(format!("group:{slot}:{id}:{name}"));}if matches!(field,"margin"|"size"){exp.push(format!("advanced:{slot}:{id}:layout.paper:section:paper"));}}
+ let opens=h.target.open==exp;let marks=h.place.ends_with(" · JSON")==raw;
+ assert_eq!(h.target.page,pg);
+ if raw {assert!(body.text.contains(&v.editors.json[&module_key(slot,id)].input));assert_eq!(invalid,body.text.iter().any(|x|x=="not closed"));}
+ checks+=1;if !(reaches&&marks&&opens){bad+=1;}wrong_anchor+=usize::from(!reaches);invisible_open+=usize::from(!opens);unlabeled+=usize::from(!marks);
+ }
+ }
+ }}}
+ println!("{checks} found destinations: {bad} mismatches; {wrong_anchor} had no matching rendered anchor, {invisible_open} opened invisible disclosures, {unlabeled} lacked the correct mode label. Hit count and ordered identity, sibling isolation, raw text/error and page controls checked.");
+ if bad!=0{std::process::exit(1)}
+}
