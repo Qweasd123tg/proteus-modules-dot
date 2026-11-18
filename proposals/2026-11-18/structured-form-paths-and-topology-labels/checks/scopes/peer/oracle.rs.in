@@ -1,0 +1,83 @@
+use std::collections::BTreeSet;
+mod core_dto { /*CORE*/ }
+use core_dto::{ConfigField,ConfigValueSchema,ModuleConfigSchema};
+mod settings {use super::*; /*FUNCS*/ }
+use settings::section_scope;
+/*PATH*/
+/*EDIT*/
+#[derive(Clone,Debug,PartialEq,Eq)]enum PageId{Form}
+mod spot {use super::*; /*DEST*/ /*SPOT*/ }
+mod find { use super::*;
+ /*HIT*/
+ /*SCOPE*/
+ pub(super) fn hit(fields:&[ConfigField],title:&str,slot:&str,module:&str)->spot::Destination{
+    let mut f=Finder::new(title);
+    Scope{slot,module,page:&PageId::Form}.fields(&mut f,fields,None,"Palette",&[]);
+    let mut hits=f.finish();assert_eq!(hits.len(),1);hits.pop().unwrap().target
+ }
+}
+fn root_scope(slot:&str,module:&str)->String{ /*ROOT*/ }
+fn group_scope(path:&FieldPath)->String{ /*INNER*/ }
+fn gkey(scope:&str)->String{ /*GRP*/ }
+fn akey(scope:&str)->String{ /*ADV*/ }
+type Open=BTreeSet<String>;
+// Settled render: both advanced items in a group share a section, and every fixture group has real children.
+// Widgets/animation/coordinates are intentionally not asserted.
+fn rows(fields:&[ConfigField],base:Option<&FieldPath>,scope:&str,slot:&str,module:&str,open:&Open,out:&mut Vec<(String,String)>){
+ for f in fields{
+  let advanced_count=fields.iter().filter(|other|other.advanced && other.section.as_ref().map(|s|&s.id)==f.section.as_ref().map(|s|&s.id)).count();
+  if f.advanced && advanced_count>=2 && !open.contains(&akey(&section_scope(scope,f))) { continue; }
+  let path=base.map_or_else(||FieldPath::new(slot,module,&f.key),|p|p.child(&f.key));
+  out.push((f.title.clone(),spot::field(&path)));
+  if let ConfigValueSchema::Object{fields:fs}=&f.value {
+   let g=group_scope(&path); if open.contains(&gkey(&g)){rows(fs,Some(&path),&g,slot,module,open,out)}
+  }
+ }
+}
+fn leaf(key:&str,title:&str)->ConfigField{ConfigField::new(key,title,"",ConfigValueSchema::Boolean{}).advanced()}
+fn grp(key:&str,title:&str,fields:Vec<ConfigField>)->ConfigField{ConfigField::new(key,title,"",ConfigValueSchema::Object{fields})}
+fn ls(tag:&str,sec:Option<&str>)->Vec<ConfigField>{
+ ["hue","style"].iter().map(|k|{let f=leaf(k,&format!("{tag}{k}"));if let Some(s)=sec{f.section(s,"Palette section","")}else{f}}).collect()
+}
+fn wire(fs:Vec<ConfigField>)->Vec<ConfigField>{let val=ModuleConfigSchema{fields:fs};let bytes=serde_json::to_vec(&val).unwrap();let again:ModuleConfigSchema=serde_json::from_slice(&bytes).unwrap();assert_eq!(val,again);again.fields}
+fn shown(fields:&[ConfigField],title:&str,pre:Open,slot:&str,module:&str)->(Vec<String>,Vec<String>){
+ let hit=find::hit(fields,title,slot,module);
+ let mut open=pre;open.extend(hit.open.iter().cloned());
+ let mut list=vec![]; rows(fields,None,&root_scope(slot,module),slot,module,&open,&mut list);
+ (list.iter().filter(|(_,key)|Some(key)==hit.spot.as_ref()).map(|(t,_)|t.to_owned()).collect(),list.iter().map(|(t,_)|t.to_owned()).collect())
+}
+fn main(){
+ let(mut fails,mut n,mut dropdowns,mut advs,mut pair_n)=(0,0,0,0,0);
+ for (a,b) in [("ui","theme"),("a","b.c"),("a:b","цвет"),("100%","a"),("a%2E","β"),("樣式","亮色")]{
+  for (slot,module) in [("tool","palette"),("tool","palette.v2"),("form:demo","style%3As")]{for sec in [None,Some("mood"),Some("palette.2:%")]{ 
+   let ab=format!("{a}.{b}");let fields=wire(vec![grp(&ab,"Flatgrp",ls("Flat",sec)),grp(a,"Wrapper",vec![grp(b,"Nestedgrp",ls("Nested",sec))])]);
+   let parent=FieldPath::new(slot,module,a);let nested=parent.child(b);let flat=FieldPath::new(slot,module,&ab);
+   let mut pre=Open::new();pre.insert(gkey(&group_scope(&parent)));
+   for t in ["Nestedhue","Flatstyle","Nestedgrp","Flatgrp"]{
+     let (spot,all)=shown(&fields,t,pre.clone(),slot,module);
+     if t=="Nestedhue" && n==0 {println!("Selecting {t}: matched rendered spot titles {spot:?}; visible {all:?}");}
+     fails+=usize::from(spot!=[t]);n+=1;
+   }
+   // Both object headers are visible. Simulate one stock toggle in a settled form.
+   pre.insert(gkey(&group_scope(&nested)));
+   dropdowns+=usize::from(pre.contains(&gkey(&group_scope(&flat))));
+   // Both object headers intentionally open. Target only the advanced section under nested.
+   pre.insert(gkey(&group_scope(&flat)));
+   let ns=section_scope(&group_scope(&nested),&ls("Nested",sec)[0]);
+   pre.insert(akey(&ns));
+   let mut list=vec![];rows(&fields,None,&root_scope(slot,module),slot,module,&pre,&mut list);
+   advs+=usize::from(list.iter().any(|(t,_)|t=="Flathue"));pair_n+=1;
+  }}
+ }
+ println!("search visible extra spot rows {fails}/{n}, second object shares toggled state {dropdowns}/{pair_n}, unintended advanced reveal {advs}/{pair_n}");
+ // Old key 'cards:section:looks' is both a literal group and cards' advanced section named looks.
+ let fields=wire(vec![grp("cards:section:looks","First",ls("Raw",None)),grp("cards","Second",ls("Section",Some("looks")))]);
+ let mut pre=Open::new();pre.insert(gkey(&group_scope(&FieldPath::new("tool","palette","cards:section:looks"))));
+ let (_match_titles,vis)=shown(&fields,"Sectionhue",pre,"tool","palette");
+ println!("colon/section counterexample: extra advanced row visible = {}",vis.iter().any(|t|t=="Rawhue"));
+ #[cfg(old)]{assert_eq!((fails,dropdowns,advs),(n,pair_n,pair_n));assert!(vis.iter().any(|t|t=="Rawhue"));}
+ #[cfg(fixed)]{assert_eq!((fails,dropdowns,advs),(0,0,0));assert!(!vis.iter().any(|t|t=="Rawhue"));}
+ let controls=wire(vec![grp("opt","G1",ls("Plain",None)),grp("display","G2",ls("Other",None))]);
+ for field in ["Plainhue","Otherstyle","G1","G2"]{assert_eq!(shown(&controls,field,Open::new(),"tool","palette").0,[field]);}
+ println!("ordinary controls 4/4, core DTO serde round-trip passed, no semantic/host validator executed");
+}

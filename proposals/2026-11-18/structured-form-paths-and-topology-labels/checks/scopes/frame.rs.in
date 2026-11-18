@@ -1,0 +1,66 @@
+#![allow(dead_code)]
+use serde::{Serialize,Deserialize};
+use serde_json::Value;
+use std::collections::HashSet;
+/*DTO*/
+/*EDIT*/
+#[derive(Clone,Debug,PartialEq,Eq)] enum PageId{Modules}
+#[derive(Clone,Debug)] struct FieldPath{slot:String,module:String,keys:Vec<String>}
+impl FieldPath{/*BUILD*/}
+mod settings{use super::*;/*SCOPEKEY*/}
+mod spot{
+ use super::*;
+ pub(super) struct Destination{pub page:PageId,pub open:Vec<String>,pub spot:Option<String>}
+ impl Destination{pub fn new(page:PageId)->Self{Self{page,open:vec![],spot:None}}}
+ /*FIELD*/
+}
+mod finder{
+ use super::*;
+ /*HIT*/
+ /*SCOPE*/
+ pub(super) fn find<'a>(slot:&'a str,module:&'a str,fs:&[ConfigField],q:&str)->Hit{
+ let mut f=Finder::new(q);Scope{slot,module,page:&PageId::Modules}.fields(&mut f,fs,None,"Settings",&[]);let mut h=f.finish();assert_eq!(h.len(),1);h.pop().unwrap()
+ }
+}
+fn group(path:&FieldPath)->(String,String){/*GROUP*/(scope,key)}
+fn root_scope(slot:&str,module:&str)->String{/*ROOT*/}
+fn field(k:&str,title:&str,v:Value)->Value{serde_json::json!({"key":k,"title":title,"description":"","value":v,"default":null,"required":false,"advanced":false,"unit":null})}
+fn obj(fs:Vec<Value>)->Value{serde_json::json!({"type":"object","fields":fs})}
+fn boolean()->Value{serde_json::json!({"type":"boolean"})}
+fn main(){
+ let modern=/*MODERN*/;let(mut selections,mut duplicate,mut events,mut coupled,mut scopes,mut collided)=(0,0,0,0,0,0);
+ for (kk,i) in ["panel","style","a:b","t%3A","v.2","名","%","space id"].into_iter().enumerate().map(|(idx,k)|(k,idx)){
+ for k in ["theme","a.b",":","%2E","色","field 2"]{
+ for (s,m) in [("display","main"),("s:a","view.v2"),("a","b:c"),("a:b","c")]{
+ let literal=format!("{kk}.{k}");
+ let nested=field(kk,"Outer panel",obj(vec![field(k,"NestedGroup",obj(vec![field("value","FindNested",boolean())]))]));
+ let direct=field(&literal,"LiteralGroup",obj(vec![field("value","FindLiteral",boolean())]));
+ let bytes=serde_json::to_vec(&serde_json::json!({"fields":[direct,nested]})).unwrap();
+ let fs:ModuleConfigSchema=serde_json::from_slice(&bytes).unwrap();assert_eq!(fs.fields.len(),2);
+ let outer=FieldPath::new(s,m,kk);let lit=FieldPath::new(s,m,&literal);let inner=outer.child(k);
+ assert_ne!(lit.keys,inner.keys);assert_eq!(lit.dotted(),inner.dotted());
+ let (outer_s,outer_k)=group(&outer);let (lit_s,lit_k)=group(&lit);let (inner_s,inner_k)=group(&inner);
+ for (query,want) in [("FindLiteral",lit.child("value")),("FindNested",inner.child("value"))]{
+  let h=finder::find(s,m,&fs.fields,query);assert_eq!(&h.title,query);
+  let opened:HashSet<_>=h.target.open.iter().cloned().collect();
+  let key=h.target.spot.unwrap();let mut selected=Vec::new();
+  // Set outer open initially, as if the user has already expanded the common top-level group.
+  if opened.contains(&lit_k){let p=lit.child("value");if spot::field(&p)==key{selected.push(p.keys);}}
+  if (opened.contains(&outer_k)||i%2==0)&&opened.contains(&inner_k){let p=inner.child("value");if spot::field(&p)==key{selected.push(p.keys);}}
+  selections+=1;duplicate+=usize::from(selected.as_slice()!=[want.keys]);
+ }
+ // The checked row and one unrelated group's key toggle together if their identities collide.
+ events+=1;coupled+=usize::from(lit_k==inner_k);
+ // Form section metadata is a sibling grouping, not a FieldPath segment.
+ let r=root_scope(s,m);
+ let mut f=fs.fields[0].clone();f.section=Some(ConfigSection{id:format!("x:section:{k}"),title:"A".into(),description:"".into()});
+ let a=settings::section_scope(&r,&f);
+ f.section.as_mut().unwrap().id=k.into();
+ let px=FieldPath::new(s,m,"section:x");let b=settings::section_scope(&group(&px).0,&f);
+ scopes+=1;collided+=usize::from(a==b);
+ assert!(!outer_s.is_empty()&&!lit_s.is_empty()&&!inner_s.is_empty());
+ }}}println!("{selections} exact-hit queries: {duplicate} with wrong or duplicate visible selection; {coupled}/{events} coupled independent disclosures; {collided}/{scopes} distinct advanced-section identities collide.");
+ if modern{assert_eq!((duplicate,coupled,collided),(0,0,0));}else{assert!(duplicate>0&&coupled==events&&collided==scopes);}
+ // Plain location strings stay readable and unchanged.
+ let p=FieldPath::new("model","plain","ui").child("theme");assert_eq!(spot::field(&p),"field:model:plain:ui.theme");
+}

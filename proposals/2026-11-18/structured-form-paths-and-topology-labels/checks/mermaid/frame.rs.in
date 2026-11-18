@@ -1,0 +1,20 @@
+// Constrain data to fields inspected by this read-only presentation function.
+#[allow(dead_code)]mod core {
+ #[derive(Default)] pub struct TopologySnapshot{pub profile:String,pub slots:Vec<SlotTopology>,pub tools:Vec<ToolTopology>,pub edges:Vec<Edge>}
+ pub struct SlotTopology{pub id:String,pub active_module:Option<String>,pub category:String,pub order:usize}
+ pub struct ToolTopology{pub name:String,pub registered:bool,pub enabled:bool}
+ pub struct Edge{pub kind:String,pub from:String,pub to:String,pub label:Option<String>}
+}
+mod presentation{
+ mod helpers{use crate::core::{SlotTopology,TopologySnapshot};@@helpers@@}
+ pub mod mermaid{@@renderer@@}
+}
+fn main(){use core::*;
+ let caption=std::env::args().nth(1).unwrap();
+ let snap=TopologySnapshot{
+  profile:caption.clone(),
+  slots:vec![SlotTopology{id:"draft".into(),active_module:Some(caption.clone()),category:"pipeline".into(),order:1},
+    SlotTopology{id:"display".into(),active_module:Some(caption.clone()),category:"display".into(),order:2}],
+  tools:vec![ToolTopology{name:caption.clone(),registered:true,enabled:true},ToolTopology{name:format!("{} note",caption),registered:false,enabled:false}],
+  edges:vec![Edge{kind:"uses".into(),from:"slot:draft".into(),to:"slot:display".into(),label:None}],
+ };print!("{}",presentation::mermaid::render_topology_mermaid(&snap));}
