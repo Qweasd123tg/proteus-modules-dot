@@ -1,0 +1,31 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index d16b190..2838b22 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -529,7 +529,10 @@ danger?, confirm?, prompt?, separated?, checked?, selected?, disabled?, header?}
+ выбирает строку), `strike` (зачёркнуто), `menu` — пункты контекстного меню по
+ правому клику, `kind` (`item` по умолчанию или `header` — заголовок раздела:
+ стрелка по `expanded`, мелкий приглушённый текст, клик шлёт `expand`/`collapse`,
+-клавиатура его пропускает), `count?` (число в рамке справа), `stats?` —
++клавиатура пропускает заголовки, пока есть хотя бы одна строка `item`.
++Если остались только заголовки, навигационные клавиши перемещают видимый
++курсор между ними без `preview`; Enter или пробел раскрывает или сворачивает
++выбранный раздел через `expand`/`collapse`, как при клике), `count?` (число в рамке справа), `stats?` —
+ `{added, deleted}` (неотрицательные целые, справа `+N −M` зелёным/красным) и
+ `hint?` (подсказка при наведении, например полный путь).
+ Дерево поддерживает стрелки, Home/End, PageUp/PageDown, Enter и пробел.
+diff --git a/sdk/src/ui.rs b/sdk/src/ui.rs
+index 0bdfb97..53693af 100644
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -266,8 +266,8 @@ pub fn tree(id: &str, rows: Vec<Value>, action: &str) -> Value {
+     json!({"type": "tree", "id": id, "rows": rows, "action": action})
+ }
+ 
+-/// A tree section header: a click sends `expand`/`collapse`, the keyboard
+-/// passes it by. Options: `count`, `checked`.
++/// A tree section header: a click sends `expand`/`collapse`; the keyboard
++/// skips it while there are item rows, and can reopen it in a header-only tree. Options: `count`, `checked`.
+ pub fn tree_header(id: &str, label: &str, expanded: bool) -> Value {
+     json!({"id": id, "label": label, "kind": "header", "expanded": expanded})
+ }

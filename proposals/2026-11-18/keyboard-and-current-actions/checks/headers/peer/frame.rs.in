@@ -1,0 +1,55 @@
+#![allow(dead_code)]
+use std::{marker::PhantomData,ops::{Deref,DerefMut,Range},rc::Rc};
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]enum Kind{Header,Item}
+#[derive(Debug,Clone,PartialEq,Eq)]struct Row{id:String,kind:Kind,depth:usize,expanded:Option<bool>,selected:bool}
+impl Row{@HEADER@}
+struct App{events:Vec<(String,&'static str)>}
+struct Context<T>{app:App,p:PhantomData<T>,stopped:bool}
+impl<T> Context<T>{fn new()->Self{Self{app:App{events:vec![]},p:PhantomData,stopped:false}} fn stop_propagation(&mut self){self.stopped=true} fn notify(&mut self){}}
+impl<T>Deref for Context<T>{type Target=App;fn deref(&self)->&App{&self.app}}
+impl<T>DerefMut for Context<T>{fn deref_mut(&mut self)->&mut App{&mut self.app}}
+struct Key{key:String}struct KeyDownEvent{keystroke:Key}
+struct List;impl List{fn scroll_to_reveal_item(&self,_:usize){}fn splice(&self,_:Range<usize>,_:usize){}}
+struct Fold{id:String,open:bool}
+type Layout=u8;
+struct Tree{rows:Vec<Row>,layout:Layout,cursor:usize,folds:Vec<Fold>,list:List,action:Rc<dyn Fn(String,&'static str,&mut App)>}
+fn folds(_:&[Row],_:&[Row])->Vec<Fold>{vec![]}
+mod motion{pub fn toggled(_:String,_:bool,_:&mut crate::App){}}
+impl Tree{
+ fn fold_key(&self,s:&str)->String{s.into()}
+ @SET@
+ @ACTAT@
+ @ACT@
+ @STEP@
+ @KEY@
+ fn new(rows:Vec<Row>)->Self{let mut tree=Self{rows,layout:0,cursor:0,folds:vec![],list:List,action:Rc::new(|id,e,cx|cx.events.push((id,e)))};@INIT@}
+ fn tick(&mut self,key:&str)->Vec<(String,&'static str)>{let mut cx=Context::new();self.key(&KeyDownEvent{keystroke:Key{key:key.into()}},&mut cx);cx.app.events}
+ fn ring(&self,index:Option<usize>,focused:bool,keyboard:bool,row:&Row)->bool{@RING@}
+}
+fn r(i:usize,k:Kind,expanded:Option<bool>)->Row{Row{id:format!("section:{i}"),kind:k,expanded,selected:false,depth:0}}
+fn items(n:usize,mask:usize,variant:usize)->Vec<Row>{(0..n).map(|i|{let head=mask & (1<<i)!=0; let mut row=r(i,if head{Kind::Header}else{Kind::Item},if head{[None,Some(false),Some(true)][(i+variant)%3]}else{None});if !head{row.id=format!("file:{i}");row.depth=1};row}).collect()}
+fn main(){
+ let keys=["up","down","home","end","pageup","pagedown","space","enter","left","right","noop"];
+ let(mut navigation,mut total,mut action_ok,mut actions,mut ring_ok,mut rings,mut reached)=(0,0,0,0,0,0,false);
+ for n in [1,2,3,7,13,17]{for v in 0..3{let rows=(0..n).map(|i|r(i,Kind::Header,[None,Some(false),Some(true)][(v+i)%3])).collect::<Vec<_>>();
+ for pos in 0..n{for key in keys{
+  let mut t=Tree::new(rows.clone());t.cursor=pos;let e=t.tick(key);
+  let target=match key{"up"=>pos.saturating_sub(1),"down"=>(pos+1).min(n-1),"home"=>0,"end"=>n-1,"pageup"=>pos.saturating_sub(12),"pagedown"=>(pos+12).min(n-1),_=>pos};
+  if matches!(key,"up"|"down"|"home"|"end"|"pageup"|"pagedown"){total+=1;navigation+=usize::from(t.cursor==target&&e.is_empty());}
+  if matches!(key,"enter"|"space"){actions+=1;let wanted=if rows[pos].expanded==Some(true){"collapse"}else{"expand"};action_ok+=usize::from(e==[(rows[pos].id.clone(),wanted)]);}
+  for focused in [false,true]{for kb in [false,true]{let present=t.ring(Some(t.cursor),focused,kb,&rows[t.cursor]);let absent=t.ring(None,focused,kb,&rows[t.cursor]);ring_ok+=usize::from(present==(focused&&kb)&&!absent);rings+=1;}}
+ }} }}
+ let mut mixed=0;let mut hash=0xcbf29ce484222325u64;
+ let mut feed=|s:&str|{for b in s.bytes(){hash^=b as u64;hash=hash.wrapping_mul(0x100000001b3)}hash=hash.wrapping_mul(31)};
+ for n in 1..=7{for mask in 0..(1<<n)-1{for v in 0..3{let rows=items(n,mask,v);for seed in 0..n{
+  let mut t=Tree::new(rows.clone());t.cursor=t.step(seed,1);assert!(!t.rows[t.cursor].header());
+  for key in keys{let ev=t.tick(key);assert!(!t.rows[t.cursor].header());assert!(ev.iter().all(|(id,_)|id.starts_with("file:")));feed(&format!("{:?}/{}",ev,t.cursor));mixed+=1;}
+ }}}}
+ let mut empty=Tree::new(vec![]);for key in keys{assert!(empty.tick(key).is_empty())}
+ let mut t=Tree::new(vec![r(0,Kind::Header,Some(false)),r(1,Kind::Header,Some(false))]);
+ let moving=t.tick("down");let enter=t.tick("enter");let chose=enter==[("section:1".to_string(),"expand")];
+ if chose&&moving.is_empty(){let mut data=t.rows.clone();data[1].expanded=Some(true);let mut f=r(2,Kind::Item,None);f.id="file:inside-second".into();f.depth=1;data.push(f);t.set_rows(data,0,&mut Context::new());reached=t.rows[t.cursor].id=="file:inside-second";}
+ println!("Only section rows: navigation+no file event {navigation}/{total}; keyboard activation=pointer {action_ok}/{actions}; visibility/ghost ring {ring_ok}/{rings}. Synthetic two-collapsed-sections Down → Enter → update puts focus in target section: {reached}.");
+ println!("Item-containing tree controls: {mixed} operations, fingerprint {hash:016x}, all actions target ordinary file rows. Empty tree: 11/11 no row events.");
+ if navigation!=total||action_ok!=actions||ring_ok!=rings||!reached{std::process::exit(1);}
+}

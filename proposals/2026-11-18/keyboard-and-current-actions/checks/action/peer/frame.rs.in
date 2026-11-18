@@ -1,0 +1,63 @@
+mod gui{
+use super::*;
+use std::{cell::{Cell,RefCell},collections::HashMap,marker::PhantomData,rc::Rc,ops::{Range,Deref,DerefMut}};
+pub(super) type App=Vec<(String,Option<Value>)>;
+pub(super) struct Context<T>{pub log:App,_p:PhantomData<T>}
+impl<T> Default for Context<T>{fn default()->Self{Self{log:vec![],_p:PhantomData}}}
+impl<T> Deref for Context<T>{type Target=App;fn deref(&self)->&App{&self.log}}
+impl<T> DerefMut for Context<T>{fn deref_mut(&mut self)->&mut App{&mut self.log}}
+impl<T> Context<T>{
+fn new<V>(&mut self,f:impl FnOnce(&mut Context<V>)->V)->Entity<V>{Rc::new(RefCell::new(f(&mut Context::default())))}
+fn weak_entity(&self)->WeakEntity<T>{WeakEntity(PhantomData)} fn focus_handle(&self)->FocusHandle{FocusHandle}
+fn notify(&mut self){} fn entity_id(&self)->usize{0} fn stop_propagation(&mut self){}
+}
+type Entity<T>=Rc<RefCell<T>>;
+trait Update<T>{fn update<V,U>(&self,_:&mut Context<U>,f:impl FnOnce(&mut T,&mut Context<T>)->V)->V;}
+impl<T> Update<T> for Entity<T>{fn update<V,U>(&self,_:&mut Context<U>,f:impl FnOnce(&mut T,&mut Context<T>)->V)->V{f(&mut self.borrow_mut(),&mut Context::default())}}
+struct WeakEntity<T>(PhantomData<T>); impl WeakEntity<view::DeclarativeView>{ fn update<V>(&self,cx:&mut App,f:impl FnOnce(&mut Recorder,&mut App)->V)->Result<V,()>{Ok(f(&mut Recorder,cx))}}
+struct Recorder;impl Recorder{fn act(&mut self,k:String,v:Option<Value>,c:&mut App){c.push((k,v))}}
+struct KeyDownEvent{keystroke:Keystroke} struct Keystroke{key:String}
+struct FocusHandle;impl FocusHandle{fn tab_stop(self,_:bool)->Self{self}}
+enum ListAlignment{Top} type EntityId=usize;type SharedString=String;
+struct ListState;impl ListState{fn new(_:usize,_:ListAlignment,_:f32)->Self{Self}fn splice(&mut self,_:Range<usize>,_:usize){}fn scroll_to_reveal_item(&self,_:usize){}}
+enum ScrollStrategy{Top,Nearest} struct UniformListScrollHandle;impl UniformListScrollHandle{fn new()->Self{Self} fn scroll_to_item(&self,_:usize,_:ScrollStrategy){}}
+fn px(x:f32)->f32{x}type Pixels=f32;type Point<T>=(T,T);type Bounds<T>=(T,T);fn point<T>(x:T,y:T)->Point<T>{(x,y)}
+mod motion{pub fn toggled<T>(_:String,_:bool,_:&mut T){panic!("test only uses leaves")}}
+mod view{pub(super) use super::fields::View as DeclarativeView;}
+mod fields{
+use super::*;use super::{tree::{Tree,Layout},rows::{List,Lanes}};
+@binding@
+#[derive(Default)] pub(super) struct Fields{pub(super) graphs:HashMap<String,Entity<graph::Graph>>,pub(super) lists:HashMap<String,Entity<List>>,pub(super) trees:HashMap<String,Entity<Tree>>,pub(super) lanes:HashMap<String,Entity<Lanes>>}
+#[derive(Default)] pub(super) struct View{pub(super) fields:Fields,embedded:bool}
+impl View{pub(super) fn prepare(&mut self,n:&Node,cx:&mut Context<Self>){match n{
+@Graph@ @List@ @Lanes@ @Tree@
+Node::Fill{children}=>{for child in children{self.prepare(child,cx);}}}}
+@bind@
+}}
+mod tree{
+use super::*;use crate::tree::Row;use super::fields::WidgetAction;
+#[derive(Clone,Copy,PartialEq)]pub(super) struct Layout{pub indent:f32,pub chevrons:bool,pub guides:bool}
+@tree.action@ @tree.struct@
+impl Tree{ @tree.methods@
+pub(super) fn press(&mut self,k:&str)->App{let mut cx=Context::default();self.key(&KeyDownEvent{keystroke:Keystroke{key:k.to_owned()}},&mut cx);cx.log}
+} @folds@
+}
+mod rows{
+use super::*;use crate::lanes::Column;use super::fields::WidgetAction;
+pub(super) trait Kind:Default+'static{type Row:Clone+PartialEq+'static;const SCROLL:ScrollStrategy;const MOVED:Option<&'static str>;fn id(r:&Self::Row)->&str;fn selected(r:&Self::Row)->bool;fn measure(&mut self,r:&[Rc<Self::Row>]);}
+#[derive(Default)]pub(super) struct LI;impl Kind for LI{type Row=crate::list::Row;const SCROLL:ScrollStrategy=ScrollStrategy::Top;const MOVED:Option<&'static str>=None;
+@kind.list@}
+#[derive(Default)]pub(super) struct LA{pub(super) columns:Vec<Column>,pub(super) visible:Vec<bool>,pub(super) weights:Vec<f32>,lanes:usize}impl Kind for LA{type Row=crate::lanes::Row;const SCROLL:ScrollStrategy=ScrollStrategy::Nearest;const MOVED:Option<&'static str>=Some("select");
+@kind.lanes@}
+pub(super) type List=Rows<LI>;pub(super) type Lanes=Rows<LA>;
+@rows.struct@
+impl<K:Kind> Rows<K>{@rows.methods@
+pub(super) fn press(&mut self,k:&str)->App{let mut cx=Context::default();self.key(&KeyDownEvent{keystroke:Keystroke{key:k.to_owned()}},&mut cx);cx.log}
+}impl Lanes{@setcol@}
+}
+mod graph{
+use super::*;use crate::graph::{Node,Edge};use super::fields::WidgetAction;
+struct Drag; @graph.struct@
+impl Graph{@graph.methods@
+pub(super) fn press(&self,i:usize)->App{let mut log=vec![];if let Some(r)=self.nodes.get(i){let this=self;let select=&r.id;let cx=&mut log;@graph.click@}log}
+}}
