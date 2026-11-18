@@ -1,0 +1,39 @@
+use std::{ops::Range,collections::BTreeMap};
+use markdown::{mdast,mdast::Node,to_mdast,ParseOptions};
+@PARSECX@
+#[derive(Clone,Debug)]struct SourceSegment{rendered:Range<usize>,source:Range<usize>,linear:bool}
+#[derive(Clone,Copy)]struct Span{start:usize,end:usize}
+fn decoded_entity(_: &str)->Option<(String,usize)>{panic!("must not decode entities in code")}
+@MAPPERS@
+struct Index{text:String,source_map:Vec<SourceSegment>}
+impl Index{@INVERSE@}
+fn leaves<'a>(n:&'a Node,out:&mut Vec<&'a Node>){if matches!(n,Node::InlineCode(_)){out.push(n);}else if let Some(kids)=n.children(){for k in kids{leaves(k,out);}}}
+fn main(){
+ let mut fwd=0u64;let mut fw=0u64;let mut rev=0u64;let mut rw=0u64;let mut parsed=0u64;let mut skip=0;
+ for (wrap_l,wrap_r) in [("Paragraph "," end."),("**bold "," bold**"),("> > nested "," text"),("- list "," text")] {
+ for ticks in [2usize,3,5] {let delim="`".repeat(ticks);
+ for (literal,padded) in [("a",false),("   ",false),(" `a` ",true),("`猫🙂`",true),(" `e\u{301}Z` ",true),("a  b",true),("a &amp; \\x",false),("😸\tX",true)]{
+ for offset in [0usize,17,800]{
+ let prefix=format!("{wrap_l}λ ");let spacer=" between ";let pad=if padded{" "}else{""};
+ let encoding=format!("{delim}{pad}{literal}{pad}{delim}");let source=format!("{prefix}{encoding}{spacer}{encoding}{wrap_r}");
+ let parse=to_mdast(&source,&ParseOptions::gfm()).unwrap();let mut nodes=vec![];leaves(&parse,&mut nodes);
+ if nodes.len()!=2 || nodes.iter().any(|n|!matches!(n,Node::InlineCode(v) if v.value==literal)){skip+=1;continue}
+ let cx=MarkdownParseContext::new(&source,offset);let mut index=Index{text:String::new(),source_map:vec![]};let mut truth=vec![];
+ for (i,node) in nodes.iter().enumerate(){let Node::InlineCode(v)=node else{panic!()};let p=node.position().unwrap();let absolute=Span{start:p.start.offset+offset,end:p.end.offset+offset};let s=@SOURCE@;
+ let start=offset+prefix.len()+delim.len()+pad.len()+i*(encoding.len()+spacer.len());let render=index.text.len();
+ let boundaries=(0..=literal.len()).filter(|&i|literal.is_char_boundary(i)).collect::<Vec<_>>();
+ for (u,&a) in boundaries.iter().enumerate(){for &b in &boundaries[u+1..]{
+ fwd+=1;if source_range_for_segments(&s,a..b)!=Some(start+a..start+b){fw+=1;}
+ }}
+ for ab in boundaries.windows(2){truth.push((start+ab[0]..start+ab[1],render+ab[0]..render+ab[1]));}
+ index.push_source_segments(render,literal,&s);index.text.push_str(literal);index.text.push('|');
+ }
+ let source_edges=(0..=source.len()).filter(|&i|source.is_char_boundary(i)).collect::<Vec<_>>();
+ for (u,&a) in source_edges.iter().enumerate(){for &b in &source_edges[u+1..]{let sr=offset+a..offset+b;
+ let wanted=truth.iter().filter(|(s,_)|s.start<sr.end && s.end>sr.start).map(|(_,r)|r.clone()).reduce(|a,b|a.start..b.end);
+ rev+=1;if index.range_for_source(&sr)!=wanted{rw+=1;}
+ }}
+ parsed+=1;
+ }}}}
+ println!("{parsed} two-occurrence nested/plain GFM fixtures; {skip} non-code fixtures skipped; forward selection {fw}/{fwd} wrong; source-to-rendered highlights {rw}/{rev} wrong");if fw+rw>0{std::process::exit(1);}
+}

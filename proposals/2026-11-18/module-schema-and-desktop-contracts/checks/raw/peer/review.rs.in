@@ -1,0 +1,57 @@
+#![allow(dead_code,private_interfaces)]
+use std::collections::{HashSet,HashMap};
+#[derive(Clone,Debug,PartialEq,Eq)]struct PageId(u8);
+#[derive(Clone)]struct Section{title:String,description:String}
+#[derive(Clone)]enum ConfigValueSchema{Leaf,Object{fields:Vec<ConfigField>}}
+#[derive(Clone)]struct ConfigField{key:String,title:String,description:String,advanced:bool,section:Option<Section>,value:ConfigValueSchema}
+fn editable_field(_:&ConfigField)->bool{true} // only editable leaf/object values in fixture
+#[derive(Clone)]struct FieldPath{slot:String,module:String,keys:Vec<String>}
+impl FieldPath{fn new(s:&str,m:&str,k:&str)->Self{Self{slot:s.into(),module:m.into(),keys:vec![k.into()]}}fn child(&self,k:&str)->Self{let mut p=self.clone();p.keys.push(k.into());p}fn dotted(&self)->String{self.keys.join(".")}}
+fn section_scope(s:&str,f:&ConfigField)->String{format!("{s}:{}",f.key)}
+mod spot{use super::*;/*DEST*/ /*FIELD*/ /*RAW*/}
+/*FINDER*/ /*SCOPE*/
+type Key=(String,String);fn module_key(s:&str,m:&str)->Key{(s.into(),m.into())}
+struct Schema{fields:Vec<ConfigField>}struct ConfigBuilderSnapshot(HashMap<Key,Schema>);struct Info<'a>{schema:Option<&'a Schema>}
+fn module_info<'a>(ss:&'a ConfigBuilderSnapshot,s:&str,m:&str)->Option<Info<'a>>{ss.0.get(&module_key(s,m)).map(|schema|Info{schema:Some(schema)})}
+#[derive(Default)]struct Elem{buf:Vec<String>,mark:Option<String>}fn v_flex()->Elem{Default::default()}fn div()->Elem{Default::default()}
+impl Elem{fn gap_1p5(self)->Self{self}fn children(mut self,items:impl IntoIterator<Item=Elem>)->Self{for x in items{self.buf.extend(x.buf)}self}fn text_xs(self)->Self{self}fn text_color(self,_:())->Self{self}fn child(mut self,t:impl Into<String>)->Self{self.buf.push(t.into());self}fn into_any_element(self)->Self{self}}
+struct Theme{muted_foreground:(),danger:()}struct Editor{input:String,error:Option<String>}
+struct Editors{json:HashMap<Key,Editor>}
+struct SettingsView{raw:HashSet<Key>,editors:Editors}
+impl SettingsView{
+ fn is_json(&self,s:&str,m:&str)->bool{self.raw.contains(&module_key(s,m))}
+ fn text_area(&self,s:&String,_:&())->Elem{div().child(s.clone())}
+ fn spotted(&self,s:&str,mut e:Elem,_:&())->Elem{e.mark=Some(s.into());e}
+ fn raw_body(&self,slot:&str,module:&str,schema:Option<&Schema>)->Elem{let cx=&();let theme=Theme{muted_foreground:(),danger:()};/*RAWBODY*/ panic!("raw only")}
+ /*SEARCH*/
+}
+fn leaf(i:usize)->ConfigField{ConfigField{key:format!("param{i}"),title:format!("T{i:02} Field"),description:"padding".into(),advanced:i%3==0,section:None,value:ConfigValueSchema::Leaf}}
+const MOD:[(&str,&str);4]=[("paint","alpha"),("paint","shared"),("layout","shared"),("visual","palette")];
+fn main(){
+ let mut count=0;let mut lost=0;let mut raw_count=0;let mut absent_count=0;let mut invalid_count=0;let mut raw_only=0;let pg=PageId(7);
+ let mut ss=ConfigBuilderSnapshot(HashMap::new());for (s,m) in MOD{let mut group=leaf(99);group.key="section".into();group.title="Layout".into();group.value=ConfigValueSchema::Object{fields:(0..41).map(leaf).collect()};ss.0.insert(module_key(s,m),Schema{fields:vec![group]});}
+ for mask in 0..16{for text in ["{\"param9\":0,\"raw_only_xyz\":1}", "{\"param0\": true}", "{\"open\": ["]{
+ let mut v=SettingsView{raw:HashSet::new(),editors:Editors{json:HashMap::new()}};
+ for (i,(s,m)) in MOD.into_iter().enumerate(){if mask&(1<<i)!=0{v.raw.insert(module_key(s,m));v.editors.json.insert(module_key(s,m),Editor{input:text.into(),error:text.ends_with('[').then(||"incomplete".to_owned())});}}
+ for query in ["field","T09","param9","raw_only_xyz","nonexistent"] {
+ let mut find=Finder::new(query);
+ // A match already in the Finder, intentionally not a module-field target.
+ find.add(Hit::new(format!("{query} outside"),"other",PageId(9)).spot("unrelated".into()),&[]);
+ for (i,(s,m)) in MOD.into_iter().enumerate(){let open=vec![format!("outer{s}"),format!("box{m}")];v.search_params(&ss,&mut find,s,m,&pg,&format!("M{i}"),&open);}
+ let got=find.finish();assert_eq!(got[0].target.spot.as_deref(),Some("unrelated"));assert_eq!(got[0].place,"other");
+ let expected:Vec<(usize,usize)>=if query=="field"{(0..4).flat_map(|i|(0..41).map(move|j|(i,j))).take(59).collect()}else if matches!(query,"T09"|"param9"){(0..4).map(|i|(i,9)).collect()}else{vec![]};
+ assert_eq!(got.len(),expected.len()+1);
+ if query=="raw_only_xyz"{raw_only+=1;}
+ let mut anchors:HashSet<String>=HashSet::new();
+ for (s,m) in MOD{if v.is_json(s,m){let body=v.raw_body(s,m,Some(&ss.0[&module_key(s,m)]));if let Some(key)=body.mark{assert!(anchors.insert(key));}assert_eq!(body.buf[0],text);assert_eq!(body.buf.get(1).map(String::as_str),text.ends_with('[').then_some("incomplete"));}}
+ for (hit,(i,j)) in got.iter().skip(1).zip(expected){
+ let (s,m)=MOD[i];assert_eq!(hit.title,format!("T{j:02} Field"));assert_eq!(hit.target.page,pg);let open=vec![format!("outer{s}"),format!("box{m}")];
+ let raw=v.is_json(s,m);let fieldkey=spot::field(&FieldPath::new(s,m,"section").child(&format!("param{j}")));
+ if raw{let actual=v.raw_body(s,m,Some(&ss.0[&module_key(s,m)]));let match_key=actual.mark.is_some()&&actual.mark==hit.target.spot;
+ let ok=match_key&&hit.target.open==open&&hit.place==format!("M{i} · Layout · JSON");if !ok{lost+=1};assert_eq!(ok,/*PATCHED*/);
+ raw_count+=1;absent_count+=usize::from(!text.contains(&format!("\"param{j}\"")));invalid_count+=usize::from(text.ends_with('['));
+ }else{assert_eq!(hit.target.spot.as_deref(),Some(fieldkey.as_str()));assert_eq!(hit.place,format!("M{i} · Layout"));assert!(hit.target.open.starts_with(&open));assert!(hit.target.open.iter().any(|k|k==&format!("group:{s}:{m}:section")));}
+ count+=1;
+ }}}}
+ println!("all found={count}; raw={raw_count}, routes missing actual rendered editor={lost}; missing literal raw key={absent_count}, invalid buffer={invalid_count}; unrelated raw-only property not indexed={raw_only}; 60-result limit/rank/order, preserved target pages/form routes and raw bytes/errors.");
+}

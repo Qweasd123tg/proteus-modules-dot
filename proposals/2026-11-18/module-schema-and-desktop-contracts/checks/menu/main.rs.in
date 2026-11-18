@@ -1,0 +1,57 @@
+#![allow(dead_code)]
+use std::{alloc::{GlobalAlloc,Layout,System},hint::black_box,sync::atomic::{AtomicBool,AtomicUsize,Ordering::Relaxed}};
+struct Count;
+static RUN:AtomicBool=AtomicBool::new(false);static ALLOC:AtomicUsize=AtomicUsize::new(0);static ID:AtomicUsize=AtomicUsize::new(0);
+const ID_BYTES:usize=113; // not a capacity of a Vec of references/Strings in this fixture
+fn count(n:usize){if RUN.load(Relaxed){ALLOC.fetch_add(1,Relaxed);if n==ID_BYTES{ID.fetch_add(1,Relaxed);}}}
+unsafe impl GlobalAlloc for Count{
+ unsafe fn alloc(&self,l:Layout)->*mut u8{count(l.size());unsafe{System.alloc(l)}}
+ unsafe fn dealloc(&self,p:*mut u8,l:Layout){unsafe{System.dealloc(p,l)}}
+ unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8{count(n);unsafe{System.realloc(p,l,n)}}
+}
+#[global_allocator]static A:Count=Count;
+type PaneId=usize;type SharedString=String;
+struct Pane{id:PaneId,tabs:Vec<String>,pinned:usize}
+impl Pane{@pane@}
+enum Node{Pane(Pane),Split(Split)}
+struct Child{node:Node}struct Split{children:Vec<Child>}
+impl Node{@tree@}
+struct TabLayout{root:Node}
+impl TabLayout{
+ fn is_locked(&self,p:PaneId)->bool{p==4} // unrelated split checker kept; one target marked fixed.
+ @layout@
+}
+mod subject{
+use super::*; pub(super) struct TabMenu{pub pane:PaneId,pub id:SharedString,pub pinned:bool,pub can_split:bool,pub has_others:bool,pub has_right:bool}
+impl TabMenu{@new@}
+}
+fn ids(start:usize,n:usize)->Vec<String>{(start..start+n).map(|i|format!("{}{:08x}","x".repeat(ID_BYTES-8),i)).collect()}
+fn pane(id:usize,start:usize,n:usize,pinned:usize)->Node{Node::Pane(Pane{id,pinned,tabs:ids(start,n)})}
+fn split(a:Node,b:Node)->Node{Node::Split(Split{children:vec![Child{node:a},Child{node:b}]})}
+fn main(){
+ let mut cases=0;
+ for n in 0..=8{for p in 0..=n{for n2 in 0..=4{for p2 in 0..=n2{
+ let l=TabLayout{root:split(pane(1,0,n,p),split(pane(2,10,n2,p2),pane(4,30,3,1)))};
+ let panes=l.panes();let mut all=panes.iter().flat_map(|o|o.tabs.iter().cloned()).collect::<Vec<_>>();all.push("vanished".into());
+ for id in &all{for dest in [1usize,2,4,77]{for painted_pin in [false,true]{
+ let expected=panes.iter().find_map(|o|o.tabs.iter().position(|k|k==id).map(|index|{
+ let eligible=(0..o.tabs.len()).filter(|&i| i>=o.pinned && i!=index).collect::<Vec<_>>();
+ (!eligible.is_empty(),eligible.iter().any(|&i|i>index))})).unwrap_or_default();
+ let list = panes.iter().find_map(|o|o.tabs.iter().position(|key|key==id).map(|at|
+      (o.tabs.iter().enumerate().filter(|(i,_)|*i>=o.pinned && *i!=at).map(|(_,s)|s.clone()).collect::<Vec<_>>(),
+       o.tabs.iter().enumerate().filter(|(i,_)|*i>=o.pinned && *i>at).map(|(_,s)|s.clone()).collect::<Vec<_>>())
+ )).unwrap_or_default();
+ assert_eq!((l.others(id), l.right_of(id)),list);
+ let m=subject::TabMenu::new(dest,id,painted_pin,&l);
+ assert_eq!((m.has_others,m.has_right),expected);assert_eq!((&m.id,m.pane,m.pinned,m.can_split),(id,dest,painted_pin,l.can_split(id,dest)));cases+=1;
+ }}}
+ }}}}
+ println!("{cases} valid-pane, pinned/unpinned, dragged-into-another-pane, absent-ID/destination snapshots: all identical to eligibility oracle");
+ for n in [8usize,32,100,256]{for p in [0,n/2,n]{
+ let l=TabLayout{root:pane(1,0,n,p)};let owner=l.pane(1).unwrap();
+ ALLOC.store(0,Relaxed);ID.store(0,Relaxed);RUN.store(true,Relaxed);
+ for (i,id) in owner.tabs.iter().enumerate(){black_box(subject::TabMenu::new(1,id,i<p,&l));}
+ RUN.store(false,Relaxed);
+ println!("n={n} pinned={p}: full constructor id-sized alloc={} total alloc/realloc={}",ID.load(Relaxed),ALLOC.load(Relaxed));
+ }}
+}

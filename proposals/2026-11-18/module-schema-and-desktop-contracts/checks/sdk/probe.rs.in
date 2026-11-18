@@ -1,0 +1,54 @@
+#![allow(dead_code)]
+extern crate self as proteus_extension;
+pub use serde_json::{json,Value};
+pub mod ui{use super::*; /*UI*/ }
+mod declarative{
+ pub mod control{pub type MenuItem=serde_json::Value;pub fn check_items(v:&[MenuItem])->anyhow::Result<()>{assert!(v.is_empty());Ok(())}}
+ pub mod widget{pub type Tone=serde_json::Value;}
+ pub mod lanes{ /*LANES*/ }
+}
+fn check(v:&Value)->Result<(),String>{
+ use declarative::lanes::{Column, Row};assert_eq!(v["type"],"lanes");
+ let cols:Vec<Column>=serde_json::from_value(v["columns"].clone()).map_err(|e|e.to_string())?;
+ let rows:Vec<Row>=serde_json::from_value(v["rows"].clone()).map_err(|e|e.to_string())?;
+ declarative::lanes::check(&cols,&rows).map_err(|e|e.to_string())
+}
+fn doc_example(){ /*SAMPLE*/ }
+use std::marker::PhantomData;
+trait Kind{type Row;const MOVED:Option<&'static str>;const SCROLL:();fn id(r:&Self::Row)->&str;}
+struct ListRows;impl ListRows{ /*CLICK*/ }
+impl Kind for ListRows{type Row=String; /*MOVED*/ const SCROLL:()=();fn id(r:&String)->&str{r}}
+struct Scroll;impl Scroll{fn scroll_to_item(&mut self,_:usize,_:()){}}
+struct KeyDownEvent{keystroke:Stroke}struct Stroke{key:String}
+#[derive(Default)] struct App{events:Vec<(String,&'static str)>}
+struct Context<T>{app:App,mark:PhantomData<T>}impl<T>Context<T>{fn stop_propagation(&mut self){}fn notify(&mut self){}}
+impl<T>std::ops::Deref for Context<T>{type Target=App;fn deref(&self)->&App{&self.app}}
+impl<T>std::ops::DerefMut for Context<T>{fn deref_mut(&mut self)->&mut App{&mut self.app}}
+struct Rows<K:Kind>{rows:Vec<K::Row>,cursor:usize,action:fn(String,&'static str,&mut App),scroll:Scroll}
+impl<K:Kind>Rows<K>{ /*ACT*/ /*KEY*/ }
+fn main(){
+ use ui::{lane_row,lanes,Node};let mut schema=0;
+ // Test 1..=7 columns: the graph can be in each position.
+ for width in 1..=7{for graph in 0..width{
+ let cols:Vec<Value>=(0..width).map(|i|if i==graph {json!({"kind":"graph","label":"Path","weight":2})}else{json!({"label":"Text","weight":1})}).collect();
+ let row=lane_row("r1","Notes",0,0);
+ let missing=lanes("x",cols.clone(),vec![row.clone()],"choose");
+ let err=check(&missing).unwrap_err();assert!(err.contains("missing field `cells`"),"{err}");
+ let values:Vec<&str>=(0..width).map(|i|if i==graph{""}else{"Ada"}).collect();
+ let good=lanes("x",cols.clone(),vec![row.clone().with("cells",values)],"choose");
+ check(&good).unwrap();
+ for n in [width-1,width+1]{let wrong=lanes("x",cols.clone(),vec![row.clone().with("cells",vec!["";n])],"choose");assert!(check(&wrong).unwrap_err().contains("one cell per column"));}
+ schema+=1;
+ }}
+ let names:Vec<_>=(0..30).map(|i|format!("entry{i}")).collect();
+ let list=ui::list("entries",names.iter().map(|n|ui::list_row(n,n)).collect(),"choose");
+ let r=list["rows"].as_array().unwrap().iter().map(|v|v["id"].as_str().unwrap().to_owned()).collect();
+ let mut rows=Rows::<ListRows>{rows:r,cursor:0,action:|s,e,a|a.events.push((s,e)),scroll:Scroll};
+ let mut cx=Context{app:App::default(),mark:PhantomData};let mut checks=0;
+ for i in 0..names.len(){for count in [1,2]{rows.act_at(i,ListRows::clicked(count),&mut cx);assert_eq!(cx.events.pop(),Some((names[i].clone(),if count==1{"preview"}else{"open"})));checks+=1;}
+ for key in ["up","down","home","end","pageup","pagedown","enter"]{rows.cursor=i;rows.key(&KeyDownEvent{keystroke:Stroke{key:key.into()}},&mut cx);
+ let want=match key{"up"=>i.saturating_sub(1),"down"=>(i+1).min(29),"home"=>0,"end"=>29,"pageup"=>i.saturating_sub(12),"pagedown"=>(i+12).min(29),_=>i};
+ assert_eq!(rows.cursor,want);if key=="enter"{assert_eq!(cx.events.pop(),Some((names[i].clone(),"open")));}else{assert!(cx.events.is_empty());}checks+=1;}}
+ doc_example();
+ println!("{}: {} list checks: one click preview; double-click/Enter open; six movement keys no event. {} column layouts: bare row rejected, one cell per column accepted, {} under/oversized lengths rejected.",if /*OLD*/{"old comment contradicts real APIs"}else{"amended rustdoc example compiled/executed"},checks,schema,2*schema);
+}

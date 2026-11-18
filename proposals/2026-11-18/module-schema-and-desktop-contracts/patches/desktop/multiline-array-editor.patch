@@ -1,0 +1,158 @@
+--- a/src/ui/settings/tags.rs
++++ b/src/ui/settings/tags.rs
+@@ -21,7 +21,10 @@
+ pub(super) fn is_tag_field(field: &ConfigField) -> bool {
+     match &field.value {
+         ConfigValueSchema::Array { items } => match items.as_ref() {
+-            ConfigValueSchema::String { secret: false, .. } => true,
++            ConfigValueSchema::String {
++                multiline: false,
++                secret: false,
++            } => true,
+             ConfigValueSchema::Enum { options } => {
+                 options.iter().all(|option| option.value.is_string())
+             }
+--- a/src/settings/schema.rs
++++ b/src/settings/schema.rs
+@@ -50,6 +50,8 @@
+     Multiline,
+     /// Array of single-line strings, one per line.
+     Lines,
++    /// Exact list of multiline strings, entered as a JSON array.
++    StringArrayJson,
+     Json,
+     /// JSON on one line for short values like `100000` or `80%`; text that
+     /// is not JSON is taken as a string.
+@@ -58,7 +60,10 @@
+ 
+ impl TextFormat {
+     pub fn is_multiline(self) -> bool {
+-        matches!(self, Self::Multiline | Self::Lines | Self::Json)
++        matches!(
++            self,
++            Self::Multiline | Self::Lines | Self::StringArrayJson | Self::Json
++        )
+     }
+ }
+ 
+@@ -108,6 +113,10 @@
+                 multiline: false,
+                 secret: false,
+             } => FieldKind::Text(TextFormat::Lines),
++            ConfigValueSchema::String {
++                multiline: true,
++                secret: false,
++            } => FieldKind::Text(TextFormat::StringArrayJson),
+             _ => FieldKind::Text(TextFormat::Json),
+         },
+         ConfigValueSchema::Object { fields } if !fields.is_empty() => FieldKind::Group(fields),
+@@ -131,7 +140,12 @@
+         {
+             text.clone()
+         }
+-        (_, Value::String(text)) if !matches!(format, TextFormat::Json | TextFormat::Value) => {
++        (_, Value::String(text))
++            if !matches!(
++                format,
++                TextFormat::Json | TextFormat::StringArrayJson | TextFormat::Value
++            ) =>
++        {
+             text.clone()
+         }
+         (TextFormat::Lines, Value::Array(items)) if items.iter().all(Value::is_string) => items
+@@ -142,9 +156,13 @@
+         (TextFormat::Integer { .. } | TextFormat::Number, Value::Number(number)) => {
+             number.to_string()
+         }
+-        (TextFormat::Json | TextFormat::Lines | TextFormat::Multiline, _) => {
+-            serde_json::to_string_pretty(value).unwrap_or_default()
+-        }
++        (
++            TextFormat::Json
++            | TextFormat::StringArrayJson
++            | TextFormat::Lines
++            | TextFormat::Multiline,
++            _,
++        ) => serde_json::to_string_pretty(value).unwrap_or_default(),
+         _ => serde_json::to_string(value).unwrap_or_default(),
+     }
+ }
+@@ -185,11 +203,21 @@
+                 .map(|line| Value::String(line.to_string()))
+                 .collect(),
+         ))),
+-        TextFormat::Json => match serde_json::from_str::<Value>(trimmed) {
+-            Ok(Value::Null) => Ok(None),
+-            Ok(value) => Ok(Some(value)),
+-            Err(error) => Err(format!("Неверный JSON: {error}")),
+-        },
++        TextFormat::Json | TextFormat::StringArrayJson => {
++            match serde_json::from_str::<Value>(trimmed) {
++                Ok(Value::Null) => Ok(None),
++                Ok(value)
++                    if format == TextFormat::StringArrayJson
++                        && !value
++                            .as_array()
++                            .is_some_and(|items| items.iter().all(Value::is_string)) =>
++                {
++                    Err("Нужен JSON-массив строк".to_string())
++                }
++                Ok(value) => Ok(Some(value)),
++                Err(error) => Err(format!("Неверный JSON: {error}")),
++            }
++        }
+         TextFormat::Value => match serde_json::from_str::<Value>(trimmed) {
+             Ok(Value::Null) => Ok(None),
+             Ok(value) => Ok(Some(value)),
+--- a/src/ui/settings/tags/tests.rs
++++ b/src/ui/settings/tags/tests.rs
+@@ -5,6 +5,33 @@
+ };
+ use serde_json::json;
+ 
++#[test]
++fn multiline_string_array_uses_the_json_editor_instead_of_single_line_tags() {
++    let field = ConfigField::new(
++        "notes",
++        "Notes",
++        "",
++        ConfigValueSchema::Array {
++            items: Box::new(ConfigValueSchema::String {
++                multiline: true,
++                secret: false,
++            }),
++        },
++    );
++    assert!(!is_tag_field(&field));
++    assert!(matches!(
++        crate::settings::field_kind(&field),
++        crate::settings::FieldKind::Text(crate::settings::TextFormat::StringArrayJson)
++    ));
++    let format = crate::settings::TextFormat::StringArrayJson;
++    let items = json!(["first\nsecond", "", "first\nsecond"]);
++    let text = crate::settings::format_value(format, &items);
++    assert_eq!(crate::settings::parse_text(format, &text), Ok(Some(items)));
++    for bad in ["42", "[1]", r#"["ok", null]"#] {
++        assert!(crate::settings::parse_text(format, bad).is_err());
++    }
++}
++
+ fn with_view(value: Option<Value>, run: impl FnOnce(Entity<SettingsView>, &mut App)) {
+     let mut cx = ::gpui::TestAppContext::single();
+     cx.update(|cx| {
+--- a/README.md
++++ b/README.md
+@@ -698,9 +698,10 @@
+   рабочий минимум контрола. Многострочные
+   поля размещаются под подписью явно. JSON, текстовые параметры и MCP-поля
+   растут по содержимому, длинные значения сначала показывают ограниченное
+-  превью и раскрываются без вложенной вертикальной прокрутки. Списки строк,
+-  кроме точных Args/Env MCP, редактируются тегами с поиском, удалением и
+-  перестановкой. Args MCP редактируются
++  превью и раскрываются без вложенной вертикальной прокрутки. Списки обычных однострочных
++  строк редактируются тегами с поиском, удалением и перестановкой, кроме
++  точных Args/Env MCP. Если модуль объявил строки списка многострочными,
++  форма показывает JSON-массив, чтобы сохранить переносы внутри каждого элемента. Args MCP редактируются
+   JSON-массивом строк (например, `["--stdio", ""]`), Env — JSON-объектом
+   со строковыми значениями (`{"PREFIX": "  value  "}`). Пустые значения —
+   `[]` и `{}`; blank, `null`, неверные типы и повторные имена Env блокируют

@@ -1,0 +1,36 @@
+mod core_schema{/*CORE*/}
+use core_schema::{ConfigChoice,ConfigField,ConfigValueSchema as V};
+use core_schema::ConfigValueSchema;
+use serde_json::{json,Value};
+/*DESKTOP*/
+fn field(item:V)->ConfigField{ConfigField::new("paragraphs","Paragraphs","",V::Array{items:Box::new(item)})}
+fn strings(m:bool)->V{V::String{multiline:m,secret:false}}
+fn main(){
+ // Schema traverses real serde with its item multiline flag intact.
+ let authored=field(strings(true)).with_default(json!(["A\nB"]));let form:ConfigField=serde_json::from_str(&serde_json::to_string(&authored).unwrap()).unwrap();assert_eq!(form,authored);
+ let format=match field_kind(&form){FieldKind::Text(f)=>f,_=>panic!("wanted kind")};assert!(format.is_multiline());
+ #[cfg(after)] {
+   assert_eq!(format,TextFormat::StringArrayJson);
+   for bad in ["42","true","{}",r#""text""#,"[1]","[true]",r#"["a",1]"#,"[null]","[[1]]","{"] {
+      assert!(parse_text(format,bad).is_err(),"{bad}");
+   }
+   assert_eq!(parse_text(format,"[]"),Ok(Some(json!([]))));
+   assert_eq!(parse_text(format,"null"),Ok(None));assert_eq!(parse_text(format,"  "),Ok(None));
+   println!("10 wrong/malformed JSON forms rejected; [] remains an empty list; blank and null follow the normal reset.");
+ }
+ #[cfg(before)] assert_eq!(format,TextFormat::Json);
+ let text_items=["Header\nBody"," leading\nspace ","blank\n\nline","東京\nRésumé","CRLF\r\nline","quoted \"line\"\nslash \\","first\nfirst","\n","line\n"];
+ let mut rejected=0;let mut controls=0;
+ // Edit by the actual form available: text pasted into its selected tag control, or a JSON-array edit in the JSON textarea.
+ // The two modes deliberately have different input grammars. Neither an OS event nor persistence is simulated.
+ for s in text_items{
+  let prior=json!(["saved\nline","duplicate","duplicate",""]);let mut expected=prior.as_array().unwrap().clone();expected.push(json!(s));
+  let got=if is_tag_field(&form){let mut new_text=s.to_string();/*ONE-LINE*/let mut rows=prior.as_array().unwrap().clone();if let Some(x)=added_value(&form,&new_text){rows.push(x)}Value::Array(rows)}
+  else {let loaded=format_value(format,&prior);assert_eq!(parse_text(format,&loaded),Ok(Some(prior.clone())));let edit=serde_json::to_string_pretty(&expected).unwrap();parse_text(format,&edit).unwrap().unwrap()};
+  rejected+=usize::from(got!=Value::Array(expected));if s=="Header\nBody"{println!("actual appended item: {:?}",got.as_array().unwrap().last())}
+ }
+ for (item,expected) in [(strings(false),true),(V::String{multiline:false,secret:true},false),(V::String{multiline:true,secret:true},false),(V::Boolean{},false),(V::Number{},false),(V::Json{},false),(V::choices(&[("a","A"),("b","B")]),true),(V::Enum{options:vec![ConfigChoice{value:json!(1),title:"N".into()}]},false)] {assert_eq!(is_tag_field(&field(item)),expected);controls+=1;}
+ let plain=ConfigField::new("note","Note","",strings(true));assert!(!is_tag_field(&plain));assert!(matches!(field_kind(&plain),FieldKind::Text(TextFormat::Multiline)));
+ println!("{} of {} multiline edits differ; {} unchanged array controls and scalar multiline route correct.",rejected,text_items.len(),controls);
+ assert_eq!(rejected,if cfg!(before){text_items.len()}else{0});
+}

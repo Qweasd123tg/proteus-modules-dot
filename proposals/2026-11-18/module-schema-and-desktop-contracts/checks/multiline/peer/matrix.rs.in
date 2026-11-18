@@ -1,0 +1,33 @@
+use serde_json::{Value,json};
+#[derive(Clone)]struct ConfigChoice{value:Value}
+#[derive(Clone)]struct ConfigField{value:ConfigValueSchema,default:Option<Value>}
+#[derive(Clone)]enum ConfigValueSchema{Boolean{},Enum{options:Vec<ConfigChoice>},Integer{minimum:Option<i64>,maximum:Option<i64>},Number{},String{multiline:bool,secret:bool},Array{items:Box<Self>},Object{fields:Vec<ConfigField>},Json{}}
+impl std::fmt::Debug for ConfigChoice{fn fmt(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{write!(f,"choice")}}
+impl std::fmt::Debug for ConfigField{fn fmt(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{write!(f,"field")}}
+@@routines@@
+fn arr(schema:ConfigValueSchema)->ConfigValueSchema{ConfigValueSchema::Array{items:Box::new(schema)}}
+fn st(m:bool,s:bool)->ConfigValueSchema{ConfigValueSchema::String{multiline:m,secret:s}}
+fn en(v:&[Value])->ConfigValueSchema{ConfigValueSchema::Enum{options:v.iter().map(|x|ConfigChoice{value:x.clone()}).collect()}}
+fn route(f:&ConfigField)->String{if is_tag_field(f){return String::from("tags");}match field_kind(f){FieldKind::Text(t)=>format!("{t:?}"),FieldKind::MultiChoice(_)=>"multi-choice".into(),FieldKind::Choice(_)=>"choice".into(),FieldKind::Switch=>"flag".into(),FieldKind::Group(_)=>"group".into()}}
+fn main(){let after=std::env::args().nth(1).unwrap()=="after";let mut matrix=0;
+for (schema,target) in [(arr(st(true,false)),if after{"StringArrayJson"}else{"tags"}),(arr(st(false,false)),"tags"),(arr(st(false,true)),"Json"),(arr(st(true,true)),"Json"),(st(false,false),"Line"),(st(true,false),"Multiline"),(st(true,true),"Secret"),(st(false,true),"Secret"),(arr(en(&[])),"tags"),(arr(en(&[json!("a"),json!("b")])),"tags"),(arr(en(&[json!("a"),json!(21)])),"multi-choice"),(arr(arr(st(true,false))),"Json"),(arr(arr(st(false,false))),"Json"),(arr(ConfigValueSchema::Boolean{}),"Json"),(ConfigValueSchema::Boolean{},"flag")]{
+for d in [None,Some(Value::Null),Some(json!(["a\nb"]))]{
+ let field=ConfigField{value:schema.clone(),default:d};assert_eq!(route(&field),target);
+ let group=ConfigField{value:ConfigValueSchema::Object{fields:vec![field.clone()]},default:None};
+ let FieldKind::Group(children)=field_kind(&group) else{panic!("lost nested object")};assert_eq!(route(&children[0]),target);matrix+=2;
+}}
+let target=ConfigField{value:arr(st(true,false)),default:None};
+let FieldKind::Text(fmt)=field_kind(&target) else{unreachable!()};assert!(fmt.is_multiline());
+let vals=[""," x ","\n","a\nb","a\r\nb","\t","'quoted'",r"\n","\"quoted\"", "📗","\u{0000}","e\u{0301}"];
+let mut valid=0;let mut invalid=0;let mut reset=0;
+for x in vals{for y in vals{for v in [json!([]),json!([x]),json!([x,y]),json!([x,y,x])]{
+  let t=format_value(fmt,&v);assert_eq!(parse_text(fmt,&t),Ok(Some(v)));valid+=1;
+}}}
+for v in [json!(1),json!(true),json!("x"),json!({"a":["x"]}),json!([null]),json!([1]),json!([false]),json!([{}]),json!([[]]),json!(["x",1]),json!([["x"]]),json!({"x":2})]{
+ let t=serde_json::to_string(&v).unwrap();let got=parse_text(fmt,&t);if after{assert!(got.is_err())}else{assert_eq!(got,Ok(Some(v.clone())))}invalid+=1;
+ assert_eq!(parse_text(TextFormat::Json,&t),Ok(Some(v)));
+}
+for text in ["","  ","\t\n","null"," null \n"]{assert_eq!(parse_text(fmt,text),Ok(None));reset+=1}
+assert!(parse_text(fmt,"[not json]").is_err());assert_eq!(parse_text(fmt,"[]"),Ok(Some(json!([]))));
+println!("{} {matrix} field/group routes with ordinary/empty/missing defaults. {valid} valid JSON string arrays round-trip in underlying format. {invalid} fresh wrong-shape inputs: {}; generic Json still accepts the same inputs; {reset} clear forms and []/malformed control checked.",if after{"after"}else{"before"},if after{"target rejects all"}else{"all accepted by underlying generic Json (not by the rendered tag UI)"});
+}
