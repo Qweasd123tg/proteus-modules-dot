@@ -1,0 +1,77 @@
+use std::{cell::Cell,marker::PhantomData};
+#[derive(Copy,Clone,Debug,Eq,PartialEq)]struct PaneId(usize);
+#[derive(Copy,Clone,Debug)]enum Edge{Left,Right,Top,Bottom}
+#[derive(Copy,Clone)]enum Axis{Row,Column}
+#[derive(Copy,Clone)]enum Size{Weight(f32),Fixed(f32)}
+impl Size{/*WEIGHT*/}
+struct Child{node:Node,size:Size} struct Split{axis:Axis,children:Vec<Child>}
+struct Pane{id:PaneId} enum Node{Pane(Pane),Split(Split)}
+#[derive(Copy,Clone,Debug)]struct Rect{x:f32,y:f32,w:f32,h:f32}
+impl Rect{fn right(self)->f32{self.x+self.w}fn bottom(self)->f32{self.y+self.h}}
+struct TabLayout{root:Node,focused:PaneId}
+/*REFERENCE*/
+/*EPSILON*/
+/*EXTENTS*/
+/*PLACE*/
+impl TabLayout{
+ fn focus(&mut self,id:PaneId){self.focused=id;}
+ fn active(&self,id:PaneId)->Option<&'static str>{["LT","LM","LB","RT","RB"].get(id.0).copied()}
+ /*METHODS*/
+}
+#[derive(Copy,Clone,PartialOrd,PartialEq)]struct Pixels(f32); fn px(x:f32)->Pixels{Pixels(x)}
+impl Pixels{fn as_f32(self)->f32{self.0}}
+#[derive(Copy,Clone)]struct Area{width:Pixels,height:Pixels}
+struct Context<T>{s:f32,marker:PhantomData<T>} struct Window; mod prefs{pub(super) fn scale<T>(c:&super::Context<T>)->f32{c.s}}
+mod split{pub(super)const DIVIDER:f32=1.;}
+struct Workspace{settings:Option<()>,tab_area:Cell<Option<Area>>,layout:TabLayout,focused_tab:Option<String>}
+impl Workspace{
+ fn update_tabs(&mut self,_:&mut Context<Self>,f:impl FnOnce(&mut TabLayout)){f(&mut self.layout)}
+ fn focus_tab(&mut self,id:&str,_:&mut Window,_:&mut Context<Self>){self.focused_tab=Some(id.to_owned());}
+ /*ACTION*/
+}
+fn weighted(n:Node)->Child{Child{node:n,size:Size::Weight(1.)}}
+fn mk(id:usize)->Node{Node::Pane(Pane{id:PaneId(id)})}
+fn layout(transpose:bool,first:bool,fixed:f32,middle:bool)->TabLayout{
+ let (a,b)=if transpose{(Axis::Column,Axis::Row)}else{(Axis::Row,Axis::Column)};
+ let half=|children|weighted(Node::Split(Split{axis:b,children}));
+ let sizes=if fixed<0.{[Size::Weight(1.),Size::Weight(1.)]}else if first{[Size::Fixed(fixed),Size::Weight(1.)]}else{[Size::Weight(1.),Size::Fixed(fixed)]};
+ let left:Vec<_>=(0..3).map(|i|Child{node:mk(i),size:Size::Weight(if middle&&i==1{2.}else{1.})}).collect();
+ TabLayout{focused:PaneId(1),root:Node::Split(Split{axis:a,children:vec![half(left),half(vec![Child{node:mk(3),size:sizes[0]},Child{node:mk(4),size:sizes[1]}])]})}
+}
+fn action(transpose:bool,first:bool,fixed:f32,middle:bool,h:f32,scale:f32,src:usize,edge:Edge,area:bool,settings:bool)->(usize,Option<String>,Vec<(PaneId,Rect)>){
+ let(w,h)=if transpose{(h,1200.)}else{(1200.,h)};
+ let mut space=Workspace{settings:settings.then_some(()),tab_area:Cell::new(area.then_some(Area{width:px(w*scale),height:px(h*scale)})),layout:layout(transpose,first,fixed,middle),focused_tab:None};
+ let rects=space.layout.rects_spaced(w,h,1.);
+ space.layout.focused=PaneId(src);space.focus_neighbor(edge,&mut Window,&mut Context{s:scale,marker:PhantomData});
+ (space.layout.focused.0,space.focused_tab,rects)
+}
+// Independent geometry rule for this regular grid: only the opposite border with
+// a single visible 1px separator is adjacent. Choose maximal intersecting side.
+// No production neighbor, layout traversal, or fallback sizes are used by oracle.
+fn allowed(rects:&[(PaneId,Rect)],src:usize,e:Edge)->Vec<usize>{
+ let t=rects.iter().find(|(id,_)|id.0==src).unwrap().1;let mut best=0.;let mut out=vec![];
+ for &(id,b) in rects{if src==id.0||b.w<=0.||b.h<=0.{continue}
+ let sep=match e{Edge::Right=>b.x-t.right(),Edge::Left=>t.x-b.right(),Edge::Top=>t.y-b.bottom(),Edge::Bottom=>b.y-t.bottom()};
+ if (sep-1.).abs()>0.001 {continue}
+ let ov=match e{Edge::Left|Edge::Right=>t.bottom().min(b.bottom())-t.y.max(b.y),Edge::Top|Edge::Bottom=>t.right().min(b.right())-t.x.max(b.x)};
+ if ov<=0.001{continue} if ov>best+0.001{best=ov;out.clear();}if (ov-best).abs()<=0.001{out.push(id.0)}
+ }if out.is_empty(){out.push(src)}out
+}
+fn main(){let tag=std::env::args().nth(1).unwrap();let after=tag=="after";let mut count=0;let mut wrong=0;
+ for tr in [false,true]{for top in [false,true]{for fixed in [-1.,97.,240.,380.,420.,640.]{for middle in [false,true]{for height in [720.,800.,1000.,1200.,1600.,1900.]{
+ for s in [0.75,1.,1.5,2.]{for at in 0..5{for e in [Edge::Left,Edge::Right,Edge::Top,Edge::Bottom]{
+ let (dest,tab,rects)=action(tr,top,fixed,middle,height,s,at,e,true,false);count+=1;
+ let allowed=allowed(&rects,at,e);
+ if !allowed.contains(&dest){wrong+=1; if after{panic!("tr={tr},fixed={fixed},h={height},src={at},edge={e:?} => {dest}, expected {allowed:?}")}}
+ assert_eq!(tab.as_deref(),if dest==at{None}else{Some(["LT","LM","LB","RT","RB"][dest])});
+ }}}}}}}}
+ let (dest,_,rects)=action(false,true,420.,false,600.,1.,1,Edge::Right,true,false);
+ println!("{tag}: {wrong}/{count} wrong destinations. Compare y spans, 600px area: source={:?}, RT={:?}, RB={:?}. Right -> {}.",rects[1].1,rects[3].1,rects[4].1,["LT","LM","LB","RT","RB"][dest]);
+ assert_eq!(dest,if after{3}else{4});
+ for s in [0.75,1.,2.]{
+  assert_eq!(action(false,true,420.,false,600.,s,1,Edge::Right,false,false).0,4); // no measurement
+  assert_eq!(action(false,true,420.,false,0.,s,1,Edge::Right,true,false).0,4); // zero area
+  assert_eq!(action(false,true,420.,false,600.,s,1,Edge::Right,true,true).0,1); // settings overlay
+ }
+ if after{assert_eq!(wrong,0)}else{assert!(wrong>0)}
+}

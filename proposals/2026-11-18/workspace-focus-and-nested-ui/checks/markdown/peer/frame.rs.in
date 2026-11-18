@@ -1,0 +1,95 @@
+#![allow(dead_code)]
+use std::sync::Arc;
+use markdown::{mdast::Node,ParseOptions,to_mdast};
+type Pixels = f32;
+type AnyElement = Div;
+struct Window;
+impl Window{fn line_height(&self)->Pixels{16.}}
+struct App;
+struct Radius{sm:Pixels}
+struct Tokens{radius:Radius}
+struct Theme{tokens:Tokens}
+impl App{fn theme(&self)->Theme{Theme{tokens:Tokens{radius:Radius{sm:2.}}}}}
+struct NodeContext{style:TextViewStyle}
+fn body_font_size(_: &NodeContext,_:&Window)->Pixels{16.}
+struct TextViewStyle;
+struct ListStyle{text:Text}
+struct Text{color:Option<u8>}
+impl TextViewStyle{fn muted_foreground(&self)->u8{0} fn link(&self)->u8{1} fn list_style(&self)->ListStyle{ListStyle{text:Text{color:None}}}fn is_dark(&self)->bool{false}}
+struct Image;
+enum ImageFormat{Svg}
+impl Image{fn from_bytes(_format:ImageFormat,_:Vec<u8>)->Self{Self}}
+const CHECK_SVG_DARK:&[u8]=b"";
+const CHECK_SVG_LIGHT:&[u8]=b"";
+fn img(_:Arc<Image>)->Div{Div{tick:true,..div()}}
+fn rems(x:f32)->f32{x}
+#[derive(Default,Debug)]
+struct Div{children:Vec<Div>,text:String,number:bool,checkbox:bool,tick:bool}
+fn div()->Div{Default::default()}
+fn h_flex()->Div{div()}
+macro_rules! nop{($($f:ident),*) => {$(fn $f(self)->Self{self})*};}
+macro_rules! one{($($f:ident),*) => {$(fn $f<T>(self,_:T)->Self{self})*};}
+impl Div{
+ nop!(w_full,min_w_0,relative,items_start,content_start,flex_none,flex,mr_2,items_center,justify_center,flex_1,overflow_hidden);
+ one!(min_w,pr,text_color,refine_style,h,size,rounded,border_color,bg,pt,pl,ml,pb);
+ fn text_right(mut self)->Self{self.number=true; self}
+ fn border_1(mut self)->Self{self.checkbox=true;self}
+ fn into_any_element(self)->Self{self}
+ fn when<F:FnOnce(Self)->Self>(self,b:bool,f:F)->Self{if b{f(self)}else{self}}
+ fn when_some<T,F:FnOnce(Self,T)->Self>(self,item:Option<T>,f:F)->Self{if let Some(t)=item{f(self,t)}else{self}}
+ fn child(mut self,c:impl Into<Div>)->Self{self.children.push(c.into());self}
+ fn children<I:IntoIterator<Item=Div>>(mut self,c:I)->Self{self.children.extend(c);self}
+ fn content(&self)->String{self.text.clone()+&self.children.iter().map(|d|d.content()).collect::<String>()}
+ fn has_tick(&self)->bool{self.tick||self.children.iter().any(|c|c.has_tick())}
+ fn markers(&self,out:&mut Vec<String>){if self.number{out.push(self.content());}if self.checkbox{out.push(if self.has_tick(){"[x]"}else{"[ ]"}.into());}for c in &self.children{c.markers(out)}}
+}
+impl From<String> for Div{fn from(text:String)->Self{Self{text,..div()}}}
+#[derive(Default,Copy,Clone)] enum PrevBlock{#[default] Other}
+@OPTIONS@
+mod prefix { @PREFIX@ }
+use prefix::list_item_prefix;
+enum BlockNode{
+ Paragraph(String),List{children:Vec<Self>,ordered:bool,start:Option<u32>},
+ ListItem{children:Vec<Self>,checked:Option<bool>,spread:bool},Root{},Heading{},Blockquote{children:Vec<Self>},
+ CodeBlock(()),Custom{},Table(()),HorizontalRule{},Break{},Definition{},Unknown,
+}
+impl BlockNode{
+ fn is_list_item(&self)->bool{matches!(self,Self::ListItem{..})}
+ fn render_block(&self,options:NodeRenderOptions,node_cx:&NodeContext,window:&mut Window,cx:&mut App)->Div{
+  let mb=0.;match self{
+  @LISTARM@
+  Self::Paragraph(t)=>div().child(t.clone()),
+  Self::Blockquote{children}=>div().children(children.iter().map(|v|v.render_block(options,node_cx,window,cx))),
+  _=>div()
+  }
+ }
+ @ROW@
+ @ITEM@
+}
+// Only the document/list/paragraph constructors needed by the synthetic fixtures.
+// The source trees themselves come from the actual markdown-rs parser.
+fn from(n:Node)->BlockNode{match n{
+ Node::List(list)=>BlockNode::List{children:list.children.into_iter().map(from).collect(),ordered:list.ordered,start:list.start},
+ Node::ListItem(item)=>BlockNode::ListItem{children:item.children.into_iter().map(from).collect(),checked:item.checked,spread:item.spread},
+ Node::Paragraph(p)=>BlockNode::Paragraph(p.children.into_iter().map(|n|n.to_string()).collect::<String>()),
+ Node::Blockquote(q)=>BlockNode::Blockquote{children:q.children.into_iter().map(from).collect()},
+ _=>BlockNode::Unknown,
+}}
+fn show(src:&str)->(Vec<String>,String){
+ let Node::Root(r)=to_mdast(src,&ParseOptions::gfm()).unwrap() else{panic!()};
+ let root=div().children(r.children.into_iter().map(|n|from(n).render_block(Default::default(),&NodeContext{style:TextViewStyle},&mut Window,&mut App)));
+ let mut m=vec![];root.markers(&mut m);(m,root.content())
+}
+
+fn count(n:&Node)->usize{usize::from(matches!(n,Node::ListItem(_)))+n.children().map_or(0,|c|c.iter().map(count).sum::<usize>())}
+fn main(){
+ let mut bad=0;let mut cases=0;
+ for parent in ["", "[ ] ","[x] "] {for child in ["","[ ] ","[x] "] {for kind in ["-","1."] {for post in ["","\n\n    Continued"] {
+   let post=post.replace("\n    ", &format!("\n{}"," ".repeat(2+kind.len()+1)));
+   let s=format!("- {parent}Parent\n  {kind} {child}Child\n{}- Grand{post}\n"," ".repeat(2+kind.len()+1));
+   let ast=to_mdast(&s,&ParseOptions::gfm()).unwrap();let expected=count(&ast);assert_eq!(expected,3);
+   let (marks,text)=show(&s); if !post.is_empty(){assert!(text.contains("Continued"))}
+   if parent=="[ ] " && child=="" && kind=="-" && !post.is_empty(){println!("fixture={s:?} mdast_list_items={expected} constructed={marks:?}");}
+   bad+=usize::from(expected!=marks.len());cases+=1;
+ }}}} println!("{bad} wrong marker counts in {cases} GFM fixtures.");if bad>0{std::process::exit(1)}
+}

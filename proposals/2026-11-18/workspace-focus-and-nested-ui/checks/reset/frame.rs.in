@@ -1,0 +1,65 @@
+use std::{collections::BTreeMap,marker::PhantomData};
+use serde_json::{json,Value,Map};
+mod data {
+use super::*;
+pub type Config=BTreeMap<String,BTreeMap<String,Value>>;
+#[derive(Default,Debug,Clone,PartialEq)]pub struct Draft{pub config:Config}
+//PATH
+#[derive(Default)]struct Request{module_config:Config}
+impl Draft{
+//METHODS
+ pub fn config_delta(&self,baseline:&Draft)->Config{let mut request=Request::default();
+//DELTA
+ request.module_config}
+}
+//UTIL
+}
+mod ui {
+use super::*;use data::*;
+struct Context<T>(PhantomData<T>);
+#[derive(Default)]pub struct Editors {pub fields:BTreeMap<FieldPath,String>}
+pub struct SettingsView{pub baseline:Draft,pub draft:Draft,pub editors:Editors,pub changes:usize}
+impl SettingsView {
+//RESET_VIEW
+ fn update_draft(&mut self,cx:&mut Context<Self>,mutate:impl FnOnce(&mut Draft)){mutate(&mut self.draft); self.draft_changed(cx);}
+ fn draft_changed(&mut self,_:&mut Context<Self>){self.changes+=1;}
+}
+type App=SettingsView;
+struct Weak;
+impl Weak{fn update<R>(&self,view:&mut App,f:impl FnOnce(&mut SettingsView,&mut Context<SettingsView>)->R)->R{f(view,&mut Context(PhantomData))}}
+struct Field{default:Option<Value>}
+struct FieldSpec{path:FieldPath,value:Option<Value>,field:Field,view:Weak}
+impl FieldSpec{
+//FIELD_RESET
+}
+pub fn click(v:&mut SettingsView,p:&FieldPath,def:Option<Value>){
+ let spec=FieldSpec{path:p.clone(),value:v.draft.value(p).cloned(),field:Field{default:def},view:Weak};
+ assert!(spec.own());spec.reset(v);
+}
+}
+use data::*;use ui::*;
+fn main(){
+ let def=json!("Default");let mut trials=0;let mut bad=0;
+ for depth in 1..=5 {for prefix in 0..=depth {for other_change in [false,true] {for interior_sibling in [false,true] {
+  let path=|at:usize| {let mut x=FieldPath::new("ui","layout","level-0");for i in 1..at{x=x.child(&format!("level-{i}"));}x};
+  let mut base=Draft::default();
+  let top=FieldPath::new("ui","layout","caption");base.set_value(&top,Some(json!("original")));
+  if prefix>0{base.set_value(&path(prefix),Some(json!({})));}
+  if interior_sibling{base.set_value(&path(depth).child("help"),Some(json!("keep sibling")));}
+  let leaf=path(depth).child("title");
+  let mut expected=base.clone();if other_change{expected.set_value(&top,Some(json!("independent")));}
+  let mut v=SettingsView{baseline:base.clone(),draft:expected.clone(),editors:Editors::default(),changes:0};
+  v.draft.edit_value(&leaf,Some(json!("Draft")),Some(&def),&base);
+  v.editors.fields.insert(leaf.clone(),"Draft".into());v.editors.fields.insert(top.clone(),"preserve pending input".into());
+  click(&mut v,&leaf,Some(def.clone()));assert!(!v.editors.fields.contains_key(&leaf));assert!(v.editors.fields.contains_key(&top));assert_eq!(v.changes,1);
+  let b=v.draft.config_delta(&base)!=expected.config_delta(&base);
+  if depth==1 && prefix==1 && !other_change && !interior_sibling {println!("After reset: {}; outgoing module delta: {:?}",v.draft.module_config("ui","layout").unwrap(),v.draft.config_delta(&base));}
+  assert_eq!(v.draft!=expected,b);bad+=b as usize;trials+=1;
+ }}}}
+ // Explicit original leaf, including explicitly saved default: reset means remove, not restore the old value.
+ for old in [json!("Default"),json!("custom")]{let k=FieldPath::new("ui","layout","group").child("title");let mut b=Draft::default();b.set_value(&k,Some(old));let mut v=SettingsView{baseline:b.clone(),draft:b,editors:Editors::default(),changes:0};v.draft.set_value(&k,Some(json!("edited")));click(&mut v,&k,Some(def.clone()));assert!(v.draft.value(&k).is_none());}
+ // A whole-group reset removes all descendants and clears its mounted child buffers, not sibling fields.
+ let k=FieldPath::new("ui","layout","group");let nested=k.child("child");let sibling=FieldPath::new("ui","layout","other");let mut b=Draft::default();b.set_value(&k,Some(json!({})));b.set_value(&sibling,Some(json!("stay")));
+ let mut v=SettingsView{baseline:b.clone(),draft:b,editors:Editors::default(),changes:0};v.draft.set_value(&nested,Some(json!({"title":"new"})));v.editors.fields.insert(nested.clone(),"discard".into());v.editors.fields.insert(sibling.clone(),"keep".into());click(&mut v,&nested,None);assert!(!v.editors.fields.contains_key(&nested));assert!(v.editors.fields.contains_key(&sibling));assert!(v.draft.value(&nested).is_none());
+ println!("{trials} nested edit/reset cycles; {bad} unexpected outgoing module deltas.");if bad>0{std::process::exit(1);}
+}

@@ -1,0 +1,106 @@
+--- a/crates/tabs/src/geometry.rs
++++ b/crates/tabs/src/geometry.rs
+@@ -125,11 +125,20 @@
+     /// The pane right beyond `edge` of `pane`: the closest one along the
+     /// way, then the one sharing the longest border.
+     pub fn neighbor(&self, pane: PaneId, edge: Edge) -> Option<PaneId> {
+-        let from = self.rect(pane)?;
++        Self::neighbor_in(&self.rects(), pane, edge)
++    }
++
++    pub(super) fn neighbor_in(
++        rects: &[(PaneId, Rect)],
++        pane: PaneId,
++        edge: Edge,
++    ) -> Option<PaneId> {
++        let from = rects.iter().find(|(id, _)| *id == pane)?.1;
+         let overlap = |a0: f32, a1: f32, b0: f32, b1: f32| a1.min(b1) - a0.max(b0);
+-        self.rects()
+-            .into_iter()
+-            .filter(|(id, _)| *id != pane)
++        rects
++            .iter()
++            .copied()
++            .filter(|(id, rect)| *id != pane && rect.w > 0. && rect.h > 0.)
+             .filter_map(|(id, to)| {
+                 let (gap, shared) = match edge {
+                     Edge::Right => (
+--- a/crates/tabs/src/ops.rs
++++ b/crates/tabs/src/ops.rs
+@@ -3,6 +3,7 @@
+ //! holding the room of locked neighbours, no single-child or nested
+ //! same-axis splits.
+ 
++use super::geometry::Rect;
+ use super::layout::TabLayout;
+ use super::pane::Pane;
+ use super::tree::{Edge, PaneId};
+@@ -132,7 +133,12 @@
+     /// Moves the focus to the pane beyond `edge` of the focused one;
+     /// returns that pane's active tab.
+     pub fn focus_neighbor(&mut self, edge: Edge) -> Option<String> {
+-        let pane = self.neighbor(self.focused, edge)?;
++        self.focus_neighbor_in(edge, &self.rects())
++    }
++
++    /// Moves focus using the pane rectangles for the rendered layout.
++    pub fn focus_neighbor_in(&mut self, edge: Edge, rects: &[(PaneId, Rect)]) -> Option<String> {
++        let pane = Self::neighbor_in(rects, self.focused, edge)?;
+         self.focus(pane);
+         self.active(pane).map(str::to_string)
+     }
+--- a/crates/tabs/src/tests/tree.rs
++++ b/crates/tabs/src/tests/tree.rs
+@@ -139,6 +139,25 @@
+ }
+ 
+ #[test]
++fn focus_uses_the_visible_neighbor_after_a_locked_split_resizes() {
++    let mut layout = single(&["a", "b", "c", "d", "e"]);
++    layout.split("b", PaneId(0), Edge::Right);
++    layout.split("c", PaneId(0), Edge::Bottom);
++    layout.split("d", PaneId(1), Edge::Top);
++    layout.split("e", PaneId(2), Edge::Bottom);
++    layout.reset(&[0]); // three equal panes at left
++    layout.lock_pane(PaneId(3), true, 1200., 841., 1.); // 420 logical pixels at top right
++    for (height, tab) in [(600., "d"), (1000., "b")] {
++        layout.focus(PaneId(2));
++        let rects = layout.rects_spaced(1200., height, 1.);
++        assert_eq!(
++            layout.focus_neighbor_in(Edge::Right, &rects).as_deref(),
++            Some(tab)
++        );
++    }
++}
++
++#[test]
+ fn resizing_keeps_minimum_sizes() {
+     let mut layout = grid();
+     layout.resize(&[], 0, 0.3, 1., 0.1);
+--- a/src/ui/tabs/mod.rs
++++ b/src/ui/tabs/mod.rs
+@@ -354,7 +354,23 @@
+             return;
+         }
+         let mut next = None;
+-        self.update_tabs(cx, |tabs| next = tabs.focus_neighbor(edge));
++        let area = self
++            .tab_area
++            .get()
++            .filter(|a| a.width > px(0.) && a.height > px(0.));
++        let scale = prefs::scale(cx);
++        self.update_tabs(cx, |tabs| {
++            next = if let Some(area) = area {
++                let rects = tabs.rects_spaced(
++                    area.width.as_f32() / scale,
++                    area.height.as_f32() / scale,
++                    split::DIVIDER,
++                );
++                tabs.focus_neighbor_in(edge, &rects)
++            } else {
++                tabs.focus_neighbor(edge)
++            };
++        });
+         if let Some(id) = next {
+             self.focus_tab(&id, window, cx);
+         }
