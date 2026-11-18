@@ -1,0 +1,59 @@
+use serde_json::{Value,json};
+use widget::Node;
+fn sample(kind: &str, id: &str, action: &str, order: &[&str], current: Option<&str>) -> Value {
+    let mut rows=vec![];
+    for &key in order {
+        let mut row=json!({"id": key,"label": format!("Title {key}")});
+        if kind=="lanes" { row["lane"]=json!(0);row["color"]=json!(0);row["cells"]=json!(["",key]); }
+        if ["lanes","tree","graph"].contains(&kind){row["selected"]=json!(Some(key)==current);}
+        if kind=="graph"{row["x"]=json!(0.0);row["y"]=json!(0.0);row["subtitle"]=json!("note");}
+        rows.push(row);
+    }
+    let mut node=json!({"type":kind,"id":id,"action":action});
+    if kind=="graph"{node["edges"]=json!([]);node["nodes"]=json!(rows);}
+    else {node["rows"]=json!(rows);}
+    if kind=="lanes"{node["columns"]=json!([{"label":"Graph","weight":1,"kind":"graph"},{"label":"Title","weight":2}]);}
+    node
+}
+fn parsed(v:&Value)->Option<Node>{
+    let node:Node=serde_json::from_value(v.clone()).ok()?;
+    node.validate().ok()?;Some(node)
+}
+fn main(){
+    let mut n=0; let mut leaves=0; let mut bad=0;
+    for t in ["tree","list","lanes","graph"]{
+        for a in ["open-details","show-description","произведение.обложка"]{
+            for b in ["sidebar.details","sidebar.note"]{
+                for ord in [&["r1","r2","r3"][..],&["r2","r3","r1"],&["r2"],&[]] {
+                    for s in [None,Some("r1"),Some("r2")]{
+                        let second=sample(t,"sidebar",b,&["sibling"],None);
+                        let first=sample(t,"catalog",a,ord,s);
+                        let node=parsed(&json!({"type":"fill","children":[first,second]})).unwrap();
+                        let Node::Fill{children}=node else{panic!()};
+                        for (i,child) in children.into_iter().enumerate(){
+                            let (id,action)=match child{
+                                Node::Tree{id,action,..}|Node::List{id,action,..}|Node::Lanes{id,action,..}|Node::Graph{id,action,..}=>(id,action),_=>panic!()};
+                            assert_eq!((id.as_str(),action.as_str()),if i==0{("catalog",a)}else{("sidebar",b)});
+                            leaves+=1;
+                        }
+                        n+=1;
+                    }
+                }
+            }
+        }
+        for f in ["action","id"]{
+            let mut missing=sample(t,"catalog","open-details",&["r1"],None);
+            missing.as_object_mut().unwrap().remove(f);assert!(parsed(&missing).is_none());bad+=1;
+            missing[f]=json!({"typo":true});assert!(parsed(&missing).is_none());bad+=1;
+        }
+        let mut invalid=sample(t,"catalog","open-details",&["r1"],Some("r1"));
+        match t {
+            "lanes"=>invalid["rows"][0]["cells"]=json!([]),
+            "list"=>invalid["rows"][0]["selected"]=json!(true),
+            "tree"=>invalid["indent"]=json!(65.),
+            _=>invalid["edges"]=json!([{"from":"r1","to":"missing"}]),
+        }
+        assert!(parsed(&invalid).is_none());bad+=1;
+    }
+    println!("{n} complete two-widget roots ({leaves} retained/sibling declarations) accepted; {bad} invalid controls rejected");
+}

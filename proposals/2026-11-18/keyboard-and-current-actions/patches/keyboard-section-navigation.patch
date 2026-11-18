@@ -1,0 +1,63 @@
+diff --git a/src/declarative/tree.rs b/src/declarative/tree.rs
+index 853d507..9b78a6f 100644
+--- a/src/declarative/tree.rs
++++ b/src/declarative/tree.rs
+@@ -59,7 +59,7 @@ impl Row {
+ pub enum Kind {
+     #[default]
+     Item,
+-    /// A section title: a click folds it, the keyboard passes it by.
++    /// A clickable section title, skipped by the keyboard while any item row remains.
+     Header,
+ }
+ 
+diff --git a/src/ui/extensions/declarative/tree.rs b/src/ui/extensions/declarative/tree.rs
+index 9554d05..01c6c1e 100644
+--- a/src/ui/extensions/declarative/tree.rs
++++ b/src/ui/extensions/declarative/tree.rs
+@@ -233,6 +233,19 @@ impl Tree {
+     }
+ 
+     fn act(&self, event: &'static str, cx: &mut App) {
++        // Only a header-only tree can have keyboard focus on a section.
++        // Navigation stays local; activation uses the section's mouse events.
++        let event = match self.rows.get(self.cursor).filter(|row| row.header()) {
++            Some(_) if event == "preview" => return,
++            Some(row) if matches!(event, "open" | "select") => {
++                if row.expanded == Some(true) {
++                    "collapse"
++                } else {
++                    "expand"
++                }
++            }
++            _ => event,
++        };
+         self.act_at(self.cursor, event, cx);
+     }
+ 
+@@ -248,7 +261,8 @@ impl Tree {
+         } else {
+             backward.or(forward)
+         };
+-        found.unwrap_or(self.cursor)
++        // If no items remain, let the keyboard reach each section to reopen it.
++        found.unwrap_or(index)
+     }
+ 
+     /// Rows under the open branch nearest to the cursor and that branch's
+diff --git a/src/ui/extensions/declarative/tree_row.rs b/src/ui/extensions/declarative/tree_row.rs
+index 8793c15..763dfd0 100644
+--- a/src/ui/extensions/declarative/tree_row.rs
++++ b/src/ui/extensions/declarative/tree_row.rs
+@@ -116,10 +116,7 @@ impl Tree {
+             })
+             .children(checkbox)
+             .when(
+-                index == Some(self.cursor)
+-                    && focused
+-                    && !row.header()
+-                    && crate::ui::kit::keyboard(),
++                index == Some(self.cursor) && focused && crate::ui::kit::keyboard(),
+                 |element| element.child(crate::ui::selection::focus(cx)),
+             )
+             .when_some(hint, |element, hint| element.tip_text(hint));

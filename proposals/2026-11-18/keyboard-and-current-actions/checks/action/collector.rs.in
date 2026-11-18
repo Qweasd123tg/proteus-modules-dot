@@ -1,0 +1,119 @@
+#![allow(dead_code,unused_variables)]
+use std::{rc::Rc,cell::RefCell,collections::HashMap,marker::PhantomData};
+use serde_json::{json,Value};
+type App=Vec<(String,Option<Value>)>;
+struct Context<T>(PhantomData<T>);
+impl<T> Default for Context<T> {fn default()->Self{Self(PhantomData)}}
+impl<T> Context<T>{
+ fn weak_entity(&self)->WeakView{WEAK_VIEWS.with(|n|n.set(n.get()+1));WeakView}
+ fn new<U>(&mut self, f:impl FnOnce(&mut Context<U>)->U)->Entity<U>{Rc::new(RefCell::new(f(&mut Context::default())))}
+}
+thread_local!{static WEAK_VIEWS:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};}
+type Entity<T>=Rc<RefCell<T>>;
+trait Update<T> {fn update<U,V>(&self,cx:&mut Context<U>,f:impl FnOnce(&mut T,&mut Context<T>)->V)->V;}
+impl<T> Update<T> for Entity<T>{fn update<U,V>(&self,_:&mut Context<U>,f:impl FnOnce(&mut T,&mut Context<T>)->V)->V{f(&mut self.borrow_mut(),&mut Context::default())}}
+#[derive(Clone)] struct WeakView;
+struct Sink;
+impl WeakView {fn update<R>(&self,cx:&mut App,f:impl FnOnce(&mut Sink,&mut App)->R)->Result<R,()>{Ok(f(&mut Sink,cx))}}
+impl Sink {fn act(&mut self,name:String,v:Option<Value>,cx:&mut App){cx.push((name,v))}}
+#[derive(Clone,PartialEq,Debug)] struct Row{id:String}
+struct Layout{indent:f32,chevrons:bool,guides:bool}
+trait Kind{fn id(row:&Row)->&str{&row.id}}
+struct LK; impl Kind for LK{}
+struct NK; impl Kind for NK{}
+type List=Rows<LK>; type Lanes=Rows<NK>;
+type RowAction=Rc<dyn Fn(String,&'static str,&mut App)>;
+struct Rows<K>{rows:Vec<Row>,other_ui_state:usize,action:RowAction,k:PhantomData<K>}
+impl<K:Kind> Rows<K>{
+ fn new(rows:Vec<Row>,_:WeakView,_:&mut Context<Self>,action:impl Fn(String,&'static str,&mut App)+'static)->Self{Self{rows,other_ui_state:0,action:Rc::new(action),k:PhantomData}}
+ fn set_rows(&mut self,rows:Vec<Row>,_:&mut Context<Self>){self.rows=rows;}
+ fn set_columns(&mut self,_:&[String],_:&mut Context<Self>){}
+ @@rows_act@@
+}
+struct Tree{rows:Vec<Row>,other_ui_state:usize,action:RowAction}
+impl Tree{
+ fn new(rows:Vec<Row>,_:Layout,_:bool,_:WeakView,_:&mut Context<Self>,action:impl Fn(String,&'static str,&mut App)+'static)->Self{Self{rows,other_ui_state:0,action:Rc::new(action)}}
+ fn set_rows(&mut self,rows:Vec<Row>,_:Layout,_:&mut Context<Self>){self.rows=rows;}
+ @@tree_act@@
+}
+mod graph{
+ use super::*;
+ pub(super) struct Graph{pub nodes:Vec<Row>,pub other_ui_state:usize,selected:Rc<dyn Fn(String,&mut App)>}
+ impl Graph{
+ pub fn new(nodes:Vec<Row>,_:Vec<String>,selected:impl Fn(String,&mut App)+'static)->Self{Self{nodes,other_ui_state:0,selected:Rc::new(selected)}}
+ pub fn set_data(&mut self,nodes:Vec<Row>,_:Vec<String>,_:&mut Context<Self>){self.nodes=nodes;}
+ pub fn click(&self,index:usize,cx:&mut App){let Some(row)=self.nodes.get(index) else{return;};let select=&row.id;let this=self; @@graph_click@@ }
+ }
+}
+enum Node{
+ Graph{id:String,nodes:Vec<Row>,edges:Vec<String>,action:String},
+ Tree{id:String,rows:Vec<Row>,action:String,indent:f32,chevrons:bool,guides:bool},
+ List{id:String,rows:Vec<Row>,action:String},
+ Lanes{id:String,columns:Vec<String>,rows:Vec<Row>,action:String}
+}
+mod ui {
+ use super::*;
+ #[derive(Default)] pub struct Fields{
+ pub graphs:HashMap<String,Entity<graph::Graph>>, pub trees:HashMap<String,Entity<Tree>>,
+ pub lanes:HashMap<String,Entity<Lanes>>,pub lists:HashMap<String,Entity<List>>}
+ #[derive(Default)] pub struct View{pub fields:Fields,pub embedded:bool}
+ impl View {
+ pub fn prepare(&mut self,node:&Node,cx:&mut Context<Self>) {match node{@@arms@@}}
+ @@sender@@
+ }
+}
+use ui::View;
+fn widget(kind:usize,id:&str,a:&str,ids:&[&str])->Node{
+ let id=id.to_owned();let action=a.to_owned();let rows=ids.iter().map(|id|Row{id:id.to_string()}).collect::<Vec<_>>();
+ match kind{0=>Node::List{id,action,rows},1=>Node::Tree{id,action,rows,indent:14.,chevrons:true,guides:true},2=>Node::Lanes{id,action,rows,columns:vec![]},3=>Node::Graph{id,action,nodes:rows,edges:vec![]},_=>unreachable!()}
+}
+fn event(v:&View,k:usize,id:&str,i:usize,e:&'static str,app:&mut App){match k{
+ 0=>v.fields.lists[id].borrow().act_at(i,e,app),1=>v.fields.trees[id].borrow().act_at(i,e,app),
+ 2=>v.fields.lanes[id].borrow().act_at(i,e,app),3=>v.fields.graphs[id].borrow().click(i,app),_=>unreachable!()}}
+macro_rules! with_entity {($v:expr,$k:expr,$id:expr,$fun:ident)=>{match $k{
+ 0=>$fun(&$v.fields.lists[$id]),1=>$fun(&$v.fields.trees[$id]),2=>$fun(&$v.fields.lanes[$id]),3=>$fun(&$v.fields.graphs[$id]),_=>unreachable!()}}}
+fn ptr<T>(e:&Entity<T>)->usize{Rc::as_ptr(e) as usize}
+fn marker(v:&View,k:usize,key:&str,write:bool)->usize {
+ macro_rules! val {($field:ident)=>{{let mut e=v.fields.$field[key].borrow_mut();if write { e.other_ui_state=73+k; }e.other_ui_state}}}
+ match k{0=>val!(lists),1=>val!(trees),2=>val!(lanes),3=>val!(graphs),_=>unreachable!()}
+}
+struct ListClicks;
+impl ListClicks {@@list_clicked@@}
+struct LanesClicks;
+impl LanesClicks {@@lanes_clicked@@}
+fn events(k:usize)->Vec<&'static str>{match k{
+ 0=>vec![ListClicks::clicked(1),ListClicks::clicked(2)],
+ 1=>vec!["select","open","check","expand","collapse"],
+ 2=>vec![LanesClicks::clicked(1),LanesClicks::clicked(2)],
+ 3=>vec!["node"],_=>unreachable!()
+}}
+fn main(){
+ let mut v=View::default();let mut cx=Context::default();
+ let mut cases=0;let mut wrong=0;
+ for k in 0..4{
+ let mut counts=(0,0);
+ for id in ["sidebar","secondary"] {v.prepare(&widget(k,id,"summary", &["a","b"]),&mut cx);}
+ let first=with_entity!(v,k,"sidebar",ptr);marker(&v,k,"sidebar",true);let weak_cnt=WEAK_VIEWS.with(|n|n.get());
+ for (action,ids) in [("summary",vec!["a","b"]),("details",vec!["a","b"]),("details",vec!["b","a"]),("annotation",vec![]),("annotation",vec!["c"]),("summary",vec!["d","c"])] {
+ v.prepare(&widget(k,"sidebar",action,&ids),&mut cx);
+ assert_eq!(first,with_entity!(v,k,"sidebar",ptr));assert_eq!(marker(&v,k,"sidebar",false),73+k);assert_eq!(WEAK_VIEWS.with(|n|n.get()),weak_cnt);
+ for (id,expected,names) in [("sidebar",action,ids.as_slice()),("secondary","summary",["a","b"].as_slice())] {
+ for i in 0..=names.len() { for e in events(k) {
+ let mut app=Vec::new();event(&v,k,id,i,e,&mut app);
+ let want=names.get(i).map(|name|(expected.to_owned(),Some(if k==3{json!(name)}else{json!({"id":name,"event":e})}))).into_iter().collect::<Vec<_>>();
+ counts.0+=1;if app!=want{counts.1+=1;}}
+ }
+ }
+ }
+ println!("{}: {} checks, {} wrong",["list","tree","lanes","graph"][k],counts.0,counts.1);
+ cases+=counts.0; wrong+=counts.1;
+ }
+ // A bare id is not a dispatch key shared across the four kinds.
+ let names=["explain","inspect","examine","describe"];
+ for k in 0..4 { v.prepare(&widget(k,"sidebar",names[k],&["example"]),&mut cx); }
+ for k in 0..4 {let e=events(k)[0];let mut app=Vec::new();event(&v,k,"sidebar",0,e,&mut app);
+ let want=vec![(names[k].to_owned(),Some(if k==3{json!("example")}else{json!({"id":"example","event":e})}))];
+ cases+=1;if app!=want{wrong+=1;}}
+ println!("total: {cases} checks, {wrong} wrong; retained entity, mock local marker and weak-view acquisition count stable on refresh");
+ if wrong!=0{std::process::exit(1);}
+}

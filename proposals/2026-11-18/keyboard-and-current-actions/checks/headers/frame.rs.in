@@ -1,0 +1,57 @@
+type App=Context<Tree>;
+use std::{collections::HashMap,ops::Range,marker::PhantomData};
+#[derive(Clone,Copy,PartialEq)]enum Kind{ Header,Item }
+#[derive(Clone,PartialEq)]struct Row{id:String,kind:Kind,selected:bool,depth:usize,expanded:Option<bool>}
+impl Row{/*HEADER*/}
+struct Fold{id:String,open:bool,gone:Vec<Row>}
+#[derive(Clone,Copy,PartialEq)] struct Layout;
+struct List{scroll:Vec<usize>}
+impl List{fn splice(&mut self,_:Range<usize>,_:usize){} fn scroll_to_reveal_item(&mut self,i:usize){self.scroll.push(i);}}
+struct Context<T>{stops:usize,events:Vec<(String,String)>,pd:PhantomData<T>}
+impl<T> Context<T>{fn notify(&mut self){}fn stop_propagation(&mut self){self.stops+=1}}
+mod motion{pub fn toggled<T>(_:String,_:bool,_:&mut T){}}
+struct Keystroke{ key:String} struct KeyDownEvent{keystroke:Keystroke}
+struct Tree{rows:Vec<Row>,cursor:usize,folds:Vec<Fold>,layout:Layout,list:List}
+impl Tree{
+ fn fold_key(&self,id:&str)->String{id.to_owned()}
+ fn act_at(&self,i:usize,event:&'static str,cx:&mut Context<Self>){if let Some(r)=self.rows.get(i){cx.events.push((r.id.clone(),event.to_owned()));}}
+ fn ring(&self,index:Option<usize>,row:&Row,focused:bool,keyboard:bool)->bool{/*RING*/}
+ /*METHODS*/
+}
+/*FOLDS*/
+fn rows(n:usize,mask:usize,selection:Option<usize>)->Vec<Row>{
+ let mut out=vec![];
+ for i in 0..n{let open=mask&(1<<i)!=0;out.push(Row{id:format!("section:{i}"),kind:Kind::Header,selected:false,depth:0,expanded:Some(open)});
+ if open{out.push(Row{id:format!("file:{i}"),kind:Kind::Item,selected:selection==Some(i),depth:1,expanded:None});}}
+ out
+}
+fn main(){
+ let after=std::env::args().nth(1).unwrap()=="after";let(mut wrong,mut count,mut sigbad,mut ringbad,mut reopened)=(0usize,0,0,0,0);
+ let mut ordinary=vec![];
+ for n in 1..=5{for initial in 0..(1<<n){for sel in 0..=n{ for key in ["up","down","home","end","pageup","pagedown","enter","space","left","right","tab","q"]{
+ let mut t=Tree{rows:vec![],folds:vec![],cursor:0,layout:Layout,list:List{scroll:vec![]}};
+ let mut c=Context{stops:0,events:vec![],pd:PhantomData};
+ let press=|t:&mut Tree,c:&mut Context<Tree>,k:&str|{c.events.clear();c.stops=0;t.key(&KeyDownEvent{keystroke:Keystroke{key:k.into()}},c);};
+ t.set_rows(rows(n,initial,Some(sel)),Layout,&mut c);
+ if initial!=0{press(&mut t,&mut c,key);assert!(c.events.iter().all(|(id,_)|id.starts_with("file:")));
+ ordinary.push((t.cursor,c.stops,c.events.clone(),t.ring(Some(t.cursor),&t.rows[t.cursor],true,true)));}
+ t.set_rows(rows(n,0,None),Layout,&mut c);let at=t.cursor;
+ press(&mut t,&mut c,key);let want=match key{"up"=>at.saturating_sub(1),"down"=>(at+1).min(n-1),"home"|"pageup"=>0,"end"|"pagedown"=>n-1,_=>at};
+ wrong+=usize::from(t.cursor!=want);let expected=match key{"enter"|"space"|"right"=>vec![(format!("section:{at}"),"expand".to_owned())],_=>vec![]};
+ sigbad+=usize::from(c.events!=expected);
+ for (i,r) in t.rows.iter().enumerate(){let lit=t.ring(Some(i),r,true,true);
+ ringbad+=usize::from(lit!=(i==t.cursor));assert!(!t.ring(Some(i),r,false,true)&&!t.ring(Some(i),r,true,false));}
+ count+=1;
+ // Reopening the chosen section starts from its actual ordinary row. No viewer or Git launches.
+ t.set_rows(rows(n,1<<want,None),Layout,&mut c);press(&mut t,&mut c,"enter");
+ assert_eq!(c.events,[(format!("file:{want}"),"open".into())]);reopened+=1;
+ t.set_rows(vec![],Layout,&mut c);press(&mut t,&mut c,key);ordinary.push((t.cursor,c.stops,c.events.clone(),false));
+ }}}}
+ // An already expanded empty header toggles closed on activation, like a click.
+ let mut t=Tree{rows:rows(1,0,None),folds:vec![],cursor:0,layout:Layout,list:List{scroll:vec![]}};
+ t.rows[0].expanded=Some(true);let mut c=Context{stops:0,events:vec![],pd:PhantomData};
+ t.key(&KeyDownEvent{keystroke:Keystroke{key:"space".into()}},&mut c);if after{assert_eq!(c.events,[("section:0".into(),"collapse".into())]);}
+ println!("{count} header-only cases: incorrect cursor {wrong}; incorrect events {sigbad}; missing/wrong ring {ringbad}. CONTROL {reopened} file activations after reopening; {} mixed/empty transcripts {:#018x}",ordinary.len(),serde_free_hash(&format!("{ordinary:?}")));
+ if after{assert_eq!((wrong,sigbad,ringbad),(0,0,0))}else{assert!(wrong>0&&sigbad>0&&ringbad>0)}
+}
+fn serde_free_hash(s:&str)->u64{s.as_bytes().iter().fold(0xcbf29ce484222325,|h,b|(h^u64::from(*b)).wrapping_mul(0x100000001b3))}

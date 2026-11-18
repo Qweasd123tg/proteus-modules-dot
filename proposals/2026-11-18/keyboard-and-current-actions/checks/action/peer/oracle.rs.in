@@ -1,0 +1,55 @@
+pub(super) fn check(){
+use fields::View;
+let mut failures=[0;4];let mut total=[0;4];let mut preserved=0;
+for (kind_idx,ty) in ["tree","list","lanes","graph"].iter().enumerate(){
+let mut v=View::default();let mut view_cx=Context::default();
+let mut last_ids:[Vec<String>;2]=Default::default();let mut last_sel=[None,None];let mut cursor=[0usize;2];let mut ptrs=[None;2];
+let mut prior:Option<Value>=None;
+for step in 0..72 {
+ let all=["a","b","c","d"];let perm= match (step/3)%7{0=>vec![all[0],all[1],all[2]],1=>vec!["c","a","b"],2=>vec!["b","a"],3=>vec!["b"],4=>vec![],5=>vec!["d","a","b"],_=>vec!["a","b","c"]};
+ let controlled= if (step/3)%4==1{Some("b")}else{None};
+ let ids=[perm,vec!["b","c","s"]];let sel=[controlled,None];
+ let actions=[["details","annotation","описание","notes"][step%4],["side","aside"][(step/9)%2]];
+ let names=["catalog","sibling"];
+ let root=json!({"type":"fill","children":[sample(ty,names[0],actions[0],&ids[0],sel[0]),sample(ty,names[1],actions[1],&ids[1],sel[1])]});
+ assert!(prior.as_ref()!=Some(&root));prior=Some(root.clone());
+ let parsed_root=parsed(&root).unwrap(); v.prepare(&parsed_root,&mut view_cx);
+ for which in 0..2{
+ let name=names[which]; let data=&ids[which];
+ let sel_id= if *ty=="tree"||*ty=="lanes"{sel[which].filter(|s|data.contains(s))}else{None};
+ let data_changed=data.iter().copied().ne(last_ids[which].iter().map(String::as_str)) || (!data.is_empty() && sel_id!=last_sel[which]);
+ if data_changed{
+     let prior_row=last_ids[which].get(cursor[which]).map(String::as_str);
+     cursor[which]=sel_id.and_then(|s| data.iter().position(|&key|key==s))
+       .or_else(||prior_row.and_then(|s| data.iter().position(|&key|key==s)))
+       .unwrap_or(cursor[which]).min(data.len().saturating_sub(1));
+ }
+ last_ids[which]=data.iter().map(|s|s.to_string()).collect();last_sel[which]=sel_id;
+ let p=match *ty{
+ "graph"=>Rc::as_ptr(&v.fields.graphs[name])as usize,
+ "tree"=>Rc::as_ptr(&v.fields.trees[name])as usize,
+ "list"=>Rc::as_ptr(&v.fields.lists[name])as usize,
+ _=>Rc::as_ptr(&v.fields.lanes[name])as usize};
+ if let Some(old)=ptrs[which]{assert_eq!(old,p);preserved+=1;}else{ptrs[which]=Some(p);}
+ if *ty=="lanes" {
+ let mut x=v.fields.lanes[name].borrow_mut();
+ if step==0{x.kind.visible[1]=false;x.kind.weights[0]=3.25;}else{assert!(!x.kind.visible[1]);assert_eq!(x.kind.weights[0],3.25);}
+ }
+ // First activate current row. Then move locally, then activate again. Same data + new action
+ // must not jump back to a controlled selected row on an equal-data repaint.
+ for key in ["enter", if (step+which)%2==0 {"down"}else{"home"},"enter"] {
+ let i=&mut cursor[which];match key {"home"=>*i=0,"down"=>*i=(*i+1).min(data.len().saturating_sub(1)),_=>{}}
+ let actual=match *ty{
+ "graph"=>v.fields.graphs[name].borrow().press(*i),"list"=>v.fields.lists[name].borrow_mut().press(key),
+ "lanes"=>v.fields.lanes[name].borrow_mut().press(key),_=>v.fields.trees[name].borrow_mut().press(key)};
+ let event=if key=="enter"{"open"}else if *ty=="tree"{"preview"}else{"select"};
+ let expected= if *ty=="list" && key!="enter" {vec![]}else{
+ data.get(*i).map(|key|{(actions[which].to_owned(),Some(if *ty=="graph"{json!(key)}else{json!({"id":key,"event":event})}))}).into_iter().collect::<Vec<_>>()};
+ total[kind_idx]+=1;if actual!=expected{failures[kind_idx]+=1;if failures[kind_idx]==1{let gesture=if *ty=="graph"{"node click"}else{key};println!("{ty} step {step} {name} {gesture}: {actual:?} instead of {expected:?}");}}
+ }
+ }
+}}
+println!("entities kept {preserved}; events per kind {total:?}; mismatches {failures:?} (Tree,List,Lanes,Graph); Lanes user column controls unchanged");if failures!=[0;4]{std::process::exit(1)}
+}
+}
+fn main(){gui::check();}

@@ -1,0 +1,307 @@
+diff --git a/src/ui/extensions/declarative/fields.rs b/src/ui/extensions/declarative/fields.rs
+index a00b819..98a16d5 100644
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -11,6 +11,38 @@ use std::collections::HashMap;
+ 
+ pub(super) mod textarea;
+ 
++/// A retained widget keeps its event sink, but its current declaration names the action.
++pub(super) struct WidgetAction {
++    name: String,
++    send: Box<dyn Fn(String, serde_json::Value, &mut App)>,
++}
++
++impl WidgetAction {
++    pub(super) fn new(
++        name: &str,
++        send: impl Fn(String, serde_json::Value, &mut App) + 'static,
++    ) -> Self {
++        Self {
++            name: name.to_owned(),
++            send: Box::new(send),
++        }
++    }
++
++    fn rebind(&mut self, name: &str) {
++        if self.name != name {
++            name.clone_into(&mut self.name);
++        }
++    }
++
++    pub(super) fn emit(&self, value: serde_json::Value, cx: &mut App) {
++        (self.send)(self.name.clone(), value, cx);
++    }
++
++    pub(super) fn row(&self, id: &str, event: &'static str, cx: &mut App) {
++        self.emit(serde_json::json!({"id": id, "event": event}), cx);
++    }
++}
++
+ pub(super) enum Text {
+     Line(Entity<InputState>),
+     Area(Entity<TextareaState>),
+@@ -318,17 +350,13 @@ impl DeclarativeView {
+             } => {
+                 if let Some(graph) = self.fields.graphs.get(id) {
+                     graph.update(cx, |graph, cx| {
++                        graph.action.rebind(action);
+                         graph.set_data(nodes.clone(), edges.clone(), cx)
+                     });
+                 } else {
+-                    let (this, action) = (cx.weak_entity(), action.clone());
+-                    let graph = cx.new(|_| {
+-                        super::graph::Graph::new(nodes.clone(), edges.clone(), move |id, cx| {
+-                            let _ = this.update(cx, |this, cx| {
+-                                this.act(action.clone(), Some(serde_json::json!(id)), cx)
+-                            });
+-                        })
+-                    });
++                    let send = self.widget_action(action, cx);
++                    let graph =
++                        cx.new(|_| super::graph::Graph::new(nodes.clone(), edges.clone(), send));
+                     self.fields.graphs.insert(id.clone(), graph);
+                 }
+             }
+@@ -551,9 +579,12 @@ impl DeclarativeView {
+                     guides: *guides,
+                 };
+                 if let Some(tree) = self.fields.trees.get(id) {
+-                    tree.update(cx, |tree, cx| tree.set_rows(rows.clone(), layout, cx));
++                    tree.update(cx, |tree, cx| {
++                        tree.action.rebind(action);
++                        tree.set_rows(rows.clone(), layout, cx);
++                    });
+                 } else {
+-                    let send = self.row_sender(action, cx);
++                    let send = self.widget_action(action, cx);
+                     let view = cx.weak_entity();
+                     let natural = self.embedded;
+                     let tree =
+@@ -569,11 +600,12 @@ impl DeclarativeView {
+             } => {
+                 if let Some(lanes) = self.fields.lanes.get(id) {
+                     lanes.update(cx, |lanes, cx| {
++                        lanes.action.rebind(action);
+                         lanes.set_columns(columns, cx);
+                         lanes.set_rows(rows.clone(), cx);
+                     });
+                 } else {
+-                    let send = self.row_sender(action, cx);
++                    let send = self.widget_action(action, cx);
+                     let view = cx.weak_entity();
+                     let lanes = cx.new(|cx| {
+                         let mut lanes = Lanes::new(rows.clone(), view, cx, send);
+@@ -585,9 +617,12 @@ impl DeclarativeView {
+             }
+             Node::List { id, rows, action } => {
+                 if let Some(list) = self.fields.lists.get(id) {
+-                    list.update(cx, |list, cx| list.set_rows(rows.clone(), cx));
++                    list.update(cx, |list, cx| {
++                        list.action.rebind(action);
++                        list.set_rows(rows.clone(), cx);
++                    });
+                 } else {
+-                    let send = self.row_sender(action, cx);
++                    let send = self.widget_action(action, cx);
+                     let view = cx.weak_entity();
+                     let list = cx.new(|cx| List::new(rows.clone(), view, cx, send));
+                     self.fields.lists.insert(id.clone(), list);
+@@ -615,21 +650,10 @@ impl DeclarativeView {
+ }
+ 
+ impl DeclarativeView {
+-    /// Sends `{id, event}` of a tree, lanes or list row with `action`.
+-    fn row_sender(
+-        &self,
+-        action: &str,
+-        cx: &mut Context<Self>,
+-    ) -> impl Fn(String, &'static str, &mut App) + 'static {
+-        let (this, action) = (cx.weak_entity(), action.to_string());
+-        move |id, event, cx| {
+-            let _ = this.update(cx, |this, cx| {
+-                this.act(
+-                    action.clone(),
+-                    Some(serde_json::json!({"id": id, "event": event})),
+-                    cx,
+-                )
+-            });
+-        }
++    fn widget_action(&self, action: &str, cx: &mut Context<Self>) -> WidgetAction {
++        let this = cx.weak_entity();
++        WidgetAction::new(action, move |name, value, cx| {
++            let _ = this.update(cx, |this, cx| this.act(name, Some(value), cx));
++        })
+     }
+ }
+diff --git a/src/ui/extensions/declarative/graph.rs b/src/ui/extensions/declarative/graph.rs
+index 268025d..19fdbec 100644
+--- a/src/ui/extensions/declarative/graph.rs
++++ b/src/ui/extensions/declarative/graph.rs
+@@ -1,5 +1,6 @@
+ //! Generic interactive graph: local pan, zoom and node dragging.
+ 
++use super::fields::WidgetAction;
+ use crate::declarative::graph::{Edge, Node};
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::{fade::faded, kit, kit::Pressable as _, prefs};
+@@ -25,15 +26,11 @@ pub(super) struct Graph {
+     drag: Option<Drag>,
+     area: Rc<Cell<Option<Bounds<Pixels>>>>,
+     fit: bool,
+-    selected: Rc<dyn Fn(String, &mut App)>,
++    pub(super) action: WidgetAction,
+ }
+ 
+ impl Graph {
+-    pub fn new(
+-        nodes: Vec<Node>,
+-        edges: Vec<Edge>,
+-        selected: impl Fn(String, &mut App) + 'static,
+-    ) -> Self {
++    pub fn new(nodes: Vec<Node>, edges: Vec<Edge>, action: WidgetAction) -> Self {
+         Self {
+             nodes,
+             edges,
+@@ -43,7 +40,7 @@ impl Graph {
+             drag: None,
+             area: Rc::default(),
+             fit: true,
+-            selected: Rc::new(selected),
++            action,
+         }
+     }
+     pub fn set_data(&mut self, nodes: Vec<Node>, edges: Vec<Edge>, cx: &mut Context<Self>) {
+@@ -211,7 +208,7 @@ impl Render for Graph {
+                         }),
+                     )
+                     .on_click(cx.listener(move |this, _, _, cx| {
+-                        (this.selected)(select.clone(), cx);
++                        this.action.emit(select.clone().into(), cx);
+                     }))
+                     .into_any_element()
+             })
+@@ -375,7 +372,8 @@ mod fit_tests {
+     fn empty_graph_quiesces_and_first_data_reenables_fit() {
+         let cx = ::gpui::TestAppContext::single();
+         cx.update(|cx| {
+-            let graph = cx.new(|_| Graph::new(vec![], vec![], |_, _| {}));
++            let graph =
++                cx.new(|_| Graph::new(vec![], vec![], WidgetAction::new("select", |_, _, _| {})));
+             graph.update(cx, |graph, cx| {
+                 graph.area.set(Some(Bounds::new(
+                     point(px(0.), px(0.)),
+diff --git a/src/ui/extensions/declarative/rows.rs b/src/ui/extensions/declarative/rows.rs
+index 8380694..31b5567 100644
+--- a/src/ui/extensions/declarative/rows.rs
++++ b/src/ui/extensions/declarative/rows.rs
+@@ -2,6 +2,7 @@
+ //! cursor that survives new rows, the keyboard, focus, clicks and the row
+ //! menu. Each kind draws its own rows and says what the keys and clicks send.
+ 
++use super::fields::WidgetAction;
+ use crate::declarative::control::MenuItem;
+ use crate::ui::context::RightClickMenu as _;
+ use gpui_kit::component::*;
+@@ -51,7 +52,7 @@ pub(super) struct Rows<K: Kind> {
+     focus: FocusHandle,
+     scroll: UniformListScrollHandle,
+     view: WeakEntity<super::view::DeclarativeView>,
+-    action: super::tree::RowAction,
++    pub(super) action: WidgetAction,
+ }
+ 
+ impl<K: Kind> Rows<K> {
+@@ -59,7 +60,7 @@ impl<K: Kind> Rows<K> {
+         rows: Vec<K::Row>,
+         view: WeakEntity<super::view::DeclarativeView>,
+         cx: &mut Context<Self>,
+-        action: impl Fn(String, &'static str, &mut App) + 'static,
++        action: WidgetAction,
+     ) -> Self {
+         let mut list = Self {
+             kind: K::default(),
+@@ -68,7 +69,7 @@ impl<K: Kind> Rows<K> {
+             focus: cx.focus_handle().tab_stop(true),
+             scroll: UniformListScrollHandle::new(),
+             view,
+-            action: Rc::new(action),
++            action,
+         };
+         list.set_rows(rows, cx);
+         list
+@@ -108,7 +109,7 @@ impl<K: Kind> Rows<K> {
+ 
+     fn act_at(&self, index: usize, event: &'static str, cx: &mut App) {
+         if let Some(row) = self.rows.get(index) {
+-            (self.action)(K::id(row).to_owned(), event, cx);
++            self.action.row(K::id(row), event, cx);
+         }
+     }
+ 
+diff --git a/src/ui/extensions/declarative/tree.rs b/src/ui/extensions/declarative/tree.rs
+index 9554d05..1d7e3de 100644
+--- a/src/ui/extensions/declarative/tree.rs
++++ b/src/ui/extensions/declarative/tree.rs
+@@ -2,6 +2,7 @@
+ //! A branch that opens or closes draws its children as one block that grows
+ //! or shrinks, like every other disclosure.
+ 
++use super::fields::WidgetAction;
+ use crate::declarative::tree::Row;
+ use crate::ui::motion;
+ use gpui_kit::component::v_flex;
+@@ -9,7 +10,6 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ use std::collections::HashMap;
+ use std::ops::Range;
+-use std::rc::Rc;
+ 
+ /// How rows are indented and joined.
+ #[derive(Clone, Copy, PartialEq)]
+@@ -19,9 +19,6 @@ pub(super) struct Layout {
+     pub guides: bool,
+ }
+ 
+-/// Sends an event of the row with this id to the process.
+-pub(super) type RowAction = Rc<dyn Fn(String, &'static str, &mut App)>;
+-
+ pub(super) struct Tree {
+     pub rows: Vec<Row>,
+     pub layout: Layout,
+@@ -33,7 +30,7 @@ pub(super) struct Tree {
+     /// Keeps the motion keys of this tree apart from other trees'.
+     entity: EntityId,
+     pub(super) view: WeakEntity<super::view::DeclarativeView>,
+-    action: RowAction,
++    pub(super) action: WidgetAction,
+     /// Embedded surfaces belong to the host scroller, so small trees render
+     /// existing rows directly instead of requiring a virtual-list viewport.
+     natural: bool,
+@@ -62,7 +59,7 @@ impl Tree {
+         natural: bool,
+         view: WeakEntity<super::view::DeclarativeView>,
+         cx: &mut Context<Self>,
+-        action: impl Fn(String, &'static str, &mut App) + 'static,
++        action: WidgetAction,
+     ) -> Self {
+         let mut tree = Self {
+             rows,
+@@ -73,7 +70,7 @@ impl Tree {
+             folds: Vec::new(),
+             entity: cx.entity_id(),
+             view,
+-            action: Rc::new(action),
++            action,
+             natural,
+         };
+         tree.list.splice(0..0, tree.rows.len());
+@@ -228,7 +225,7 @@ impl Tree {
+ 
+     pub(super) fn act_at(&self, index: usize, event: &'static str, cx: &mut App) {
+         if let Some(row) = self.rows.get(index) {
+-            (self.action)(row.id.clone(), event, cx);
++            self.action.row(&row.id, event, cx);
+         }
+     }
+ 
