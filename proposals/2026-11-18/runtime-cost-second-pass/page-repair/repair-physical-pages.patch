@@ -1,0 +1,66 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 8233554c..5172f332 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -437,13 +437,10 @@ fn rebuild_tools(
+ ) -> Option<AppLatestToolState> {
+     let mut tools = BTreeMap::new();
+     let mut requested = None;
+-    for start in (0..header.transcript.rows).step_by(PAGE_ROWS) {
+-        let rows: Vec<CompactRow> = read_section(
+-            store,
+-            &header.transcript,
+-            start,
+-            (start + PAGE_ROWS).min(header.transcript.rows),
+-        )?;
++    // fresh_header validated the section. Byte-limited pages need not align
++    // with 50-row UI windows: read each physical page once, in stored order.
++    for page in &header.transcript.pages {
++        let rows: Vec<CompactRow> = pages::read_page(store, page)?;
+         for row in rows {
+             if let Some(tool) = row.tool
+                 && accepted(&tool.status)
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index 15c015d4..9f7faeb8 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -122,11 +122,7 @@ pub(in crate::core::session_store::remote::view) fn append_section<
+         .is_some_and(|page| page.rows < PAGE_ROWS && page.bytes < NORMAL_PAGE_BYTES)
+     {
+         let page = pages.pop()?;
+-        let values: Vec<T> = read_content(store, &page.hash)?;
+-        if values.len() != page.rows {
+-            return None;
+-        }
+-        values
++        read_page(store, &page)?
+     } else {
+         vec![]
+     };
+@@ -196,10 +192,7 @@ pub(in crate::core::session_store::remote::view) fn read_section<T: DeserializeO
+         if offset >= end {
+             break;
+         }
+-        let rows: Vec<T> = read_content(store, &page.hash)?;
+-        if rows.len() != page.rows {
+-            return None;
+-        }
++        let rows: Vec<T> = read_page(store, page)?;
+         let lower = start.saturating_sub(offset);
+         let count = (end - offset).min(rows.len()).checked_sub(lower)?;
+         result.extend(rows.into_iter().skip(lower).take(count));
+@@ -208,6 +201,14 @@ pub(in crate::core::session_store::remote::view) fn read_section<T: DeserializeO
+     (result.len() == end - start).then_some(result)
+ }
+ 
++pub(super) fn read_page<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    page: &PageRef,
++) -> Option<Vec<T>> {
++    let rows: Vec<T> = read_content(store, &page.hash)?;
++    (rows.len() == page.rows).then_some(rows)
++}
++
+ pub(super) fn valid_section(section: &Section) -> bool {
+     section.pages.len() <= MAX_PAGES
+         && section.pages.iter().all(|page| {

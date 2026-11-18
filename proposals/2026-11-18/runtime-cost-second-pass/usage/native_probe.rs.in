@@ -1,0 +1,148 @@
+use crate::{Usage, baseline_report as old, report as new};
+use proteus_extension::{Value, ValueExt, json};
+use std::hint::black_box;
+
+fn rows(n: usize, models: usize, salt: usize) -> Vec<Value> {
+    (0..n).map(|i| {
+        let k = (i + salt) % models;
+        let (provider, name) = match k {
+            0 => ("z".to_owned(),"gpt-6-astra".to_owned()),
+            1 => ("a".to_owned(),"gpt-5.6".to_owned()),
+            2 => ("x/y".to_owned(),"z".to_owned()),
+            3 => ("x".to_owned(),"y/z".to_owned()),
+            4 => ("".to_owned(),"".to_owned()),
+            _ => (format!("провайдер-{}",k%7),format!("model-{k}")),
+        };
+        let input=match salt%4 {0=>200,1=>120*(i%5),2=>275000*(i%2),_=>i%311};
+        let details=match (i + salt) % 11 {
+            0=>Value::Null,
+            1=>json!({}),
+            2=>json!({"input_tokens":20,"cached_input_tokens":21}),
+            3=>json!({"input_tokens":123,"output_tokens":3,"reasoning_output_tokens":1}),
+            4=>json!({"input_tokens":"unreported","cached_input_tokens":"n/a"}),
+            _=>json!({"input_tokens":input,"output_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":3}),
+        };
+        json!({"exchange_id":format!("r{}",i%13),"turn_id":format!("t{}",i%3),
+            "started_at_ms":1700000000000usize+i, "status":(["completed","unfinished","error","timeout"][i%4]),
+            "origin":(["direct","auxiliary"][i%2]),"model":{"provider":provider,"model":name},"usage":details})
+    }).collect()
+}
+
+fn signatures(groups:Vec<(String,new::Totals)>)->Vec<(String,String)>{
+    groups.into_iter().map(|(name,t)|(name,format!("{t:?} / {:016x}",t.cost.to_bits()))).collect()
+}
+fn old_signatures(groups:Vec<(String,old::Totals)>)->Vec<(String,String)>{
+    groups.into_iter().map(|(name,t)|(name,format!("{t:?} / {:016x}",t.cost.to_bits()))).collect()
+}
+// Independent group order/membership oracle, valued by the original totals().
+fn reference(rows:&[&Value])->Vec<(String,String)>{
+    let mut names=Vec::<String>::new();
+    let mut members=Vec::<Vec<&Value>>::new();
+    for &r in rows{
+        let m = r.at("model");
+        let name=format!("{}/{}",m.str("provider"),m.str("model"));
+        match names.iter().position(|s|s==&name) {
+            Some(pos)=>members[pos].push(r),
+            None=>{names.push(name);members.push(vec![r]);}
+        }
+    }
+    let totals:Vec<_>=members.iter().map(|r|old::totals(r)).collect();
+    let mut order:Vec<_>=(0..names.len()).collect();
+    order.sort_unstable_by(|&a,&b|(totals[b].input+totals[b].output).cmp(&(totals[a].input+totals[a].output)).then(a.cmp(&b)));
+    order.into_iter().map(|i|{let t=&totals[i];(names[i].clone(),format!("{t:?} / {:016x}",t.cost.to_bits()))}).collect()
+}
+fn state(k:usize)->Usage{
+    Usage{
+        page:(k%3)as i64, model:match k%3 {1=>Some("z/gpt-6-astra".to_owned()),2=>Some("absent".to_owned()),_=>None},
+        period:["all","latest","t1","absent"][k%4].to_owned(),status:["all","missing","problems"][k%3].to_owned(),
+        query:["","gpt","absent"][k%3].to_owned(),order:["oldest","newest","tokens","cost","longest"][k%5].to_owned(),
+        ..Usage::default()
+    }
+}
+#[test]
+fn parity_groups_and_projected_widgets(){
+    let (mut groups,mut widgets)=(0,0);
+    for n in [0,1,2,7,20,21,54]{
+        for m in [1,2,3,5,11,19]{
+            for salt in 0..7{
+                let data=rows(n,m,salt);
+                for variant in 0..3{
+                    let mut r:Vec<_>=data.iter().collect();
+                    if variant==1{r.reverse();}else if variant==2{r.extend(data.iter().rev().take(5));}
+                    let expected=reference(&r); let (ot,nt)=(old::totals(&r),new::totals(&r)); assert_eq!((format!("{ot:?}"),ot.cost.to_bits()),(format!("{nt:?}"),nt.cost.to_bits()));
+                    assert_eq!(old_signatures(old::by_model(&r)),expected);
+                    assert_eq!(signatures(new::by_model(&r)),expected);
+                    groups+=1;
+                }
+                let s=json!({"latest_turn_id":"t2","requests":data});
+                for k in 0..5{
+                    let (mut before,mut after)=(state(k+salt),state(k+salt));
+                    let l=crate::baseline_view::render(&mut before,&s).unwrap();
+                    let r=crate::view::render(&mut after,&s).unwrap();
+                    assert_eq!(serde_json::to_vec(&l).unwrap(),serde_json::to_vec(&r).unwrap());
+                    assert_eq!((before.page,before.period,before.model),(after.page,after.period,after.model));
+                    widgets+=1;
+                }
+            }
+        }
+    }
+    println!("{groups} complete group/order/total observations matched all three implementations (cost to bits); {widgets} full serialized render outputs and adjusted state matched");
+}
+
+#[cfg(not(usage_alloc))]
+fn ns_per_call(mut f:impl FnMut(), repeat:usize)->f64{
+    let start=std::time::Instant::now(); for _ in 0..repeat{f();}
+    start.elapsed().as_nanos() as f64/repeat as f64
+}
+#[cfg(not(usage_alloc))]
+fn paired(label:&str, mut old:impl FnMut(), mut new:impl FnMut(), repeat:usize){
+    let(mut a,mut b)=(Vec::new(),Vec::new());old();new();
+    for i in 0..11{
+        if i%2==0 {a.push(ns_per_call(&mut old,repeat));b.push(ns_per_call(&mut new,repeat));}
+        else {b.push(ns_per_call(&mut new,repeat));a.push(ns_per_call(&mut old,repeat));}
+    }
+    a.sort_by(f64::total_cmp);b.sort_by(f64::total_cmp);
+    println!("{label}: median ns/call {:.1} -> {:.1}; {repeat} calls/sample, 11 alternating pairs",a[5],b[5]);
+}
+#[cfg(usage_alloc)]
+mod alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    #[derive(Clone,Copy,Default,Debug)]
+    pub struct Stats{ pub count:usize, pub live:usize, pub peak:usize }
+    thread_local!{static T:Cell<Option<Stats>>=const{Cell::new(None)};}
+    struct A;
+    fn account(old:usize,new:usize,yes:bool){T.with(|t|if let Some(mut s)=t.get(){
+        s.live=s.live-old+new;s.peak=s.peak.max(s.live);s.count+=usize::from(yes);t.set(Some(s))
+    });}
+    unsafe impl GlobalAlloc for A {
+        unsafe fn alloc(&self,l:Layout)->*mut u8{let p=unsafe{System.alloc(l)};if !p.is_null(){account(0,l.size(),true);}p}
+        unsafe fn dealloc(&self,p:*mut u8,l:Layout){account(l.size(),0,false);unsafe{System.dealloc(p,l)}}
+        unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8{let out=unsafe{System.realloc(p,l,n)};if !out.is_null(){account(l.size(),n,true);}out}
+    }
+    #[global_allocator]static A1:A=A;
+    pub fn measure(f:impl FnOnce())->Stats{T.with(|t|t.set(Some(Stats::default())));f();T.with(|t|t.take().unwrap())}
+}
+#[test]
+fn paired_usage_cost(){
+    for &(n,m,repeat) in &[(0,1,100),(2,1,50),(32,1,15),(80,2,8),(800,2,2),(1200,8,1),(2048,65,1)]{
+        let snap=json!({"requests":rows(n,m,7)});
+        let r:Vec<_>=snap.list("requests").iter().collect(); let distinct=reference(&r).len();
+        let old_group=||{drop(black_box(old::by_model(black_box(&r))));};
+        let new_group=||{drop(black_box(new::by_model(black_box(&r))));};
+        let old_page=||{drop(black_box(crate::baseline_view::render(&mut Usage::default(),black_box(&snap)).unwrap()));};
+        let new_page=||{drop(black_box(crate::view::render(&mut Usage::default(),black_box(&snap)).unwrap()));};
+        assert_eq!(crate::baseline_view::render(&mut Usage::default(),&snap).unwrap(),crate::view::render(&mut Usage::default(),&snap).unwrap());
+        #[cfg(not(usage_alloc))]{
+            paired(&format!("N={n} M={distinct} groups"),old_group,new_group,repeat);
+            paired(&format!("N={n} M={distinct} UI"),old_page,new_page,repeat);
+        }
+        #[cfg(usage_alloc)]{
+            let _=repeat;
+            for (label,l,r) in [("groups",alloc::measure(old_group),alloc::measure(new_group)),("UI",alloc::measure(old_page),alloc::measure(new_page))]{
+                assert_eq!((l.live,r.live),(0,0));
+                println!("N={n} M={distinct} {label}: alloc/realloc requests {} -> {}; peak live requested bytes {} -> {}",l.count,r.count,l.peak,r.peak);
+            }
+        }
+    }
+}
