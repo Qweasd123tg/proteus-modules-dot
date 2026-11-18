@@ -1,0 +1,255 @@
+diff --git a/crates/proteus-core/src/app_server/http.rs b/crates/proteus-core/src/app_server/http.rs
+index cb4dd476..8451f3ac 100644
+--- a/crates/proteus-core/src/app_server/http.rs
++++ b/crates/proteus-core/src/app_server/http.rs
+@@ -482,3 +482,107 @@ where
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++pub(crate) mod round4 {
++    use super::super::{AppEventPublisher, RuntimeEventSink, events::AppSubscription};
++    use super::{AppServerEvent, StdioOutput, encode_sse_output};
++    use crate::{
++        contracts::{EventSink, FilteredEventSink, is_streaming_delta},
++        core::{FanoutEventSink, JsonlEventStore},
++        domain::{Event, EventEnvelope, SessionId},
++    };
++    use std::sync::Arc;
++    pub(crate) struct Tap {
++        pub sink: Arc<dyn EventSink>,
++        published: AppEventPublisher,
++        sub: AppSubscription,
++        root: tempfile::TempDir,
++    }
++    impl Tap {
++        pub async fn new(id: SessionId) -> Self {
++            let published = AppEventPublisher::new(64, id, None);
++            let mut sub = published.subscribe_session();
++            sub.recv().await.unwrap();
++            sub.recv().await.unwrap();
++            let live = Arc::new(RuntimeEventSink::default());
++            assert!(live.0.set(published.clone()).is_ok());
++            let root = tempfile::tempdir().unwrap();
++            let jsonl = Arc::new(JsonlEventStore::new(root.path().join("events.jsonl")));
++            let sink = Arc::new(FanoutEventSink::new(vec![
++                Arc::new(FilteredEventSink::new(jsonl, |e| !is_streaming_delta(e))),
++                live,
++            ]));
++            Self {
++                sink,
++                published,
++                sub,
++                root,
++            }
++        }
++        pub async fn verify(&mut self, text: &str, n: usize) {
++            let (mut d, mut c, mut dx, mut full) = (0, 0, String::new(), String::new());
++            for _ in 0..n + 1 {
++                let event =
++                    tokio::time::timeout(std::time::Duration::from_secs(2), self.sub.recv())
++                        .await
++                        .unwrap()
++                        .unwrap();
++                let wire = encode_sse_output(&StdioOutput::Event {
++                    event: Box::new(event),
++                });
++                let body = std::str::from_utf8(&wire)
++                    .unwrap()
++                    .strip_prefix("event: output\ndata: ")
++                    .unwrap()
++                    .strip_suffix("\n\n")
++                    .unwrap();
++                let StdioOutput::Event { event } = serde_json::from_str(body).unwrap() else {
++                    panic!()
++                };
++                let AppServerEvent::Runtime { envelope } = *event else {
++                    panic!()
++                };
++                match envelope.event {
++                    Event::AssistantTextDelta { text, offset, .. } => {
++                        assert_eq!(offset, dx.len());
++                        d += 1;
++                        dx.push_str(&text);
++                    }
++                    Event::AssistantMessageCompleted { text, .. } => {
++                        c += 1;
++                        full = text;
++                    }
++                    _ => panic!(),
++                }
++            }
++            assert_eq!(d, n);
++            assert_eq!(c, 1);
++            assert_eq!(full, text);
++            if n > 0 {
++                assert_eq!(dx, text);
++            }
++            let rows = self.published.session_snapshot().unwrap().transcript;
++            assert_eq!(rows.len(), 1);
++            assert_eq!(rows[0].text, text);
++            assert!(!rows[0].streaming);
++            let file = std::fs::read_to_string(self.root.path().join("events.jsonl")).unwrap();
++            let jsonl: Vec<EventEnvelope> = file
++                .lines()
++                .map(|line| serde_json::from_str(line).unwrap())
++                .collect();
++            assert_eq!(jsonl.len(), 1);
++            assert!(
++                matches!(&jsonl[0].event,Event::AssistantMessageCompleted{text:t,..} if t==text)
++            );
++            eprintln!(
++                "R4 transport deltas={d} delta_bytes={} completed={c} completed_bytes={} encoded_frames={} client_envelope_decodes={} durable_eventlog_rows={} progress_final_rows=1",
++                dx.len(),
++                full.len(),
++                d + c,
++                d + c,
++                jsonl.len()
++            );
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/bound_model/presentation.rs b/crates/proteus-core/src/core/bound_model/presentation.rs
+index 50ccabb8..e1cd118a 100644
+--- a/crates/proteus-core/src/core/bound_model/presentation.rs
++++ b/crates/proteus-core/src/core/bound_model/presentation.rs
+@@ -122,6 +122,8 @@ impl ModelExecutionBinding {
+     ) -> bool {
+         let state = completed.entry(message.id).or_default();
+         let reasoning = message.reasoning_text();
++        #[cfg(test)]
++        let reasoning_len = reasoning.len();
+         // Anonymous summaries have already been published as progress, but cannot
+         // be associated honestly with any canonical item. Identified reasoning
+         // still owns its completion; terminal-only reasoning has no prior progress.
+@@ -145,6 +147,8 @@ impl ModelExecutionBinding {
+             }
+         }
+         let text = message.display_text();
++        #[cfg(test)]
++        eprintln!("R4 projection display_len={} reasoning_len={}", text.len(), reasoning_len);
+         let identity = (message.phase, text);
+         if !identity.1.is_empty() && state.text.as_ref() != Some(&identity) {
+             state.text = Some(identity.clone());
+diff --git a/crates/proteus-core/src/core/model_service.rs b/crates/proteus-core/src/core/model_service.rs
+index e4cc2755..717f4460 100644
+--- a/crates/proteus-core/src/core/model_service.rs
++++ b/crates/proteus-core/src/core/model_service.rs
+@@ -209,6 +209,116 @@ mod tests {
+         )
+     }
+ 
++    #[tokio::test]
++    async fn round4_projection_trace() {
++        use crate::{
++            app_server::http::round4::Tap,
++            contracts::ExecutionAttribution,
++            core::{JournalEntry, SessionExecutionRecorder, SessionStore, TurnOpened},
++            domain::AgentTask,
++        };
++        for (shape, chunked, tagged) in [
++            ("terminal", false, false),
++            ("deltas-terminal", true, false),
++            ("deltas-completed-terminal", true, true),
++        ] {
++            // Deliberately invalid as JSON. The answer must remain uninterpreted
++            // text, byte for byte, including fences, braces and UTF-8.
++            let chunks = ["{\"answer\":", " не JSON ", "\n```rust\n", "x()\n```"];
++            let text = chunks.concat();
++            let message = CanonicalMessage::text(MessageRole::Assistant, text.clone());
++            let mut events = Vec::new();
++            if chunked {
++                for c in chunks {
++                    events.push(ModelStreamEvent::TextDelta {
++                        message_id: message.id,
++                        phase: None,
++                        text: c.into(),
++                    });
++                }
++            }
++            if tagged {
++                events.push(ModelStreamEvent::MessageCompleted {
++                    message: message.clone(),
++                });
++            }
++            events.push(ModelStreamEvent::Response {
++                response: CanonicalModelResponse::new(message.clone(), vec![], FinishReason::Stop),
++            });
++            let message = if tagged {
++                let file =
++                    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/r4-provider.json")).unwrap();
++                events = serde_json::from_slice(&file).unwrap();
++                let Some(ModelStreamEvent::Response { response }) = events.last() else {
++                    panic!()
++                };
++                response.messages[0].clone()
++            } else {
++                message
++            };
++            let root = tempfile::tempdir().unwrap();
++            let session = new_session_id();
++            let thread = new_thread_id();
++            let turn = new_turn_id();
++            let scope = ExecutionScope::fresh(CancellationToken::new());
++            let exec = scope.execution_id;
++            let store = SessionStore::new(
++                crate::test_support::storage(std::path::Path::new(".")),
++                root.path(),
++                root.path(),
++                session,
++            )
++            .unwrap();
++            store
++                .append_execution_journal_entry(
++                    ExecutionAttribution::for_turn(exec, session, thread, turn),
++                    JournalEntry::TurnOpened(TurnOpened {
++                        intent: None,
++                        task: AgentTask::new("round4", root.path().to_owned()),
++                        base_history_revision: 0,
++                        module_epoch: 0,
++                        config_snapshot: serde_json::json!({}),
++                    }),
++                )
++                .await
++                .unwrap();
++            let mut tap = Tap::new(session).await;
++            let model = BoundModel::new(
++                Arc::new(ModelService::new(Arc::new(ScriptedAdapter::new(events)))),
++                ModelExecutionBinding::for_turn(
++                    scope,
++                    Arc::new(EventEmitter::new(tap.sink.clone())),
++                    session,
++                    thread,
++                    turn,
++                    Arc::new(SessionExecutionRecorder::for_turn(
++                        store.clone(),
++                        exec,
++                        thread,
++                        turn,
++                    )),
++                ),
++                0,
++            );
++            eprintln!("R4 begin {shape}");
++            let result = model.complete(sample_request()).await.unwrap();
++            assert_eq!(result.messages, vec![message.clone()]);
++            tap.verify(&text, if chunked { chunks.len() } else { 0 })
++                .await;
++            let journal = store.load_records().unwrap();
++            let completed=journal.iter().filter(|r| matches!(&r.entry, JournalEntry::ModelMessageRecorded(v) if v.message == message)).count();
++            let terminal = journal
++                .iter()
++                .filter(|r| matches!(&r.entry, JournalEntry::ModelResponseRecorded(_)))
++                .count();
++            assert_eq!(completed, usize::from(tagged));
++            assert_eq!(terminal, 1);
++            eprintln!(
++                "R4 journal item_completed={completed} terminal_response={terminal}; end {shape}"
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn response_tool_surface_must_match_the_shaped_request() {
+         let call = ToolCall::new(new_call_id(), "apply_patch", serde_json::json!(""))

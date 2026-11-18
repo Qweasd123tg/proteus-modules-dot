@@ -1,0 +1,54 @@
+#![allow(dead_code)]
+use std::cell::Cell;
+use std::hint::black_box;
+use std::io::{self, Read};
+use markup5ever_rcdom::RcDom;
+thread_local!{static COUNTS:Cell<(usize,usize)>=const{Cell::new((0,0))};}
+struct Meter<R>(R);
+impl<R> Meter<R>{fn new(r:R)->Self{COUNTS.with(|c|{let (k,b)=c.get();c.set((k+1,b));});Self(r)}}
+impl<R:Read> Read for Meter<R>{fn read(&mut self,b:&mut [u8])->io::Result<usize>{let n=self.0.read(b)?;COUNTS.with(|c|{let (k,b)=c.get();c.set((k,b+n));});Ok(n)}}
+mod before { BEFORE }
+mod after { AFTER }
+type F=fn(&str)->std::io::Result<RcDom>;
+fn observe(d:&RcDom)->String{format!("{:?} / {:?} / {:?}",d.document,d.quirks_mode,d.errors)}
+#[cfg(count_calls)]
+fn observe_calls(f:F,s:&str)->(String,usize,usize){COUNTS.with(|c|c.set((0,0)));let d=f(s).unwrap();let(k,b)=COUNTS.with(|c|c.get());(observe(&d),k,b)}
+fn med(f:F,s:&str,n:usize)->f64{let t=std::time::Instant::now();for _ in 0..n{drop(black_box(f(black_box(s)).unwrap()));}t.elapsed().as_nanos()as f64/n as f64}
+fn main(){
+ let a:Vec<String>=std::env::args().collect();let raw=std::fs::read_to_string(&a[2]).unwrap();
+ let cases:Vec<(String,String)>=raw.lines().map(|x|serde_json::from_str(x).unwrap()).collect();
+ let funcs:[F;2]=[before::measure::dom,after::measure::dom];
+ match a[1].as_str(){
+ "parity"=>{let mut sums=std::collections::BTreeMap::<String,[usize;6]>::new();
+ for (label,source) in &cases{
+  #[cfg(count_calls)]{
+  let (s1,n1,b1)=observe_calls(funcs[0],source);let (s2,n2,b2)=observe_calls(funcs[1],source);assert_eq!(s1,s2);
+  let g=sums.entry(label.clone()).or_default();g[0]+=1;g[1]+=usize::from(n2==1);g[2]+=n1;g[3]+=n2;g[4]+=b1;g[5]+=b2;
+  }
+  #[cfg(not(count_calls))]assert_eq!(observe(&funcs[0](source).unwrap()),observe(&funcs[1](source).unwrap()));
+ }println!("full RcDom debug structure, errors and quirks equal: {}",cases.len());println!("{{label: [cases,hits,old calls,new calls,old actual bytes read,new actual bytes read]}}");println!("{}",serde_json::to_string(&sums).unwrap());}
+ "times"=>{for label in ["plain53","plain53url","sentence53","sentence53url","plain","markdown","large-hit","large-miss"]{
+ let s=&cases.iter().find(|(n,_)|n==label).unwrap().1;let n=if s.len()<4096{400}else if s.len()<100000{8}else{2};let(mut x,mut y)=(vec![],vec![]);
+ for i in 0..13{if i%2==0{x.push(med(funcs[0],s,n));y.push(med(funcs[1],s,n));}else{y.push(med(funcs[1],s,n));x.push(med(funcs[0],s,n));}}
+ x.sort_by(f64::total_cmp);y.sort_by(f64::total_cmp);
+ println!("{label}: {} B; median ns {:.0} -> {:.0}; {} calls/sample, 13 alternating pairs",s.len(),x[6],y[6],n);
+ }}
+ "once"=>{let f=funcs[a[3].parse::<usize>().unwrap()];let s=&cases[0].1;for _ in 0..3{drop(black_box(f(black_box(s)).unwrap()));}let p=std::fs::read_to_string("/proc/self/status").unwrap();println!("{}",p.lines().find(|v|v.starts_with("VmHWM:")).unwrap());}
+ #[cfg(alloc_probe)] "alloc"=>{for(label,s) in &cases{
+ drop(funcs[0](s).unwrap());drop(funcs[1](s).unwrap());
+ let stat=|f:F|{alloc::start();let d=black_box(f(black_box(s)).unwrap());let retained=alloc::read().live;drop(d);let v=alloc::end();assert_eq!(v.live,0);(v.count,v.peak,retained)};
+ println!("{} {} B: (calls, peak requested live B, returned tree live B) {:?} -> {:?}",label,s.len(),stat(funcs[0]),stat(funcs[1]));}}
+ _=>panic!()
+ }
+}
+#[cfg(alloc_probe)]
+mod alloc{
+use std::{alloc::{GlobalAlloc,Layout,System},cell::Cell};
+#[derive(Clone,Copy,Default)]pub struct S{pub count:usize,pub live:usize,pub peak:usize}
+thread_local!{static T:Cell<Option<S>>=const{Cell::new(None)};}
+fn acct(old:usize,new:usize,yes:bool){T.with(|t|if let Some(mut s)=t.get(){s.count+=usize::from(yes);s.live=s.live-old+new;s.peak=s.peak.max(s.live);t.set(Some(s));});}
+struct A;unsafe impl GlobalAlloc for A{
+unsafe fn alloc(&self,l:Layout)->*mut u8{let p=unsafe{System.alloc(l)};if !p.is_null(){acct(0,l.size(),true);}p}
+unsafe fn dealloc(&self,p:*mut u8,l:Layout){acct(l.size(),0,false);unsafe{System.dealloc(p,l)}}
+unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8{let p=unsafe{System.realloc(p,l,n)};if !p.is_null(){acct(l.size(),n,true);}p}}
+#[global_allocator]static A1:A=A;pub fn start(){T.with(|t|t.set(Some(S::default())));}pub fn read()->S{T.with(|t|t.get().unwrap())}pub fn end()->S{T.with(|t|t.take().unwrap())}}
