@@ -1,0 +1,113 @@
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -54,6 +54,10 @@
+     pub state: Text,
+     pub settings: bool,
+     pub grow: bool,
++    // Bindings may change while the native field with this id stays mounted.
++    action: String,
++    submit: Option<String>,
++    lines: usize,
+     value: String,
+     placeholder: String,
+     _subscription: Subscription,
+@@ -343,7 +347,15 @@
+             } => {
+                 let grow = settings && *lines > 1;
+                 if let Some(input) = self.fields.inputs.get_mut(id) {
+-                    let layout_changed = input.grow != grow || input.value != *value;
++                    let layout_changed =
++                        input.grow != grow || input.lines != *lines || input.value != *value;
++                    if input.action != *action {
++                        input.action.clone_from(action);
++                    }
++                    if input.submit != *submit {
++                        input.submit.clone_from(submit);
++                    }
++                    input.lines = *lines;
+                     input.settings = settings;
+                     input.grow = grow;
+                     if input.placeholder != *placeholder {
+@@ -361,36 +373,30 @@
+                     }
+                 } else {
+                     let multi = *lines > 1;
+-                    let (action, submit, identity) = (action.clone(), submit.clone(), id.clone());
++                    let identity = id.clone();
+                     let handle =
+                         move |this: &mut DeclarativeView,
+                               text: SharedString,
+                               event: &InputEvent,
+                               cx: &mut Context<DeclarativeView>| {
+-                            match event {
+-                                InputEvent::Change
+-                                    if this
+-                                        .fields
+-                                        .inputs
+-                                        .get(&identity)
+-                                        .is_some_and(|input| input.value != text.as_ref()) =>
+-                                {
+-                                    this.act(
+-                                        action.clone(),
+-                                        Some(serde_json::json!(text.to_string())),
+-                                        cx,
+-                                    )
++                            let Some(input) = this.fields.inputs.get(&identity) else {
++                                return;
++                            };
++                            let action = match event {
++                                InputEvent::Change if input.value != text.as_ref() => {
++                                    Some(&input.action)
+                                 }
+                                 InputEvent::PressEnter { secondary, .. } if *secondary == multi => {
+-                                    if let Some(submit) = &submit {
+-                                        this.act(
+-                                            submit.clone(),
+-                                            Some(serde_json::json!(text.to_string())),
+-                                            cx,
+-                                        )
+-                                    }
++                                    input.submit.as_ref()
+                                 }
+-                                _ => {}
++                                _ => None,
++                            };
++                            if let Some(action) = action {
++                                this.act(
++                                    action.clone(),
++                                    Some(serde_json::json!(text.to_string())),
++                                    cx,
++                                );
+                             }
+                         };
+                     let (state, subscription) = if multi {
+@@ -401,14 +407,12 @@
+                             input.set_value(value.clone(), window, cx);
+                             input
+                         });
+-                        let (input_id, min_rows) = (id.clone(), *lines);
++                        let input_id = id.clone();
+                         let subscription = cx.subscribe(&state, move |this, state, event, cx| {
+-                            if matches!(event, InputEvent::Change) {
+-                                let grow = this
+-                                    .fields
+-                                    .inputs
+-                                    .get(&input_id)
+-                                    .is_some_and(|input| input.grow);
++                            if matches!(event, InputEvent::Change)
++                                && let Some(input) = this.fields.inputs.get(&input_id)
++                            {
++                                let (min_rows, grow) = (input.lines, input.grow);
+                                 textarea::resize(&state, min_rows, grow, cx);
+                                 if grow && textarea::preview(&state.read(cx).value()).is_some() {
+                                     this.fields
+@@ -439,6 +443,9 @@
+                             state,
+                             settings,
+                             grow,
++                            action: action.clone(),
++                            submit: submit.clone(),
++                            lines: *lines,
+                             value: value.clone(),
+                             placeholder: placeholder.clone(),
+                             _subscription: subscription,

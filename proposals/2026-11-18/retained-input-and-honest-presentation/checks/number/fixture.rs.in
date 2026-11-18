@@ -1,0 +1,29 @@
+use serde_json::{Value,json};
+//SOURCE
+fn number(s:&str)->Value{parse_text(TextFormat::Number,s).unwrap().unwrap()}
+fn exact(v:&Value,expected:i128)->bool{
+ let n=v.as_number().unwrap();
+ if let Some(i)=n.as_i64(){ return i as i128==expected; }
+ if let Some(u)=n.as_u64(){ return u as i128==expected; }
+ n.as_f64().is_some_and(|x|x as i128==expected)
+}
+fn main(){
+ let mut cases=vec![0i128,1,-1,42,i64::MIN as i128,i64::MAX as i128,u64::MAX as i128];
+ for e in 0..=64u32{for delta in -9..=9i128{let v=(1i128<<e)+delta;cases.extend([v,-v]);}}
+ cases.retain(|&v|v>=i64::MIN as i128 && v<=u64::MAX as i128);cases.sort();cases.dedup();
+ let mut failures=0;
+ for &v in &cases {
+   let orig=Value::Number(serde_json::Number::from_i128(v).unwrap()); let text=format_value(TextFormat::Number,&orig);
+   let parsed=number(&text);failures+=(!exact(&parsed,v)) as usize;
+   if v==(v as f64)as i128{assert_eq!(parsed,json!(v as f64));}
+ }
+ for text in ["42","42.0","0.5","-0","0.000000125","2.3e2"," 7.5 ","+.5",".25","2.","+003"]{
+   let want=serde_json::Number::from_f64(text.trim().parse::<f64>().unwrap()).unwrap();
+   assert_eq!(number(text),Value::Number(want));
+ }
+ assert_eq!(parse_text(TextFormat::Number,"  ").unwrap(),None);assert!(parse_text(TextFormat::Number,"1x").is_err());
+ let example=9_007_199_254_740_993i64;let text=format_value(TextFormat::Number,&json!(example));
+ println!("Number, displayed {text} -> edited draft value {}",number(&text));
+ println!("{} exact integer spellings tested; {failures} numeric magnitude changes.",cases.len());
+ if failures>0 {std::process::exit(1);}
+}

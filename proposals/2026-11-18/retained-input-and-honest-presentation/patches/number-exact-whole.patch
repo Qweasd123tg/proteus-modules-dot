@@ -1,0 +1,23 @@
+diff --git a/src/settings/schema.rs b/src/settings/schema.rs
+index 1a79911..9dd7b99 100644
+--- a/src/settings/schema.rs
++++ b/src/settings/schema.rs
+@@ -172,7 +172,17 @@ pub fn parse_text(format: TextFormat, text: &str) -> Result<Option<Value>, Strin
+         TextFormat::Number => trimmed
+             .parse::<f64>()
+             .ok()
+-            .and_then(serde_json::Number::from_f64)
++            .and_then(|number| {
++                // Preserve the existing representation unless binary64 would round
++                // an integer spelling that JSON can store exactly.
++                if let Ok(whole) = trimmed.parse::<i128>()
++                    && whole != number as i128
++                    && let Some(exact) = serde_json::Number::from_i128(whole)
++                {
++                    return Some(exact);
++                }
++                serde_json::Number::from_f64(number)
++            })
+             .map(|number| Some(Value::Number(number)))
+             .ok_or_else(|| "Нужно число".to_string()),
+         TextFormat::Line | TextFormat::Secret | TextFormat::Multiline => {

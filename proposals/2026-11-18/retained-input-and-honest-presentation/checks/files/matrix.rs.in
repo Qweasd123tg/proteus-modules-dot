@@ -1,0 +1,84 @@
+use std::{collections::{HashMap,HashSet,VecDeque},cell::Cell};
+const EXPAND_ALL:usize=256; const CHAIN:usize=32;
+mod paths{/*PATHS*/}
+thread_local!{static SCANS:Cell<usize>=const{Cell::new(0)};}
+#[derive(Clone,PartialEq)] enum Kind{Directory,File,Symlink}
+#[derive(Clone)]struct Entry{kind:Kind,path:String}
+#[derive(Clone)]struct Entries(Vec<Entry>);
+impl Entries {fn iter(&self)->impl Iterator<Item=&Entry>{self.0.iter().inspect(|_|SCANS.set(SCANS.get()+1))}}
+#[derive(Clone)]struct Listing{entries:Entries}
+type Loader<'a>=dyn FnMut(&str)->Result<Listing,()>+'a;
+#[derive(Default)]struct Project{listings:HashMap<String,Option<Listing>>,expanded:HashSet<String>,heads:HashMap<String,String>}
+impl Project{
+/*LISTING*/
+/*A*/
+/*B*/
+}
+const ROOT:&str="base/fold/root";
+fn entry(kind:Kind,s:&str)->Entry{Entry{kind,path:s.to_owned()}}
+fn oracle(f:&HashMap<String,Option<Listing>>,expanded:&HashSet<String>,cached:&HashMap<String,Option<Listing>>,head:bool)->(HashSet<String>,Vec<String>){
+ let(mut expanded,mut cache,mut reads)=(expanded.clone(),cached.clone(),vec![]);
+ if head{expanded.extend(["base/fold".to_owned()]);}
+ let mut remaining=256_usize;
+ let mut level=vec![ROOT.to_owned()];
+ for depth in 0..=32{
+   let mut next=vec![];
+   for path in level.into_iter().take(remaining){
+    remaining-=1;expanded.insert(path.clone());
+    let list=cache.entry(path.clone()).or_insert_with(||{reads.push(path.clone());f.get(&path).cloned().flatten()});
+    if depth<32 { if let Some(list)=list{
+      for e in &list.entries.0 { if e.kind==Kind::Directory{next.push(e.path.clone());}}
+    }}
+   }
+   if remaining==0||next.is_empty(){break}
+   level=next;
+ }
+ (expanded,reads)
+}
+fn test(f:&HashMap<String,Option<Listing>>,extras:usize,pre:usize,head:bool)->(usize,usize,usize){
+ let mut keys:Vec<_>=f.keys().cloned().collect(); keys.sort();
+ let expanded:HashSet<String>=keys.iter().skip(2).step_by(extras.max(1)).cloned().chain(["unrelated".into(),String::new()]).collect();
+ let cached=if pre>0{keys.iter().enumerate().filter(|(i,_)|i%pre==1).map(|(i,k)|(k.clone(),if i%13==0{None}else{f[k].clone()})).collect()}else{HashMap::new()};
+ let (expected,reads)=oracle(f,&expanded,&cached,head);
+ let mut counts=[0;2];
+ for n in 0..2{
+  let mut p=Project{expanded:expanded.clone(),listings:cached.clone(),heads:if head{HashMap::from([(ROOT.into(),"base/fold".into())])}else{HashMap::new()}};
+  let mut seen=vec![];let mut load=|s:&str|{seen.push(s.to_string());f.get(s).cloned().flatten().ok_or(())};
+  SCANS.set(0);
+  if n==0{p.expand_a(ROOT,&mut load)}else{p.expand_b(ROOT,&mut load)};
+  counts[n]=SCANS.get();assert_eq!(expected,p.expanded);assert_eq!(reads,seen);assert!(seen.len()<=256);
+ }
+ assert!(counts[1]<=counts[0]);(reads.len(),counts[0],counts[1])
+}
+struct Rng(u32);impl Rng{fn next(&mut self)->usize{self.0=self.0.wrapping_mul(1664525).wrapping_add(1013904223);(self.0>>5) as usize}}
+fn broad(n:usize,seed:u32)->HashMap<String,Option<Listing>>{
+ let mut r=Rng(seed);let mut f=HashMap::new();let mut root_entries=vec![];
+ for i in 0..n{
+   let key=format!("{ROOT}/d{i:04}");
+   let mut leafs=Vec::new();
+   for j in 0..(1+r.next()%11){let leaf=format!("{key}/l{j:02}");leafs.push(entry(Kind::Directory,&leaf));
+      f.insert(leaf,Some(Listing{entries:Entries(vec![])}));}
+   if i%13==0{leafs.push(entry(Kind::Directory,&key))}
+   root_entries.push(entry(Kind::Directory,&key));
+   if r.next()%7==0{root_entries.push(entry(Kind::Directory,&key));}
+   root_entries.push(entry(if i%2==0{Kind::File}else{Kind::Symlink},&format!("ignore_{i}")));
+   f.insert(key,if i%17==6{None}else{Some(Listing{entries:Entries(leafs)})});
+ }
+ // Vary supplied order: lexical, backwards, and deliberately intermixed.
+ match seed%3 {0=>root_entries.sort_by(|a,b|a.path.cmp(&b.path)),1=>root_entries.reverse(),_=>{}}
+ f.insert(ROOT.to_owned(),Some(Listing{entries:Entries(root_entries)})); f
+}
+fn main(){
+ let mut cases=0;let mut listed=0;let mut total_scans=[0,0];
+ for n in [0,1,2,19,63,128,254,255,256,257,511]{for seed in 0..12{
+   let f=broad(n,seed);for pre in [0,5,9]{for head in [false,true]{
+     let(z,a,b)=test(&f,5+(seed as usize),pre,head);cases+=1;listed+=z;total_scans[0]+=a;total_scans[1]+=b;
+   }}
+ }}
+ for depth in [0,31,32,33,49]{let mut f=HashMap::new();let mut path=ROOT.to_owned();
+   for _ in 0..depth{let child=format!("{path}/a");f.insert(path,Some(Listing{entries:Entries(vec![entry(Kind::Directory,&child)])}));path=child;}
+   let(z,_,_)=test(&f,3,0,true);assert_eq!(z,(depth+1).min(33));cases+=1;listed+=z;
+ }
+ let f=broad(4096,1);let(z,a,b)=test(&f,7,0,true);assert!(a>9000&&b<600);
+ println!("{} oracle cases / {} ordered in-memory loader calls per version; scanned entries in 792 breadth cases {} -> {}. Wide 4,096-directory (plus other entries) reversed fixture: {} identical ordered loader calls, {} -> {} visits to listing entries.",cases,listed,total_scans[0],total_scans[1],z,a,b);
+}

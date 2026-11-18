@@ -1,0 +1,25 @@
+use serde_json::Value;
+struct ConfigField{value:ConfigValueSchema}
+enum ConfigValueSchema{Array{items:Box<Self>},Enum{options:Vec<OptionItem>},Other}
+struct OptionItem{value:Value,title:String}
+fn field(options:&[(&str,&str)])->ConfigField{ConfigField{value:ConfigValueSchema::Array{items:Box::new(ConfigValueSchema::Enum{options:options.iter().map(|(k,t)| OptionItem{value:Value::from(*k),title:(*t).into()}).collect()})}}}
+SOURCE
+fn main(){
+ let keys=["one","Два","e\u{301}","é"," X ","✶"];
+ let mut success=0; let mut cases=0; let mut controls=0;
+ // Rotating order and all combinations of labels exercise ambiguity in both directions.
+ for i in 0..6{for shift in 0..6{for mix in 0..6{
+  let opts:Vec<_>=(0..6).map(|j|{let k=(j+i)%6; let title=if k==mix{"Shown"}else{keys[(k+shift)%6]};(keys[k],title)}).collect();
+  let f=field(&opts);
+  for key in keys{let visible=tag_label(&Value::from(key)); if added_value(&f,&visible)==Some(Value::from(key)){success+=1;} cases+=1;}
+  for t in ["Shown","Case"," whitespace ","🐾", "ONE"]{let expected=opts.iter().find(|(_,title)|*title==t).map(|x|x.0).unwrap_or(t);assert_eq!(added_value(&f,t),Some(Value::from(expected)));controls+=1;}
+  assert_eq!(added_value(&f,""),None); controls+=1;
+ }}}
+ let chosen=field(&[("dense","Compact"),("Compact","Compact view")]); println!("typing ambiguous Compact -> {:?}",added_value(&chosen,"Compact"));
+ // A free stored value matching a title is not itself a listed canonical key.
+ assert_eq!(added_value(&chosen,"Compact view"),Some(Value::from("Compact")));
+ let duplicate=field(&[("first","Welcome"),("second","Welcome")]);assert_eq!(added_value(&duplicate,"Welcome"),Some(Value::from("first")));
+ let free=ConfigField{value:ConfigValueSchema::Other};assert_eq!(added_value(&free,"déjà"),Some(Value::from("déjà")));
+ println!("Canonical re-entry {success}/{cases}; invariant controls {}/{}.",controls+3,controls+3);
+ if cases!=success{std::process::exit(1)}
+}

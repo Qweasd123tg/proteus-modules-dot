@@ -1,0 +1,16 @@
+--- a/src/ui/picker.rs
++++ b/src/ui/picker.rs
+@@ -225,7 +225,12 @@
+                     .scroll_to_item(self.cursor, ScrollStrategy::Nearest);
+                 cx.notify();
+             }
+-            "enter" => {
++            // Search and Back are real header buttons: their focused Enter
++            // must reach the native press/release handler, not commit a row.
++            "enter"
++                if self.list_focus.is_focused(window)
++                    || self.search_focus(cx).is_focused(window) =>
++            {
+                 if let Some(choice) = self.current() {
+                     (self.pick)(choice.value.clone(), window, cx);
+                 }
