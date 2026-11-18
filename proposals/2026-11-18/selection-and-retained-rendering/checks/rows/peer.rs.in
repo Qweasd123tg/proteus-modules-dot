@@ -1,0 +1,31 @@
+use std::{rc::Rc,marker::PhantomData};
+#[derive(Clone,PartialEq,Debug)]struct R {id:String,sel:bool,data:String}
+trait Kind{type Row:Clone+PartialEq;fn id(r:&Self::Row)->&str;fn selected(r:&Self::Row)->bool;fn measure(&mut self,_:&[Rc<Self::Row>]);}
+struct K(usize);impl Kind for K{type Row=R;fn id(r:&R)->&str{&r.id}fn selected(r:&R)->bool{r.sel}fn measure(&mut self,_:&[Rc<R>]){self.0+=1;}}
+enum ScrollStrategy{Nearest}#[derive(Default)]struct Scroll(Vec<usize>);impl Scroll{fn scroll_to_item(&mut self,i:usize,_:ScrollStrategy){self.0.push(i)}}
+struct Context<T>(usize,PhantomData<T>);impl<T> Context<T>{fn notify(&mut self){self.0+=1;}}
+struct Rows<K:Kind>{ rows:Vec<Rc<K::Row>>,cursor:usize,kind:K,scroll:Scroll }
+impl<K:Kind> Rows<K> {
+//SET_ROWS
+}
+fn r(i:usize)->R{R{id:format!("id-{}",i%2),sel:i==3,data:format!("item-{i}")}}
+fn main(){
+ let mut rows=Rows{rows:vec![],cursor:0,kind:K(0),scroll:Scroll::default()};let mut cx=Context(0,PhantomData);
+ let data:Vec<_>=(0..1024).map(r).collect(); rows.set_rows(&data,&mut cx);assert_eq!(rows.cursor,3);
+ let ptr=rows.rows[0].clone();let removed=rows.rows[1].clone();let big=rows.rows.capacity();
+ rows.set_rows(&data[..1],&mut cx);let one=rows.rows.capacity();assert_eq!(rows.cursor,0);assert!(Rc::ptr_eq(&ptr,&rows.rows[0]));assert_eq!(removed.data,"item-1");
+ rows.set_rows(&[],&mut cx);let zero=rows.rows.capacity();assert_eq!(rows.rows.len(),0);assert_eq!(rows.cursor,0);
+ rows.set_rows(&data,&mut cx);assert_eq!(rows.cursor,3);assert_eq!(*ptr,data[0]);assert!(!Rc::ptr_eq(&ptr,&rows.rows[0]));assert!(one<big && zero==0);
+ let mut vectors=vec![vec![]]; for _ in 0..3{let new:Vec<_>=vectors.iter().flat_map(|s|(0..4).map(move |i|{let mut z=s.clone();z.push(r(i));z})).collect();vectors.extend(new)}vectors.sort_by_key(|v|v.iter().map(|r|r.data.clone()).collect::<Vec<_>>());vectors.dedup();
+ let mut count=0;
+ for a in &vectors{for b in &vectors{for cur in 0..a.len().max(1){
+ let mut state=Rows{rows:a.iter().cloned().map(Rc::new).collect(),cursor:cur,kind:K(0),scroll:Scroll::default()};let mut c=Context(0,PhantomData);
+ let olds=state.rows.clone();let chosen=b.iter().position(|r|r.sel);let initial=a.get(cur);
+ let out=if a==b{cur}else{chosen.or_else(||initial.and_then(|r|b.iter().position(|w|w.id==r.id))).unwrap_or(cur).min(b.len().saturating_sub(1))};
+ let moved=a!=b&&a.iter().find(|r|r.sel).map(|r|r.id.as_str())!=chosen.map(|i|b[i].id.as_str());
+ state.set_rows(b,&mut c); assert_eq!(state.cursor,out);assert_eq!(state.scroll.0,if moved{vec![out]}else{vec![]});assert_eq!(c.0,(a!=b) as usize);assert_eq!(state.kind.0,c.0);
+ for (n,row) in state.rows.iter().enumerate(){assert_eq!(**row,b[n]);if let Some(old)=olds.get(n){assert_eq!(Rc::ptr_eq(old,row),*old.as_ref()==b[n]);}}
+ for (i,row) in olds.iter().enumerate(){assert_eq!(**row,a[i]);}count+=1;
+ }}}
+ println!("{count} full-state transitions and retained Rc pointer/value checks; shrink/regrowth capacity {big} -> {one} -> {zero} -> {}",rows.rows.capacity());
+}

@@ -1,0 +1,124 @@
+--- a/src/ui/extensions/declarative/rows.rs
++++ b/src/ui/extensions/declarative/rows.rs
+@@ -27,7 +27,7 @@
+     /// Layout shared by all rows, recomputed when they change.
+     fn measure(&mut self, rows: &[Rc<Self::Row>]);
+     /// One row without its click and menu; `ring` marks the cursor.
+-    fn draw(&self, row: &Self::Row, index: usize, ring: bool, cx: &App) -> Stateful<Div>;
++    fn draw(&self, row: &Rc<Self::Row>, index: usize, ring: bool, cx: &App) -> Stateful<Div>;
+ 
+     fn frame(&self, frame: Stateful<Div>, _: &Context<Rows<Self>>) -> Stateful<Div>
+     where
+@@ -56,7 +56,7 @@
+ 
+ impl<K: Kind> Rows<K> {
+     pub fn new(
+-        rows: Vec<K::Row>,
++        rows: &[K::Row],
+         view: WeakEntity<super::view::DeclarativeView>,
+         cx: &mut Context<Self>,
+         action: impl Fn(String, &'static str, &mut App) + 'static,
+@@ -74,8 +74,14 @@
+         list
+     }
+ 
+-    pub fn set_rows(&mut self, rows: Vec<K::Row>, cx: &mut Context<Self>) {
+-        if self.rows.len() == rows.len() && self.rows.iter().zip(&rows).all(|(a, b)| **a == *b) {
++    pub fn set_rows(&mut self, rows: &[K::Row], cx: &mut Context<Self>) {
++        let prefix = self
++            .rows
++            .iter()
++            .zip(rows)
++            .take_while(|(old, new)| old.as_ref() == *new)
++            .count();
++        if prefix == self.rows.len() && prefix == rows.len() {
+             return;
+         }
+         let selected = rows.iter().position(K::selected);
+@@ -93,7 +99,20 @@
+             })
+             .unwrap_or(self.cursor)
+             .min(rows.len().saturating_sub(1));
+-        self.rows = rows.into_iter().map(Rc::new).collect();
++        // Keep immutable snapshots for unchanged rows and any active paint/menu callback.
++        self.rows.truncate(rows.len());
++        // A large list may become empty or shrink to only a few filtered items.
++        if rows.len() <= self.rows.capacity() / 4 {
++            self.rows.shrink_to_fit();
++        }
++        let common = self.rows.len();
++        for (old, new) in self.rows[prefix..].iter_mut().zip(&rows[prefix..]) {
++            if old.as_ref() != new {
++                *old = Rc::new(new.clone());
++            }
++        }
++        self.rows
++            .extend(rows[common..].iter().cloned().map(Rc::new));
+         self.kind.measure(&self.rows);
+         if moved {
+             self.scroll
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -570,13 +570,13 @@
+                 if let Some(lanes) = self.fields.lanes.get(id) {
+                     lanes.update(cx, |lanes, cx| {
+                         lanes.set_columns(columns, cx);
+-                        lanes.set_rows(rows.clone(), cx);
++                        lanes.set_rows(rows, cx);
+                     });
+                 } else {
+                     let send = self.row_sender(action, cx);
+                     let view = cx.weak_entity();
+                     let lanes = cx.new(|cx| {
+-                        let mut lanes = Lanes::new(rows.clone(), view, cx, send);
++                        let mut lanes = Lanes::new(rows, view, cx, send);
+                         lanes.set_columns(columns, cx);
+                         lanes
+                     });
+@@ -585,11 +585,11 @@
+             }
+             Node::List { id, rows, action } => {
+                 if let Some(list) = self.fields.lists.get(id) {
+-                    list.update(cx, |list, cx| list.set_rows(rows.clone(), cx));
++                    list.update(cx, |list, cx| list.set_rows(rows, cx));
+                 } else {
+                     let send = self.row_sender(action, cx);
+                     let view = cx.weak_entity();
+-                    let list = cx.new(|cx| List::new(rows.clone(), view, cx, send));
++                    let list = cx.new(|cx| List::new(rows, view, cx, send));
+                     self.fields.lists.insert(id.clone(), list);
+                 }
+             }
+--- a/src/ui/extensions/declarative/lanes.rs
++++ b/src/ui/extensions/declarative/lanes.rs
+@@ -67,8 +67,8 @@
+             .border_color(cx.theme().border.opacity(0.6))
+             .overflow_hidden()
+     }
+-    fn graph(&self, row: &Row, cx: &App) -> Div {
+-        let painted = Rc::new(row.clone());
++    fn graph(&self, row: &Rc<Row>, cx: &App) -> Div {
++        let painted = Rc::clone(row);
+         let graph = canvas(
+             |_, _, _| {},
+             move |bounds, _, window, cx| {
+@@ -127,7 +127,7 @@
+     fn measure(&mut self, rows: &[Rc<Row>]) {
+         self.lanes = rows.iter().map(|r| r.width()).max().unwrap_or(1);
+     }
+-    fn draw(&self, row: &Row, index: usize, ring: bool, cx: &App) -> Stateful<Div> {
++    fn draw(&self, row: &Rc<Row>, index: usize, ring: bool, cx: &App) -> Stateful<Div> {
+         let theme = cx.theme();
+         let selected = theme.sidebar_accent_foreground;
+         h_flex()
+--- a/src/ui/extensions/declarative/list.rs
++++ b/src/ui/extensions/declarative/list.rs
+@@ -49,7 +49,7 @@
+ 
+     fn measure(&mut self, _: &[Rc<Row>]) {}
+ 
+-    fn draw(&self, row: &Row, index: usize, ring: bool, cx: &App) -> Stateful<Div> {
++    fn draw(&self, row: &Rc<Row>, index: usize, ring: bool, cx: &App) -> Stateful<Div> {
+         let theme = cx.theme();
+         let muted = theme.muted_foreground;
+         let hidden = row.chips.len().saturating_sub(CHIPS);

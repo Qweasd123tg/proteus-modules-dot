@@ -1,0 +1,44 @@
+use std::cell::Cell;
+use std::rc::Rc;
+use std::marker::PhantomData;
+thread_local! { static CLONES:Cell<usize>=const{Cell::new(0)}; }
+#[derive(Debug,PartialEq,Eq)] struct Record{id:String,label:String,meta:Vec<String>,selected:bool}
+impl Clone for Record{fn clone(&self)->Self{CLONES.set(CLONES.get()+1);Self{id:self.id.clone(),label:self.label.clone(),meta:self.meta.clone(),selected:self.selected}}}
+fn row(id:usize,rev:usize,selected:bool)->Record{Record{id:format!("item-{id}"),label:format!("Work item {rev}"),meta:vec!["Alice".into(),format!("Label {id}"),"Reviewed".into()],selected}}
+trait Kind {type Row:Clone+PartialEq;fn id(r:&Self::Row)->&str;fn selected(r:&Self::Row)->bool;fn measure(&mut self,r:&[Rc<Self::Row>]);}
+#[derive(Default)] struct TestKind{measures:usize,measured_len:usize}
+impl Kind for TestKind{type Row=Record;fn id(r:&Record)->&str{&r.id}fn selected(r:&Record)->bool{r.selected}fn measure(&mut self,r:&[Rc<Record>]){self.measures+=1;self.measured_len=r.len();}}
+#[derive(Default)] struct Scroll(Vec<usize>);enum ScrollStrategy{Nearest}
+impl Scroll{fn scroll_to_item(&mut self,i:usize,_:ScrollStrategy){self.0.push(i);}}
+struct Context<T>(usize,PhantomData<T>);impl<T>Context<T>{fn notify(&mut self){self.0+=1}}
+struct Rows<K:Kind>{kind:K,rows:Vec<Rc<K::Row>>,cursor:usize,scroll:Scroll}
+impl<K:Kind>Rows<K>{//METHOD
+}
+impl Rows<TestKind>{fn empty()->Self{Self{kind:TestKind::default(),rows:vec![],cursor:0,scroll:Scroll::default()}}fn pass(&mut self,values:&Vec<Record>,c:&mut Context<Self>){self.set_rows(/*CALL*/,c)}}
+fn paint(row:/*ARG*/)->Rc<Record>{/*CAPTURE*/ painted}
+fn next(s:&mut u64)->usize{*s=s.wrapping_mul(6364136223846793005).wrapping_add(1);(*s>>32)as usize}
+fn differential(){
+ let mut seed=12;let mut table=Rows::empty();let mut cx=Context(0,PhantomData);let mut prior=Vec::<Record>::new();
+ let mut visited=0usize;
+ for i in 0..30_000{
+  let n=next(&mut seed)%13;let mut values:Vec<_>=(0..n).map(|_|row(next(&mut seed)%6,next(&mut seed)%8,next(&mut seed)%3==0)).collect();
+  if i%9==0 {values=prior.to_vec();} else if i%9==1 {values=prior.iter().rev().cloned().collect();} 
+  table.cursor=if prior.is_empty(){0}else{next(&mut seed)%prior.len()};
+  let same=prior==values;
+  let old_sel=prior.iter().find(|x|x.selected).map(|x|x.id.as_str());
+  let sel=values.iter().position(|x|x.selected);let moved=old_sel!=sel.map(|j|values[j].id.as_str());let prior_id=prior.get(table.cursor).map(|x|&x.id);
+  let expected=if same{table.cursor}else{sel.or_else(|| values.iter().position(|r|Some(&r.id)==prior_id)).unwrap_or(table.cursor).min(values.len().saturating_sub(1))}; 
+  let held=table.rows.clone();let stats=(cx.0,table.kind.measures,table.scroll.0.len());table.pass(&values,&mut cx);
+  assert!(held.iter().map(Rc::as_ref).eq(prior.iter()));assert!(table.rows.iter().map(Rc::as_ref).eq(values.iter()));
+  assert_eq!(table.cursor,expected);assert_eq!((cx.0,table.kind.measures,table.scroll.0.len()),(stats.0+usize::from(!same),stats.1+usize::from(!same),stats.2+usize::from(!same&&moved)));
+  if !same{assert_eq!(table.kind.measured_len,values.len());}if !same&&moved {assert_eq!(table.scroll.0.last(),Some(&expected));}
+  prior=values;visited+=1;
+ } println!("{visited} semantic transitions: full records, retained paint data, duplicate IDs/selection, cursor, measure/notify and scroll target matched.");
+}
+fn main(){differential();let n=1024;let mut values:Vec<_>=(0..n).map(|i|row(i,0,false)).collect();let mut t=Rows::empty();let mut cx=Context(0,PhantomData);t.pass(&values,&mut cx);
+ CLONES.set(0);for _ in 0..20{t.pass(&values,&mut cx);}let unchanged=CLONES.get();
+ let held=t.rows[512].clone();values[512].label.push('!');CLONES.set(0);t.pass(&values,&mut cx);let one=CLONES.get();
+ assert!(!held.label.ends_with('!'));assert!(t.rows[512].label.ends_with('!'));
+ CLONES.set(0);let paints:Vec<_>=t.rows[490..530].iter().map(|r|paint(r)).collect();let capture=CLONES.get();assert_eq!(paints.len(),40);assert!(paints[22].label.ends_with('!'));
+ println!("1024 rows: 20 unchanged accepted refreshes = {unchanged} row payload clones; single-row edit = {one}; 40 lane canvas captures = {capture}.");
+ #[cfg(before)]assert_eq!((unchanged,one,capture),(20480,1024,40));#[cfg(after)]assert_eq!((unchanged,one,capture),(0,1,0));}

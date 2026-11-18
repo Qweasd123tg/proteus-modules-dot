@@ -1,0 +1,61 @@
+#![allow(dead_code)]
+extern crate self as gpui_kit;
+use std::{path::{Path,PathBuf},rc::Rc,cell::RefCell};
+pub mod assets {pub enum IconName{Folder,FolderOpen}}
+pub mod component{
+ pub struct Icon;
+ impl Icon{pub fn new(_:crate::assets::IconName)->Self{Self}}
+ pub mod menu{
+  use crate::*;
+  #[derive(Default)] pub struct PopupMenu{pub items:Vec<PopupMenuItem>,pub headers:Vec<String>}
+  pub struct PopupMenuItem{pub label:String,pub disabled:bool,pub click:Option<Box<dyn Fn((),&mut Window,&mut App)>>}
+  impl PopupMenu{pub fn label(mut self,s:&str)->Self{self.headers.push(s.into());self}pub fn item(mut self,item:PopupMenuItem)->Self{self.items.push(item);self}}
+  impl PopupMenuItem{pub fn new(s:impl Into<String>)->Self{Self{label:s.into(),disabled:false,click:None}}
+   pub fn icon(self,_:super::Icon)->Self{self}pub fn disabled(mut self,v:bool)->Self{self.disabled=v;self}
+   pub fn on_click(mut self,f:impl Fn((),&mut Window,&mut App)+'static)->Self{self.click=Some(Box::new(f));self}}
+ }
+}
+pub struct Window;pub struct Recent(Vec<PathBuf>);impl Recent{pub fn iter(&self)->impl Iterator<Item=&Path>{self.0.iter().map(PathBuf::as_path)}}
+pub struct Pref{pub recent:Recent}pub struct App{pub prefs:Pref,pub absent:Option<PathBuf>}
+impl App {fn available(&self,path:&Path)->bool{self.absent.as_deref()!=Some(path)}}
+mod ui{
+ use super::*;
+ pub mod prefs{pub fn current(cx:&crate::App)->&crate::Pref{&cx.prefs}}
+ pub mod chrome{pub mod projects{include!("reviewed_source.rs");}}
+ pub fn inspect(paths:&[PathBuf],current:Option<PathBuf>,absent:Option<PathBuf>)->Vec<(String,PathBuf,bool)>{
+  let trace=Rc::new(RefCell::new(vec![]));let seen=trace.clone();
+  let menu=chrome::projects::Projects::new(current.clone(),move|path,_,_|seen.borrow_mut().push(path),|_,_| panic!("unexpected directory picker"));
+  let mut cx=App{prefs:Pref{recent:Recent(paths.to_vec())},absent:absent.clone()};
+  let mut result=menu.items(component::menu::PopupMenu::default(),&mut cx);
+  assert_eq!(result.items.pop().unwrap().label,"Открыть папку…");
+  let expected:Vec<_>=paths.iter().filter(|p|Some(p.as_path())!=current.as_deref()).take(8).collect();assert_eq!(result.items.len(),expected.len());
+  assert_eq!(result.headers.len(),usize::from(!expected.is_empty()));
+  let mut got=vec![];for (row,path) in result.items.into_iter().zip(expected){assert_eq!(row.disabled,absent.as_ref()==Some(path));if !row.disabled{row.click.unwrap()((),&mut Window,&mut cx);assert_eq!(trace.borrow().last(),Some(path));}got.push((row.label,path.clone(),row.disabled));}got
+ }
+}
+fn p(s:&str)->PathBuf{PathBuf::from(s)}
+fn main(){
+ let fixed=cfg!(candidate); let mut ambiguous=0;let mut groups=0;let mut rows=0;
+ fn distinct(set:&[(String,PathBuf,bool)])->bool{set.iter().enumerate().all(|(i,row)|set[..i].iter().all(|other|row.0!=other.0))}
+ let display=|paths:&[PathBuf]|ui::inspect(paths,None,None).into_iter().map(|x|x.0).collect::<Vec<_>>();
+ let prefix=format!("/{}", "длинная-папка/".repeat(68));let long=format!("{prefix}one/shared/project");
+ let examples=[
+  (vec![p("/ws/a/app"),p("/ws/b/app"),p("/ws/docs")],vec!["a/app","b/app","docs"]),
+  (vec![p("/work/app"),p("/work/app/app"),p("/work/app/app/app")],vec!["work/app","work/app/app","app/app/app"]),
+  (vec![p("/"),p("project"),p("/project"),p("tmp/project")],vec!["/","project","/project","tmp/project"]),
+  (vec![p("a/x/app"),p("b/x/app"),p("в/документация"),p("ю/документация")],vec!["a/x/app","b/x/app","в/документация","ю/документация"]),
+  (vec![p(&long),p(&format!("{prefix}two/shared/project")),p("/other/project")],vec!["one/shared/project","two/shared/project","other/project"]),
+  (vec![p("."),p(".."),p("/"),p("nonexistent-name")],vec![".","..","/","nonexistent-name"]),
+ ];
+ for (paths,expected) in &examples{let got=display(paths);println!("{:?}",got);if fixed{assert_eq!(&got,expected);}}
+ let pool:Vec<_>=["/","relative","/w/a","/w/b","/w/q/a","/w/r/a","/w/a/a","/w/a/a/a","/client/a","client/a","../x/a","Ω/Ω","ω/Ω","dir/🧭"].iter().map(|s|p(s)).collect();
+ for n in 1..=pool.len(){for rot in 0..pool.len(){let mut seen=pool.clone();seen.rotate_left(rot);seen.truncate(n);
+  for skip in [None,Some(seen[0].clone())]{let known=ui::inspect(&seen,skip,seen.last().cloned());groups+=1;rows+=known.len();ambiguous+=usize::from(!distinct(&known));
+   for row in &known{let name=row.1.file_name().map(|s|s.to_string_lossy().into_owned()).unwrap_or_else(||row.1.display().to_string());let homonyms=known.iter().filter(|p|p.1.file_name()==row.1.file_name()).count();if homonyms==1{assert_eq!(row.0,name);}}
+  }
+ }}
+ #[cfg(unix)]{use std::ffi::OsString;use std::os::unix::ffi::OsStringExt;
+  let(paths1,paths2)=(PathBuf::from(OsString::from_vec(b"/w/\xff".to_vec())),PathBuf::from(OsString::from_vec(b"/w/\xfe".to_vec())));let names=display(&[paths1,paths2]);if fixed{assert_ne!(names[0],names[1]);}else{assert_eq!(names[0],names[1]);}
+ }
+ println!("checked_groups={groups} checked_rows={rows} ambiguous_groups={ambiguous}");if fixed{assert_eq!(ambiguous,0);}else{assert!(ambiguous>0);}
+}
