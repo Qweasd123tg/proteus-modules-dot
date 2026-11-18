@@ -1,0 +1,32 @@
+#[cfg(test)]
+mod projection_probe {
+    use super::*;
+    use std::{hint::black_box, time::Instant};
+    #[test]
+    fn actual_projection_pairs() {
+        let cases = [
+            ("small string", Value::from("Короткая подпись".to_owned()), 1000),
+            ("100000 text lines", Value::from("x\n".repeat(100000)), 8),
+            ("100000 JSON elements", Value::Array(vec![Value::Null;100000]), 3),
+            ("single 1m-scalar wrapped message", Value::from("🦀".repeat(1000000)), 2),
+            ("single 1m-byte string field in unwrapped JSON", json!({"text":"x".repeat(1000000)}), 4),
+        ];
+        for (name, value, iterations) in cases {
+            let f = |old:bool|{
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    let render = if old { baseline::disclosure } else { disclosure };
+                    black_box(render("x:output","fixture",black_box(&value),&Open));
+                }
+                start.elapsed().as_nanos() as f64 / iterations as f64
+            };
+            assert_eq!(baseline::disclosure("x:output","fixture",&value,&Open),disclosure("x:output","fixture",&value,&Open));
+            let mut a=vec![]; let mut b=vec![];
+            for i in 0..11 {
+                if i%2==0 {a.push(f(true));b.push(f(false));} else {b.push(f(false));a.push(f(true));}
+            }
+            a.sort_by(f64::total_cmp); b.sort_by(f64::total_cmp);
+            println!("{name}: complete widget values identical; median ns/call {:.1} -> {:.1} (11 pairs, {iterations} calls/sample)",a[5],b[5]);
+        }
+    }
+}

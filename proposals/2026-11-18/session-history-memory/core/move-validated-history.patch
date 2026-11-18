@@ -1,0 +1,32 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index 672939d..ff4f926 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -223,20 +223,20 @@ impl RemoteValidatedRead {
+             }
+             Ok(())
+         })?;
++        ensure!(
++            validation.history_revision() == source.snapshot.revision.history_revision,
++            "storage snapshot history revision mismatch"
++        );
+         let resume = proteus_contracts::contracts::StorageResumeState {
++            last_history_turn: validation.last_history_turn(),
++            interrupted_turns: validation.interrupted_turns(),
+             conversation: StorageConversation {
+                 revision: source.snapshot.revision,
+                 model_context: context.snapshot(),
+-                messages: validation.history().to_vec(),
++                messages: validation.into_history(),
+             },
+             usage: usage.snapshot(store.session_id()),
+-            last_history_turn: validation.last_history_turn(),
+-            interrupted_turns: validation.interrupted_turns(),
+         };
+-        ensure!(
+-            validation.history_revision() == source.snapshot.revision.history_revision,
+-            "storage snapshot history revision mismatch"
+-        );
+         Ok((
+             Self {
+                 source,
