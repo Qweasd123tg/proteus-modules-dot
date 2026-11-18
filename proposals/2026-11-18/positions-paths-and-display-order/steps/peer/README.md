@@ -1,0 +1,5 @@
+# Independent: retain a positional gesture only while its options survive
+
+Compiles the two pinned production projections (Model option labels, Model index→value lookup) and Desktop's geometry, display caption, pointer state transitions and retained option update. The adapter records callbacks without making any request, writing settings, using a real pointer, or creating a window. Its loop and counterexample oracle are separate from the author's in-tree test and harness. It simulates the event order, not how often it occurs. Old/new list lengths 2–6, rotations/reversals, every old position, with or without motion on the current frame. Includes a second release to detect duplicates, a fresh selection on the new list, and a separate observation that unchanged display names can mask a different semantic mapping. No stale-down-after-refresh delivery ordering is assumed or solved.
+
+`before.log` and `after.log` report the native run; all listed counts are asserted. Run the top-level verifier or call `python3 peer.py STEPS_RS VIEW_RS EXTENSIONS_CHECKOUT SERDE_JSON_RLIB --rustc RUSTC`.

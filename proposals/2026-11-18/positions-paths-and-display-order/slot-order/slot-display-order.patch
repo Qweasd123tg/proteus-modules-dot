@@ -1,0 +1,101 @@
+--- a/crates/proteus-core/src/core/topology_render.rs
++++ b/crates/proteus-core/src/core/topology_render.rs
+@@ -3,6 +3,8 @@
+ mod markdown;
+ mod mermaid;
+ mod runtime;
++#[cfg(test)]
++mod slot_order_tests;
+ mod table;
+ 
+ pub use map::render_topology_map;
+--- a/crates/proteus-core/src/core/topology_render/table.rs
++++ b/crates/proteus-core/src/core/topology_render/table.rs
+@@ -1,6 +1,6 @@
+ use crate::core::TopologySnapshot;
+ 
+-use super::helpers::{module_source_label, yes_no};
++use super::helpers::{module_source_label, ordered_slots, yes_no};
+ 
+ pub fn render_topology_table(snapshot: &TopologySnapshot) -> String {
+     let mut lines = Vec::new();
+@@ -16,9 +16,8 @@
+     lines.push("Active slots:".to_owned());
+     lines.push(render_table(
+         ["slot", "active_module", "source"],
+-        &snapshot
+-            .slots
+-            .iter()
++        &ordered_slots(snapshot)
++            .into_iter()
+             .filter_map(|slot| {
+                 let active = slot.active_module.as_ref()?;
+                 let source = snapshot
+--- a/crates/proteus-core/src/core/topology_render/markdown.rs
++++ b/crates/proteus-core/src/core/topology_render/markdown.rs
+@@ -1,7 +1,7 @@
+ use crate::core::TopologySnapshot;
+ 
+ use super::{
+-    helpers::{module_source_label, yes_no},
++    helpers::{module_source_label, ordered_slots, yes_no},
+     map::render_topology_map,
+     runtime::render_topology_runtime_path,
+ };
+@@ -44,7 +44,7 @@
+     out.push_str("\n## Active Slots\n\n");
+     out.push_str("| Slot | Active Module | Source | Responsibility |\n");
+     out.push_str("|---|---|---|---|\n");
+-    for slot in &snapshot.slots {
++    for slot in ordered_slots(snapshot) {
+         let active = slot.active_module.as_deref().unwrap_or("-");
+         let source = slot
+             .active_module
+--- /dev/null
++++ b/crates/proteus-core/src/core/topology_render/slot_order_tests.rs
+@@ -0,0 +1,45 @@
++use super::{render_topology_markdown, render_topology_table};
++use crate::core::{SlotTopology, TopologySnapshot};
++
++#[test]
++fn slot_tables_follow_display_order_without_changing_their_membership() {
++    let slot = |id: &str, order, active: bool| SlotTopology {
++        id: id.to_owned(),
++        order,
++        active_module: active.then(|| "example".to_owned()),
++        ..Default::default()
++    };
++    let snapshot = TopologySnapshot {
++        slots: vec![
++            slot("custom", 900, true),
++            slot("first", 1, false),
++            slot("beta", 10, true),
++            slot("alpha", 10, true),
++        ],
++        ..Default::default()
++    };
++
++    let table = render_topology_table(&snapshot);
++    let table_rows = table
++        .split_once("Active slots:\n")
++        .unwrap()
++        .1
++        .lines()
++        .skip(2)
++        .take_while(|line| !line.is_empty())
++        .map(|line| line.split_whitespace().next().unwrap())
++        .collect::<Vec<_>>();
++    assert_eq!(table_rows, ["beta", "alpha", "custom"]);
++
++    let markdown = render_topology_markdown(&snapshot);
++    let markdown_rows = markdown
++        .split_once("## Active Slots\n\n")
++        .unwrap()
++        .1
++        .lines()
++        .skip(2)
++        .take_while(|line| line.starts_with("| "))
++        .map(|line| line.split('|').nth(1).unwrap().trim())
++        .collect::<Vec<_>>();
++    assert_eq!(markdown_rows, ["first", "beta", "alpha", "custom"]);
++}

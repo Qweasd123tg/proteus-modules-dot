@@ -1,0 +1,68 @@
+use serde_json::{json,Value};
+const SUBJECT_LIMIT:usize=300;const ARG_LIMIT:usize=160;const MAX_ARGS:usize=6;const TUNING_ARGS:&[&str]=&["yield_time_ms","max_output_tokens"];
+mod tool_display{use super::*; /*FUNCS*/
+fn known_subject(n:&str)->Option<&'static str>{if n=="read_many_files"{Some("paths")}else{None}}
+/*HELPER*/
+pub struct Headline{pub label:String,pub subject_key:Option<String>,pub text:Option<String>}
+pub fn headline(name:&str,args:&Value)->Headline{
+ let key=match name{"read_many_files"=>"paths","catalog_paths"=>"paths","caption"=>"text",_=>"paths"};
+ let text=args.get(key).and_then(|v|subject_text(key,v));Headline{label:name.to_owned(),subject_key:text.as_ref().map(|_|key.to_string()),text}
+}}
+struct App;struct Theme{mono_font_family:(),muted_foreground:()}impl App{fn theme(&self)->Theme{Theme{mono_font_family:(),muted_foreground:()}}}
+#[derive(Debug,PartialEq,Eq,Clone)]struct AnyElement(Vec<String>);type Div=AnyElement;
+impl AnyElement{fn into_any_element(self)->Self{self} fn gap_2(self)->Self{self}fn min_w_0(self)->Self{self}fn text_xs(self)->Self{self}fn font_family(self,_:())->Self{self}fn flex_none(self)->Self{self}fn text_color(self,_:())->Self{self}fn child(mut self,e:impl Into<AnyElement>)->Self{self.0.extend(e.into().0);self}}
+impl From<String> for AnyElement{fn from(s:String)->Self{Self(vec![s])}}
+fn div()->AnyElement{AnyElement(vec![])}fn h_flex()->Div{div()}fn faded(s:String)->String{s}
+fn row_id(_: &'static str,id:u64)->u64{id}fn code_block(_:u64,s:String,_:&App)->Div{AnyElement(vec![s])}
+struct Fold{key:u64}impl Fold{fn block(&self,_:usize,txt:&str,f:impl Fn(String)->Div,_:&App)->Div{f(txt.to_owned())}}
+struct AppTranscriptTool{name:String,args:Value}fn tool_args(t:&AppTranscriptTool)->&Value{&t.args} // synthetic arg record only
+/*DETAILS*/
+/*LEGACY*/
+fn compare_original(name:&str,a:Value)->Vec<Vec<String>>{let row=AppTranscriptTool{name:name.into(),args:a};legacy_details(&Fold{key:1},&row,&App).into_iter().map(|e|e.0).collect()}
+fn run(name:&str,a:Value)->(Option<String>,Vec<Vec<String>>){let row=AppTranscriptTool{name:name.into(),args:a};let head=tool_display::headline(name,&row.args).text;let data=argument_details(&Fold{key:1},&row,&App).into_iter().map(|e|e.0).collect();(head,data)}
+fn verify_budget(block:&str,raw:&[String])->usize {
+ assert!(block.len()<=2000,"aggregate {} bytes; cap=2000",block.len());
+ let lines=block.split('\n').collect::<Vec<_>>();assert_eq!(lines.len(),raw.len());let mut shortened=0;
+ for (line,original) in lines.into_iter().zip(raw){
+ let ord=original.chars().take(160).collect::<String>();let mut boundaries=ord.char_indices().map(|(i,_)|i).collect::<Vec<_>>();boundaries.push(ord.len());
+ if let Some(emitted)=line.strip_suffix("…"){
+ shortened+=1;let mut lo=0;let mut hi=boundaries.len();
+ while lo<hi {let mid=(lo+hi)/2;let part=format!("{:?}",&ord[..boundaries[mid]]);if part.len()<emitted.len(){lo=mid+1}else{hi=mid}}
+ assert!(lo<boundaries.len());let end=boundaries[lo];assert!(end<original.len());assert_eq!(emitted,format!("{:?}",&ord[..end]));assert!(!ord.is_empty()&&end>0);
+ }else{assert_eq!(line,format!("{original:?}"));assert_eq!(ord.len(),original.len());}
+ }
+ shortened
+}
+fn main(){
+ let mut changed=0;let mut unchanged=0;let mut max_bytes=0;let mut max_lines=0;
+ // Explicit independent expected text for contrasting paths, including genuine newline vs literal backslash-n.
+ let y=json!({"paths":["a\nb","a\\nb","dir/文.txt","a\"b","c\r\nd"]});
+ let (h,r)=run("read_many_files",y.clone());assert_eq!(h.as_deref(),Some("a\nb +4"));assert_eq!(r[0][0],r#""a\nb"
+"a\\nb"
+"dir/文.txt"
+"a\"b"
+"c\r\nd""#);assert_eq!(r.len(),1);assert_eq!(r[0][0].lines().count(),5);
+ // Short (lossless preview) and long (prefix with explicit ellipsis) UTF-8 names; no malformed object is serialized.
+ for n in 0..=24{for width in [1,159,160,161,600]{for name in ["read_many_files","catalog_paths"]{for state in 0..3{
+ let base="α".repeat(width);let vals:Vec<_>=(0..n).map(|i|if state==1&&i==n/2{json!(3)}else if state==2&&i==n.saturating_sub(1){json!({"a":"o"})}else{json!(base)}).collect();
+ let args=json!({"paths":vals,"line_numbers":true});let before=compare_original(name,args.clone());let (h,rows)=run(name,args);let short=(2..=20).contains(&n)&&name=="read_many_files"&&state==0;
+ if short{assert_eq!(h.as_deref(),Some(format!("{} +{}",base,n-1).chars().take(300).collect::<String>().as_str()));
+ verify_budget(&rows[0][0],&vec![base.clone();n]);assert_eq!(rows[1],vec!["line_numbers:".to_owned(),"true".to_owned()]);assert_eq!(rows.len(),2);changed+=1;
+ }else{assert_eq!(rows,before);assert!(rows.iter().all(|r|r!=&vec![format!("\"{base}\"")]));assert!(rows.iter().all(|r|r.len()==2));unchanged+=1;}
+ }}}}
+ for c in ['😀','\t','\r','\n','\0','\u{200b}','\u{10ffff}']{let path=c.to_string().repeat(161);let (_,r)=run("read_many_files",json!({"paths":vec![path;20]}));let b=&r[0][0];verify_budget(b,&vec![c.to_string().repeat(161);20]);max_bytes=max_bytes.max(b.len());max_lines=max_lines.max(b.split('\n').count());}
+ let mut boundaries=0;let mut omission=0;let mut close=0;
+ for n in 2usize..=20{for prefix in 0..=165 {for c in ["p","α","😀","\u{10ffff}"] {
+ let names=(0..n).map(|i| format!("{i:02}_{}{}",c.repeat(prefix),if i%3==0 {"-fin"}else{""})).collect::<Vec<_>>();
+ let rendered_size=names.iter().map(|x|format!("{x:?}").len()).sum::<usize>()+n-1;
+ let (_,r)=run("read_many_files",json!({"paths":names}));let b=&r[0][0];let short=verify_budget(b,&names);
+ if rendered_size.abs_diff(2000)<32{close+=1;}omission+=usize::from(short>0);boundaries+=1;
+ }}}
+ println!("aggregate controls {boundaries}, with a marked shortened filename {omission}, full-input sizes within 31 bytes of 2000: {close}; all <=2000 bytes, all names present in order, checked each exact escaped source/prefix and truncation mark.");
+ let mut point_count=0usize;let mut conservative=0usize;
+ for c in (0..=0x10ffff).filter_map(char::from_u32){let cs=c.to_string();let bound=c.escape_debug().map(char::len_utf8).sum::<usize>();let at_start=format!("{cs:?}").len()-2;let at_middle=format!("{:?}",format!("a{cs}z")).len()-4;
+ assert!(at_start<=bound && at_middle<=bound,"{c:?}: max {bound}, actual {at_start}/{at_middle}");point_count+=1;if at_start!=bound||at_middle!=bound{conservative+=1;}}
+ println!("{point_count} Unicode scalar values independently checked at start and inside a Rust Debug string; underestimated bytes=0, conservative estimates={conservative}.");
+ let scalar=run("read_many_files",json!({"paths":"two short names","max_bytes_total":400})); assert_eq!(scalar.1,vec![vec!["two short names".to_owned()],vec!["max_bytes_total:".to_owned(),"400".to_owned()]]);
+ println!("candidate: {changed} bounded accepted arrays; {unchanged} generic, malformed or out-of-count controls byte-identical in rendered row strings vs original; distinct labels for LF, CRLF, quotes, literal backslash-n. Selected-label stress maximum {max_bytes} bytes / {max_lines} lines (not a universal memory measurement).");
+}

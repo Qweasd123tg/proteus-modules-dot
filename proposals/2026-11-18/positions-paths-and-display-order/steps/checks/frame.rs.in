@@ -1,0 +1,55 @@
+#![allow(dead_code,private_interfaces)]
+use std::{cell::Cell,collections::BTreeSet,marker::PhantomData,ops::{Deref,DerefMut},rc::Rc};
+use serde_json::{json,Value};
+const DEFAULT:&str="_default"; trait ValueExt{fn at(&self,k:&str)->&Value;fn list(&self,k:&str)->&[Value];}
+impl ValueExt for Value{fn at(&self,k:&str)->&Value{&self[k]}fn list(&self,k:&str)->&[Value]{self[k].as_array().map(Vec::as_slice).unwrap_or_default()}}
+struct Host(Value);impl Host{fn setting(&self,k:&str)->Option<&Value>{self.0.get(k)}}
+__EFFORTS__
+fn wire(raw:&[&str],shown:usize)->Value{
+    let raw=raw.iter().map(|s| json!({"name":s,"value":format!("effort:{s}")})).collect::<Vec<_>>();
+    let host=Host(json!({"reasoning_effort":{"options":raw}})); let efforts=efforts(&host);assert!(efforts.len()>=2);
+    __EMIT__
+}
+fn received(labels:&[&str],position:usize)->Option<String>{let efforts=labels.iter().map(|s|json!({"name":s,"value":format!("effort:{s}")})).collect::<Vec<_>>();let value=json!(position);
+    __RECEIVE__
+    chosen.and_then(Value::as_str).map(str::to_owned)
+}
+#[derive(Default)]struct App(Vec<usize>);struct Context<T>(App,PhantomData<fn()->T>);
+impl<T>Context<T>{fn notify(&mut self){}}impl<T>Deref for Context<T>{type Target=App;fn deref(&self)->&App{&self.0}}impl<T>DerefMut for Context<T>{fn deref_mut(&mut self)->&mut App{&mut self.0}}
+type Pixels=f32;#[derive(Clone,Copy,Default)]struct Bounds<T>{x:T,size:Size<T>}#[derive(Clone,Copy,Default)]struct Size<T>{width:T,height:T}impl Bounds<f32>{fn left(&self)->f32{self.x}}
+__CENTER__
+__NEAREST__
+struct Stepper{options:Vec<String>,selected:usize,scrub:Option<usize>, track:Rc<Cell<Bounds<f32>>>,thumb:Rc<Cell<Option<f32>>>,changed:Rc<dyn Fn(usize,&mut App)>}
+impl Stepper{
+__METHODS__
+fn shown(&self)->usize{let count=self.options.len();__SHOW__ shown}
+}
+fn apply(stepper:&mut Stepper,options:&Vec<String>, selected:&usize,cx:&mut Context<Stepper>){__UPDATE__}
+fn pointer_down(this:&mut Stepper,count:usize,x:f32,cx:&mut Context<Stepper>){__DOWN__}
+fn pointer_move(this:&mut Stepper,count:usize,x:f32,cx:&mut Context<Stepper>){__MOVE__}
+fn root(v:&Value)->Vec<String>{assert_eq!(v["id"],"reasoning");assert_eq!(v["action"],"effort");v["options"].as_array().unwrap().iter().map(|s|s.as_str().unwrap().to_owned()).collect()}
+fn main(){
+let mode=std::env::args().nth(1).unwrap(); let base=["Low","Medium","High","Maximum"];
+let sets:[&[&str];6]=[&base,&["Low","High"],&["Maximum","High","Medium","Low"],&["Low","Moderate","High","Maximum"],&["Low","Medium","High","Maximum","Extra"],&["Medium","Low","High","Maximum"]];
+let b=Bounds{x:0.,size:Size{width:328.,height:28.}};let(mut scenarios,mut wrong,mut controls,mut control_wrong)=(0,0,0,0);
+for &opts in &sets {for initial in 0..base.len(){for pos in 0..base.len(){for selected in 0..opts.len(){for movement in 0..2{
+   let from=wire(&base,initial);let to=wire(opts,selected);let mut cx=Context::<Stepper>(App::default(),PhantomData);let mut step=Stepper::new(root(&from),initial,|i,cx|cx.0.push(i));step.track.set(b);
+   let x=center(b,base.len(),pos as f32);pointer_down(&mut step,base.len(),x,&mut cx);assert_eq!(step.scrub,Some(pos));assert!(cx.0.0.is_empty());
+   apply(&mut step,&root(&to),&selected,&mut cx);
+   let rendered=step.shown();
+   if movement!=0{pointer_move(&mut step,opts.len(),center(b,opts.len(),0.),&mut cx)}
+   step.finish_scrub(&mut cx);step.finish_scrub(&mut cx);
+   let changed=&base[..]!=opts; let expected=if changed{vec![]}else{vec![if movement!=0{0}else{pos}]};
+   if changed{scenarios+=1;wrong+=usize::from(cx.0.0!=expected)}else{controls+=1;control_wrong+=usize::from(cx.0.0!=expected)}
+   if opts==["Low","High"]&&initial==0&&pos==3&&selected==0&&movement==0{
+      println!("{mode} shrink after press Maximum: visible_before_release={} events={:?} receiver={:?}",opts[rendered],cx.0.0,cx.0.0.last().and_then(|i|received(opts,*i)));
+   }
+   if opts==["Maximum","High","Medium","Low"]&&initial==0&&pos==1&&selected==3&&movement==0{
+      println!("{mode} reorder after press Medium: visible_before_release={} events={:?} receiver={:?}",opts[rendered],cx.0.0,cx.0.0.last().and_then(|i|received(opts,*i)));
+   }
+   // Fresh click and keyboard step must still commit once each.
+   cx.0.0.clear();pointer_down(&mut step,opts.len(),center(b,opts.len(),1.),&mut cx);step.finish_scrub(&mut cx);step.step(-1,&mut cx);assert_eq!(cx.0.0,[1,0]);
+}}}}}
+println!("{mode}: changed-list mismatches {wrong}/{scenarios}; stable or selected-only mishandled {control_wrong}/{controls}; fresh press+key controls {}/{}",scenarios+controls,scenarios+controls);
+assert_eq!(control_wrong,0);if mode=="before"{assert!(wrong>0)}else{assert_eq!(wrong,0)}
+}
