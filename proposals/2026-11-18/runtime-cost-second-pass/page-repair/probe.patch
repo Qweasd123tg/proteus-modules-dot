@@ -1,0 +1,152 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index a9eb3edc..59ec569b 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -153,3 +153,115 @@ fn cache_fingerprints_ignore_independent_worker_object_order() {
+     assert_eq!(store.saved_transcript_page(None, None).unwrap().total, 51);
+     assert!(store.fresh_read_model().is_some());
+ }
++
++mod repair_page_probe {
++    use super::*;
++    use proteus_contracts::app_protocol::{AppToolState, AppTranscriptTool};
++    use std::{sync::Arc, time::Instant};
++
++    fn tool(id: usize, status: &str) -> AppTranscriptTool {
++        AppTranscriptTool {
++            terminal: None,
++            call_id: format!("id-{id}"),
++            name: "preview".to_owned(),
++            args: serde_json::json!({"index": id}),
++            effective_args: Some(serde_json::json!({"effective": id})),
++            status: status.to_owned(),
++            result: Some(format!("result-{id}")),
++            metadata: serde_json::Value::Null,
++        }
++    }
++
++    fn prepare(n: usize, split: bool) -> (Arc<Backend>, RemoteSessionStore, Option<AppToolState>) {
++        let (backend, store) = Backend::store();
++        if n > 0 {
++            backend.append(n);
++        }
++        let mut model = SessionReadModel::from_validated(
++            &store, RemoteValidatedRead::open(store.clone()).unwrap(), full,
++        ).unwrap();
++        for (i, row) in model.transcript.iter_mut().enumerate() {
++            row.message_id = Some(uuid::Uuid::from_u128(i as u128 + 1000));
++            if split && (i == 0 || i == 25) {
++                row.text = "x".repeat(2 * 1024 * 1024 + 128);
++            }
++        }
++        let expected = if n == 0 {
++            None
++        } else {
++            let latest = n.saturating_sub(2);
++            model.transcript[0].tool = Some(tool(0, "completed"));
++            let accepted = tool(latest, "completed");
++            let expected = AppToolState::from(&accepted);
++            model.transcript[latest].tool = Some(accepted);
++            if n > 1 { model.transcript[n - 1].tool = Some(tool(n - 1, "denied")); }
++            Some(expected)
++        };
++        let source = RemoteCacheSource::read(&store).unwrap();
++        store.save_read_model(&source, &model);
++        let header = cache::header(&store).unwrap();
++        assert_eq!(header.transcript.rows, n);
++        let mut state = backend.0.lock().unwrap();
++        state.measured_pages = header.transcript.pages.iter()
++            .map(|p| format!("display-data-{}", p.hash)).collect();
++        // Rows have distinct IDs; pages are distinct content addresses here.
++        assert_eq!(state.measured_pages.len(), header.transcript.pages.len());
++        drop(state);
++        (backend, store, expected)
++    }
++
++    #[test]
++    fn repair_rejects_missing_modified_and_wrong_length_pages() {
++        let (backend, store, _) = prepare(101, true);
++        let mut header = cache::header(&store).unwrap();
++        assert_eq!(header.transcript.pages.iter().map(|p| p.rows).collect::<Vec<_>>(), [25, 50, 26]);
++        let digest = &header.tools["preview"];
++        let page_key = format!("display-data-{}", header.transcript.pages[1].hash);
++        let mut state = backend.0.lock().unwrap();
++        state.cache.remove(&format!("display-data-{digest}")).unwrap();
++        let page = state.cache.remove(&page_key).unwrap();
++        drop(state);
++        let head = |backend: &Arc<Backend>| backend.0.lock().unwrap().cache["display-view-v1-head"].clone();
++        let prior_head = head(&backend);
++        assert!(store.saved_tool_state("preview").is_none());
++        assert_eq!(head(&backend), prior_head);
++        backend.0.lock().unwrap().cache.insert(page_key.clone(), serde_json::json!([]));
++        assert!(store.saved_tool_state("preview").is_none());
++        assert_eq!(head(&backend), prior_head);
++        backend.0.lock().unwrap().cache.insert(page_key, page);
++        header.transcript.pages[0].rows += 1;
++        header.transcript.pages[2].rows -= 1;
++        cache::publish(&store, &header).unwrap();
++        let wrong_head = head(&backend);
++        assert!(store.saved_tool_state("preview").is_none());
++        assert_eq!(head(&backend), wrong_head);
++    }
++
++    #[test]
++    #[ignore = "paired native repair workload; run this test alone"]
++    fn measure_cached_tool_repair() {
++        for (shape, n, split) in [("empty-hit",0,false),("tiny",1,false),("short-aligned",50,false),
++                                  ("long-aligned",10_000,false),("long-split",10_000,true)] {
++            let (backend, store, expected) = prepare(n, split);
++            let header = cache::header(&store).unwrap();
++            let pages = header.transcript.pages.len();
++            let missing = header.tools.get("preview").map(|d| format!("display-data-{d}"));
++            for rep in 0..8 {
++                let mut state = backend.0.lock().unwrap();
++                if let Some(key) = &missing { state.cache.remove(key).unwrap(); }
++                let reads = state.record_reads;
++                let prior = state.page_reads;
++                drop(state);
++                let start = Instant::now();
++                let got = std::hint::black_box(store.saved_tool_state("preview")).unwrap();
++                let nanos = start.elapsed().as_nanos();
++                assert_eq!(serde_json::to_value(&got.tool).unwrap(), serde_json::to_value(&expected).unwrap());
++                assert_eq!(got.revision, header.source.revision().unwrap());
++                let state = backend.0.lock().unwrap();
++                assert_eq!(state.record_reads, reads);
++                let reads = state.page_reads - prior;
++                println!("REPAIR shape={shape} n={n} pages={pages} rep={rep} page_reads={reads} nanos={nanos}");
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+index 72076f1e..f873bc96 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+@@ -29,6 +29,8 @@ pub(super) struct State {
+     pub(super) cache: HashMap<String, Value>,
+     pub(super) writes: Vec<String>,
+     pub(super) record_reads: usize,
++    pub(super) measured_pages: std::collections::HashSet<String>,
++    pub(super) page_reads: usize,
+     pub(super) fail_head: bool,
+     handles: u64,
+ }
+@@ -56,6 +58,8 @@ impl Backend {
+             cache: HashMap::new(),
+             writes: vec![],
+             record_reads: 0,
++            measured_pages: Default::default(),
++            page_reads: 0,
+             handles: 0,
+             fail_head: false,
+         })));
+@@ -168,6 +172,9 @@ impl SessionStorage for Backend {
+                 })
+             }
+             Request::ReadCache { key, source, .. } => {
++                if state.measured_pages.contains(&key) {
++                    state.page_reads += 1;
++                }
+                 let value = if source.as_ref().is_none_or(|source| current(&state, source)) {
+                     state.cache.get(&key).cloned()
+                 } else {

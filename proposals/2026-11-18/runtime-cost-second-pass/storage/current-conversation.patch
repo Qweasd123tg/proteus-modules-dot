@@ -1,0 +1,18 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 344f3af..1a6afe0 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -181,7 +181,12 @@ impl SnapshotState {
+     }
+     pub fn conversation_at(&mut self, point: StorageHistoryPoint) -> Result<StorageConversation> {
+         if point == StorageHistoryPoint::Current {
+-            return Ok(self.fold()?.conversation());
++            let state = self.fold()?;
++            return Ok(StorageConversation {
++                revision: state.revision(),
++                model_context: state.model_context.snapshot(),
++                messages: state.validation.into_history(),
++            });
+         }
+         self.reset_page_cursor();
+         self.source.reset()?;

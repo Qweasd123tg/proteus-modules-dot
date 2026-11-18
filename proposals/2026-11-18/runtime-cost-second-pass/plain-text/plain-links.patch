@@ -1,0 +1,15 @@
+diff --git a/packages/markdown-render/src/plain.rs b/packages/markdown-render/src/plain.rs
+index 9beecc7..37a30ec 100644
+--- a/packages/markdown-render/src/plain.rs
++++ b/packages/markdown-render/src/plain.rs
+@@ -25,6 +25,10 @@ pub(super) fn render(id: &str, source: &str) -> Result<Value> {
+ }
+ 
+ fn links(source: &str) -> Result<Vec<Range<usize>>> {
++    // Every span accepted by collect contains this literal in the original text.
++    if !source.contains("://") {
++        return Ok(Vec::new());
++    }
+     // No emphasis, escapes, code, HTML, images or authored Markdown links are
+     // interpreted. Autolink literal is the only enabled construct.
+     let constructs = Constructs {
