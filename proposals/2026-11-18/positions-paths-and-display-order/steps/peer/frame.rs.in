@@ -1,0 +1,50 @@
+#![allow(dead_code)]
+use std::{rc::Rc,cell::RefCell,collections::BTreeSet,marker::PhantomData};
+use serde_json::{Value,json};
+mod sdk{/*SDK*/}
+use sdk::ValueExt;
+const DEFAULT:&str="_default";
+struct Host(Value);impl Host{fn setting(&self,s:&str)->Option<&Value>{self.0.get(s)}}
+type Pixels=f32;
+#[derive(Clone,Copy)] struct Sz{width:f32,height:f32}
+#[derive(Clone,Copy)] struct Bounds<P>{size:Sz,l:f32,p:PhantomData<P>}
+impl Bounds<f32>{fn left(&self)->f32{self.l}}
+/*DEFS*/
+fn labels(host:&Host)->Vec<String>{let efforts=efforts(host);/*LABELS*/options.iter().map(|v|v.as_str().unwrap().to_owned()).collect()}
+fn resolved(host:&Host,i:usize)->Option<String>{let value=json!(i);let efforts=efforts(host);/*RESOLVE*/chosen.and_then(Value::as_str).map(str::to_owned)}
+#[derive(Default)]struct App{recorded:Vec<usize>}
+struct Context<S>(App,PhantomData<S>);impl<S> Context<S>{fn notify(&mut self){}}
+impl<S> std::ops::Deref for Context<S>{type Target=App;fn deref(&self)->&App{&self.0}}
+impl<S> std::ops::DerefMut for Context<S>{fn deref_mut(&mut self)->&mut App{&mut self.0}}
+struct Stepper{options:Vec<String>,selected:usize,scrub:Option<usize>,changed:Rc<dyn Fn(usize,&mut App)>}
+impl Stepper{
+ /*STEPPER*/
+ fn update(&mut self,options:&Vec<String>,selected:usize){/*UPDATE*/}
+ fn shown(&self)->usize {let count=self.options.len();/*SHOWN*/shown}
+}
+fn host(ids:&[usize],same:bool)->Host{let mut opts=vec![json!({"name":"default","value":"_default"})];for i in ids{opts.push(json!({"name":if same{"Level".into()}else{format!("Level {i}")},"value":format!("effort:{i}")}));}Host(json!({"reasoning_effort":{"options":opts}}))}
+fn main(){
+ let candidate=/*FRESH*/;let bound=Bounds{l:13.0,size:Sz{width:167.0,height:28.0},p:PhantomData};
+ let(mut changed,mut committed,mut stable,mut mismatch,mut invalid,mut fresh,mut hidden)=(0,0,0,0,0,0,0);
+ for n in 2..=6{for size in 2..=6{for shift in 0..size{for reverse in [false,true]{for drag in 0..n{for move_after in [false,true]{
+ let old=(0..n).collect::<Vec<_>>();let mut new=(0..size).map(|i|(i+shift)%size).collect::<Vec<_>>();if reverse{new.reverse();}
+ let oh=host(&old,false);let nh=host(&new,false);let ol=labels(&oh);let nl=labels(&nh);let identical=ol==nl;let mut cx=Context(App::default(),PhantomData);let mut p=Stepper{options:ol,selected:0,scrub:None,changed:Rc::new(|i,a|a.recorded.push(i))};
+ p.scrub_to(nearest(bound,n,center(bound,n,drag as f32)),&mut cx);assert_eq!(p.shown(),drag);
+ p.update(&nl,size-1);
+ if move_after && p.scrub.is_some(){p.scrub_to(nearest(bound,size,center(bound,size,(size-1) as f32)),&mut cx);}
+ p.finish_scrub(&mut cx);p.finish_scrub(&mut cx);
+ if identical{let want=if move_after{size-1}else{drag};assert_eq!(cx.recorded,[want]);assert_eq!(resolved(&nh,want),Some(format!("effort:{want}")));stable+=1;}
+ else {changed+=1;let actual=cx.recorded.last().copied();if actual.is_some(){committed+=1;}
+ if !move_after{if let Some(idx)=actual{match resolved(&nh,idx){None=>invalid+=1,Some(v)=>mismatch+=usize::from(v!=format!("effort:{drag}"))}}}
+ if candidate {assert!(actual.is_none());assert_eq!(p.shown(),size-1);}}
+ // A distinctly new, explicit gesture in the replacement layout still works.
+ cx.recorded.clear();p.scrub_to(0,&mut cx);p.finish_scrub(&mut cx);assert_eq!(cx.recorded,[0]);assert_eq!(resolved(&nh,0),Some(format!("effort:{}",new[0])));fresh+=1;
+ }}}}}}
+ // Same wire widget/labels and selection, different declared values behind it. No receiver write performed.
+ for n in 2..=6{let ids=(0..n).collect::<Vec<_>>();for sh in 1..n{let nd=(0..n).map(|i|(i+sh)%n).collect::<Vec<_>>();let x=host(&ids,true);let y=host(&nd,true);assert_eq!(labels(&x),labels(&y));
+ for i in 0..n{assert_ne!(resolved(&x,i),resolved(&y,i));hidden+=1;}
+ }}
+ assert_eq!((changed,stable,fresh,hidden),(1556,44,1600,70));
+ if candidate {assert_eq!((committed,invalid,mismatch),(0,0,0));} else {assert_eq!((committed,invalid,mismatch),(1556,110,530));}
+ println!("changed visible option-list schedules {changed}: action sent {committed}; release without further movement: {invalid} out-of-range and {mismatch} referring to a different value. {stable} stable-list controls, {fresh} fresh actions correct. {hidden} unobservable same-label/value remaps unchanged.");
+}

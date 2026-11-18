@@ -1,0 +1,56 @@
+mod core{
+ use serde::{Deserialize,Serialize};
+ @@slot@@
+ #[derive(Default)]pub struct TopologySnapshot{pub profile:String,pub cwd:String,pub permission_mode:String,pub config_path:Option<String>,pub module_epoch:u64,pub model:Option<Model>,pub hooks:Vec<String>,pub slots:Vec<SlotTopology>,pub modules:Vec<ModuleTopology>,pub tools:Vec<ToolTopology>,pub edges:Vec<TopologyEdge>,pub warnings:Vec<Warning>}
+ pub struct Model{pub provider:String,pub name:String}
+ pub struct ModuleTopology{pub slot:String,pub id:String,pub source:ModuleSourceTopology}
+ pub enum ModuleSourceTopology{Builtin,Process,Config,Unknown}
+ pub struct ToolTopology{pub enabled:bool,pub registered:bool,pub name:String,pub safety:String,pub source:String,pub description:String}
+ pub struct TopologyEdge{pub kind:String,pub from:String,pub to:String}
+ pub struct Warning{pub severity:String,pub message:String}
+}
+mod present{
+ mod helpers{@@helpers@@}
+ mod runtime{pub fn render_topology_runtime_path(_:&crate::core::TopologySnapshot)->String{"[not under test]".into()}}
+ pub mod map{@@map@@}
+ mod table{@@table@@}
+ mod markdown{@@markdown@@}
+ pub use table::render_topology_table;pub use markdown::render_topology_markdown;
+ #[cfg(test)]mod slot_order_tests{@@regression@@}
+}
+use core::*;
+use std::hash::{Hash,Hasher,DefaultHasher};
+fn perm(a:&mut [usize],i:usize,out:&mut Vec<Vec<usize>>){if i==a.len(){out.push(a.to_vec());return}for j in i..a.len(){a.swap(i,j);perm(a,i+1,out);a.swap(i,j)}}
+fn retain_report(doc:&str,md:bool)->(Vec<&str>,String){
+ let (mark,end)=if md{("## Active Slots\n\n","\n## Tools\n")}else{("Active slots:\n","\n\nTools:\n")};
+ let (a,rest)=doc.split_once(mark).unwrap();let (body,b)=rest.split_once(end).unwrap();
+ let mut lines=body.lines();let h1=lines.next().unwrap();let h2=lines.next().unwrap();
+ let mut rows:Vec<_>=lines.filter(|x|!x.is_empty()).collect();
+ let ids=rows.iter().map(|l|if md{l.split('|').nth(1).unwrap().trim()}else{l.split_whitespace().next().unwrap()}).collect();
+ rows.sort_unstable();(ids,format!("{a}{mark}{h1}\n{h2}\n{}{end}{b}",rows.join("\n")))
+}
+fn main(){let after=std::env::args().nth(1).unwrap()=="after";
+ let (mut n,mut bad_t,mut bad_m,mut bad_same,mut stable,mut wire_count)=(0,0,0,0,0,0);
+ let mut content=DefaultHasher::new();let mut canonical=DefaultHasher::new();
+ let names=["zinc","blue","green","apricot","one"];let mut pp=vec![];perm(&mut [0,1,2,3,4],0,&mut pp);
+ for p in &pp{for ranks in [[1000,1,5,7,300],[17,17,17,17,17],[u32::MAX,0,0,u32::MAX,2]]{for mask in 0..32{
+ let wire:Vec<_>=p.iter().map(|&i|serde_json::json!({"id":names[i],"title":format!("Title {}",names[i]),"responsibility":format!("UI card {}",names[i]),"active_module":if mask&(1<<i)==0{None}else{Some("example")},"required":i%2==0,"category": if i==0{"custom"}else{"pipeline"},"order":ranks[i]})).collect();
+ // The real pinned public SlotTopology definition and serde derives receive the snapshot's slot sequence.
+ let slots:Vec<SlotTopology>=serde_json::from_value(serde_json::Value::Array(wire)).unwrap();
+ let snap=TopologySnapshot{slots,profile:"sample".into(),cwd:"desk".into(),hooks:vec!["alpha".into(),"beta".into()],modules:names.iter().map(|s|ModuleTopology{slot:s.to_string(),id:"example".into(),source:ModuleSourceTopology::Config}).collect(),warnings:vec![Warning{severity:"note".into(),message:"ordinary fixture".into()}],..Default::default()};
+ let mut indices=vec![0;p.len()];for(i,row) in snap.slots.iter().enumerate(){let ix=snap.slots.iter().enumerate().filter(|(j,b)|b.order<row.order || (b.order==row.order && *j<i)).count();indices[ix]=i}
+ let want_md:Vec<_>=indices.iter().map(|&i|snap.slots[i].id.as_str()).collect();let want_table:Vec<_>=indices.iter().filter(|&&i|snap.slots[i].active_module.is_some()).map(|&i|snap.slots[i].id.as_str()).collect();
+ let table=present::render_topology_table(&snap);let md=present::render_topology_markdown(&snap);
+ let (t,tn)=retain_report(&table,false);let (m,mn)=retain_report(&md,true);
+ let map_part=md.split_once("Slot/module map\n").unwrap().1.split_once("\nToolRegistry map").unwrap().0;
+ let mm:Vec<_>=map_part.lines().map(|l|l.trim_start().strip_prefix("slot:").unwrap().split_whitespace().next().unwrap()).collect();
+ assert_eq!(mm,want_md);bad_same+=usize::from(mm!=m);bad_m+=usize::from(m!=want_md);bad_t+=usize::from(t!=want_table);
+ tn.hash(&mut content);mn.hash(&mut content);n+=1;
+ if ranks.windows(2).all(|w|w[0]==w[1]){assert_eq!(m,want_md);assert_eq!(t,want_table);stable+=1}
+ if snap.slots.windows(2).all(|w|w[0].order<=w[1].order){table.hash(&mut canonical);md.hash(&mut canonical);wire_count+=1}
+ }}}
+ let empty=TopologySnapshot::default();assert!(retain_report(&present::render_topology_table(&empty),false).0.is_empty());assert!(retain_report(&present::render_topology_markdown(&empty),true).0.is_empty());
+ if after{assert_eq!((bad_m,bad_t,bad_same),(0,0,0))}else{assert!(bad_m>0&&bad_t>0&&bad_same>0)}
+ println!("{n} snapshots: standalone table order mismatches={bad_t}; Markdown slot-table order mismatches={bad_m}; conflicting order within one report={bad_same}. {stable} all-tie controls; {wire_count} canonical wire cases; empty covered.");
+ println!("content={} canonical_wire={}",content.finish(),canonical.finish());
+}

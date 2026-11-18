@@ -1,0 +1,81 @@
+use serde_json::{Value,json};
+use proteus_contracts::domain::ToolSpec;
+mod tool_display{
+ use super::*;
+ const APPLY_PATCH:&str="apply_patch"; const UPDATE_PLAN:&str="update_plan";
+ /*CONSTS*/
+ /*KNOWN*/
+ /*HEAD*/
+ pub fn headline(name:&str,args:&Value)->Headline{
+   assert!(![APPLY_PATCH, UPDATE_PLAN].contains(&name)); // their separate special-format branches aren't in scope
+   let known=known_subject(name);let label=name.to_owned();
+ /*BRANCH*/
+ /*FUNCS*/
+ /*HELP*/
+ /*TEST*/
+ pub fn source_regression(){expanded_known_path_list_is_bounded_and_keeps_filename_boundaries();}
+}
+#[derive(Default,Debug,Clone)]struct AnyElement{selections:Vec<(String,String)>,labels:Vec<String>}
+impl AnyElement{
+ fn into_any_element(self)->Self{self} fn gap_2(self)->Self{self}fn min_w_0(self)->Self{self}fn text_xs(self)->Self{self}fn flex_none(self)->Self{self}
+ fn font_family(self,_:String)->Self{self}fn text_color(self,_:u8)->Self{self}
+ fn child(self,x:impl Into<AnyElement>)->Self{let mut n=self;let mut x=x.into();n.selections.append(&mut x.selections);n.labels.append(&mut x.labels);n}
+}
+impl From<String> for AnyElement{fn from(x:String)->Self{Self{labels:vec![x], ..Default::default()}}}
+fn div()->AnyElement{Default::default()}fn h_flex()->AnyElement{div()}fn faded(x:String)->AnyElement{x.into()}
+struct Theme{mono_font_family:String,muted_foreground:u8} struct App(Theme);impl App{fn theme(&self)->&Theme{&self.0}}
+struct Fold{key:u64}impl Fold{fn block<F:FnOnce(String)->AnyElement>(&self,_p:usize,x:&str,f:F,_cx:&App)->AnyElement{f(x.into())}}
+fn row_id(s:&'static str,_:u64)->&'static str{s}
+fn code_block(id:&str,text:String,_:&App)->AnyElement{AnyElement{selections:vec![(id.to_owned(),text)], ..Default::default()}}
+struct AppTranscriptTool{name:String,args:Value,effective_args:Option<Value>}
+mod ui{mod card{
+ use super::super::*;
+ /*TOOL_ARGS*/
+ /*UI*/
+ pub(super) fn one(tool:&AppTranscriptTool)->AnyElement{
+  let nodes=argument_details(&Fold{key:5},tool,&App(Theme{mono_font_family:"test".into(),muted_foreground:0}));
+  nodes.into_iter().fold(AnyElement::default(),|n,x|n.child(x))
+ }
+}pub(super) fn render(n:&str,args:serde_json::Value,effective_args:Option<serde_json::Value>)->super::AnyElement{
+ card::one(&super::AppTranscriptTool{name:n.into(),args,effective_args})
+}}
+fn main(){
+ let raw:Value=serde_json::from_str(include_str!("input.json")).unwrap();
+ let spec:ToolSpec=serde_json::from_value(raw.clone()).unwrap();
+ assert_eq!(serde_json::to_value(&spec).unwrap(),raw);
+ assert_eq!(spec.name,"read_many_files");let paths=&spec.input_schema["properties"]["paths"];
+ assert_eq!(paths["type"],"array");assert_eq!(paths["items"]["type"],"string");assert_eq!(spec.input_schema["required"],json!(["paths"]));
+ assert!(paths.get("maxItems").is_none());assert!(paths["description"].as_str().unwrap().contains("Maximum 20"));
+ assert_eq!(spec.metadata["aliases"][1],"open multiple files");
+ let name=&spec.name;let mut n_cases=0;let mut exact=0;
+ for n in 2..=20{for variant in 0..6{
+   let mut fs:Vec<_>=(0..n).map(|i|format!("docs/page{i}.md")).collect();
+   match variant{1=>fs[0]="read me.txt".into(),2=>fs[n-1]="folio\n2.md".into(),3=>fs[n-1]="a\\b\"c\tфайл".into(),4=>fs[n-1]="документы/表.rs".into(),5=>fs[n-1]=fs[0].clone(),_=>{}};
+   let mut args=json!({"paths":fs});if variant%2==0{args["line_numbers"]=json!(true);}
+   let head=tool_display::headline(name,&args);
+   assert_eq!(head.subject,Some(format!("{} +{}",fs[0],n-1)));assert_eq!(head.subject_key.as_deref(),Some("paths"));
+   let ui=ui::render(name,args,None);
+   let wanted=fs.iter().map(|s|format!("{s:?}")).collect::<Vec<_>>().join("\n");
+   let got=ui.selections.iter().find(|(id,_)|id=="tool-paths");
+   if got.is_some_and(|(_,text)|text==&wanted && text.lines().count()==n){exact+=1;}
+   if variant%2==0 {assert_eq!(ui.labels,["line_numbers:","true"])}else{assert!(ui.labels.is_empty())}
+   n_cases+=1;
+ }}
+ #[cfg(before)]assert_eq!(exact,0);#[cfg(after)]assert_eq!(exact,n_cases);
+ println!("Shipped descriptor→Core ToolSpec serde exact; header/neighbor controls unchanged; {exact}/{n_cases} multi-file expanded cards show the expected, separately escaped filename rows.");
+ // Bounded additional desktop control only. Header already has its own independent formatting.
+ for (n,args) in [("unknown",json!({"paths":["a","b"]})),(name,json!({"paths": ["a"]})),(name,json!({"paths": []})),(name,json!({"paths": ["a",{}]})),(name,json!({"paths": vec!["x";21]})),(name,json!({"paths": vec!["x";1024]})),(name,json!({"other": ["x","y"]})),("grep",json!({"pattern":"ok","paths":["a","b"]}))]{
+  assert!(!ui::render(n,args,None).selections.iter().any(|(k,_)|k=="tool-paths"));
+ }
+ let scalar=ui::render("read_file",json!({"path":"lib.rs"}),None);assert_eq!(scalar.selections,[("tool-subject".to_owned(),"lib.rs".into())]);
+ #[cfg(after)]{
+   for len in [159,160,161,10000]{let s="θ".repeat(len);let rows=ui::render(name,json!({"paths":["first",&s]}),None);let text=&rows.selections[0].1;
+   let cap="θ".repeat(len.min(160));assert!(text.ends_with(&format!("{cap:?}{}",if len>160{"…"}else{""})));}
+   let sample="\0\n\r\t\u{2028}\u{2029}\\\"";let ui=ui::render(name,json!({"paths":["first",sample]}),None);
+   assert_eq!(ui.selections[0].1.lines().count(),2);assert!(ui.selections[0].1.contains("\\n"));
+   let changed=ui::render(name,json!({"paths":["bad","old"]}),Some(json!({"paths":["new1","new2"]})));
+   assert_eq!(changed.selections[0].1,"\"new1\"\n\"new2\"");
+ }
+ tool_display::source_regression();
+ println!("8 unsupported/fallback cases do not expose a new block; original scalar path block preserved. No host, actual event, OS clipboard or GPUI execution.");
+}

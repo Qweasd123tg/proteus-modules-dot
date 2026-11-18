@@ -1,0 +1,27 @@
+use serde_json::{json,Value};
+const SUBJECT_LIMIT:usize=300;const ARG_LIMIT:usize=160;const MAX_ARGS:usize=6;const TUNING_ARGS:&[&str]=&["yield_time_ms","max_output_tokens"];
+mod tool_display{use super::*; /*FUNCS*/
+pub struct Headline{pub subject_key:Option<String>,pub text:Option<String>}
+pub fn headline(name:&str,args:&Value)->Headline{
+ let key=match name{"read_many_files"=>"paths","catalog_paths"=>"paths","caption"=>"text",_=>"paths"};
+ let text=args.get(key).and_then(|v|subject_text(key,v));Headline{subject_key:text.as_ref().map(|_|key.to_string()),text}
+}}
+struct App;struct Theme{mono_font_family:(),muted_foreground:()}impl App{fn theme(&self)->Theme{Theme{mono_font_family:(),muted_foreground:()}}}
+#[derive(Debug,PartialEq,Eq,Clone)]struct AnyElement(Vec<String>);type Div=AnyElement;
+impl AnyElement{fn into_any_element(self)->Self{self} fn gap_2(self)->Self{self}fn min_w_0(self)->Self{self}fn text_xs(self)->Self{self}fn font_family(self,_:())->Self{self}fn flex_none(self)->Self{self}fn text_color(self,_:())->Self{self}fn child(mut self,e:impl Into<AnyElement>)->Self{self.0.extend(e.into().0);self}}
+impl From<String> for AnyElement{fn from(s:String)->Self{Self(vec![s])}}
+fn div()->AnyElement{AnyElement(vec![])}fn h_flex()->Div{div()}fn faded(s:String)->String{s}
+fn row_id(_: &'static str,id:u64)->u64{id}fn code_block(_:u64,s:String,_:&App)->Div{AnyElement(vec![s])}
+struct Fold{key:u64}impl Fold{fn block(&self,_:usize,txt:&str,f:impl Fn(String)->Div,_:&App)->Div{f(txt.to_owned())}}
+struct AppTranscriptTool{name:String,args:Value}fn tool_args(t:&AppTranscriptTool)->&Value{&t.args} // synthetic arg record only
+/*DETAILS*/
+fn run(name:&str,a:Value)->(Option<String>,Vec<Vec<String>>){let row=AppTranscriptTool{name:name.into(),args:a};let head=tool_display::headline(name,&row.args).text;let data=argument_details(&Fold{key:1},&row,&App).into_iter().map(|e|e.0).collect();(head,data)}
+fn main(){
+ let(v,p)=run("read_many_files",json!({"paths":["src/a.rs","docs/b.md","test/c.txt"]}));assert_eq!(v,Some("src/a.rs +2".into()));assert!(p.is_empty());println!("source {v:?} => expanded arguments {p:?}");
+ let mut n=0;
+ for length in 2..=20{let mut group=vec!["src/начало.rs".to_owned()];group.extend((1..length).map(|i|format!("docs/{i:02} paper.md")));for t in [None,Some(true),Some(false)]{let mut o=json!({"paths":group});if let Some(b)=t{o["line_numbers"]=json!(b);}
+ let (s,r)=run("read_many_files",o);assert_eq!(s,Some(format!("src/начало.rs +{}",length-1)));assert_eq!(r.len(),usize::from(t.is_some()));if let Some(b)=t{assert_eq!(r,vec![vec!["line_numbers:".to_string(),b.to_string()]]);}n+=1;}}
+ // Control for the previously useful string subject.
+ let (s,r)=run("caption",json!({"text":"draft caption","level":3}));assert_eq!(s,Some("draft caption".to_string()));assert_eq!(r,vec![vec!["draft caption".to_owned()],vec!["level:".to_string(),"3".to_owned()]]);
+ println!("{n} published-shape multi-file requests (2..20 paths, optional argument), none had a paths argument element; scalar subject control unchanged. Short synthetic labels, no operations.");
+}

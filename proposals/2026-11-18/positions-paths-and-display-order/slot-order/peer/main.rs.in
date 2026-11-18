@@ -1,0 +1,49 @@
+mod contracts { // No tool entries in this fixture. Stand-in for unused external DTO field type.
+    #[derive(Clone,Debug,PartialEq,serde::Serialize,serde::Deserialize)]
+    pub struct ProcessToolOwner;
+}
+mod core { include!(DTO_FILE); }
+mod runtime { pub fn render_topology_runtime_path(_: &crate::core::TopologySnapshot)->String { String::from("(excluded)") } }
+mod pre {
+ pub mod helpers {include!(HELPERS_BEFORE);}
+ pub mod map {include!(MAP_BEFORE);}
+ pub mod table {include!(TABLE_BEFORE);}
+ pub mod markdown {include!(MARKDOWN_BEFORE);}
+ use crate::runtime;
+}
+mod post {
+ pub mod helpers {include!(HELPERS_AFTER);}
+ pub mod map {include!(MAP_AFTER);}
+ pub mod table {include!(TABLE_AFTER);}
+ pub mod markdown {include!(MARKDOWN_AFTER);}
+ use crate::runtime;
+}
+use core::{SlotTopology as Slot,TopologySnapshot as Snapshot};
+fn rows(s:&str,sep:&str,header:usize,kind:u8)->Vec<String> {
+ s.split_once(sep).unwrap().1.lines().skip(header).take_while(|l|!l.is_empty())
+ .map(|l|match kind {0=>l.split_whitespace().next().unwrap(),1=>l.split('|').nth(1).unwrap().trim(),_=>l.trim_start().strip_prefix("slot:").unwrap().split_whitespace().next().unwrap()}.to_owned()).collect()
+}
+fn perm(a:&mut[usize],i:usize,f:&mut impl FnMut(&[usize])) {if i==a.len(){f(a);return}for j in i..a.len(){a.swap(i,j);perm(a,i+1,f);a.swap(i,j)}}
+fn main(){
+ let mut cases=0;let mut mr=0;let mut tr=0;let mut sorted=0;let mut tie=0;
+ for n in 0..=4{
+ let mut p=(0..n).collect::<Vec<_>>();
+ perm(&mut p,0,&mut |p|{for mask in 0..(1u8<<n){for pattern in 0..4 {
+ let mut s=Snapshot::default();for &i in p {let id=["wide","ロール","last","ab"][i]; let order=match pattern {0=>[u32::MAX,0,1,1][i],1=>3,2=>[2,4,1,3][i],_=>[1,1,2,2][i]};
+ s.slots.push(Slot{id:id.into(),title:id.into(),responsibility:format!("instruction {id}"),active_module:(mask>>i&1!=0).then(||format!("active_{id}")),required:false,category:"custom".into(),order});}
+ // Exact serde round-trip, same collect order and every public field.
+ let s:Snapshot=serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+ // Independent bucket algorithm: numeric ascending, within bucket retain input order. Includes inactive from input, never synthesizes new rows.
+ let mut buckets=std::collections::BTreeMap::<u32,Vec<(&str,bool)>>::new();for slot in &s.slots {buckets.entry(slot.order).or_default().push((&slot.id,slot.active_module.is_some()));}
+ let all:Vec<_>=buckets.values().flatten().map(|e|e.0.to_owned()).collect();let active:Vec<_>=buckets.values().flatten().filter(|e|e.1).map(|e|e.0.to_owned()).collect();
+ let is_sorted=s.slots.windows(2).all(|w|w[0].order<=w[1].order);tie+=usize::from(buckets.values().any(|x|x.len()>1));
+ let original=serde_json::to_value(&s).unwrap();let bmap=pre::map::render_topology_map(&s);let bmd=pre::markdown::render_topology_markdown(&s);let btxt=pre::table::render_topology_table(&s);let amd=post::markdown::render_topology_markdown(&s);let atxt=post::table::render_topology_table(&s);
+ let seg="\nSlot/module map\n";let smd="\n## Active Slots\n\n";let stxt="\nActive slots:\n";
+ assert_eq!(rows(&bmap,seg,0,2),all);assert_eq!(rows(&bmd,seg,0,2),all);assert_eq!(rows(&amd,seg,0,2),all);
+ if rows(&bmd,smd,2,1)!=all {mr+=1} if rows(&btxt,stxt,2,0)!=active {tr+=1}
+ assert_eq!(rows(&amd,smd,2,1),all);assert_eq!(rows(&atxt,stxt,2,0),active);assert_eq!(serde_json::to_value(&s).unwrap(),original);
+ if is_sorted {assert_eq!(bmd,amd);assert_eq!(btxt,atxt);sorted+=1;}
+ cases+=1;
+ }}});}
+ assert!(mr>0 && tr>0);println!("{} synthetic serde DTOs; stable buckets incl 0/u32::MAX, Unicode IDs, active masks; ties {}, already ordered full outputs byte-equal {}. Before incorrect Markdown tables {}, plain active tables {}; after 0, 0. Both original and new embedded map order agree with oracle.",cases,tie,sorted,mr,tr);
+}
