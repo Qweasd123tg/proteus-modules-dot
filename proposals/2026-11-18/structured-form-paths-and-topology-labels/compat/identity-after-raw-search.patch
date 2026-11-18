@@ -1,0 +1,121 @@
+--- a/src/settings/mod.rs
++++ b/src/settings/mod.rs
+@@ -14,7 +14,7 @@
+ 
+ pub use draft::{Draft, FieldPath};
+ pub use schema::{FieldKind, TextFormat, choice_title, field_kind, format_value, parse_text};
+-pub use schema::{field_sections, section_scope};
++pub use schema::{field_sections, form_scope, section_scope};
+ 
+ #[cfg(test)]
+ mod tests;
+--- a/src/settings/schema.rs
++++ b/src/settings/schema.rs
+@@ -30,10 +30,39 @@
+     sections
+ }
+ 
++// Field titles and dotted paths are human-readable labels, not unique UI keys.
++// Escape delimiters on the way into an internal key; display/config keys are untouched.
++fn push_scope_part(out: &mut String, part: &str) {
++    for ch in part.chars() {
++        match ch {
++            '%' => out.push_str("%25"),
++            ':' => out.push_str("%3A"),
++            '.' => out.push_str("%2E"),
++            _ => out.push(ch),
++        }
++    }
++}
++
++pub fn form_scope(slot: &str, module: &str, keys: &[String]) -> String {
++    let mut out = String::new();
++    push_scope_part(&mut out, slot);
++    out.push(':');
++    push_scope_part(&mut out, module);
++    for (i, key) in keys.iter().enumerate() {
++        out.push(if i == 0 { ':' } else { '.' });
++        push_scope_part(&mut out, key);
++    }
++    out
++}
++
+ pub fn section_scope(scope: &str, field: &ConfigField) -> String {
+     field.section.as_ref().map_or_else(
+         || scope.to_owned(),
+-        |section| format!("{scope}:section:{}", section.id),
++        |section| {
++            let mut out = format!("{scope}:section:");
++            push_scope_part(&mut out, &section.id);
++            out
++        },
+     )
+ }
+ 
+--- a/src/ui/settings/spot.rs
++++ b/src/ui/settings/spot.rs
+@@ -60,7 +60,10 @@
+ }
+ 
+ pub(super) fn field(path: &FieldPath) -> String {
+-    format!("field:{}:{}:{}", path.slot, path.module, path.dotted())
++    format!(
++        "field:{}",
++        crate::settings::form_scope(&path.slot, &path.module, &path.keys)
++    )
+ }
+ 
+ /// The one editor actually rendered instead of per-field controls in raw mode.
+--- a/src/ui/settings/search.rs
++++ b/src/ui/settings/search.rs
+@@ -441,10 +441,11 @@
+         place: &str,
+         open: &[String],
+     ) {
+-        let scope = match parent {
+-            None => format!("{}:{}", self.slot, self.module),
+-            Some(path) => format!("{}:{}:{}", self.slot, self.module, path.dotted()),
+-        };
++        let scope = crate::settings::form_scope(
++            self.slot,
++            self.module,
++            parent.map_or(&[], |path| path.keys.as_slice()),
++        );
+         for field in fields.iter().filter(|field| editable_field(field)) {
+             let path = match parent {
+                 None => FieldPath::new(self.slot, self.module, &field.key),
+@@ -478,10 +479,8 @@
+                 && !nested.is_empty()
+             {
+                 way.push(format!(
+-                    "group:{}:{}:{}",
+-                    self.slot,
+-                    self.module,
+-                    path.dotted()
++                    "group:{}",
++                    crate::settings::form_scope(self.slot, self.module, &path.keys)
+                 ));
+                 let place = format!("{place} · {}", field.title);
+                 self.fields(finder, nested, Some(&path), &place, &way);
+--- a/src/ui/settings/group.rs
++++ b/src/ui/settings/group.rs
+@@ -175,7 +175,7 @@
+         cx: &Context<Self>,
+     ) -> AnyElement {
+         let theme = cx.theme();
+-        let scope = format!("{}:{}:{}", path.slot, path.module, path.dotted());
++        let scope = crate::settings::form_scope(&path.slot, &path.module, &path.keys);
+         let key = format!("group:{scope}");
+         let open = self.is_open(&key);
+         let value = self.draft.value(path);
+--- a/src/ui/settings/params.rs
++++ b/src/ui/settings/params.rs
+@@ -150,7 +150,7 @@
+             &schema.fields,
+             |key| FieldPath::new(slot, module, key),
+             self.draft.module_config(slot, module),
+-            &format!("{slot}:{module}"),
++            &crate::settings::form_scope(slot, module, &[]),
+             cx,
+         );
+         card(rows, cx).into_any_element()

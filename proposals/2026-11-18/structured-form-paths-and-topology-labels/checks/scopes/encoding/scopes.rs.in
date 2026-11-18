@@ -1,0 +1,36 @@
+use std::collections::HashSet;
+struct ConfigSection{id:String}
+struct ConfigField{section:Option<ConfigSection>}
+@@FUNS@@
+fn unwrap_component(s:&str)->String{
+ let mut out=String::new();let mut it=s.chars();
+ while let Some(ch)=it.next(){if ch=='%' {match (it.next(),it.next()) {
+ (Some('2'),Some('5'))=>out.push('%'),(Some('2'),Some('E'))=>out.push('.'),(Some('3'),Some('A'))=>out.push(':'),_=>panic!("malformed component")}}else{out.push(ch)}}out
+}
+type Decoded=(String,String,Vec<String>,Option<String>);
+fn decode(s:&str)->Decoded{
+ let mut it=s.split(':');let a=unwrap_component(it.next().unwrap());let b=unwrap_component(it.next().unwrap());let rest=it.collect::<Vec<_>>();
+ let (k,sec)=match &rest[..]{[]=>(None,None),[path]=>(Some(*path),None),["section",sec]=>(None,Some(*sec)),[path,"section",sec]=>(Some(*path),Some(*sec)),_=>panic!("bad separator grammar")};
+ let keys=k.map(|v|v.split('.').map(unwrap_component).collect()).unwrap_or_default();
+ (a,b,keys,sec.map(unwrap_component))
+}
+fn main(){
+ let names=["","a","b","section",":",".","%","%25","%2E","%3A","%3a","a.b","a:b","%23%","..","a:b.c","тема","🖋","%．"];
+ let prefixes=["",":","%","one.two","section","section:name","a%2Eb"];
+ let mut n=0;let mut clean=0;let mut structural=HashSet::new();let mut cap=0;
+ for (i,slot) in names.iter().enumerate(){for (j,module) in names.iter().enumerate(){
+ let keys=std::iter::once(vec![]).chain(names.iter().map(|k|vec![k.to_string()])).chain(names.iter().flat_map(|a|names.iter().map(move |b|vec![a.to_string(),b.to_string()]))).chain(names.iter().map(|c|vec![names[(i+j)%names.len()].into(),"".into(),c.to_string()]));
+ for keys in keys{let scope=form_scope(slot,module,&keys);
+ for sec in std::iter::once(None).chain(prefixes.iter().copied().map(Some)){
+ let field=ConfigField{section:sec.map(|s|ConfigSection{id:s.into()})};
+ let named=section_scope(&scope,&field);let parsed=decode(&named);
+ assert_eq!(parsed,(slot.to_string(),module.to_string(),keys.clone(),sec.map(str::to_owned)));n+=1;
+ if i==0&&j==0{assert!(structural.insert(named.clone()));}
+ if std::iter::once(*slot).chain(std::iter::once(*module)).chain(keys.iter().map(String::as_str)).chain(sec).all(|s|!s.contains([':', '.', '%'])){
+ let old=format!("{slot}:{module}{}{}",if keys.is_empty(){String::new()}else{format!(":{}",keys.join("."))},sec.map(|s|format!(":section:{s}")).unwrap_or_default());assert_eq!(named,old);clean+=1;
+ }
+ }
+ }cap=cap.max(structural.len());
+ }}
+ println!("{n} independently decoded cases; {clean} delimiter-free legacy strings identical; {cap} unique role/key/section encodings in fixed-pair collision table.");
+}

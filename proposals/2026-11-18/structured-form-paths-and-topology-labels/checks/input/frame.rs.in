@@ -1,0 +1,89 @@
+#![allow(dead_code)]
+use std::borrow::Cow;
+use std::{cell::{RefCell,Ref},collections::HashMap,rc::Rc};
+type SharedString=Rc<str>;
+struct Window;
+#[derive(Clone)] struct Entity<T>(Rc<RefCell<T>>);
+impl<T> Entity<T>{fn read<'a,C>(&'a self,_:&C)->Ref<'a,T>{self.0.borrow()} fn id(&self)->usize{Rc::as_ptr(&self.0) as usize}}
+#[derive(Clone)] struct InputState{value:SharedString,placeholder:String,min:usize,max:usize,mask_pattern:MaskPattern}
+#[derive(Clone)]enum MaskPattern{Plain, Number{}}
+fn normalize_number_input(_: &str)->Cow<'_,str>{unreachable!("no number masks in this input")}
+type TextareaState=InputState;
+impl InputState{fn is_single_line(&self)->bool{self.min==1}
+/*NORMALIZE*/
+    fn new<C>(_:&mut Window,_:&mut C)->Self{Self{value:"".into(),placeholder:String::new(),min:1,max:1,mask_pattern:MaskPattern::Plain}}
+    fn value(&self)->SharedString{self.value.clone()}
+    fn placeholder(mut self,p:String)->Self{self.placeholder=p;self}
+    fn set_value<C>(&mut self,v:String,_:&mut Window,_:&mut C){self.value=self.normalize_input(&v).as_ref().into()}
+    fn auto_grow(mut self,min:usize,max:usize)->Self{self.min=min;self.max=max;self}
+}
+struct TextInput {/*INPUT_PROPS*/}
+enum Text { Line(Entity<InputState>), Area(Entity<TextareaState>) }
+impl Text{
+    fn e(&self)->&Entity<InputState>{match self{Self::Line(s)|Self::Area(s)=>s}}
+    fn set_value<C>(&self,v:String,w:&mut Window,cx:&mut C){self.e().0.borrow_mut().set_value(v,w,cx)}
+    fn set_placeholder<C>(&self,p:String,_:&mut Window,_:&mut C){self.e().0.borrow_mut().placeholder=p}
+    fn value<C>(&self,cx:&C)->SharedString{self.e().read(cx).value()}
+}
+enum InputEvent{Change,PressEnter{secondary:bool},Other}
+struct Subscription;
+type Handler=Rc<dyn Fn(&mut DeclarativeView,&InputEvent,&mut Context<DeclarativeView>)>;
+struct Context<T>{handlers:HashMap<usize,Handler>,_t:std::marker::PhantomData<T>}
+impl Context<DeclarativeView>{
+    fn new<T>(&mut self,f:impl FnOnce(&mut Self)->T)->Entity<T>{Entity(Rc::new(RefCell::new(f(self))))}
+    fn subscribe<T:Clone+'static>(&mut self,state:&Entity<T>,f:impl Fn(&mut DeclarativeView,Entity<T>,&InputEvent,&mut Self)+'static)->Subscription{
+        let entity=state.clone();self.handlers.insert(entity.id(),Rc::new(move|v,e,c|f(v,entity.clone(),e,c)));Subscription
+    }
+}
+mod textarea{
+    use super::*; pub fn max_rows(value:&str,min:usize,grow:bool)->usize{if grow{(value.chars().count()+1).max(min)}else{min}}
+    pub fn resize<C>(entity:&Entity<TextareaState>,min:usize,grow:bool,_:&mut C){let mut r=entity.0.borrow_mut();r.min=min;r.max=max_rows(&r.value,min,grow);}
+    pub fn preview(_:&str)->Option<String>{None} pub fn disclosure_id(id:&str)->String{format!("input-preview:{id}")}
+}
+#[derive(Default)] struct Fields{inputs:HashMap<String,TextInput>,disclosures:HashMap<String,bool>}
+#[derive(Default)] struct DeclarativeView{fields:Fields,sent:Vec<(String,serde_json::Value)>}
+enum Node{Input{id:String,value:String,placeholder:String,action:String,lines:usize,submit:Option<String>,search:bool}}
+impl DeclarativeView{
+    fn prune(&mut self,nodes:&[Node]){let mut ids=std::collections::HashSet::new();for node in nodes{match node{/*IDS*/}}/*RETAIN*/}
+    fn act(&mut self,a:String,v:Option<serde_json::Value>,_:&mut Context<Self>){self.sent.push((a,v.unwrap()))}
+    fn prepare(&mut self,node:&Node,settings:bool,window:&mut Window,cx:&mut Context<Self>){ match node{/*ARM*/} }
+}
+
+pub use serde_json::{json,Value};
+mod ui{use super::*;/*SDK*/}
+mod fields {pub(super) use super::Text;}
+#[derive(Debug,PartialEq,Eq)]enum Render{Blank,Search,Area,Line}struct Empty;fn div()->Empty{Empty}impl Empty{fn into_any_element(self)->Render{Render::Blank}}
+struct ElementId;impl ElementId{#[allow(non_snake_case)]fn Name(_:String)->Self{Self}}
+mod fake_ui{pub mod search{use super::super::*;pub struct Search;impl Search{
+ pub fn new(_:ElementId,_:Entity<InputState>,_:(),_:String)->Self{Self}pub fn into_any_element(self)->Render{Render::Search}
+}}}
+struct Painter<'a>{fields:&'a Fields,focus:()}
+mod paint{use super::*;impl Painter<'_>{pub(super) fn node(&self,n:&Node)->Render{match n{/*SEARCH*/ Node::Input{id,..}=>match self.fields.inputs.get(id).map(|t|&t.state){Some(Text::Line(_))=>Render::Line,Some(Text::Area(_))=>Render::Area,None=>Render::Blank}}}}}
+fn sdk_area(id:&str)->Value{use ui::Node as _;ui::input(id,"published note","Заметка","note.change").with("lines",3)}
+fn sdk_search(id:&str)->Value{ui::search(id,"","Искать","filter.change")}
+fn as_node(o:&Value)->Node{Node::Input{id:o["id"].as_str().unwrap().into(),value:o["value"].as_str().unwrap().into(),placeholder:o["placeholder"].as_str().unwrap().into(),action:o["action"].as_str().unwrap().into(),submit:None,search:o["search"].as_bool().unwrap_or(false),lines:o["lines"].as_u64().unwrap_or(1) as usize}}
+fn sync(v:&mut DeclarativeView,c:&mut Context<DeclarativeView>,w:&mut Window,data:&[Value]){let nodes:Vec<_>=data.iter().map(as_node).collect();v.prune(&nodes);for n in nodes{v.prepare(&n,false,w,c)}}
+fn native(v:&DeclarativeView,key:&str)->Entity<InputState>{v.fields.inputs[key].state.e().clone()}
+fn main(){
+ let mut n=0;let mut lossy=0;let mut ordinary=0;let mut overwritten=0;
+ for l in ["", " ","a","два","αβ","💼","red\tblue"]{for r in ["","file","край","🪴"]{for sep in ["","/","\r","\n","\r\n","\n\n"]{
+ let draft=format!("{l}{sep}{r}");let mut c=Context{handlers:HashMap::new(),_t:std::marker::PhantomData};let mut v=DeclarativeView::default();let mut w=Window;
+ let area=sdk_area("note");let search=sdk_search("filter");sync(&mut v,&mut c,&mut w,&[area.clone()]);
+ let old=native(&v,"note");old.0.borrow_mut().value=draft.clone().into();let old_id=old.id();drop(old);
+ sync(&mut v,&mut c,&mut w,&[search.clone(),area.clone()]);let p=Painter{fields:&v.fields,focus:()};
+ assert_eq!(p.node(&as_node(&search)),Render::Search);assert_eq!(p.node(&as_node(&area)),Render::Area);
+ assert_eq!(native(&v,"note").id(),old_id);assert_eq!(native(&v,"note").read(&c).value().as_ref(),draft);
+ assert_eq!(native(&v,"filter").read(&c).value().as_ref(),"");assert_eq!(native(&v,"filter").read(&c).placeholder,"Искать");
+ sync(&mut v,&mut c,&mut w,&[search.clone()]);assert!(!v.fields.inputs.contains_key("note")); // map entry gone, no claim about reference destruction
+ let mut compact=InputState::new(&mut w,&mut c);compact.set_value(draft.clone(),&mut w,&mut c);
+ let actual=compact.value();assert_eq!(&*actual,draft.replace(['\n','\r'],""));
+ if actual.as_ref()!=draft {lossy+=1}else{ordinary+=1};
+ assert!(v.sent.is_empty());
+ // A forced control-type change with the *same* id: a render fallback never sees
+ // the previous edit if a new declared value has already replaced it.
+ let mut c=Context{handlers:HashMap::new(),_t:std::marker::PhantomData}; let mut v=DeclarativeView::default();sync(&mut v,&mut c,&mut w,&[area.clone()]);native(&v,"note").0.borrow_mut().value=draft.clone().into();
+ let s1=ui::search("note","published note","New search","filter.change");sync(&mut v,&mut c,&mut w,&[s1.clone()]);assert_eq!(Painter{fields:&v.fields,focus:()}.node(&as_node(&s1)),Render::Blank);assert_eq!(&*native(&v,"note").read(&c).value(),draft);
+ let s2=sdk_search("note");sync(&mut v,&mut c,&mut w,&[s2.clone()]);assert_eq!(Painter{fields:&v.fields,focus:()}.node(&as_node(&s2)),Render::Blank);assert_eq!(&*native(&v,"note").read(&c).value(),"");overwritten+=usize::from(!draft.is_empty());n+=1;
+ }}}
+ println!("two-ID coexistence: {n} drafts, all retained byte-for-byte (including empty, non-ASCII and multiple lines); all {n} fresh Search controls have their own empty value + placeholder; after removing the note it is absent from the retained field map in {n}/{n}. Immediate one-line seeding would change {lossy} drafts; {ordinary} unaffected. With same ID and unchanged declared value all {n} drafts survived but were not rendered; changing declared value to empty while retaining that ID overwrote {overwritten} nonempty drafts before paint.");
+}
