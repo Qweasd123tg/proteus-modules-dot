@@ -1,0 +1,45 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 344f3af..ff5608d 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -51,7 +51,7 @@ pub(crate) struct SnapshotState {
+     verified: bool,
+     verified_version: Option<crate::backend::SourceVersion>,
+     page_after: Option<u64>,
+-    pending: Option<JournalRecord>,
++    pending: Option<(JournalRecord, usize)>,
+ }
+ impl SnapshotState {
+     pub fn new(
+@@ -144,23 +144,26 @@ impl SnapshotState {
+         let mut records = Vec::new();
+         let mut bytes = 0_usize;
+         while records.len() < limit as usize {
+-            let record = match self.pending.take() {
+-                Some(record) => record,
++            let (record, measured_bytes) = match self.pending.take() {
++                Some((record, bytes)) => (record, Some(bytes)),
+                 None => match self.source.next()? {
+-                    Some(record) => record,
++                    Some(record) => (record, None),
+                     None => break,
+                 },
+             };
+             if record.session_seq <= after {
+                 continue;
+             }
+-            let record_bytes = encoded_bytes(&record)?;
++            let record_bytes = match measured_bytes {
++                Some(bytes) => bytes,
++                None => encoded_bytes(&record)?,
++            };
+             ensure!(
+                 record_bytes <= SESSION_STORAGE_MAX_RECORD_BYTES,
+                 "canonical record exceeds maximum"
+             );
+             if !records.is_empty() && bytes + record_bytes > SESSION_STORAGE_PAGE_BYTE_BUDGET {
+-                self.pending = Some(record);
++                self.pending = Some((record, record_bytes));
+                 break;
+             }
+             bytes += record_bytes;

@@ -1,0 +1,242 @@
+diff --git a/crates/proteus-core/src/app_server/http/tests/sse.rs b/crates/proteus-core/src/app_server/http/tests/sse.rs
+index fc5b47ae..55b64e69 100644
+--- a/crates/proteus-core/src/app_server/http/tests/sse.rs
++++ b/crates/proteus-core/src/app_server/http/tests/sse.rs
+@@ -110,3 +110,237 @@ async fn stored_summary_updates_notify_the_http_stream() {
+     .expect("completed refresh remains visible to a new connection");
+     server.shutdown().await;
+ }
++
++mod frame_probe {
++    use super::*;
++    use bytes::Bytes;
++    use proteus_contracts::app_protocol::{AppSessionSnapshot, AppTranscriptMessage};
++    use std::{
++        io::{BufRead, BufReader, Read, Write},
++        net::{SocketAddr, TcpStream},
++        time::Instant,
++    };
++
++    fn rows(n: usize, chars: usize) -> Vec<AppTranscriptMessage> {
++        (0..n)
++            .map(|i| AppTranscriptMessage {
++                message_id: Some(uuid::Uuid::from_u128(i as u128 + 7)),
++                timestamp_ms: Some(i as i64),
++                phase: None,
++                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
++                text: format!("{i} \"первая строка\"\n終\\ {}", "x".repeat(chars)),
++                images: vec![],
++                tool: None,
++                subagent: None,
++                streaming: false,
++            })
++            .collect()
++    }
++    fn event(n: usize, len: usize) -> StdioOutput {
++        StdioOutput::Event {
++            event: Box::new(AppServerEvent::SessionSnapshot {
++                snapshot: Box::new(AppSessionSnapshot {
++                    session_id: uuid::Uuid::from_u128(42),
++                    stream_id: "stream".into(),
++                    seq: 43,
++                    root_thread_id: None,
++                    transcript: rows(n, len),
++                    history: None,
++                    execution: Default::default(),
++                }),
++            }),
++        }
++    }
++    fn reference(output: &StdioOutput) -> Vec<u8> {
++        let json=serde_json::to_string(output).unwrap_or_else(|error|
++            serde_json::to_string(&serde_json::json!({"type":"response","id":null,"ok":false,"output":null,"error":format!("{error:#}")})).unwrap());
++        format!("event: output\ndata: {json}\n\n").into_bytes()
++    }
++
++    #[test]
++    fn exact_wire_and_partial_json_failure() {
++        for (n, len) in [(0, 0), (1, 0), (2, 1), (50, 1024), (1, 1048576)] {
++            let item = event(n, len);
++            assert_eq!(encode_sse_output(&item).as_ref(), reference(&item));
++        }
++        #[cfg(unix)]
++        {
++            use std::os::unix::ffi::OsStringExt;
++            let mut o = event(1, 1024);
++            let StdioOutput::Event { event } = &mut o else {
++                unreachable!()
++            };
++            let AppServerEvent::SessionSnapshot { snapshot } = event.as_mut() else {
++                unreachable!()
++            };
++            snapshot.transcript[0].images.push(crate::domain::ImageRef {
++                id: "img".into(),
++                name: "fixture".into(),
++                mime_type: "image/png".into(),
++                path: std::ffi::OsString::from_vec(vec![255, 254]).into(),
++            });
++            assert!(serde_json::to_string(&o).is_err());
++            let actual = encode_sse_output(&o);
++            assert_eq!(actual.as_ref(), reference(&o));
++            let body = std::str::from_utf8(&actual)
++                .unwrap()
++                .strip_prefix("event: output\ndata: ")
++                .unwrap()
++                .strip_suffix("\n\n")
++                .unwrap();
++            assert!(matches!(
++                serde_json::from_str::<StdioOutput>(body).unwrap(),
++                StdioOutput::Response { ok: false, .. }
++            ));
++        }
++    }
++
++    // Small independent test client: real HTTP/1.1 chunk boundaries do not
++    // necessarily coincide with SSE frames. No Desktop widget/paint is timed.
++    fn receive(addr: SocketAddr, dir: &str, expected: &serde_json::Value) -> u128 {
++        let start = Instant::now();
++        let mut stream = TcpStream::connect(addr).unwrap();
++        stream.set_nodelay(true).unwrap();
++        stream
++            .set_read_timeout(Some(Duration::from_secs(15)))
++            .unwrap();
++        write!(stream,"GET /events?session_dir={dir} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer session-secret\r\nOrigin: http://127.0.0.1:1430\r\nAccept: text/event-stream\r\n\r\n").unwrap();
++        let mut rd = BufReader::new(stream);
++        let mut line = String::new();
++        rd.read_line(&mut line).unwrap();
++        assert!(line.contains(" 200 "), "{line}");
++        loop {
++            line.clear();
++            rd.read_line(&mut line).unwrap();
++            if line == "\r\n" {
++                break;
++            }
++        }
++        let mut buf = Vec::new();
++        loop {
++            line.clear();
++            assert!(rd.read_line(&mut line).unwrap() > 0);
++            let n = usize::from_str_radix(line.trim().split(';').next().unwrap(), 16).unwrap();
++            assert!(n > 0);
++            let pos = buf.len();
++            buf.resize(pos + n, 0);
++            rd.read_exact(&mut buf[pos..]).unwrap();
++            let mut crlf = [0; 2];
++            rd.read_exact(&mut crlf).unwrap();
++            assert_eq!(crlf, *b"\r\n");
++            let received_at = start.elapsed().as_nanos();
++            while let Some(end) = buf.windows(2).position(|x| x == b"\n\n") {
++                let frame = &buf[..end];
++                if let Some(data) = frame.strip_prefix(b"event: output\ndata: ") {
++                    if let StdioOutput::Event { event } =
++                        serde_json::from_slice::<StdioOutput>(data).unwrap()
++                        && let AppServerEvent::SessionSnapshot { snapshot } = *event
++                    {
++                        assert_eq!(
++                            serde_json::to_value(snapshot.transcript).unwrap(),
++                            *expected
++                        );
++                        return received_at;
++                    }
++                }
++                buf.drain(..end + 2);
++            }
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    #[ignore = "paired Core/HTTP benchmark, release binaries run sequentially"]
++    async fn measure_initial_frame() {
++        let (state, server, _root) = test_state().await;
++        server.start_session().await.unwrap();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let accept = tokio::spawn(async move {
++            loop {
++                let (stream, _) = listener.accept().await.unwrap();
++                let state = state.clone();
++                tokio::spawn(async move {
++                    let service = service_fn(move |req| route_request(state.clone(), req));
++                    let _ = http1::Builder::new()
++                        .serve_connection(TokioIo::new(stream), service)
++                        .await;
++                });
++            }
++        });
++        let dir = server
++            .session_dir_path()
++            .unwrap()
++            .to_str()
++            .unwrap()
++            .to_owned();
++        for (shape, n, len) in [
++            ("empty", 0, 0),
++            ("short", 1, 80),
++            ("typical", 50, 1024),
++            ("large", 50, 65536),
++        ] {
++            let payload = event(n, len);
++            let fixture = rows(n, len);
++            // Load canonical rows via the actual configured JSONL worker before
++            // timing a warm connection. This stage is not included in GET latency.
++            let store = server.runtime.session_store().unwrap();
++            let thread = crate::domain::new_thread_id();
++            store.clear_history(thread).await.unwrap();
++            let canon: Vec<_> = fixture
++                .iter()
++                .map(|row| {
++                    use crate::model_standard::{CanonicalMessage, MessageRole};
++                    CanonicalMessage::text(
++                        if row.role == "user" {
++                            MessageRole::User
++                        } else {
++                            MessageRole::Assistant
++                        },
++                        row.text.clone(),
++                    )
++                })
++                .collect();
++            if !canon.is_empty() {
++                store.append_history(thread, None, &canon).await.unwrap();
++            }
++            let completed =
++                crate::app_server::read_model::project_completed_transcript(store).unwrap();
++            assert!(
++                completed
++                    .messages
++                    .iter()
++                    .map(|row| (&row.role, &row.text))
++                    .eq(fixture.iter().map(|row| (&row.role, &row.text)))
++            );
++            let expected = Arc::new(serde_json::to_value(&completed.messages).unwrap());
++            server.events.finish_progress(Ok(completed));
++            for rep in 0..10 {
++                let start = Instant::now();
++                let mut byte_count = 0;
++                let loops = if n * len < 10000 {
++                    512
++                } else if len < 65536 {
++                    64
++                } else {
++                    8
++                };
++                for _ in 0..loops {
++                    let bytes: Bytes =
++                        std::hint::black_box(encode_sse_output(std::hint::black_box(&payload)));
++                    byte_count = bytes.len();
++                }
++                let local = start.elapsed().as_nanos() / loops as u128;
++                let d = dir.clone();
++                let e = expected.clone();
++                let wire = tokio::task::spawn_blocking(move || receive(addr, &d, &e))
++                    .await
++                    .unwrap();
++                println!(
++                    "FRAME shape={shape} rep={rep} bytes={byte_count} encoder_ns={local} tcp_to_full_snapshot_ns={wire}"
++                );
++            }
++        }
++        accept.abort();
++        server.shutdown().await;
++    }
++}
