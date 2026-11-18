@@ -1,0 +1,88 @@
+#![allow(dead_code,unused_variables)]
+use serde_json::{Value,json};
+use std::{collections::{HashMap,HashSet},marker::PhantomData};
+type ModuleKey=(String,String);
+#[derive(Clone,PartialEq,Eq,Hash,Debug)]struct FieldPath{slot:String,module:String,key:String}
+struct Field{input:String,error:Option<String>,revision:Revision} 
+#[derive(Default)]struct Revision;
+impl Revision{fn edited(&mut self,_:u64){}}
+#[derive(Default)]struct Editors{fields:HashMap<FieldPath,Field>,json:HashMap<ModuleKey,Field>}
+impl Editors{@@forget@@ @@form_error@@}
+struct Context<T>(PhantomData<T>);
+impl<T> Default for Context<T>{fn default()->Self{Self(PhantomData)}}
+impl<T> Context<T>{fn notify(&mut self){}fn weak_entity(&self)->Weak{Weak}}
+impl Context<SettingsView>{fn listener(&self,cb:impl Fn(&mut SettingsView,&(),&mut (),&mut Self)+'static)->Cb{Box::new(move|v,cx|cb(v,&(),&mut (),cx))}}
+type Cb=Box<dyn Fn(&mut SettingsView,&mut Context<SettingsView>)>;
+struct App<'a>(&'a mut SettingsView,&'a mut Context<SettingsView>);
+struct Weak;impl Weak{fn update(&self,app:&mut App,cb:impl FnOnce(&mut SettingsView,&mut Context<SettingsView>))->Result<(),()>{cb(app.0,app.1);Ok(())}}
+fn hashed_id<T>(_name:&str,_:&T)->u8{0}
+struct MenuOption<T>{label:String,value:T,checked:bool}
+fn select_menu<T:Clone+'static>(_:u8,_:&str,options:Vec<MenuOption<T>>,f:impl Fn(T,&mut App)+'static)->Control{
+ assert_eq!(options.len(),1);assert!(options[0].label.to_lowercase().contains("отбросить"));let x=options[0].value.clone();
+ Control{popup:true,disabled:false,callback:Some(Box::new(move|v,cx|f(x.clone(),&mut App(v,cx))))}
+}
+struct Control{popup:bool,disabled:bool,callback:Option<Cb>}
+mod kit{use super::*;pub(super) fn button(_:u8)->Control{Control{popup:false,disabled:false,callback:None}}}
+impl Control{
+ fn faded_label(self,_:&str)->Self{self}fn quiet(self,_:&Context<SettingsView>)->Self{self}
+ fn xsmall(self)->Self{self}fn disabled(mut self,d:bool)->Self{self.disabled=d;self}
+ fn hint(self,_:&str,_:&Context<SettingsView>)->Self{self}fn on_click(mut self,f:Cb)->Self{self.callback=Some(f);self}
+ fn into_any_element(self)->Self{self}
+ fn press(&self,confirm:bool,v:&mut SettingsView,cx:&mut Context<SettingsView>){if !self.disabled&&(!self.popup||confirm){self.callback.as_ref().unwrap()(v,cx);}}
+}
+@@mode@@
+@@format@@
+@@parse@@
+@@module_key@@
+#[derive(Default)]struct SettingsView{editors:Editors,json:HashSet<ModuleKey>,values:HashMap<FieldPath,Value>,edit_revision:u64}
+impl SettingsView{
+ fn is_json(&self,s:&str,m:&str)->bool{self.json.contains(&module_key(s,m))}
+ fn edit_field(&mut self,p:&FieldPath,v:Option<Value>,_:Option<&Value>,_:&mut Context<Self>){if let Some(v)=v{self.values.insert(p.clone(),v);}else{self.values.remove(p);}}
+ @@text_changed@@ @@json_error@@ @@switch@@
+ fn button(&self,slot:&str,module:&str,cx:&Context<Self>)->Control{@@button@@}
+}
+fn path(s:&str,m:&str,k:&str)->FieldPath{FieldPath{slot:s.into(),module:m.into(),key:k.into()}}
+fn field(input:&str)->Field{Field{input:input.into(),error:None,revision:Revision}}
+fn main(){
+ let mut tests=0;let mut wrong=0;let mut first=0;let mut fixes=0;
+ for bad in ["[",r#"{"paper": "#,r#"{"layout":[1,2,"#]{
+ for sibling_bad in [false,true]{
+ for confirm in [false,true]{
+ for other_slot in [false,true]{
+ let mut v=SettingsView::default();let mut cx=Context::default();
+ let a=path("presentation","layout","rules");let b=path(if other_slot{"display"}else{"presentation"},if other_slot{"layout"}else{"caption"},"rules");
+ let last=json!({"layout":"compact"});v.values.insert(a.clone(),last.clone());v.editors.fields.insert(a.clone(),field(bad));
+ v.editors.fields.insert(b.clone(),field(if sibling_bad{bad}else{"[]"}));
+ v.text_changed(&a,TextFormat::Json,None,bad,&mut cx);
+ v.text_changed(&b,TextFormat::Json,None,if sibling_bad{bad}else{"[]"},&mut cx);
+ assert_eq!(v.values[&a],last);assert!(v.editors.fields[&a].error.is_some());
+ let button=v.button(&a.slot,&a.module,&cx);button.press(false,&mut v,&mut cx);
+ tests+=1;if v.is_json(&a.slot,&a.module)||v.editors.fields.get(&a).is_none_or(|f|f.input!=bad||f.error.is_none()){wrong+=1;first+=1;}
+ if button.popup {
+   if confirm {button.press(true,&mut v,&mut cx);}
+   else {
+      let corrected=r#"{"layout":[1,2]}"#;
+      v.editors.fields.get_mut(&a).unwrap().input=corrected.into();
+      v.text_changed(&a,TextFormat::Json,None,corrected,&mut cx);
+      let direct=v.button(&a.slot,&a.module,&cx);assert!(!direct.popup);direct.press(false,&mut v,&mut cx);fixes+=1;
+   }
+ }
+ assert!(v.is_json(&a.slot,&a.module));assert!(!v.editors.fields.contains_key(&a));assert!(v.editors.fields.contains_key(&b));
+ assert_eq!(v.editors.fields[&b].error.is_some(),sibling_bad);
+ let expected=if !confirm && button.popup {json!({"layout":[1,2]})}else{last};
+ assert_eq!(v.values[&a],expected);
+ // Raw JSON errors still prevent leaving through the button.
+ v.editors.json.insert(module_key(&a.slot,&a.module),Field{input:"{".into(),error:Some("incomplete".into()),revision:Revision});
+ let raw=v.button(&a.slot,&a.module,&cx);assert!(raw.disabled);raw.press(false,&mut v,&mut cx);
+ assert!(v.is_json(&a.slot,&a.module));assert_eq!(v.editors.json[&module_key(&a.slot,&a.module)].input,"{");
+ // If an older, normal button arrives just after a form error, do not discard.
+ v.editors.json.get_mut(&module_key(&a.slot,&a.module)).unwrap().error=None;
+ let raw=v.button(&a.slot,&a.module,&cx);raw.press(false,&mut v,&mut cx);
+ v.editors.fields.insert(a.clone(),field("[]"));
+ let old=v.button(&a.slot,&a.module,&cx);assert!(!old.popup&&!old.disabled);
+ v.editors.fields.get_mut(&a).unwrap().input=bad.into();v.text_changed(&a,TextFormat::Json,None,bad,&mut cx);
+ old.press(false,&mut v,&mut cx);tests+=1;if v.is_json(&a.slot,&a.module)||!v.editors.fields.contains_key(&a){wrong+=1;}
+ }}}}
+ println!("24 scenarios; {tests} loss gates, {wrong} wrong ({first} fresh and {} stale ordinary buttons); {fixes} repaired form buffers transferred to raw mode; sibling and raw-error controls passed",wrong-first);
+ if wrong>0{std::process::exit(1)}
+}

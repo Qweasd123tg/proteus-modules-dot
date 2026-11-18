@@ -1,0 +1,20 @@
+#![allow(dead_code)]
+mod kit{
+pub type Pixels=f32;pub const fn px(n:f32)->f32{n}
+#[derive(Copy,Clone,Debug)]pub struct Point<T>{pub x:T,pub y:T}
+#[derive(Copy,Clone,Debug)]pub struct Size<T>{pub width:T,pub height:T}
+#[derive(Copy,Clone,Debug)]pub struct Bounds<T>{pub origin:Point<T>,pub size:Size<T>}
+#[derive(Default)]pub struct Edges{pub top:f32,pub bottom:f32,pub left:f32,pub right:f32}
+impl Bounds<f32>{
+ pub fn center(&self)->Point<f32>{Point{x:self.origin.x+self.size.width/2.,y:self.origin.y+self.size.height/2.}}
+ pub fn contains(&self,p:&Point<f32>)->bool{p.x>=self.origin.x&&p.y>=self.origin.y&&p.x<self.origin.x+self.size.width&&p.y<self.origin.y+self.size.height}
+ pub fn extend(self,e:Edges)->Self{Self{origin:Point{x:self.origin.x-e.left,y:self.origin.y-e.top},size:Size{width:self.size.width+e.left+e.right,height:self.size.height+e.top+e.bottom}}}
+}
+#[derive(Default)]pub struct Window(pub u32);impl Window{pub fn refresh(&mut self){self.0+=1;}}
+pub struct App(pub Option<&'static str>);
+}
+mod tabs{pub type PaneId=u32; pub struct Pane{pub id:PaneId,pub tabs:Vec<String>,pub pinned:usize} pub struct TabLayout(pub Vec<String>);impl TabLayout{pub fn contains(&self,id:&str)->bool{self.0.iter().any(|s|s==id)}}}
+mod ui{use crate::{kit::*,tabs::*};
+mod drag{pub fn current(cx:&crate::kit::App)->Option<&str>{cx.0}}
+mod prefs{pub fn scale(_:&crate::kit::App)->f32{1.}}
+#[path="SUBJECT"] mod arrange;

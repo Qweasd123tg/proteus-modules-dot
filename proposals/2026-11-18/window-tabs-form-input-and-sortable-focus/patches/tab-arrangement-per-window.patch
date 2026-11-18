@@ -1,0 +1,194 @@
+--- a/src/ui/tabs/arrange.rs
++++ b/src/ui/tabs/arrange.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::cell::RefCell;
+ use std::collections::HashMap;
++use std::rc::Rc;
+ 
+ use gpui_kit::*;
+ 
+@@ -15,12 +16,14 @@
+ 
+ /// Where the dragged tab would land: a pane and an index among its other
+ /// tabs.
+-#[derive(Clone, Copy, PartialEq)]
++#[derive(Clone, Copy, Default, PartialEq)]
+ enum Target {
++    #[default]
+     Home,
+     At(PaneId, usize),
+ }
+ 
++#[derive(Default)]
+ struct Arrange {
+     dragging: Option<String>,
+     /// Bumped whenever a drag starts or ends, so the strips are drawn afresh
+@@ -31,13 +34,14 @@
+     bounds: HashMap<String, Bounds<Pixels>>,
+ }
+ 
+-thread_local! {
+-    static STATE: RefCell<Arrange> = RefCell::new(Arrange {
+-        dragging: None,
+-        generation: 0,
+-        target: Target::Home,
+-        bounds: HashMap::new(),
+-    });
++/// Shared by the strips of one workspace, never by two system windows.
++#[derive(Clone, Default)]
++pub(in crate::ui) struct TabArrangement(Rc<RefCell<Arrange>>);
++
++impl TabArrangement {
++    fn update<R>(&self, f: impl FnOnce(&mut Arrange) -> R) -> R {
++        f(&mut self.0.borrow_mut())
++    }
+ }
+ 
+ /// How one strip is drawn this frame.
+@@ -51,12 +55,17 @@
+     pub gap_width: Pixels,
+ }
+ 
+-pub(super) fn frame(pane: &Pane, layout: &TabLayout, cx: &App) -> Frame {
++pub(super) fn frame(
++    arrangement: &TabArrangement,
++    pane: &Pane,
++    layout: &TabLayout,
++    cx: &App,
++) -> Frame {
+     let dragging = drag::current(cx)
+         .and_then(|key| key.strip_prefix("tab:"))
+         .filter(|id| layout.contains(id))
+         .map(str::to_string);
+-    STATE.with_borrow_mut(|state| {
++    arrangement.update(|state| {
+         if state.dragging != dragging {
+             if dragging.is_none() {
+                 state.bounds.clear();
+@@ -85,8 +94,8 @@
+     })
+ }
+ 
+-pub(super) fn record(id: &str, bounds: Bounds<Pixels>) {
+-    STATE.with_borrow_mut(|state| match state.bounds.get_mut(id) {
++pub(super) fn record(arrangement: &TabArrangement, id: &str, bounds: Bounds<Pixels>) {
++    arrangement.update(|state| match state.bounds.get_mut(id) {
+         Some(known) => *known = bounds,
+         None => {
+             state.bounds.insert(id.to_string(), bounds);
+@@ -98,6 +107,7 @@
+ /// front of the first other tab whose middle lies to the right, within its
+ /// own group of pinned or unpinned tabs; leaving the strip sends it back.
+ pub(super) fn hover(
++    arrangement: &TabArrangement,
+     pane: &Pane,
+     dragging: &str,
+     pinned: bool,
+@@ -110,7 +120,7 @@
+         bottom: REACH_Y,
+         ..Default::default()
+     });
+-    STATE.with_borrow_mut(|state| {
++    arrangement.update(|state| {
+         let next = if reach.contains(&position) {
+             let others = others(pane, dragging);
+             let index = others
+@@ -138,11 +148,15 @@
+ 
+ /// The tab a drop on the strip of `pane` lands in front of: `Some(None)`
+ /// for the end of its group, `None` when the drag is not over this strip.
+-pub(super) fn drop_before(pane: &Pane, dragging: &str) -> Option<Option<String>> {
+-    let index = STATE.with_borrow(|state| match state.target {
+-        Target::At(at, index) if at == pane.id => Some(index),
+-        _ => None,
+-    })?;
++pub(super) fn drop_before(
++    arrangement: &TabArrangement,
++    pane: &Pane,
++    dragging: &str,
++) -> Option<Option<String>> {
++    let index = match arrangement.0.borrow().target {
++        Target::At(at, index) if at == pane.id => index,
++        _ => return None,
++    };
+     Some(others(pane, dragging).get(index).cloned())
+ }
+ 
+--- a/src/ui/tabs/bar.rs
++++ b/src/ui/tabs/bar.rs
+@@ -29,7 +29,7 @@
+             .get(&id)
+             .map(|(strip, _)| strip.clone())
+             .unwrap_or_default();
+-        let frame = arrange::frame(pane, layout, cx);
++        let frame = arrange::frame(&self.tab_arrangement, pane, layout, cx);
+         let tabs = match &frame.dragging {
+             Some(dragging) => self.render_dragged_strip(pane, layout, &frame, dragging, cx),
+             None => self.render_strip_tabs(pane, layout, cx),
+@@ -53,9 +53,11 @@
+                     .when_some(frame.dragging, |strip, dragging| {
+                         let pinned = dragged_state(&dragging, layout).is_some_and(|s| s.pinned);
+                         let (hovered, dropped) = (pane.clone(), pane.clone());
++                        let arrangement = self.tab_arrangement.clone();
+                         strip
+                             .on_drag_move::<DraggedTab>(move |event, window, _| {
+                                 arrange::hover(
++                                    &arrangement,
+                                     &hovered,
+                                     &dragging,
+                                     pinned,
+@@ -66,7 +68,11 @@
+                             })
+                             .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                                 this.tab_drag = false;
+-                                if let Some(before) = arrange::drop_before(&dropped, &dragged.id) {
++                                if let Some(before) = arrange::drop_before(
++                                    &this.tab_arrangement,
++                                    &dropped,
++                                    &dragged.id,
++                                ) {
+                                     let before = before.as_deref();
+                                     this.move_tab(&dragged.id, dropped.id, before, window, cx);
+                                 }
+@@ -169,10 +175,11 @@
+     ) -> AnyElement {
+         let element = self.render_tab(pane.id, tab, state, layout, cx);
+         let id = tab.to_string();
++        let arrangement = self.tab_arrangement.clone();
+         let measured = div()
+             .w_full()
+             .h_full()
+-            .on_prepaint(move |bounds, _, _| arrange::record(&id, bounds))
++            .on_prepaint(move |bounds, _, _| arrange::record(&arrangement, &id, bounds))
+             .child(element);
+         let min = min_width(state.pinned);
+         reveal(tab, shown, min, measured.into_any_element())
+--- a/src/ui/tabs/mod.rs
++++ b/src/ui/tabs/mod.rs
+@@ -13,6 +13,7 @@
+ mod tab;
+ mod view;
+ 
++pub(super) use arrange::TabArrangement;
+ pub(super) use drop::TabDrop;
+ pub(super) use motion::TabMotion;
+ pub(super) use split::{SplitDrag, SplitResize};
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -105,6 +105,7 @@
+     pub(super) sidebar_last: Option<&'static str>,
+     /// A tab is being dragged, so panes show where it can go.
+     pub(super) tab_drag: bool,
++    pub(super) tab_arrangement: super::tabs::TabArrangement,
+     /// Where the dragged tab would land when dropped onto a pane.
+     pub(super) tab_drop: Option<TabDrop>,
+     /// Scroll of each pane's tab strip and the active tab it last showed,
+@@ -277,6 +278,7 @@
+             sidebar_drag: None,
+             sidebar_last: None,
+             tab_drag: false,
++            tab_arrangement: Default::default(),
+             tab_drop: None,
+             tab_strips: HashMap::new(),
+             sessions_arrived: None,

@@ -1,0 +1,62 @@
+use std::collections::{HashMap,HashSet};
+use std::rc::{Rc,Weak};
+use std::cell::Cell;
+use std::hash::{Hash,Hasher};
+thread_local! {static OBS:Cell<bool>=const{Cell::new(false)}; static EQ:Cell<usize>=const{Cell::new(0)}; static HASH:Cell<usize>=const{Cell::new(0)};}
+fn start_count(){EQ.set(0);HASH.set(0);OBS.set(true)}
+fn end_count()->(usize,usize){OBS.set(false);(EQ.get(),HASH.get())}
+#[derive(Clone,Debug,Eq)] struct Id(usize);
+impl PartialEq for Id{fn eq(&self,k:&Self)->bool{if OBS.get(){EQ.set(EQ.get()+1)} self.0==k.0}}
+impl Hash for Id{fn hash<H:Hasher>(&self,h:&mut H){if OBS.get(){HASH.set(HASH.get()+1)}self.0.hash(h)}}
+#[derive(Clone)]struct Size{height:usize}
+#[derive(Clone)]struct Bounds{size:Size}
+struct CX; struct Window;
+impl Window {fn layout_bounds(&self,i:usize)->Bounds{Bounds{size:Size{height:3*i+5}}}}
+struct Child(usize);
+impl Child {fn request_layout(&mut self,_:&mut Window,_:&mut CX)->usize{self.0}}
+struct State{focus:HashMap<Id,Rc<()>>}
+struct Arrange{ids:Vec<Id>, children:Vec<Child>}
+impl Arrange{
+ fn gate(&mut self,state:&mut State)->(usize,usize){
+ let window=&mut Window; let cx=&mut CX;
+ @@layout@@
+ let layouts=&children;
+ @@raw@@
+ assert_eq!(raw.len(),self.ids.len());
+ @@keep@@
+ for (pos,id) in self.ids.iter().enumerate(){assert_eq!(heights[id],3*self.ids.iter().rposition(|j|j==id).unwrap_or(pos)+5)}
+ count
+ }}
+fn check(old:Vec<usize>,new:Vec<usize>,base:bool)->(usize,usize) {
+ let mut state=State{focus:HashMap::new()};
+ let mut weak=HashMap::<usize,Weak<()>>::new();
+ for k in old.iter().chain(new.iter()){
+    let h=state.focus.entry(Id(*k)).or_insert_with(|| Rc::new(())).clone();
+    if let Some(w)=weak.get(k){assert!(w.ptr_eq(&Rc::downgrade(&h)))}else{weak.insert(*k,Rc::downgrade(&h));}
+ }
+ let keys:Vec<_>=new.iter().map(|k|Id(*k)).collect();
+ let inspected=state.focus.len();
+ let mut arr=Arrange{children:(0..keys.len()).map(Child).collect(),ids:keys};
+ let (eq,h)=arr.gate(&mut state);
+ let expected:HashSet<usize>=new.iter().copied().collect();
+ assert_eq!(state.focus.len(),expected.len());
+ for (k,w) in &weak{if expected.contains(k){assert!(Rc::ptr_eq(&w.upgrade().unwrap(),&state.focus[&Id(*k)]))}else{assert!(w.upgrade().is_none())}}
+ if base{
+   assert_eq!(h,0);assert_eq!(eq,weak.keys().map(|k|new.iter().position(|v|v==k).map_or(new.len(),|x|x+1)).sum());
+ }else if !new.is_empty(){assert_eq!(h,inspected)}
+ (eq,h)
+}
+fn main(){
+ let base=std::env::args().nth(1).unwrap()=="before";let mut frames=0usize;
+ for oldmask in 0..64{for mask in 0..64{for order in 0..3{
+ let o=(0..6).filter(|j|oldmask&(1<<j)!=0).collect();
+ let mut n:Vec<_>=(0..6).filter(|j|mask&(1<<j)!=0).collect();if order==1{n.reverse()}if order==2&&!n.is_empty(){n.rotate_left(1);n.push(n[0])}
+ check(o,n,base);frames+=1
+ }}}
+ let n=1024;let range:Vec<_>=(0..n).collect();
+ let (a,h)=check(range.clone(),range.iter().rev().copied().collect(),base);
+ let (b,i)=check(range,(n..2*n).collect(),base);
+ println!("{frames} replacement frames: reordered, disjoint, empty, duplicate-content keys; surviving pointer identities and dropped stale pointers verified");
+ if base{println!("1024 reversed: {a} Eq, {h} hashes; 1024→1024 disjoint: {b} Eq, {i} hashes (old+new focus installed).")}
+ else{println!("1024 reversed: {h} hash operations; 1024→1024 disjoint: {i} hash operations. Equality probes depend on RandomState; not timed.")}
+}

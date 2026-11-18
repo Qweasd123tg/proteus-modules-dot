@@ -1,0 +1,136 @@
+diff --git a/src/ui/settings/editors.rs b/src/ui/settings/editors.rs
+index 6233a77..6498808 100644
+--- a/src/ui/settings/editors.rs
++++ b/src/ui/settings/editors.rs
+@@ -119,12 +119,25 @@ impl Editors {
+             || self.mcp.values().any(McpForm::has_errors)
+     }
+ 
++    pub(super) fn form_error(&self, slot: &str, module: &str) -> bool {
++        self.fields.iter().any(|(path, field)| {
++            path.slot == slot && path.module == module && field.error.is_some()
++        })
++    }
++
+     fn forget_form(&mut self, slot: &str, module: &str) {
+         self.fields
+             .retain(|path, _| path.slot != slot || path.module != module);
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++pub(super) enum ParameterMode {
++    Form,
++    Json,
++    DiscardInvalidFormAndOpenJson,
++}
++
+ pub(super) fn module_key(slot: &str, module: &str) -> ModuleKey {
+     (slot.to_string(), module.to_string())
+ }
+@@ -469,15 +482,31 @@ impl SettingsView {
+         }
+     }
+ 
+-    /// Switches one module between the form and raw JSON; each side is
+-    /// rebuilt from the draft.
+-    pub(super) fn toggle_json(&mut self, slot: &str, module: &str, cx: &mut Context<Self>) {
++    /// Rebuild the destination from the draft. Only the explicit discard item
++    /// may drop form text with a parse error.
++    pub(super) fn switch_mode(
++        &mut self,
++        slot: &str,
++        module: &str,
++        target: ParameterMode,
++        cx: &mut Context<Self>,
++    ) {
+         let key = module_key(slot, module);
+-        if self.json.remove(&key) {
+-            self.editors.json.remove(&key);
+-        } else {
+-            self.editors.forget_form(slot, module);
+-            self.json.insert(key);
++        match target {
++            ParameterMode::Form => {
++                if self.json_error(slot, module) || !self.json.remove(&key) {
++                    return;
++                }
++                self.editors.json.remove(&key);
++            }
++            ParameterMode::Json | ParameterMode::DiscardInvalidFormAndOpenJson => {
++                if (matches!(target, ParameterMode::Json) && self.editors.form_error(slot, module))
++                    || !self.json.insert(key)
++                {
++                    return;
++                }
++                self.editors.forget_form(slot, module);
++            }
+         }
+         cx.notify();
+     }
+diff --git a/src/ui/settings/params.rs b/src/ui/settings/params.rs
+index b0b0bf6..74991f9 100644
+--- a/src/ui/settings/params.rs
++++ b/src/ui/settings/params.rs
+@@ -8,8 +8,8 @@ use gpui_kit::component::*;
+ use gpui_kit::*;
+ 
+ use super::SettingsView;
+-use super::editors::module_key;
+-use super::widgets::{card, hashed_id, section};
++use super::editors::{ParameterMode, module_key};
++use super::widgets::{MenuOption, card, hashed_id, section, select_menu};
+ use crate::settings::FieldPath;
+ use crate::settings::catalog::{editable_fields, editable_params, module_info};
+ use crate::ui::kit;
+@@ -92,7 +92,35 @@ impl SettingsView {
+             .map(|_| {
+                 let json = self.is_json(slot, module);
+                 let (slot, module) = (slot.to_string(), module.to_string());
+-                kit::button(hashed_id("params-mode", &(&slot, &module)))
++                let id = hashed_id("params-mode", &(&slot, &module));
++                if !json && self.editors.form_error(&slot, &module) {
++                    let view = cx.weak_entity();
++                    return select_menu(
++                        id,
++                        "JSON…",
++                        vec![MenuOption {
++                            label: "Отбросить ввод с ошибками и открыть JSON".into(),
++                            value: (),
++                            checked: false,
++                        }],
++                        move |(), cx| {
++                            let _ = view.update(cx, |this, cx| {
++                                this.switch_mode(
++                                    &slot,
++                                    &module,
++                                    ParameterMode::DiscardInvalidFormAndOpenJson,
++                                    cx,
++                                )
++                            });
++                        },
++                    );
++                }
++                let target = if json {
++                    ParameterMode::Form
++                } else {
++                    ParameterMode::Json
++                };
++                kit::button(id)
+                     .faded_label(if json { "Форма" } else { "JSON" })
+                     .quiet(cx)
+                     .xsmall()
+@@ -105,9 +133,10 @@ impl SettingsView {
+                         },
+                         cx,
+                     )
+-                    .on_click(
+-                        cx.listener(move |this, _, _, cx| this.toggle_json(&slot, &module, cx)),
+-                    )
++                    .on_click(cx.listener(move |this, _, _, cx| {
++                        this.switch_mode(&slot, &module, target, cx)
++                    }))
++                    .into_any_element()
+             });
+         (file.is_some() || mode.is_some()).then(|| {
+             h_flex()

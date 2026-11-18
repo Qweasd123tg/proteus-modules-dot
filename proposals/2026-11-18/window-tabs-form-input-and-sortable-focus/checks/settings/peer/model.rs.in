@@ -1,0 +1,30 @@
+use std::{collections::{HashMap,HashSet}, marker::PhantomData};
+type ModuleKey=(String,String);
+#[derive(Clone,Debug,Hash,PartialEq,Eq)]struct FieldPath{slot:String,module:String,leaf:usize}
+#[derive(Clone,Debug,PartialEq,Eq)]struct Field{buf:String,error:Option<String>}
+#[derive(Clone,Default,Debug,PartialEq,Eq)]struct Editors{fields:HashMap<FieldPath,Field>,json:HashMap<ModuleKey,Field>}
+impl Editors{/*FORM*/ /*FORGET*/}
+#[derive(Copy,Clone,Debug,PartialEq,Eq)]enum ParameterMode{Form,Json,DiscardInvalidFormAndOpenJson}
+struct Context<T>{signals:u32,t:PhantomData<T>}impl<T>Context<T>{fn notify(&mut self){self.signals+=1}}
+#[derive(Clone,Default,Debug,PartialEq,Eq)]struct View{json:HashSet<ModuleKey>,editors:Editors}
+ /*KEY*/
+impl View{/*JSON*/ /*SWITCH*/}
+const K:[(&str,&str);3]=[("a","x"),("a","y"),("b","x")];
+fn field(err:bool,s:String)->Field{Field{buf:s,error:err.then(||"unfinished".into())}}
+fn main(){
+ let mut cases=0;let mut duplicate=0;let mut scoped=0;
+ for raw_modes in 0..8 {for raw_errs in 0..8 {for field_errs in 0..64 {
+ let mut start=View::default();for (i,(s,m)) in K.iter().copied().enumerate(){
+ let k=module_key(s,m);let json=raw_modes&(1<<i)!=0;if json{start.json.insert(k.clone());start.editors.json.insert(k,field(raw_errs&(1<<i)!=0,format!("raw-{s}-{m}")));}
+ else{for leaf in 0..2{let b=field_errs&(1<<(2*i+leaf))!=0;start.editors.fields.insert(FieldPath{slot:s.into(),module:m.into(),leaf},field(b,format!("entry-{s}-{m}-{leaf}-{}",if b{"["}else{"[]"})));}}
+ }
+ for (i,(s,m)) in K.iter().copied().enumerate(){for t in [ParameterMode::Form,ParameterMode::Json,ParameterMode::DiscardInvalidFormAndOpenJson]{
+ let was=raw_modes&(1<<i)!=0;let raw_bad=raw_errs&(1<<i)!=0;let field_bad=field_errs&(3<<(2*i))!=0;let mut view=start.clone();let mut cx=Context{signals:0,t:PhantomData};
+ let changes=match t{ParameterMode::Form=>was&&!raw_bad,ParameterMode::Json=>!was&&!field_bad,ParameterMode::DiscardInvalidFormAndOpenJson=>!was};
+ let mut expected=start.clone();let key=module_key(s,m);
+ if changes{if was{expected.json.remove(&key);expected.editors.json.remove(&key);}else{expected.json.insert(key);for leaf in 0..2{expected.editors.fields.remove(&FieldPath{slot:s.into(),module:m.into(),leaf});}}}
+ view.switch_mode(s,m,t,&mut cx);assert_eq!(view,expected);assert_eq!(cx.signals,u32::from(changes));cases+=1;
+ view.switch_mode(s,m,t,&mut cx);assert_eq!(view,expected);assert_eq!(cx.signals,u32::from(changes));duplicate+=1;scoped+=2;
+ }} }}}
+ println!("Exact native switch_mode/form_error/forget_form/json_error; {cases} state transitions; {duplicate} immediate duplicate deliveries; {scoped} unchanged neighbor modules (same slot or same module name); all pass.");
+}

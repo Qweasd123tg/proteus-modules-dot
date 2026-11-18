@@ -1,0 +1,31 @@
+use std::{rc::Rc,cell::Cell,hash::{Hash,Hasher,BuildHasherDefault,DefaultHasher}};
+type HashMap<K,V>=std::collections::HashMap<K,V,BuildHasherDefault<DefaultHasher>>;
+thread_local!{static EQ:Cell<usize>=const{Cell::new(0)};static HASH:Cell<usize>=const{Cell::new(0)};}
+#[derive(Clone,Debug)]struct Id(Rc<str>);
+impl PartialEq for Id{fn eq(&self,b:&Self)->bool{EQ.set(EQ.get()+1);self.0==b.0}}
+impl Eq for Id{}
+impl Hash for Id{fn hash<H:Hasher>(&self,h:&mut H){HASH.set(HASH.get()+1);self.0.hash(h)}}
+fn reset_counters(){EQ.set(0);HASH.set(0)}
+fn counts()->(usize,usize){(EQ.get(),HASH.get())}
+struct Size{height:i32}struct Rect{size:Size}
+struct State{focus:HashMap<Id,Rc<usize>>}struct Arrange{ids:Vec<Id>}
+impl Arrange{fn measure(&self,state:&mut State,raw:&[(Id,Rect)])->((usize,usize),HashMap<Id,i32>){/*PREPAINT*/(cost,heights)}}
+fn key(i:usize)->Id{Id(format!("field:項目:{i}").into())}
+fn main(){
+ let after=std::env::args().nth(1).unwrap()=="after";let mut cases=0;
+ for n in 0..=80{for phase in 0..8{for shift in [0usize,1,9,40]{
+ let mut wanted=(0..n).filter(|i|(i+phase)%4!=1).map(|i|(i+shift)%120).collect::<Vec<_>>();
+ if phase%2==0{wanted.reverse();}if phase%3==0&&!wanted.is_empty(){wanted.push(wanted[0]);}
+ let ids=wanted.iter().map(|&i|key(i)).collect();let a=Arrange{ids};let mut st=State{focus:HashMap::default()};let mut all=Vec::new();
+ for j in (0..128).filter(|i|(i+phase)%5!=1){let h=Rc::new(j);all.push((j,h.clone()));st.focus.insert(key(j),h);}
+ let raw=a.ids.iter().enumerate().map(|(j,id)|(id.clone(),Rect{size:Size{height:j as i32}})).collect::<Vec<_>>();
+ let (_,h)=a.measure(&mut st,&raw);for (id,old) in all{let v=st.focus.get(&key(id));assert_eq!(v.is_some(),wanted.contains(&id));if let Some(v)=v{assert!(Rc::ptr_eq(v,&old));}}
+ for (id,ht) in h{let latest=wanted.iter().rposition(|i|key(*i)==id).unwrap();assert_eq!(ht,latest as i32);}
+ cases+=1;
+ }}}
+ println!("{cases} independent focus-membership/handle-identity and measured-height checks.");
+ for n in [1,16,256,1024,4096]{let a=Arrange{ids:(0..n).map(key).collect()};let mut st=State{focus:a.ids.iter().enumerate().map(|(i,id)|(id.clone(),Rc::new(i))).collect()};let raw=a.ids.iter().map(|id|(id.clone(),Rect{size:Size{height:0}})).collect::<Vec<_>>();
+ let ((eq,hash),_)=a.measure(&mut st,&raw);println!("n={n}: pruning existing handles, id equality calls={eq}, key hashes={hash}");
+ assert_eq!(st.focus.len(),n);if after{assert_eq!(hash,n);assert!(eq<2*n)}else{assert_eq!((eq,hash),(n*(n+1)/2,0));}
+ }
+}
