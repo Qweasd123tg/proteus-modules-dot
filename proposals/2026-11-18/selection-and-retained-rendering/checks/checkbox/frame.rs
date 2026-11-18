@@ -16,6 +16,12 @@ impl FieldSpec{
 }
 //HELPER
 struct Choice{value:Value}
+struct ConfigField{value:ConfigValueSchema}
+enum ConfigValueSchema{Array{items:Box<ConfigValueSchema>},Enum{options:Vec<Choice>},String{secret:bool},Other}
+mod tags {use super::*;
+//TAG_RULE
+}
+use tags::is_tag_field;
 fn toggle(handler:&FieldSpec,cx:&mut App,options:&[Choice],value:Value,checked:&bool){
  let selected=cx.draft.value(&handler.path).or(handler.field.default.as_ref()).and_then(Value::as_array).cloned().unwrap_or_default();
  //CLICK
@@ -27,7 +33,11 @@ fn initial(s:&FieldSpec,v:Option<Value>)->App{
 }
 fn perms(v:&[Value],p:Vec<Value>,out:&mut Vec<Vec<Value>>){out.push(p.clone()); for x in v {if !p.contains(x){let mut q=p.clone();q.push(x.clone());perms(v,q,out);}}}
 fn main(){
- let vals=vec![json!("Blue"),json!("Gold"),json!("Grey"),json!("Green")];
+ let vals=vec![json!(10),json!(20),json!(30),json!(40)];
+ let tagged=|v:&[Value]| is_tag_field(&ConfigField{value:ConfigValueSchema::Array{items:Box::new(ConfigValueSchema::Enum{options:v.iter().cloned().map(|value|Choice{value}).collect()})}});
+ assert!(tagged(&[json!("Blue"),json!("Gold"),json!("Grey"),json!("Green")]));
+ assert!(!tagged(&vals));
+ assert!(!tagged(&[json!("Blue"),json!(20)]));
  let opts:Vec<_>=vals.iter().cloned().map(|value|Choice{value}).collect();
  let mut bs=Vec::new();perms(&vals,vec![],&mut bs);
  let(mut cases,mut fail)=(0,0);
@@ -50,9 +60,9 @@ fn main(){
  }
  println!("{cases} two-click cycles; {fail} do not restore original draft");
  let s=spec(None);
- for (v,click,expected) in [(json!(["obsolete","Grey"]),json!("Blue"),json!(["Blue","Grey"])),(json!(["Grey","Grey"]),json!("Blue"),json!(["Blue","Grey"])),(json!(["Grey","Blue"]),json!("Gold"),json!(["Blue","Gold","Grey"]))]{
+ for (v,click,expected) in [(json!(["obsolete",30]),json!(10),json!([10,30])),(json!([30,30]),json!(10),json!([10,30])),(json!([30,10]),json!(20),json!([10,20,30]))]{
   let mut app=initial(&s,Some(v)); toggle(&s,&mut app,&opts,click,&true);assert_eq!(app.draft.value(&s.path),Some(&expected))
  }
- let mut app=initial(&s,None);let array=json!(["Grey","Blue"]);s.set(Some(array.clone()),&mut app);assert_eq!(app.draft.value(&s.path),Some(&array));
+ let mut app=initial(&s,None);let array=json!([30,10]);s.set(Some(array.clone()),&mut app);assert_eq!(app.draft.value(&s.path),Some(&array));
  if fail>0{std::process::exit(1);}
 }

@@ -48,7 +48,15 @@ def run():
     if git_blob(b) != BASE:
         raise ValueError("source blob mismatch")
     d = source("src/settings/draft.rs").decode()
-    skeleton = (HERE / "frame.rs").read_text()
+    # Verify the actual discriminator and precedence, not only the isolated checkbox handler.
+    fields = b.decode()
+    assert "let tagged = super::tags::is_tag_field(field);" in fields
+    assert "let control = if tagged {\n            self.string_tags(&spec, cx)\n        } else {\n            match kind {" in fields
+    assert "FieldKind::MultiChoice(options) => multi_choice(&spec, options)," in fields
+    schema = source("src/settings/schema.rs").decode()
+    assert "ConfigValueSchema::Array { items } => match items.as_ref() {\n            ConfigValueSchema::Enum { options } => FieldKind::MultiChoice(options)," in schema
+    tag_source = source("src/ui/settings/tags.rs").decode()
+    skeleton = (HERE / "frame.rs").read_text().replace("//TAG_RULE", method(tag_source,"is_tag_field"))
     with tempfile.TemporaryDirectory() as td:
         work = Path(td).resolve()
         (work / PATH).parent.mkdir(parents=True)
@@ -79,6 +87,7 @@ def run():
             if got.returncode != expected[1] or got.stdout.strip() != wanted:
                 raise RuntimeError(f"{mode}: unexpected {got.returncode}: {got.stdout} {got.stderr}")
             print(f"{mode}: {got.stdout.strip()}")
+    print("Pinned dispatch and native tag predicate: four string values -> tag editor; four numeric values or mixed string/number -> checkbox handler.")
     print("Pinned source, patch application and reverse applicability verified. No GUI, service or profile was run.")
 
 if __name__ == "__main__":
