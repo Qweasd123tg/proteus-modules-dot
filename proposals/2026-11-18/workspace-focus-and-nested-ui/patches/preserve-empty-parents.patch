@@ -1,0 +1,43 @@
+diff --git a/src/settings/draft.rs b/src/settings/draft.rs
+index dd53d45..70c79d1 100644
+--- a/src/settings/draft.rs
++++ b/src/settings/draft.rs
+@@ -159,7 +159,14 @@ impl Draft {
+         };
+         if value.is_some() {
+             self.set_value(path, value);
+-        } else if let Some(module) = self
++        } else {
++            self.reset_value(path, baseline);
++        }
++    }
++
++    /// Remove the field itself, but keep any originally empty parent objects.
++    pub fn reset_value(&mut self, path: &FieldPath, baseline: &Draft) {
++        if let Some(module) = self
+             .config
+             .get_mut(&path.slot)
+             .and_then(|modules| modules.get_mut(&path.module))
+@@ -379,7 +386,7 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
+ 
+ /// Removes `keys` under `value`; returns whether the caller should prune the
+ /// empty object. Schema edits retain empty ancestors present in the baseline;
+-/// ordinary resets pass no baseline and keep their existing pruning behavior.
++/// callers without a baseline prune all newly empty ancestors.
+ fn remove_nested(value: &mut Value, keys: &[String], baseline: Option<&Value>) -> bool {
+     let Some(object) = value.as_object_mut() else {
+         return false;
+diff --git a/src/ui/settings/editors.rs b/src/ui/settings/editors.rs
+index 6233a77..360a8b0 100644
+--- a/src/ui/settings/editors.rs
++++ b/src/ui/settings/editors.rs
+@@ -495,7 +495,8 @@ impl SettingsView {
+         self.editors
+             .fields
+             .retain(|editor, _| !editor.starts_with(path));
+-        self.update_draft(cx, |draft| draft.set_value(path, None));
++        self.draft.reset_value(path, &self.baseline);
++        self.draft_changed(cx);
+     }
+ }
+ 

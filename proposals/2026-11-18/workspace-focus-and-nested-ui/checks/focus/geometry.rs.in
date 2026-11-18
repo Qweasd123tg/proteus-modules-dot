@@ -1,0 +1,52 @@
+#![allow(dead_code)]
+#[derive(Copy,Clone)] enum Axis{Row,Column}
+#[derive(Copy,Clone,PartialEq,Debug)] enum Edge{Left,Right,Top,Bottom}
+#[derive(Copy,Clone,PartialEq,Debug)] struct PaneId(usize);
+struct Pane{id:PaneId}
+enum Node{Pane(Pane),Split(Split)}
+struct Split{axis:Axis,children:Vec<Child>}
+struct Child{size:Size,node:Node}
+#[derive(Copy,Clone)] enum Size {Weight(f32),Fixed(f32)}
+impl Size{fn weight(self)->f32{if let Size::Weight(w)=self{w}else{0.}}}
+struct TabLayout{root:Node}
+mod native {
+use super::*;
+@RECT@
+@PLACE@
+@EXTENTS@
+impl TabLayout {
+@RECTS@
+}
+pub(super) fn go(l:&TabLayout,area:Option<(f32,f32)>,scale:f32,edge:Edge)->Option<PaneId>{@CALL@}
+}
+fn pn(id:usize)->Node{Node::Pane(Pane{id:PaneId(id)})}
+fn group(axis:Axis,nodes:Vec<(Node,Size)>)->Node{Node::Split(Split{axis,children:nodes.into_iter().map(|(node,size)|Child{node,size}).collect()})}
+fn layout(edge:Edge,locked:f32)->TabLayout{
+ let (along,perp)=if matches!(edge,Edge::Left|Edge::Right){(Axis::Row,Axis::Column)}else{(Axis::Column,Axis::Row)};
+ let a=group(perp,vec![(pn(0),Size::Weight(1.)),(pn(1),Size::Weight(1.)),(pn(2),Size::Weight(1.))]);
+ let b=group(perp,vec![(pn(3),Size::Fixed(locked)),(pn(4),Size::Weight(1.))]);
+ let (u,v)=if matches!(edge,Edge::Right|Edge::Bottom){(a,b)}else{(b,a)};
+ TabLayout{root:group(along,vec![(u,Size::Weight(1.)),(v,Size::Weight(1.))])}
+}
+fn expected(extent:f64,locked:f64)->Option<PaneId>{
+ let third=(extent-2.)/3.;let (lo,hi)=(third+1.,third*2.+1.);
+ let locked=locked.min(extent-1.);
+ let f64overlap=|a:f64,b:f64| (b.min(hi)-a.max(lo)).max(0.);
+ let (a,b)=(f64overlap(0.,locked),f64overlap(locked+1.,extent));
+ if (a-b).abs()<0.03{return None;} // intentional ties & subpixel ties left to original order
+ Some(PaneId(if a>b {3}else{4}))
+}
+fn main(){
+ let(mut passed,mut n,mut fallback,mut fall_n)=(0,0,0,0);
+ for edge in [Edge::Right,Edge::Left,Edge::Bottom,Edge::Top]{
+ for extent in [301.,459.,600.,719.,841.,1000.,1279.,1800.]{
+ for locked in [69.,211.,303.,420.,511.,777.,1120.] {for scale in [0.75,1.,1.25,1.75,2.]{
+ let Some(want)=expected(extent,locked)else{continue};
+ let l=layout(edge,locked as f32);
+ let (w,h)=if matches!(edge,Edge::Right|Edge::Left){(1100.,extent as f32)}else{(extent as f32,1100.)};
+ let got=native::go(&l,Some((w*scale,h*scale)),scale,edge);n+=1;passed+=usize::from(got==Some(want));
+ let a=native::go(&l,None,scale,edge);let b=l.neighbor(PaneId(1),edge);fallback+=usize::from(a==b);fall_n+=1;
+ }}}}
+ println!("Correct settled visible focus in mirrored/rotated grids at five scales: {passed}/{n}; unmeasured reference fallback {fallback}/{fall_n}.");
+ if passed!=n||fallback!=fall_n {std::process::exit(1);}
+}

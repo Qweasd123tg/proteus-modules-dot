@@ -1,0 +1,12 @@
+mod before{ /*BEFORE*/ pub fn f(x:f64)->String{number(x)} }
+mod after{ /*AFTER*/ pub fn f(x:f64)->String{number(x)} }
+fn main(){
+ let mut changed=0;let mut same=0;let mut maxlen=0;
+ let stop=0.005_f64.to_bits();
+ let mut cases=vec![0.,-0.,0.001,0.004,0.005,0.006,0.1,0.99,1.,12.5,f64::MIN_POSITIVE,f64::MAX];
+ for off in -16i64..=16{cases.push(f64::from_bits((stop as i64+off) as u64));}
+ for exp in 0..=2046u64 {for frac in [0u64,1,(1u64<<32)-1,1u64<<49,1u64<<51,(1u64<<52)-2,(1u64<<52)-1]{cases.push(f64::from_bits(exp<<52|frac));}}
+ for x in cases{let old=before::f(x);let new=after::f(x);if x>0. && old.parse::<f64>().unwrap()==0.{assert!(new.parse::<f64>().unwrap()>0.);assert!(!new.starts_with("0.00"));maxlen=maxlen.max(new.len());changed+=1;}else{assert_eq!(old,new,"value={x:e}");same+=1;}}
+ let a=[0.001,0.004]; assert_eq!((a[0]/a[1]) as f32,0.25); assert_eq!(a.map(before::f),["0.00","0.00"]); assert_eq!(a.map(after::f),["1.00e-3","4.00e-3"]);
+ println!("{changed} originally zero-looking positives now labeled nonzero, max new length {maxlen}; {same} other spellings unchanged including the 0.005 boundary, signed/unsigned zero and huge values.");
+}

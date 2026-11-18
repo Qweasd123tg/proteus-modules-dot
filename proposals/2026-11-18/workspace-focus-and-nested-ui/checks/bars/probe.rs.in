@@ -1,0 +1,18 @@
+/*CATALOG*/
+/*NUMBER*/
+struct Bar { value:f64 }
+fn main() {
+    use std::io::{self,BufRead};
+    for line in io::stdin().lock().lines() {
+        let raw=render_json(&line.unwrap()).unwrap();
+        let unit=raw["unit"].as_str().unwrap_or_default();
+        let inputs=raw["bars"].as_array().unwrap();
+        let bars: Vec<_>=inputs.iter().map(|r| Bar{value:r["value"].as_f64().unwrap()}).collect();
+        /*PEAK*/
+        let rows:Vec<_>=bars.iter().zip(inputs).map(|(bar,input)|{
+            /*FRACTION*/
+            serde_json::json!({"label":input["label"],"fraction":fraction,"text":/*LABEL*/,"value_bits":bar.value.to_bits().to_string()})
+        }).collect();
+        println!("{}",serde_json::json!({"rows":rows,"unit":unit}));
+    }
+}

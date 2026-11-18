@@ -1,0 +1,77 @@
+#![allow(dead_code,unused_variables)]
+use std::{cell::Cell,collections::HashMap,ops::Deref,time::Instant};
+type SharedString=String;
+#[derive(Default,Debug)] struct Elem { label:Option<String>, kids:Vec<Self>,progress:Option<u32>}
+type AnyElement=Elem;type Div=Elem;
+fn div()->Div{Elem::default()}fn v_flex()->Div{div()}
+impl Elem{
+ fn label(s:String)->Self{Self{label:Some(s),..Default::default()}}
+ fn child(mut self,x:Self)->Self{self.kids.push(x);self}
+ fn children(mut self,it:impl IntoIterator<Item=Self>)->Self{self.kids.extend(it);self}
+ fn into_any_element(self)->Self{self}
+ fn w_full(self)->Self{self}fn px(self,_:f32)->Self{self}fn pb(self,_:f32)->Self{self}
+ fn opacity(mut self,x:f32)->Self{self.progress=Some(x.to_bits());self}
+ fn disclosure_frame(self,_:&App)->Self{self}fn flex_1(self)->Self{self}fn min_h_0(self)->Self{self}
+ fn flex_none(self)->Self{self}fn min_w_0(self)->Self{self}fn px_2(self)->Self{self}fn pt_2(self)->Self{self}fn pb_2(self)->Self{self}
+ fn when(self,yes:bool,f:impl FnOnce(Self)->Self)->Self{if yes{f(self)}else{self}}
+ fn seq(&self,out:&mut Vec<String>){if let Some(s)=&self.label{out.push(s.clone());}if let Some(n)=self.progress{out.push(format!("p={n:08x}"));}for el in &self.kids{el.seq(out)}}
+}
+mod prefs{pub struct Unit(pub f32);pub fn scaled(x:f32)->Unit{Unit(x)}impl Unit{pub fn to_pixels(self,_:f32)->f32{self.0}}}
+struct Theme{radius:f32,font_size:f32}
+struct App{phases:HashMap<String,(bool,f32)>,reduced:bool}
+impl App{fn theme(&self)->Theme{Theme{radius:5.,font_size:15.}}}
+struct Context<T>{app:App,marker:std::marker::PhantomData<T>}
+impl<T>Deref for Context<T>{type Target=App;fn deref(&self)->&App{&self.app}}
+mod kit{use super::*;pub(super) fn surface(e:Elem,_:&App)->Elem{e}}
+enum ElementId{Name(String)}
+struct Reveal;
+impl Reveal{fn new(_:ElementId,_:Option<f32>,e:Elem)->Elem{e}}
+mod ui{pub(crate) mod motion{use super::super::*;
+ fn progress_at(key:&str,open:bool,_at:Instant,cx:&App)->Option<f32>{
+    if cx.reduced{return None;}cx.phases.get(key).filter(|x|x.0==open).map(|x|x.1)
+ }
+ /*MOTION*/
+}}
+enum Node{Disclosure{id:usize,open:bool,children:Vec<Node>},Text{label:String},Tabs{tabs:Vec<usize>,action:Option<String>},Stack{},Select{},Card{},Button{},Menu{},Checkbox{}}
+fn greedy(_:&Node)->bool{false}
+struct View{visits:Cell<usize>,copies:Cell<usize>}
+impl View{
+ fn tabs(&self,_:&[usize],_:Option<&str>,_:&str,_:bool,_:&mut Context<Self>)->Elem{unreachable!()}
+ /*FILL*/
+ fn node(&self,node:&Node,path:&str,cx:&mut Context<Self>)->Elem{
+ self.visits.set(self.visits.get()+1);
+ match node{Node::Text{label}=>{self.copies.set(self.copies.get()+1);Elem::label(label.clone())}
+ Node::Disclosure{id,open,children}=>{
+  let opened=*open;let key=id.to_string();let header=Elem::label(format!("header{id}"));
+  /*BODY*/
+ }_=>unreachable!()}
+ }
+}
+fn output(n:&Node,c:&App,seq:&mut Vec<String>){
+ match n{Node::Text{label}=>seq.push(label.clone()),Node::Disclosure{id,open,children}=>{
+   seq.push(format!("header{id}"));
+   let phase=c.phases.get(&id.to_string()).filter(|(v,_)|!c.reduced&&v==open).map(|v|v.1);
+   if *open||phase.is_some(){if let Some(v)=phase{seq.push(format!("p={:08x}",v.to_bits()));}for child in children{output(child,c,seq)}}
+ }_=>unreachable!()}
+}
+fn fixture(states:&[usize;3],id:usize,depth:usize,width:usize)->Node{
+ let mut kids=vec![];for i in 0..width{kids.push(Node::Text{label:format!("visible text for {id}/{i}")})}
+ if depth<2{kids.push(fixture(states,id+1,depth+1,width));}
+ Node::Disclosure{id,open:matches!(states[depth],1|2|4),children:kids}
+}
+fn main(){
+ let v=View{visits:Cell::new(0),copies:Cell::new(0)};let mut n=0;
+ for a in 0..6 {for b in 0..6{for c in 0..6{for reduced in [false,true]{
+   let states=[a,b,c];let tree=fixture(&states,0,0,3);let mut app=App{phases:HashMap::new(),reduced};
+   for (i,x) in states.into_iter().enumerate(){let transition=match x{2=>Some((true,0.35)),3=>Some((false,0.18)),4=>Some((false,0.12)),5=>Some((true,0.57)),_=>None};if let Some(tr)=transition{app.phases.insert(i.to_string(),tr);}}
+   let mut cx=Context{app,marker:std::marker::PhantomData};let mut want=vec![];output(&tree,&cx,&mut want);
+   let mut actual=vec![];v.node(&tree,"root",&mut cx).seq(&mut actual);assert_eq!(actual,want);n+=1;
+ }}}}
+ println!("{n} nested phase/reduced-motion frames: same ordered headers, text and progress as the oracle.");
+ for (type_,states,reduced,phase) in [("settled closed",[0,0,0],false,None),("settled open",[1,1,1],false,None),("closing root",[0,1,1],false,Some((false,0.48))),("reduced closed",[0,1,1],true,Some((false,0.48)))]{
+  let tree=fixture(&states,0,0,128);let mut cx=Context{app:App{phases:phase.into_iter().map(|p|("0".to_string(),p)).collect(),reduced},marker:std::marker::PhantomData};v.visits.set(0);v.copies.set(0);for _ in 0..20{let _=v.node(&tree,"root",&mut cx);}
+  let (vis,cp)=(v.visits.get(),v.copies.get());let should_skip=type_=="settled closed"||type_=="reduced closed";
+  assert_eq!((vis,cp),if cfg!(after)&&should_skip{(20,0)}else{(7740,7680)});
+  println!("{type_}: 20 builds of a 387-node tree: {vis} node-dispatch calls; {cp} synthetic text payload constructions.");
+ }
+}
