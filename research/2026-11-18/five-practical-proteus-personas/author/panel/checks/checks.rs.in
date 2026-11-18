@@ -1,0 +1,65 @@
+use serde::Deserialize;
+use serde_json::Value;
+#[path=PANEL_PATH]
+mod panel;
+mod control {
+    use super::*;
+    /*CTRL*/
+}
+mod schema {
+    use super::*;
+    /*SCHEMA*/
+}
+use schema::Node;
+fn inspect(panel:&panel::Tally, expected:u16) -> [String;3] {
+    let node:Node=serde_json::from_value(panel.view()).expect("relevant native Desktop variants deserialize");
+    let Node::Card{title,children}=node else {panic!("card")};
+    assert_eq!(title.as_deref(),Some("Счётчик рядов"));
+    let [Node::Metric{label,value,..},Node::Stack{direction,children:buttons,..}]=children.as_slice() else {panic!("metric then row")};
+    assert_eq!((label.as_str(),value.as_str()),("Готово рядов",expected.to_string().as_str()));
+    assert_eq!(*direction,schema::Direction::Row);
+    assert_eq!(buttons.len(),3);
+    let labels=["+1 ряд","−1 ряд","Сбросить"];let actions=["add","undo","reset"];
+    std::array::from_fn(|i|{
+        let Node::Button{label,action,disabled,value,..}=&buttons[i] else {panic!("button")};
+        assert_eq!(label,&labels[i]);assert_eq!(action,&actions[i]);assert!(value.is_none());
+        assert_eq!(*disabled,if i==0 {expected==999}else{expected==0});
+        action.clone()
+    })
+}
+#[test]
+fn model_and_all_emitted_action_names() {
+    let mut panel=panel::Tally::default();
+    let mut count=0;
+    for _ in 0..1001 {let actions=inspect(&panel,count);panel.act(&actions[0]);count=(count+1).min(999);}
+    for _ in 0..1001 {let actions=inspect(&panel,count);panel.act(&actions[1]);count=count.saturating_sub(1);}
+    for initial in [0,1,2,37,997,998,999] {
+        let mut choices=inspect(&panel,0);
+        for _ in 0..initial {panel.act(&choices[0]);}
+        choices=inspect(&panel,initial);
+        panel.act("unrelated");inspect(&panel,initial);
+        panel.act(&choices[2]);inspect(&panel,0);
+    }
+    println!("1001 increments + 1001 decrements; 1000 reachable counts checked incl. limits and disabled flags; 7 reset/unknown controls.");
+}
+#[test]
+fn interleaving_and_new_model() {
+    for mut n in 0..243 {
+        let mut panel=panel::Tally::default();let mut score=0u16;
+        for _ in 0..5 {
+            let i=n%3;n/=3;
+            let selected=inspect(&panel,score)[i].clone();panel.act(&selected);
+            score=match i {0=>score+1,1=>score.saturating_sub(1),_=>0};
+            inspect(&panel,score);
+        }
+    }
+    inspect(&panel::Tally::default(),0);
+    println!("243 5-action sequences, 1215 transitions. IDs are read from SDK render; no actual button clicked.");
+}
+#[test]
+fn intentional_misspelled_field() {
+    let mut v=panel::Tally::default().view();v["children"][1]["children"][0]["disable"]=true.into();
+    let expected=serde_json::from_value::<Node>(v).unwrap_err();
+    assert!(expected.to_string().contains("unknown field `disable`"),"{expected}");
+    println!("Deliberate negative control: {expected}");
+}
