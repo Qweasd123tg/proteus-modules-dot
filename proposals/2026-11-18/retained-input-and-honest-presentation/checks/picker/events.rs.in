@@ -1,0 +1,115 @@
+use std::{any::Any,cell::{Cell,RefCell},marker::PhantomData,ops::{Deref,DerefMut},rc::Rc};
+
+#[derive(Copy,Clone,PartialEq,Debug)] enum DispatchPhase { Capture, Bubble }
+impl DispatchPhase { fn bubble(self)->bool {self == Self::Bubble} }
+struct App { propagate_event:bool, stops:usize, opens:usize, backs:usize, picks:Vec<usize> }
+impl App { fn stop_propagation(&mut self) { self.propagate_event=false; self.stops+=1; } }
+struct Context<'a,T>{ app:&'a mut App, t:PhantomData<T> }
+impl<T> Deref for Context<'_,T>{ type Target=App; fn deref(&self)->&App{self.app} }
+impl<T> DerefMut for Context<'_,T>{fn deref_mut(&mut self)->&mut App{self.app}}
+impl<T> Context<'_,T>{fn notify(&mut self){}}
+#[derive(Clone,Copy,PartialEq,Debug)] enum Role { List, Field, SearchButton, Back }
+#[derive(Clone)] struct FocusHandle { id: Role }
+impl FocusHandle { fn is_focused(&self,window:&Window)->bool{self.id==window.focus} }
+struct Input;
+impl Input { fn read(&self,_:&App)->&Self{self} fn focus_handle(&self,_:&App)->FocusHandle{FocusHandle{id:Role::Field}} }
+mod search { use super::*; pub(super) fn focus(_:&Input,w:&mut Window,_:&mut App){w.focus=Role::Field;} }
+#[derive(Clone,Default)] struct Modifiers { control:bool,alt:bool,shift:bool }
+impl Modifiers { fn modified(&self)->bool{self.control||self.alt||self.shift} }
+#[derive(Clone)] struct Stroke{key:String,modifiers:Modifiers}
+struct KeyDownEvent { keystroke:Stroke } struct KeyUpEvent {keystroke:Stroke}
+struct Scroll; enum ScrollStrategy { Nearest } impl Scroll {fn scroll_to_item(&mut self,_:usize,_:ScrollStrategy){}}
+struct Choice<T>{value:T}
+type Listener=Rc<dyn Fn(&dyn Any,DispatchPhase,&mut Window,&mut App)>;
+#[derive(Default)] struct Node{key_listeners:Vec<Listener>}
+struct Tree(Vec<Node>);
+impl Tree{fn node(&self,id:usize)->&Node{&self.0[id]}}
+struct Frame{dispatch_tree:Tree}
+struct Window {rendered_frame:Frame,focus:Role,focus_generation:usize}
+type DispatchNodeId=usize;
+trait SmallArray{type Item;} impl<T,const N:usize> SmallArray for [T;N]{type Item=T;}
+type SmallVec<A>=Vec<<A as SmallArray>::Item>;
+impl Window{
+    fn default_prevented(&self)->bool{false}
+    fn on_key_event<E:'static>(&mut self, listener:impl Fn(&E,DispatchPhase,&mut Window,&mut App)+'static){
+        self.rendered_frame.dispatch_tree.0[1].key_listeners.push(Rc::new(move|event,p,w,cx|{
+            if let Some(event)=event.downcast_ref(){listener(event,p,w,cx)}
+        }));
+    }
+    /*DISPATCH*/
+}
+#[derive(Clone)] struct Hitbox{bounds:usize} enum KeyboardButton{Enter,Space}
+struct KeyboardClickEvent{button:KeyboardButton,bounds:usize} enum ClickEvent{Keyboard(KeyboardClickEvent)}
+type ClickListener = Rc<dyn Fn(&ClickEvent,&mut Window,&mut App)>;
+fn register_button(window:&mut Window,click_listeners:Vec<ClickListener>){
+    let pending_keyboard_down=Rc::new(RefCell::new(None)); let hitbox=Hitbox{bounds:0};
+    /*BUTTON*/
+}
+mod picker {
+use super::*;
+pub(super) const VISIBLE:usize=8;
+pub(super) struct Picker<T>{pub(super) options:Vec<Choice<T>>,pub(super) matches:Vec<usize>,pub(super) cursor:usize,pub(super) searchable:bool,pub(super) list_focus:FocusHandle,pub(super) search:Input,pub(super) scroll:Scroll,pub(super) pick:Rc<dyn Fn(T,&mut Window,&mut App)>}
+impl<T:Clone> Picker<T>{
+    /*FOCUS*/
+    /*CURRENT*/
+    /*KEYS*/
+    pub(super) fn press(&mut self,e:&KeyDownEvent,w:&mut Window,cx:&mut App){self.keys(e,w,&mut Context{app:cx,t:PhantomData})}
+}
+}
+use picker::Picker;
+#[derive(Debug,PartialEq)] struct Obs{open:usize,back:usize,picks:Vec<usize>,cursor:usize,focus:Role}
+fn run(target:Role,n:usize,at:usize,key:&str,mods:Modifiers,repeat:usize)->Obs{
+    let mut w=Window{rendered_frame:Frame{dispatch_tree:Tree(vec![Node::default(),Node::default()])},focus:target,focus_generation:1};
+    let mut cx=App{propagate_event:true,stops:0,opens:0,backs:0,picks:vec![]};
+    let model=Rc::new(RefCell::new(Picker{options:(10..10+n).map(|value|Choice{value}).collect(),
+        matches:(0..n).rev().collect(), cursor:at, searchable:true, list_focus:FocusHandle{id:Role::List},
+        search:Input,scroll:Scroll,pick:Rc::new(|v,_,a|a.picks.push(v))}));
+    let m=model.clone();
+    w.rendered_frame.dispatch_tree.0[0].key_listeners.push(Rc::new(move|event,phase,w,cx|{
+        if phase==DispatchPhase::Capture && let Some(e)=event.downcast_ref::<KeyDownEvent>() { m.borrow_mut().press(e,w,cx); }
+    }));
+    if matches!(target,Role::SearchButton|Role::Back) {
+        register_button(&mut w, vec![Rc::new(move|_,_,a|match target{Role::SearchButton=>a.opens+=1, Role::Back=>a.backs+=1,_=>unreachable!()})]);
+    }
+    let stroke=Stroke{key:key.into(),modifiers:mods};
+    for _ in 0..repeat {
+        for e in [&KeyDownEvent{keystroke:stroke.clone()} as &dyn Any,&KeyUpEvent{keystroke:stroke.clone()} as &dyn Any] {
+            cx.propagate_event=true; w.dispatch_key_down_up_event(e,&vec![0,1],&mut cx);
+        }
+    }
+    let cursor=model.borrow().cursor;
+    Obs{open:cx.opens,back:cx.backs,picks:cx.picks,cursor,focus:w.focus}
+}
+fn main(){
+    let phase=std::env::args().nth(1).unwrap();let mut errors=0;let mut total=0;let mut c_nonempty=0;let mut c_empty=0;
+    for role in [Role::List,Role::Field,Role::SearchButton,Role::Back] {
+      for n in [0,1,2,9,13] {for at in 0..n.max(1) {for key in ["enter","space","up","down","pageup","pagedown","escape","f","tab"] {
+        for flag in 0..8 {for repeat in [1,2] {
+          let mods=Modifiers{control:flag&1!=0,alt:flag&2!=0,shift:flag&4!=0};
+          let got=run(role,n,at,key,mods.clone(),repeat);
+          let mut expect=Obs{open:0,back:0,picks:vec![],cursor:at,focus:role};
+          for _ in 0..repeat{
+            if key=="f" && flag==1{expect.focus=Role::Field;}
+            if flag!=0 {continue}
+            match (key,role){
+              ("enter"|"space",Role::SearchButton)=>expect.open+=1,
+              ("enter"|"space",Role::Back)=>expect.back+=1,
+              ("enter",_) if n>0 => expect.picks.push(n+9-at),
+              ("down",_) if n>0 =>expect.cursor=(expect.cursor+1)%n,
+              ("up",_) if n>0=>expect.cursor=(expect.cursor+n-1)%n,
+              ("pageup",_)=>expect.cursor=expect.cursor.saturating_sub(8),
+              ("pagedown",_) if n>0=>expect.cursor=(expect.cursor+8).min(n-1),
+              _=>{}
+            }
+          }
+          total+=1;if got!=expect{errors+=1;
+             assert!(flag==0&&key=="enter"&&matches!(role,Role::SearchButton|Role::Back));
+             if n==0{c_empty+=1}else{c_nonempty+=1}
+          }
+        }}
+      }}}
+    }
+    let ex=run(Role::SearchButton,2,1,"enter",Modifiers::default(),1);
+    println!("{phase}: cases={total}, mismatches={errors}, empty={c_empty}, nonempty={c_nonempty}; Search focused at second row: open={}, picked={:?}",ex.open,ex.picks);
+    if phase=="before"{assert_eq!(errors,104);}else{assert_eq!(errors,0);}
+}

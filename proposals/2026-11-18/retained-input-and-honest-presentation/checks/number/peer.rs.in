@@ -1,0 +1,43 @@
+#![allow(dead_code)]
+use serde_json::{Value,Number};
+#[derive(Copy,Clone)]
+enum TextFormat{Number,Line,Secret,Multiline,Json,Lines,Value,Integer{minimum:Option<i64>,maximum:Option<i64>}}
+mod before {use super::*; BEFORE}
+mod after {use super::*; AFTER}
+// Reconstruct the exact mathematical integer denoted by binary64 via its bits,
+// independently of the patch's f64 -> i128 cast. This only sees the tested,
+// bounded integer domain. No decimals or out-of-domain conversions use it.
+fn exact(v:&Value)->i128{
+ let n=v.as_number().unwrap();
+ if let Some(x)=n.as_i64(){return x.into();}
+ if let Some(x)=n.as_u64(){return x.into();}
+ let b=n.as_f64().unwrap().to_bits();
+ if b << 1 == 0{return 0;}
+ let e=((b>>52)&0x7ff) as i32-1023;
+ let sig=(b&((1u64<<52)-1)) as i128 | (1i128<<52);
+ let val=if e>=52{sig<<(e-52)}else{sig>>(52-e)};
+ if b>>63==0{val}else{-val}
+}
+fn main(){
+ let mut obs=std::collections::BTreeSet::new();
+ for k in 0..=64{let p=1i128<<k;for base in [-p,p]{for off in -21..=21{let n=base+off;if n>=i64::MIN as i128 && n<=u64::MAX as i128 {obs.insert(n);}}}}
+ let mut prng=0xbb67ae8584caa73bu64;
+ for _ in 0..5000{prng=prng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);obs.insert(prng as i128);obs.insert((prng as i64) as i128);}
+ let mut old_ok=0;let mut exact_floats_unchanged=0;
+ for &n in &obs{
+  let from=Value::Number(Number::from_i128(n).unwrap());
+  let s=before::format_value(TextFormat::Number,&from);assert_eq!(s,n.to_string());
+  let old=before::parse_text(TextFormat::Number,&s).unwrap().unwrap();
+  let new=after::parse_text(TextFormat::Number,&s).unwrap().unwrap();
+  assert_eq!(exact(&new),n,"{s}");
+  if exact(&old)==n{
+   old_ok+=1; assert_eq!(new.to_string(),old.to_string());
+   assert_eq!(new.as_number().unwrap().is_f64(),old.as_number().unwrap().is_f64()); exact_floats_unchanged+=1;
+  }
+ }
+ let controls=["","  ","4","-0","-0.0",".25","+0.5","007.25","1.","4e0","1e3","1E-4","9007199254740993.0","9.007199254740993e15","-9223372036854775809","18446744073709551616","000042","+42","abc","1_000","1,5"];
+ for c in controls{assert_eq!(after::parse_text(TextFormat::Number,c),before::parse_text(TextFormat::Number,c),"{c}")}
+ let lexical=["+9007199254740993","009007199254740993"," 9007199254740993 ","  -09007199254740993  "];
+ for c in lexical {let v=after::parse_text(TextFormat::Number,c).unwrap().unwrap();assert_eq!(exact(&v),c.trim().parse::<i128>().unwrap());}
+ println!("Stored integer -> editor text -> numeric value: {old_ok}/{} -> {}/{}. Exact-float representation unchanged in {exact_floats_unchanged} cases. {} unchanged spelling/blank/error/out-of-range controls; {} rounded optional-sign/leading-zero/whitespace spelling controls.",obs.len(),obs.len(),obs.len(),controls.len(),lexical.len());
+}

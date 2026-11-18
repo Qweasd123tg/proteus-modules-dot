@@ -1,0 +1,14 @@
+diff --git a/src/ui/settings/tags.rs b/src/ui/settings/tags.rs
+index 3e1fab0..7f83047 100644
+--- a/src/ui/settings/tags.rs
++++ b/src/ui/settings/tags.rs
+@@ -166,7 +166,8 @@ fn added_value(field: &ConfigField, text: &str) -> Option<Value> {
+     {
+         if let Some(value) = options
+             .iter()
+-            .find(|option| option.value.as_str() == Some(text) || option.title == text)
++            .find(|option| option.value.as_str() == Some(text))
++            .or_else(|| options.iter().find(|option| option.title == text))
+             .map(|option| option.value.clone())
+         {
+             return Some(value);

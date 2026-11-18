@@ -1,0 +1,45 @@
+--- a/crates/diff/src/lib.rs
++++ b/crates/diff/src/lib.rs
+@@ -67,8 +67,10 @@
+         }
+         if self.lines.is_empty() {
+             self.note(match self.status.as_str() {
+-                "added" | "untracked" => "Пустой файл",
+                 "deleted" => "Файл удалён",
++                // FileInfo alone says nothing about the contents of the file.
++                _ if self.patch.is_empty() => "Текст изменений не предоставлен",
++                "added" | "untracked" => "Пустой файл",
+                 "renamed" => "Файл переименован без изменения содержимого",
+                 _ => "Содержимое не изменилось",
+             });
+--- a/crates/diff/src/tests.rs
++++ b/crates/diff/src/tests.rs
+@@ -136,3 +136,28 @@
+         input
+     );
+ }
++
++#[test]
++fn metadata_without_a_patch_does_not_claim_to_know_the_contents() {
++    let raw = "diff --git a/empty.txt b/empty.txt\nnew file mode 100644\n";
++    for status in ["added", "untracked", "modified", "renamed", "conflict", ""] {
++        let info = FileInfo {
++            path: "other.txt".into(),
++            status: status.into(),
++            message: None,
++        };
++        let files = parse(raw, &[info]);
++        assert_eq!(files.len(), 2);
++        assert_eq!(files[0].lines[0].text, "Пустой файл");
++        assert_eq!(files[0].patch, raw);
++        let card = &files[1];
++        assert_eq!(
++            card.lines[0].text, "Текст изменений не предоставлен",
++            "{status:?}"
++        );
++        assert_eq!(card.status, status);
++        assert_eq!(card.unified, [0]);
++        assert_eq!(card.pairs, [Pair::Full(0)]);
++        assert!(card.patch.is_empty());
++    }
++}

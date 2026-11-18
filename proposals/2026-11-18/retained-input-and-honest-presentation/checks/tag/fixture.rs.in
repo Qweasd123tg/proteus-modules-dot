@@ -1,0 +1,36 @@
+use serde_json::{Value,json};
+struct Choice{value:Value,title:String}
+struct ConfigField{value:ConfigValueSchema}
+enum ConfigValueSchema{Array{items:Box<ConfigValueSchema>},Enum{options:Vec<Choice>},String{secret:bool},Other}
+#[derive(Clone)]enum Edit{Add(Value),Remove(usize),MoveBefore{from:usize,before:Option<usize>}}
+mod form{use super::*;
+ //SOURCE
+ pub(super) fn active(field:&ConfigField)->bool{is_tag_field(field)}
+ pub(super) fn cycle(field:&ConfigField,val:&str)->String{
+  let initial=vec![Value::from(val)];let display=tag_label(&initial[0]);
+  let empty=edited(&initial,Edit::Remove(0)).unwrap();
+  let typed=added_value(field,&display).unwrap();
+  let final_items=edited(&empty,Edit::Add(typed)).unwrap();
+  final_items[0].as_str().unwrap().to_owned()
+ }
+ pub(super) fn accepted(f:&ConfigField,s:&str)->Option<Value>{added_value(f,s)}
+}
+fn field(keys:&[&str],titles:&[&str],order:&[usize])->ConfigField{
+ ConfigField{value:ConfigValueSchema::Array{items:Box::new(ConfigValueSchema::Enum{options:order.iter().map(|&i|Choice{value:json!(keys[i]),title:titles[i].into()}).collect()})}}
+}
+fn main(){
+ let keys=["dense","Compact","通常"];let names=["dense","Compact","通常","Pretty"];let orders=[[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+ let(mut n,mut bad)=(0,0);
+ for a in names{for b in names{for c in names{let titles=[a,b,c];for order in orders{
+  let f=field(&keys,&titles,&order);assert!(form::active(&f));
+  for key in keys{bad+=(form::cycle(&f,key)!=key) as usize; n+=1;}
+  assert_eq!(form::accepted(&f," free * "),Some(json!(" free * ")));
+  assert_eq!(form::accepted(&f,""),None);
+  let expected=order.iter().find(|&&i|titles[i]=="Pretty").map(|&i|keys[i]).unwrap_or("Pretty");
+  assert_eq!(form::accepted(&f,"Pretty"),Some(json!(expected)));
+ }}}}
+ let direct=field(&["dense","Compact"],&["Compact","Compact layout"],&[0,1]);
+ println!("Displayed Compact -> remove -> enter Compact -> {}",form::cycle(&direct,"Compact"));
+ println!("{n} remove/re-enter cycles; {bad} changed the visible value.");
+ if bad>0{std::process::exit(1);}
+}
