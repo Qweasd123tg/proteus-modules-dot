@@ -1,0 +1,50 @@
+diff --git a/workflow/coding-workflow/src/dynamic_tools.rs b/workflow/coding-workflow/src/dynamic_tools.rs
+index 5ccbf12..08be9f4 100644
+--- a/workflow/coding-workflow/src/dynamic_tools.rs
++++ b/workflow/coding-workflow/src/dynamic_tools.rs
+@@ -177,6 +177,10 @@ pub fn handle_meta_tool_call(
+     call: &ToolCall,
+     phase: &str,
+ ) -> Result<ToolResult, ProcessModuleError> {
++    // Deferred preparation normalizes its own call, including for checkpoints.
++    if call.name == TOOL_CALL {
++        return handle_deferred_call(host, input, call, phase);
++    }
+     let effective = match normalized_meta_call(call, phase) {
+         Ok(call) => call,
+         Err(result) => return Ok(result),
+@@ -185,7 +189,6 @@ pub fn handle_meta_tool_call(
+     match call.name.as_str() {
+         TOOL_SEARCH => handle_search(host, input, call),
+         TOOL_DESCRIBE => handle_describe(host, input, call),
+-        TOOL_CALL => handle_deferred_call(host, input, call, phase),
+         _ => Ok(ToolResult::error(
+             call.id.clone(),
+             format!("unknown Proteus meta-tool '{}'", call.name),
+diff --git a/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs b/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
+index 0f403d3..19a1031 100644
+--- a/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
++++ b/workflow/coding-workflow/src/tests/dynamic_tool_surface.rs
+@@ -58,11 +58,9 @@ fn proteus_tool_call_preserves_execution_identity_and_actual_result() {
+     let outer_call = ToolCall::new(
+         new_call_id(),
+         dynamic_tools::TOOL_CALL,
+-        json!({
+-            "name": "hidden_echo",
+-            "args": { "path": "README.md" }
+-        }),
+-    );
++        json!({"name": "not_the_tool", "args": {}}),
++    )
++    .with_raw_arguments(r#"{"name":"hidden_echo","args":{"path":"README.md"}}"#);
+     let input = workflow_input("call hidden tool");
+     let input_json = serde_json::to_string(&input).expect("input json");
+     let hidden_echo = test_tool("hidden_echo", "Echo hidden file", ToolSafety::ReadOnly);
+@@ -85,6 +83,7 @@ fn proteus_tool_call_preserves_execution_identity_and_actual_result() {
+     let executed_calls = host.executed_calls.lock().expect("executed calls");
+     assert_eq!(executed_calls.len(), 1);
+     assert_eq!(executed_calls[0].name, "hidden_echo");
++    assert_eq!(executed_calls[0].args, json!({"path": "README.md"}));
+     assert_eq!(executed_calls[0].id, outer_call.id);
+ 
+     let result = output
