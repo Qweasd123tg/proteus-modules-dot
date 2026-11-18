@@ -1,0 +1,32 @@
+use serde_json::{json,Value};
+const SUBJECT_LIMIT:usize=300;const ARG_LIMIT:usize=160;const MAX_ARGS:usize=6;const TUNING_ARGS:&[&str]=&["yield_time_ms","max_output_tokens"];
+mod tool_display{use super::*; /*FUNCS*/
+pub struct Headline{pub label:String,pub subject_key:Option<String>,pub subject:Option<String>,pub stats:Option<()>}
+fn generic_subject_key(_:&Value)->Option<String>{unreachable!("Known public grep subject")}
+pub fn headline(name:&str,args:&Value)->Headline{let known=match name{"grep"=>Some("pattern"),_=>unreachable!()};let label=name.to_owned();/*HEAD*/}
+}
+struct App;struct Theme{mono_font_family:(),muted_foreground:()}impl App{fn theme(&self)->Theme{Theme{mono_font_family:(),muted_foreground:()}}}
+#[derive(Debug,PartialEq,Eq,Clone)]struct AnyElement(Vec<String>);type Div=AnyElement;
+impl AnyElement{fn into_any_element(self)->Self{self} fn gap_2(self)->Self{self}fn min_w_0(self)->Self{self}fn text_xs(self)->Self{self}fn font_family(self,_:())->Self{self}fn flex_none(self)->Self{self}fn text_color(self,_:())->Self{self}fn child(mut self,e:impl Into<AnyElement>)->Self{self.0.extend(e.into().0);self}}
+impl From<String> for AnyElement{fn from(s:String)->Self{Self(vec![s])}}
+fn div()->AnyElement{AnyElement(vec![])}fn h_flex()->Div{div()}fn faded(s:String)->String{s}
+fn row_id(_: &'static str,id:u64)->u64{id}fn code_block(_:u64,s:String,_:&App)->Div{AnyElement(vec![s])}
+struct Fold{key:u64}impl Fold{fn block(&self,_:usize,txt:&str,f:impl Fn(String)->Div,_:&App)->Div{let text=txt;let build=f;const PEEK_CHARS:usize=2000;const PEEK_LINES:usize=12;/*FOLD*/ unreachable!("only short ordinary fixtures")}}
+struct AppTranscriptTool{name:String,args:Value}fn tool_args(t:&AppTranscriptTool)->&Value{&t.args} // synthetic arg record only
+/*DETAILS*/
+fn run(name:&str,a:Value)->(Option<String>,Vec<Vec<String>>){let row=AppTranscriptTool{name:name.into(),args:a};let head=tool_display::headline(name,&row.args).subject;let data=argument_details(&Fold{key:1},&row,&App).into_iter().map(|e|e.0).collect();(head,data)}
+
+fn main(){
+ let mut blank_groups=0;let mut trailing=0;let mut leading=0;let mut literal=0;
+ for with_root in [false,true]{let row=|pattern:&str|{let mut a=json!({"pattern":pattern});if with_root{a["path"]=json!("src");}run("grep",a)};
+ let whitespace=[""," ","    ","\t","\t ","\n","\r\n","\u{2003}"];
+ let reference=row("");assert_eq!(reference.0,None);assert!(reference.1.contains(&vec!["pattern:".to_owned(),"".into()]));for x in whitespace{assert_eq!(row(x),reference);blank_groups+=1;}
+ for name in ["done","TODO","кот","item💼","é"]{let orig=row(name);assert_eq!(orig.0.as_deref(),Some(name));assert!(orig.1.contains(&vec![name.to_string()]));
+ for gap in [" ","   ","\t","\r\n","\u{2003}"]{let t=format!("{name}{gap}");assert_eq!(row(&t),orig);trailing+=1;
+ let l=format!("{gap}{name}");let x=row(&l);assert_eq!(x.0,orig.0);assert_ne!(x.1,orig.1);assert!(x.1.contains(&vec![l]));leading+=1;
+ }}
+ for x in [r"[ ]{4}",r"done[ ]",r"\t"]{let r=row(x);assert_eq!(r.0.as_deref(),Some(x));assert!(r.1.contains(&vec![x.to_owned()]));literal+=1;}
+ }
+ println!("static grep DTO, no matching/execution: {blank_groups} blank/whitespace inputs share the same empty pattern presentation per optional-root group; {trailing} nonempty trailing-whitespace inputs identical to unpadded ones in both headline and expanded content; {leading} prefix-whitespace controls differ in expanded text; {literal} explicit regex spellings remain visible.");
+ for p in ["done","done ","  done","    ",r"done[ ]"]{println!("{p:?} -> {:?}",run("grep",json!({"pattern":p})))}
+}

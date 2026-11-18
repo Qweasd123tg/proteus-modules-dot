@@ -1,0 +1,20 @@
+use std::{rc::Rc,cell::RefCell,io::BufRead};
+#[derive(Clone,Debug,Eq,PartialEq)]struct Atom(String);impl AsRef<str> for Atom{fn as_ref(&self)->&str{self.0.as_str()}}
+struct Name{local:Atom}mod html5ever{pub(super)struct Attribute{pub(super)name:super::Name,pub(super)value:super::Atom}}
+macro_rules! local_name{($s:literal)=>{Atom($s.to_owned())}}
+struct Node{data:NodeData,children:RefCell<Vec<Rc<Node>>>,text:String}
+enum NodeData{Element{name:Name,attrs:RefCell<Vec<html5ever::Attribute>>}, Other}
+struct NodeContext;
+mod node{#[derive(Clone,Copy,PartialEq,Default,Debug)] pub(super)enum ColumnumnAlign{#[default]None,Left,Center,Right}}
+use node::ColumnumnAlign;
+#[derive(Default)]struct Table{children:Vec<TableRow>,column_aligns:Vec<ColumnumnAlign>}#[derive(Default)]struct TableRow{children:Vec<TableCell>}struct TableCell{children:P}struct P(String);impl P{fn selected_source(&self)->String{self.0.clone()}fn to_markdown(&self)->String{self.0.clone()}}
+fn parse_table_cell(row:&mut TableRow,n:&Rc<Node>,_:&RefCell<Vec<html5ever::Attribute>>,_:&mut NodeContext){row.children.push(TableCell{children:P(n.text.clone())})}
+__HINT__
+__ROW__
+impl Table{__ALIGN__
+__MARKDOWN__
+}
+__SELECT__
+fn project(value:ColumnumnAlign)->char{let align=value;let grow=2.;__SLACK__ match(lead as u32,trail as u32){(0,2)=>'L',(1,1)=>'C',(2,0)=>'R',_=>panic!()}}
+fn main(){for line in std::io::stdin().lock().lines(){let mut table=Table::default();for row in line.unwrap().split(';'){let mut cells=Vec::new();for cell in row.split('/'){let v=cell.split('~').collect::<Vec<_>>();let name=|n:&str|Name{local:Atom(n.to_string())};let attrs=v[1].split(',').filter(|a|!a.is_empty()).map(|kv|{let (k,v)=kv.split_once('=').unwrap();html5ever::Attribute{name:name(k),value:Atom(v.to_owned())}}).collect();cells.push(Rc::new(Node{data:NodeData::Element{name:name(v[0]),attrs:RefCell::new(attrs)},children:RefCell::default(),text:v[2].to_owned()}));}parse_table_row(&mut table,&Rc::new(Node{data:NodeData::Other,children:RefCell::new(cells),text:String::new()}),&mut NodeContext);}
+let h=table.children[0].children.len();let col=(0..h).map(|i|match table.column_align(i){ColumnumnAlign::None=>'N',ColumnumnAlign::Left=>'L',ColumnumnAlign::Center=>'C',ColumnumnAlign::Right=>'R'}).collect::<String>();let slack=(0..h).map(|i|project(table.column_align(i))).collect::<String>();println!("{}\t{}\t{}\t{}\t{}",col,table.to_markdown().lines().nth(1).unwrap(),table_selected_source(&table).lines().nth(1).unwrap_or("-"),slack, table.children.iter().map(|r|r.children.len()).sum::<usize>());}}

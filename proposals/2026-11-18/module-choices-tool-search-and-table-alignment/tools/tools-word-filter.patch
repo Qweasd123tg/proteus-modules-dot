@@ -1,0 +1,147 @@
+--- a/src/settings/catalog.rs
++++ b/src/settings/catalog.rs
+@@ -446,11 +446,54 @@
+     })
+ }
+ 
+-pub fn tool_matches(tool: &ConfigBuilderTool, query: &str) -> bool {
+-    let query = query.trim().to_lowercase();
+-    query.is_empty()
+-        || tool.name.to_lowercase().contains(&query)
+-        || tool.description.to_lowercase().contains(&query)
++/// The Tools filter, like Settings search, requires every query word.
++/// Keep the normalized query for all rows in this render.
++pub struct ToolQuery(String);
++
++impl ToolQuery {
++    pub fn new(query: &str) -> Self {
++        Self(query.trim().to_lowercase())
++    }
++
++    pub fn matches_tool(&self, tool: &ConfigBuilderTool) -> bool {
++        self.matches(&tool.name, &tool.description)
++    }
++
++    /// A row without a registered tool has only a name.
++    pub fn matches_name(&self, name: &str) -> bool {
++        self.matches(name, "")
++    }
++
++    fn matches(&self, name: &str, description: &str) -> bool {
++        if self.0.is_empty() {
++            return true;
++        }
++        let name = name.to_lowercase();
++        let mut lower_description = None;
++        self.0.split_whitespace().all(|word| {
++            name.contains(word)
++                || lower_description
++                    .get_or_insert_with(|| description.to_lowercase())
++                    .contains(word)
++        })
++    }
++}
++
++#[cfg(test)]
++mod tool_search_tests {
++    use super::ToolQuery;
++
++    #[test]
++    fn matches_all_visible_words_without_searching_unavailable_metadata() {
++        let description = "Show the current git branch and working tree status in short format.";
++        let matches = |text| ToolQuery::new(text).matches("git_status", description);
++        assert!(matches("git status"));
++        assert!(matches("Status BRANCH"));
++        assert!(matches(" git_status "));
++        assert!(ToolQuery::new("status  git").matches_name("git_status"));
++        assert!(!ToolQuery::new("branch").matches_name("git_status"));
++        assert!(!matches("changed files"));
++    }
+ }
+ 
+ /// Tool names enabled in the draft that the snapshot does not know.
+--- a/src/ui/settings/tools.rs
++++ b/src/ui/settings/tools.rs
+@@ -16,7 +16,7 @@
+ use super::spot::Destination;
+ use super::widgets::{Tone, card, changed_dot, chip, hashed_id, item_row, named, note, section};
+ use crate::settings::addons::{ToolOrigin, package_state, tool_origin};
+-use crate::settings::catalog::{PageId, find_tool, missing_tools, tool_matches, tool_pack};
++use crate::settings::catalog::{PageId, ToolQuery, find_tool, missing_tools, tool_pack};
+ use crate::ui::kit;
+ use crate::ui::kit::Hint as _;
+ use crate::ui::prefs;
+@@ -30,6 +30,7 @@
+         let Some(snapshot) = self.snapshot() else {
+             return Vec::new();
+         };
++        let query = ToolQuery::new(&self.tool_query);
+         let enabled = snapshot
+             .tools
+             .iter()
+@@ -41,17 +42,17 @@
+                 if self.tool_query.is_empty()
+                     || pack.tools.iter().any(|name| {
+                         find_tool(snapshot, name)
+-                            .is_some_and(|tool| tool_matches(tool, &self.tool_query))
++                            .is_some_and(|tool| query.matches_tool(tool))
+                             && tool_pack(snapshot, name).is_some_and(|(owner, group)| {
+                                 owner.id == plugin.id && group.id == pack.id
+                             })
+                     })
+                 {
+-                    bodies.push(self.tool_pack_group(plugin, pack, cx));
++                    bodies.push(self.tool_pack_group(plugin, pack, &query, cx));
+                 }
+             }
+         }
+-        bodies.extend(self.tool_groups(cx));
++        bodies.extend(self.tool_groups(&query, cx));
+         if bodies.is_empty() {
+             bodies.push(note("Ничего не найдено.", cx).into_any_element());
+         }
+@@ -79,6 +80,7 @@
+         &self,
+         plugin: &ConfigBuilderPlugin,
+         pack: &ConfigBuilderToolPack,
++        query: &ToolQuery,
+         cx: &Context<Self>,
+     ) -> AnyElement {
+         let snapshot = self.snapshot().expect("tools page needs a snapshot");
+@@ -118,7 +120,7 @@
+             if let Some(tool) = find_tool(snapshot, name) {
+                 if tool_pack(snapshot, name)
+                     .is_some_and(|(owner, group)| owner.id == plugin.id && group.id == pack.id)
+-                    && tool_matches(tool, &self.tool_query)
++                    && query.matches_tool(tool)
+                 {
+                     rows.push(self.tool_row(tool, cx));
+                 }
+@@ -153,13 +155,13 @@
+     }
+ 
+     /// Tools not actually placed in a process pack keep their reported origin.
+-    pub(super) fn tool_groups(&self, cx: &Context<Self>) -> Vec<AnyElement> {
++    pub(super) fn tool_groups(&self, query: &ToolQuery, cx: &Context<Self>) -> Vec<AnyElement> {
+         let Some(snapshot) = self.snapshot() else {
+             return Vec::new();
+         };
+         let mut groups = BTreeMap::<ToolOrigin<'_>, Vec<&ConfigBuilderTool>>::new();
+         for tool in snapshot.tools.iter().filter(|tool| {
+-            tool_pack(snapshot, &tool.name).is_none() && tool_matches(tool, &self.tool_query)
++            tool_pack(snapshot, &tool.name).is_none() && query.matches_tool(tool)
+         }) {
+             groups
+                 .entry(tool_origin(tool, self.addons()))
+@@ -179,10 +181,9 @@
+                 .into_any_element()
+             })
+             .collect();
+-        let query = self.tool_query.to_lowercase();
+         let missing: Vec<_> = missing_tools(snapshot, &self.draft)
+             .into_iter()
+-            .filter(|name| name.to_lowercase().contains(&query))
++            .filter(|name| query.matches_name(name))
+             .collect();
+         if !missing.is_empty() {
+             bodies.push(

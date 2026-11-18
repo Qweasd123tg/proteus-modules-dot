@@ -1,0 +1,40 @@
+use proteus_contracts::app_protocol::config_builder::ConfigBuilderTool;
+#[derive(Clone,Debug,PartialEq,Eq)] enum PageId{Tools}
+mod spot{use super::*;/*DEST*/}
+/*HIT*/
+/*LOCAL*/
+/*UNIT*/
+fn make(name:&str,description:&str)->ConfigBuilderTool{
+  ConfigBuilderTool{name:name.into(),description:description.into(),source:"example_source".into(),owner:None,safety:"".into(),enabled:false,runtime_managed:false,registered:true}
+}
+fn global(t:&ConfigBuilderTool,q:&str)->bool {
+ let mut f=Finder::new(q);if f.terms.is_empty(){return false;}
+ // Same searchable fields as search_tools. Destination/target construction has no effect on acceptance.
+ f.add(Hit::new(&t.name,"Tools",PageId::Tools), &[&t.description,&t.source]);!f.finish().is_empty()
+}
+fn missing(name:&str,q:&str)->bool {/*MISS*/}
+fn main(){
+ let docs:Vec<(String,String,Vec<String>)>=serde_json::from_str(include_str!("rows.json")).unwrap();
+ let mut canonical=0;let mut old_hits=0;let mut removed=0;let mut alias_hits=[0;2];let mut alias_n=0;
+ for (name,description,aliases) in docs {
+  let t=make(&name,&description);let t:ConfigBuilderTool=serde_json::from_value(serde_json::to_value(t).unwrap()).unwrap();
+  let q=name.replace('_'," "); let local=tool_matches(&t,&q); assert!(global(&t,&q));canonical+=usize::from(local);
+  println!("{name}: canonical query {q:?}: global=true local={local}");
+  for alias in aliases {let g=global(&t,&alias);let l=tool_matches(&t,&alias);alias_n+=1;alias_hits[0]+=usize::from(g);alias_hits[1]+=usize::from(l);println!("  declared alias {alias:?}: global={g} local={l}");}
+  for text in [&name,&description]{let mut indices=text.char_indices().map(|(i,_)|i).collect::<Vec<_>>();indices.push(text.len());
+   for i in 0..indices.len(){for j in i..indices.len(){for q in [text[indices[i]..indices[j]].to_owned(),format!("  {}  ",text[indices[i]..indices[j]].to_uppercase())]{
+     let low=q.trim().to_lowercase();let old=low.is_empty()||name.to_lowercase().contains(&low)||description.to_lowercase().contains(&low);
+     old_hits+=usize::from(old);removed+=usize::from(old&&!tool_matches(&t,&q));
+   }}}
+  }
+ }
+ #[cfg(before)]assert_eq!(canonical,1);#[cfg(after)]assert_eq!(canonical,3);assert_eq!(removed,0);
+ let a=make("display_color","ЦВЕТ коллекции ζ");
+ for (q,expected) in [("",true),("  ",true),("DISPLAY_COLOR",true),("цвет коллекции",true),("palette",false),("invented metadata",false)] {assert_eq!(tool_matches(&a,q),expected);}
+ #[cfg(after)]{for q in [" COLOR\tцвет ","ζ display","цвет\u{2003}color","COLLECTION COLOR"]{if q=="COLLECTION COLOR"{assert!(!tool_matches(&a,q));}else{assert!(tool_matches(&a,q))}}
+  assert!(missing("git_status","STATUS  git"));assert!(!missing("git_status","working tree"));
+  tool_search_tests::matches_all_visible_words_without_searching_unavailable_metadata();
+ }#[cfg(before)]assert!(!missing("git_status","STATUS  git"));
+ assert!(!tool_matches(&a,"example_source"));assert!(global(&a,"example_source")); // sources deliberately differ
+ println!("canonical tool phrases: local {canonical}/3, global 3/3; published aliases: global={}/{alias_n}, local={}/{alias_n}; old literal-positive checks={old_hits}, removed={removed}.",alias_hits[0],alias_hits[1]);
+}

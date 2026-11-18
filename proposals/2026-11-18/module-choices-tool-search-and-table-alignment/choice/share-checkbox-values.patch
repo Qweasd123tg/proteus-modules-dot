@@ -1,0 +1,37 @@
+--- a/src/ui/settings/fields.rs
++++ b/src/ui/settings/fields.rs
+@@ -237,14 +237,17 @@
+ }
+ 
+ fn multi_choice(spec: &Rc<FieldSpec>, options: &[ConfigChoice]) -> AnyElement {
+-    let selected: Vec<Value> = spec
++    let selected: Rc<[Value]> = spec
+         .effective()
+         .and_then(Value::as_array)
+-        .cloned()
++        .map(|values| Rc::from(values.as_slice()))
+         .unwrap_or_default();
++    // All checkboxes use the same immutable inputs. Titles belong to the labels,
++    // not to each retained click handler.
++    let values: Rc<[Value]> = options.iter().map(|choice| choice.value.clone()).collect();
+     let boxes = options.iter().enumerate().map(|(ix, choice)| {
+         let checked = selected.contains(&choice.value);
+-        let (handler, options, value) = (spec.clone(), options.to_vec(), choice.value.clone());
++        let (handler, values) = (spec.clone(), values.clone());
+         let selected = selected.clone();
+         div().min_w_0().max_w_full().child(
+             kit::checkbox(hashed_id("multi", &(&spec.path, ix)))
+@@ -253,11 +256,10 @@
+                 .max_w_full()
+                 .label(choice.title.clone())
+                 .on_click(move |checked, _, cx| {
+-                    let next: Vec<Value> = options
++                    let next: Vec<Value> = values
+                         .iter()
+-                        .map(|option| &option.value)
+                         .filter(|option| {
+-                            if **option == value {
++                            if **option == values[ix] {
+                                 *checked
+                             } else {
+                                 selected.contains(option)
