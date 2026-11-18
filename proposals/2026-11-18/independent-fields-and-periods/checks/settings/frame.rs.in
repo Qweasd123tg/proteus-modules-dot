@@ -1,0 +1,75 @@
+use std::marker::PhantomData;
+use serde_json::Value;
+#[derive(Clone)]struct ConfigSection{id:String,title:String,description:String}
+#[derive(Clone)]struct ConfigField{key:String,title:String,description:String,advanced:bool,section:Option<ConfigSection>,value:ConfigValueSchema}
+#[derive(Clone)]enum ConfigValueSchema{Object{fields:Vec<ConfigField>},Enum{options:Vec<()>},Array{items:Box<ConfigValueSchema>},Text}
+mod catalog{use super::*;
+//EDITABLE
+}
+mod data{use super::*;
+//SECTIONS
+}
+use data::*;
+//ADDS_CONTEXT
+type FieldPath=String;
+#[derive(Clone,Default)]struct AnyElement(Vec<String>);
+impl From<String> for AnyElement{fn from(s:String)->Self{Self(vec![s])}}
+impl AnyElement{
+ fn child(mut self,c:impl Into<Self>)->Self{self.0.extend(c.into().0);self}
+ fn children<R:Into<Self>>(mut self,cs:impl IntoIterator<Item=R>)->Self{for c in cs{self=self.child(c);}self}
+ fn text_sm(self)->Self{self}fn px_4(self)->Self{self}fn pt_4(self)->Self{self}fn pb_2(self)->Self{self}fn gap_1(self)->Self{self}fn font_semibold(self)->Self{self}fn text_xs(self)->Self{self}fn text_color(self,_:())->Self{self}fn into_any_element(self)->Self{self}
+ fn row_rule(self,_:&Context<SettingsView>)->Self{self}
+}
+fn div()->AnyElement{AnyElement::default()}fn v_flex()->AnyElement{div()}fn nested(e:AnyElement)->AnyElement{e}
+fn note(s:String,_:&Context<SettingsView>)->AnyElement{s.into()}
+fn nested_group(h:AnyElement,b:AnyElement,_:&Context<SettingsView>)->AnyElement{h.child(b)}
+fn describe_text(s:String)->String{s}
+fn described(_:(),s:String,_:Option<String>,_:Option<String>,_:&Context<SettingsView>)->AnyElement{s.into()}
+fn hashed_id<T>(_:&str,_:&T){}
+fn disclosure<F:Fn(&mut ())+'static>(_:(),_:bool,label:AnyElement,_:bool,_f:F,_:&Context<SettingsView>)->AnyElement{div().child("TOGGLE".to_string()).child(label)}
+struct State;
+impl State{fn value(&self,_:&FieldPath)->Option<&Value>{None}}
+struct SettingsView{draft:State,baseline:State,open:bool}struct Context<T>(PhantomData<T>);struct Weak;struct Theme{muted_foreground:()}
+impl<T> Context<T>{fn theme(&self)->Theme{Theme{muted_foreground:()}}fn weak_entity(&self)->Weak{Weak}}
+impl Weak{fn update(&self,_:&mut (),_:impl FnOnce(&mut SettingsView,&mut ())){ }}
+impl SettingsView{
+ fn toggle_open(&mut self,_:&str,_:&mut ()){}
+ fn is_open(&self,_:&str)->bool{self.open}
+ fn reveal(&self,_:&str,_:&Context<Self>,show:impl FnOnce()->AnyElement)->AnyElement{if self.open{show()}else{div()}}
+ fn render_field(&self,path:&String,field:&ConfigField,_:&Context<Self>)->AnyElement{format!("FIELD {path}: {}",field.title).into()}
+//METHODS
+}
+fn field(key:&str,title:&str,advanced:bool,sect:Option<(&str,&str,&str)>)->ConfigField{
+ ConfigField{key:key.into(),title:title.into(),description:"field help".into(),advanced,value:ConfigValueSchema::Text,section:sect.map(|(id,t,d)|ConfigSection{id:id.into(),title:t.into(),description:d.into()})}
+}
+fn draw(fields:&[ConfigField],open:bool)->Vec<String>{
+ let view=SettingsView{draft:State,baseline:State,open};let cx=Context(PhantomData);
+ view.field_rows(fields,|key|format!("sample.{key}"),None,"sample",&cx).into_iter().flat_map(|el|el.0).collect()
+}
+fn main(){
+ let fields=[field("screen_width","Width",true,Some(("s","Screen","In pixels"))),field("print_width","Width",true,Some(("p","Print","In millimetres")))];
+ println!("Two independently authored sections: {:?}",draw(&fields,false));
+ let mut tests=0;let mut mismatches=0;
+ for n in 1..=5{for mask in 0..(1<<n){for opened in [false,true]{for meta in [None,Some(("s","Screen","In pixels")),Some(("s","Width","")),Some(("s","Width","Different help")),Some(("s","Width","field help")),Some(("s"," Width  ","\u{a0}field help\t")),Some(("s","Width"," \t "))]{
+ let fields:Vec<_>=(0..n).map(|i|field(&format!("w{i}"),"Width",mask&(1<<i)!=0,meta)).collect();
+ let got=draw(&fields,opened); let regular=fields.iter().filter(|f|!f.advanced).count();let adv=n-regular;
+ let expected_fields:Vec<_>=fields.iter().filter(|f|!f.advanced).chain(fields.iter().filter(|f|f.advanced&&(adv==1||opened))).map(|f|format!("FIELD sample.{}: Width",f.key)).collect();
+ assert_eq!(got.iter().filter(|s|s.starts_with("FIELD ")).cloned().collect::<Vec<_>>(),expected_fields);
+ assert_eq!(got.iter().filter(|s|s.as_str()=="TOGGLE").count(),(adv>1)as usize);
+ if let Some((_,title,desc))=meta{
+  let new_information=!title.trim().is_empty()&&title.trim()!="Width"||!desc.trim().is_empty()&&desc.trim()!="field help";
+  let show_title=regular>0||adv>1||new_information;
+  let show_desc=!desc.is_empty()&&(regular>0 || (adv>1 && opened) || (adv==1 && new_information));
+  let observed_title=got.iter().any(|s|s==title);let observed_desc=got.iter().any(|s|s==desc);
+  if observed_title!=show_title || observed_desc!=show_desc{mismatches+=1;}
+ }
+ tests+=1;
+ }}}}
+ // Noneditable schema siblings do not turn a singleton into a longer section.
+ let mut filtered=fields[0].clone();filtered.key="unused".into();filtered.value=ConfigValueSchema::Object{fields:vec![]};let only=&fields[0..1];
+ assert_eq!(draw(&[only[0].clone(),filtered],false),draw(only,false));
+ // Leading/trailing padding in the field itself must not introduce a header either.
+ let mut padded=field("w"," Width  ",true,Some(("s","Width","field help")));padded.description="  field help\t".into();
+ assert_eq!(draw(&[padded],false),["FIELD sample.w:  Width  "]);
+ println!("{tests} author-schema/open-state combinations; {mismatches} missing or unexpected metadata cases.");if mismatches>0{std::process::exit(1);}
+}

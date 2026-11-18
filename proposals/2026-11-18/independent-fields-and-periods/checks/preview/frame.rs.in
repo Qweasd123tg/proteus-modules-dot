@@ -1,0 +1,61 @@
+use std::collections::HashMap;
+use serde_json::json;
+mod widget; mod graph; mod tree; mod lanes; mod list; mod control;
+mod icons {pub fn lucide(_: &str)->Option<()> { unreachable!() }}
+mod svg {pub fn validate(_: &str)->anyhow::Result<()> { unreachable!() }}
+mod diff {pub type FileInfo=serde_json::Value;}
+use widget::Node;
+#[derive(Default)] struct Input { <OPENFLAG> }
+type Map = HashMap<String,()>;
+#[derive(Default)] struct Fields {
+    disclosures: HashMap<String,bool>, inputs: HashMap<String,Input>,
+    rich_text:Map,contents:Map,codes:Map,terminals:Map,trees:Map,graphs:Map,lanes:Map,lists:Map,diffs:Map,pickers:Map,
+}
+#[derive(Default)] struct View {fields:Fields, steps:Map}
+<HELPER>
+mod textarea {<IDHELPER>}
+#[allow(unused_imports)] use textarea::*;
+<PREVIEW>
+impl View {
+    <PRUNE>
+    fn mount(&mut self,root:&Node) {
+        self.prune_fields(root);
+        root.visit(&mut |n| match n {
+          Node::Disclosure{id,open,..}=>{<DISCINIT>}
+          Node::Input{id,..}=>{self.fields.inputs.entry(id.clone()).or_insert(Input{<INIT>});},
+          _=>{}
+        });
+    }
+    fn explicit(&self,id:&String,open:&bool)->bool{<DISCREAD>}
+    fn toggle_explicit(&mut self,id:&String,opened:bool){let this=self;<DISCCLICK>}
+    fn area(&self,id:&str)->bool{let view=self;<READ>open}
+    fn click(&mut self,id:&str){let open=self.area(id);let view=self;let input_id=<KEYID>;<CLICK>}
+    fn keyboard(&mut self,id:&str){if self.area(id){return;}let view=self;let keyboard_id=<KEYID>;<KEY>}
+    fn edit(&mut self,id:&str,grow:bool,text:&str){let this=self;let input_id=id.to_owned(); if grow&&editor_preview(text.chars()).is_some(){<EDIT>}}
+}
+fn tree(i:&str,s:&str,def:bool,area:bool,section:bool,text:&str)->Node{
+    let mut children=vec![];
+    if area {children.push(json!({"type":"setting_row","id":"note-row","label":"Note","control":{"type":"input","id":i,"lines":3,"value":text,"placeholder":"","action":"change"}}));}
+    if section {children.push(json!({"type":"disclosure","id":s,"label":"Details","open":def,"children":[{"type":"empty","text":"Details"}]}));}
+    let n: Node=serde_json::from_value(json!({"type":"fill","children":children})).unwrap();n.validate().unwrap(); n
+}
+fn main(){
+ let expect_after=std::env::args().nth(1).unwrap()=="after";
+ let long="æ".repeat(2001); assert!(editor_preview("ñ".repeat(2000).chars()).is_none());assert!(editor_preview(long.chars()).is_some());
+ let mut total=0;let mut bad=0;let mut controls=0;let mut bad_controls=0;
+ for id in ["note","заметка","input-preview:note"] {for s in [format!("input-preview:{id}"),format!("ordinary:{id}")] {let alias=s==format!("input-preview:{id}");for def in [false,true] {
+  let full=tree(id,&s,def,true,true,&long);let no_area=tree(id,&s,def,false,true,&long);let no_sec=tree(id,&s,def,true,false,&long);
+  for c in 0..8usize.pow(3){let mut v=View::default();v.mount(&full); let (mut p,mut d)=(false,def);let mut mismatch=(v.area(id),v.explicit(&s,&def))!=(p,d);let mut code=c;
+    for _ in 0..3{let op=code%8;code/=8;match op{
+        0=>{v.click(id);p=!p;},
+        1=>{let cur=v.explicit(&s,&def);v.toggle_explicit(&s,cur);d=!d;},
+        2=>{v.keyboard(id);p=true;},3=>{v.edit(id,true,&long);p=true;},
+        4=>{v.edit(id,true,"short");},5=>{v.edit(id,false,&long);},
+        6=>{v.mount(&no_area);v.mount(&full);p=false;},7=>{v.mount(&no_sec);v.mount(&full);d=def;},_=>unreachable!()
+    } mismatch|=(v.area(id),v.explicit(&s,&def))!=(p,d);}
+    if alias {total+=1;bad+=mismatch as usize;} else {controls+=1;bad_controls+=mismatch as usize;}
+  }
+ }}}
+ println!("{}: miscoupled action sequences {bad}/{total}; unaffected ordinary-ID controls {}/{}",if expect_after{"after"}else{"before"},controls-bad_controls,controls);
+ assert_eq!(bad_controls,0); if expect_after{assert_eq!(bad,0)}else{assert!(bad>0)}
+}
