@@ -1,0 +1,27 @@
+use markdown::{ParseOptions,to_mdast,mdast::Node};
+/*CELL*/
+fn gfm_cells(s:&str)->Vec<Vec<String>>{
+ let n=to_mdast(s,&ParseOptions::gfm()).unwrap();
+ let tables:Vec<_>=n.children().unwrap().iter().filter_map(|n|if let Node::Table(t)=n{Some(t)}else{None}).collect();
+ assert_eq!(tables.len(),1);
+ tables[0].children.iter().map(|row|row.children().unwrap().iter().map(|cell| cell.to_string()).collect()).collect()
+}
+fn main(){
+ let mut bad=0;let mut cases=0;
+ for (label,br) in [("LF","\n"),("CRLF","\r\n"),("CR","\r")]{
+  for (n,desc) in [("one",format!("first{br}second")),("two",format!("first{br}{br}second")),("pipe/Unicode",format!("東京 | page{br}second"))]{
+   let expected=desc.replace(br," ");
+   let c=md_cell(&desc);
+   let source=format!("| Tool | Safety | Source | Enabled | Registered | Description |\n|---|---|---|---|---|---|\n| x | normal | own | yes | yes | {c} |\n| y | normal | own | yes | yes | unchanged |\n");
+   let rows=gfm_cells(&source);
+   let ok=rows.len()==3 && rows[1].len()==6 && rows[1][5]==expected && rows[2][0]=="y";
+   println!("{label} {n}: body rows={}, expected two; correct names and description={ok}",rows.len()-1);
+   bad+=usize::from(!ok);cases+=1;
+  }
+ }
+ let alphabet=["A","東"," ","\t","\n","|","\\","é","\u{301}"];let mut cmp=0;
+ for a in alphabet {for b in alphabet{for c in alphabet{for d in alphabet{
+   let s=[a,b,c,d].concat();let old=s.replace('\n'," ").replace('|',"\\|").trim().to_owned();assert_eq!(md_cell(&s),old);cmp+=1;
+ }}}}
+ println!("{bad}/{cases} parsed table mismatches; {cmp} CR-free inputs byte-identical to original.");
+}

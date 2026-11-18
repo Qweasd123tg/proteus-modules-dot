@@ -1,0 +1,40 @@
+#![allow(dead_code)]
+use serde_json::{Value,json};
+mod data{ @VALUE@ } use data::ValueExt;
+@MODEL@
+mod before { use super::*; @BEFORE@ }
+mod after { use super::*; @AFTER@ }
+fn row(id:usize,turn:&Option<Value>,model:Option<(&str,&str)>)->Value{
+ let mut v=json!({"exchange_id":id%2}); // duplicate field IDs distinguish positional identity
+ if let Some(k)=turn{v["turn_id"]=k.clone();}
+ if let Some((p,m))=model{v["model"]=json!({"provider":p,"model":m});}
+ v
+}
+fn ordinal(r:&[&Value],a:&[Value])->Vec<usize>{r.iter().map(|v|a.iter().position(|x|std::ptr::eq(x,*v)).unwrap()).collect()}
+fn main(){
+ let ds=[None,Some(Value::Null),Some(json!("")),Some(json!("turn-b")),Some(json!("turn-а")),Some(json!("turn-a"))];
+ let masks=[None,Some("first/M"),Some("second/M"),Some("first/N"),Some("/"),Some("other/Z")];
+ let keys=[Some(("first","M")),Some(("second","M")),Some(("first","N")),None];
+ let(mut all,mut explicit,mut missing_new,mut missing_old,mut missing_n,mut populated,mut pop_n)=(0,0,0,0,0,0,0);
+ for len in [0usize,1,5,18]{ for offset in 0..ds.len(){ for flip in [false,true]{ for (ii,latest) in ds.iter().enumerate(){
+  let mut rows:Vec<_>=(0..len).map(|i|row(i,&ds[(i+offset)%ds.len()],keys[(i+offset)%keys.len()])).collect(); if flip{rows.reverse();}
+  let mut s=json!({"requests":rows});if let Some(v)=latest{s["latest_turn_id"]=v.clone();}
+  let a=s["requests"].as_array().unwrap();
+  for mask in masks{ for period in ["all","latest","turn-а","turn-a","turn-b","turn-missing"] {
+    let want:Vec<_>=a.iter().enumerate().filter_map(|(i,v)|{
+     let k=v["turn_id"].as_str(); let p=v["model"]["provider"].as_str().unwrap_or(""); let m=v["model"]["model"].as_str().unwrap_or("");
+     let mm=mask.is_none_or(|mask|mask==format!("{p}/{m}"));
+     let ok=match period{"all"=>true,"latest"=>latest.as_ref().and_then(Value::as_str).is_some_and(|last|!last.is_empty()&&k==Some(last)),kw=>k==Some(kw)};
+     (ok&&mm).then_some(i)}).collect();
+    let original=ordinal(&before::scoped(&s,period,mask),a);let candidate=ordinal(&after::scoped(&s,period,mask),a);
+    assert_eq!(candidate,want,"{period} {ii} {mask:?} {len} {offset}");
+    match period {
+     "all"=>{assert_eq!(original,candidate);all+=1;}
+     "latest" if ii<3=>{missing_new+=usize::from(candidate==want);missing_old+=usize::from(original==want);missing_n+=1;}
+     "latest"=>{assert_eq!(original,candidate);populated+=usize::from(candidate==want);pop_n+=1;}
+     _=>{assert_eq!(original,candidate);explicit+=1;}
+    }
+  }}
+ }}}}
+ println!("Absent/null/empty latest correct {missing_old}/{missing_n} -> {missing_new}/{missing_n}. Populated latest unchanged {populated}/{pop_n}. All unchanged {all}/{all}. Explicit turns unchanged {explicit}/{explicit}. Every result compared by data-row identity and order (including duplicated IDs).");
+}

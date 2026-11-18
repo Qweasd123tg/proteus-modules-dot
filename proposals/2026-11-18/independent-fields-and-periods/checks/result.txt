@@ -1,0 +1,81 @@
+4 independent patches; 6 changed upstream blobs. Both apply orders agree; reverse restores all source bytes.
+before: miscoupled action sequences 2880/3072; unaffected ordinary-ID controls 3072/3072
+checks=[32, 64, 32, 32, 32, 32]; violations=[16, 40, 20, 20, 20, 32] [initial, event isolation, retained defaults, remount disclosure, remount input, remount both]
+LF one: body rows=2, expected two; correct names and description=true
+LF two: body rows=2, expected two; correct names and description=true
+LF pipe/Unicode: body rows=2, expected two; correct names and description=true
+CRLF one: body rows=3, expected two; correct names and description=false
+CRLF two: body rows=1, expected two; correct names and description=false
+CRLF pipe/Unicode: body rows=3, expected two; correct names and description=false
+CR one: body rows=3, expected two; correct names and description=false
+CR two: body rows=1, expected two; correct names and description=false
+CR pipe/Unicode: body rows=3, expected two; correct names and description=false
+6/9 parsed table mismatches; 6561 CR-free inputs byte-identical to original.
+after: miscoupled action sequences 0/3072; unaffected ordinary-ID controls 3072/3072
+checks=[32, 64, 32, 32, 32, 32]; violations=[0, 0, 0, 0, 0, 0] [initial, event isolation, retained defaults, remount disclosure, remount input, remount both]
+LF one: body rows=2, expected two; correct names and description=true
+LF two: body rows=2, expected two; correct names and description=true
+LF pipe/Unicode: body rows=2, expected two; correct names and description=true
+CRLF one: body rows=2, expected two; correct names and description=true
+CRLF two: body rows=2, expected two; correct names and description=true
+CRLF pipe/Unicode: body rows=2, expected two; correct names and description=true
+CR one: body rows=2, expected two; correct names and description=true
+CR two: body rows=2, expected two; correct names and description=true
+CR pipe/Unicode: body rows=2, expected two; correct names and description=true
+0/9 parsed table mismatches; 6561 CR-free inputs byte-identical to original.
+before: exact Core cell-writer regression FAIL (expected)
+after: exact Core cell-writer regression PASS
+before:
+Two independently authored sections: ["FIELD sample.screen_width: Width", "FIELD sample.print_width: Width"]
+868 author-schema/open-state combinations; 4 missing or unexpected metadata cases.
+after:
+Two independently authored sections: ["Screen", "In pixels", "FIELD sample.screen_width: Width", "Print", "In millimetres", "FIELD sample.print_width: Width"]
+868 author-schema/open-state combinations; 0 missing or unexpected metadata cases.
+base
+ordered field paths and toggle counts correct for 1008 cases; 22 singleton distinguishing-text mismatches; e.g. ["title=\"\", description=\"Units: points\", rows=[\"FIELD sample.w0: Width\"]", "title=\"  \", description=\"Units: points\", rows=[\"FIELD sample.w0: Width\"]", "title=\"Width\", description=\"Units: points\", rows=[\"FIELD sample.w0: Width\"]"]
+two sections: ["FIELD sample.screen: Width", "FIELD sample.print: Width"]
+
+after
+ordered field paths and toggle counts correct for 1008 cases; 0 singleton distinguishing-text mismatches; e.g. []
+two sections: ["Screen", "pixels", "FIELD sample.screen: Width", "Print", "millimeters", "FIELD sample.print: Width"]
+
+before
+literal slash count 0: exact row/cell=true; observed=["a", "A|B", "c", "d"]
+literal slash count 1: exact row/cell=false; observed=["a", "A\\", "B", "c", "d"]
+literal slash count 2: exact row/cell=false; observed=["a", "A\\|B", "c", "d"]
+literal slash count 3: exact row/cell=false; observed=["a", "A\\\\", "B", "c", "d"]
+literal slash count 4: exact row/cell=false; observed=["a", "A\\\\|B", "c", "d"]
+literal slash count 5: exact row/cell=false; observed=["a", "A\\\\\\", "B", "c", "d"]
+1890 byte-oracle inputs, 214 mismatches; 28 GFM data-row/neighbor checks, 24 mismatches; slash-controls=[true, false, false, false, false, false]
+
+after
+literal slash count 0: exact row/cell=true; observed=["a", "A|B", "c", "d"]
+literal slash count 1: exact row/cell=false; observed=["a", "A\\", "B", "c", "d"]
+literal slash count 2: exact row/cell=false; observed=["a", "A\\|B", "c", "d"]
+literal slash count 3: exact row/cell=false; observed=["a", "A\\\\", "B", "c", "d"]
+literal slash count 4: exact row/cell=false; observed=["a", "A\\\\|B", "c", "d"]
+literal slash count 5: exact row/cell=false; observed=["a", "A\\\\\\", "B", "c", "d"]
+1890 byte-oracle inputs, 0 mismatches; 28 GFM data-row/neighbor checks, 0 mismatches; slash-controls=[true, false, false, false, false, false]
+
+before: upstream-ready native regression RED (expected)
+before: 30/1080 mismatches; named/current/all subsets compare exact ids, source order, period counts and row placement labels
+after: upstream-ready native regression GREEN
+after: 0/1080 mismatches; named/current/all subsets compare exact ids, source order, period counts and row placement labels
+before
+Последний ход | Запросы: 2 из 2 |  | ["Вне хода", "Вне хода"]
+Весь чат | Запросы: 2 из 2 |  | ["Вне хода", "Вне хода"]
+after
+Последний ход | Запросы: 0 из 0 | По этим фильтрам запросов нет. | []
+Весь чат | Запросы: 2 из 2 |  | ["Вне хода", "Вне хода"]
+Absent/null/empty latest correct 604/864 -> 864/864. Populated latest unchanged 864/864. All unchanged 1728/1728. Explicit turns unchanged 6912/6912. Every result compared by data-row identity and order (including duplicated IDs).
+after: miscoupled action sequences 0/3072; unaffected ordinary-ID controls 3072/3072
+checks=[32, 64, 32, 32, 32, 32]; violations=[0, 0, 0, 0, 0, 0] [initial, event isolation, retained defaults, remount disclosure, remount input, remount both]
+before
+360 stable same-kind field transitions; 1110 correct events, 330 wrong events vs latest definition; 216/324 wrong textarea minimums after editing
+OPEN separately: valid textarea -> same-id compact search retains Text::Area; production search branch paints an empty div in this case.
+96 events; wrong target/submit: 44; bad minimum after definition: 8/12; after edit: 9/12; two editor IDs, two subscriptions and both unmatched drafts preserved throughout
+after
+360 stable same-kind field transitions; 1440 correct events, 0 wrong events vs latest definition; 0/324 wrong textarea minimums after editing
+OPEN separately: valid textarea -> same-id compact search retains Text::Area; production search branch paints an empty div in this case.
+96 events; wrong target/submit: 0; bad minimum after definition: 0/12; after edit: 0/12; two editor IDs, two subscriptions and both unmatched drafts preserved throughout
+Verified 4 standalone proposals and the #201 alternate. No GPUI window, server, real data or upstream build.

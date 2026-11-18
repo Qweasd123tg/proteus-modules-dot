@@ -1,0 +1,32 @@
+use markdown::{mdast::Node, to_mdast, ParseOptions};
+//CELL
+fn cells(doc:&str)->Vec<Vec<String>>{
+ let root=to_mdast(doc,&ParseOptions::gfm()).expect("valid document");
+ let mut it=root.children().unwrap().iter().filter_map(|n|if let Node::Table(t)=n{Some(t)}else{None});
+ let mut rows=vec![];for r in &it.next().unwrap().children {rows.push(r.children().unwrap().iter().map(|c|c.to_string()).collect())}
+ assert!(it.next().is_none());rows
+}
+fn doc(value:&str,index:usize)->(String,Vec<String>){
+ let mut entries=["a","b","c","d"].map(String::from);entries[index]=md_cell(value);
+ (format!("| H1 | H2 | H3 | H4 |\n|---|---|---|---|\n| {} | {} | {} | {} |\n| aa | bb | cc | dd |\n",entries[0],entries[1],entries[2],entries[3]),entries.to_vec())
+}
+fn escaped(s:&str)->String{s.replace("\r\n","\n").replace('\r',"\n").replace('\n'," ").replace('|',"\\|").trim().into()}
+fn main(){
+ let mut count=0;let mut bbad=0;
+ for a in ["東","å","|","\\","\r","\n"," ","\t","\u{00a0}"]{for b in ["a","|","\r\n","\n\n","\r","\\","\t"]{for c in ["","x","|","\r","\n","\u{2003}"]{for d in ["","δ","\r","\r\n","|"]{
+   let v=[a,b,c,d].concat();bbad+=(md_cell(&v)!=escaped(&v)) as usize;count+=1;
+ }}}}
+ let mut n=0;let mut bad=0;
+ for delim in ["\n","\r\n","\r","\r\n\r","\r\r\n","\n\r\n","\r\n\r\n"]{for i in 0..4{
+   let text=format!("Page | 一{delim}Unit");let (source,_)=doc(&text,i);
+   let actual=cells(&source);let mut expected=["a","b","c","d"].map(String::from);
+   expected[i]=text.replace("\r\n","\n").replace('\r',"\n").replace('\n'," ");
+   if actual.len()!=3 || actual[1]!=expected || actual[2]!=["aa","bb","cc","dd"]{bad+=1;}n+=1;
+ }}
+ let mut preexisting=Vec::new();
+ for num in 0..=5{let raw=format!("A{}|B","\\".repeat(num));let parsed=cells(&doc(&raw,1).0);
+   let good=parsed.len()==3 && parsed[1]==["a",&raw,"c","d"] && parsed[2]==["aa","bb","cc","dd"];
+   preexisting.push(good);println!("literal slash count {num}: exact row/cell={good}; observed={:?}",parsed[1]);}
+ println!("{count} byte-oracle inputs, {bbad} mismatches; {n} GFM data-row/neighbor checks, {bad} mismatches; slash-controls={preexisting:?}");
+ if bad>0 || bbad>0{std::process::exit(1);}
+}
