@@ -1,0 +1,39 @@
+#[derive(Clone)]struct Owner{component_id:String,module_id:String}
+#[derive(Clone)]struct ConfigBuilderTool{name:String,description:String,owner:Option<Owner>}
+struct ConfigBuilderToolPack{id:String,tools:Vec<String>}
+struct ConfigBuilderPlugin{id:String,tool_packs:Vec<ConfigBuilderToolPack>}
+struct ConfigBuilderSnapshot{tools:Vec<ConfigBuilderTool>,plugins:Vec<ConfigBuilderPlugin>}
+fn tool(n:&str,d:&str)->ConfigBuilderTool{ConfigBuilderTool{name:n.into(),description:d.into(),owner:None}}
+/*ORIG*/ /*QUERY*/ /*LOOKUP*/
+struct View{tool_query:String}
+impl View {
+ fn pack(&self,snapshot:&ConfigBuilderSnapshot,plugin:&ConfigBuilderPlugin,pack:&ConfigBuilderToolPack,query:&ToolQuery)->bool{/*PACK*/}
+ fn row(&self,snapshot:&ConfigBuilderSnapshot,plugin:&ConfigBuilderPlugin,pack:&ConfigBuilderToolPack,name:&str,tool:&ConfigBuilderTool,query:&ToolQuery)->bool{/*ROW*/}
+ fn rest(&self,snapshot:&ConfigBuilderSnapshot,tool:&ConfigBuilderTool,query:&ToolQuery)->bool{/*RES*/}
+}
+fn expected(n:&str,d:&str,q:&str)->bool{let parts=q.split_whitespace().map(str::to_lowercase);let both=[n.to_lowercase(),d.to_lowercase()];parts.into_iter().all(|w|both.iter().any(|s|s.contains(&w)))}
+fn main(){
+ let rows=[tool("git_status","Show the current git branch and working tree status in short format."),tool("git_diff","Show a bounded git diff for the workspace, optionally scoped to staged changes or a relative path."),tool("lsp_diagnostics","Open or update one workspace-relative Rust file in a persistent rust-analyzer process and return bounded publishDiagnostics output. This v0 tool supports only Rust .rs files and runs rust-analyzer from PATH."),tool("display_palette","Цвет фона, É и Café для панели"),tool("Σigma_Edit","ΟΣ περίληψη"),tool("name_İ","contains i\u{307}"),tool("format_Groß","Straße: e\u{301}")];
+ let pattern=[""," ","color","git","status","WORKING","DIFF","rUsT","diagnostics","OUTPUT","COLOR","цвет","ФОНА","Café","cafe\u{301}","GROß","STRAẞE","STRASSE","οσ","ος","Σ","İ","i\u{307}","_","a","s"];
+ let mut qs=vec!["source only".to_owned(),"changed files".into(),"  ".into(),"  paint\u{2003}\tstatus".into()];for a in pattern{for b in pattern{for join in [" ","\t","\u{2003}","  \n "]{qs.push(format!("  {a}{join}{b}  "));}}}
+ for t in &rows{qs.push(t.name.clone());qs.push(t.description.clone());for q in t.description.split_whitespace(){qs.insert(0,q.into());}}
+ let(mut trials,mut added,mut prior,mut rm,mut miss)=(0,0,0,0,0);
+ for s in &qs{let f=ToolQuery::new(s);for t in &rows{
+ let was=tool_matches(t,s);let new=f.matches_tool(t);let oracle=expected(&t.name,&t.description,s);
+ if new!=oracle{if miss<4{println!("oracle mismatch {:?} {:?}: {new}/{oracle}",t.name,s);}miss+=1;}
+ trials+=1;prior+=usize::from(was);rm+=usize::from(was&&!new);added+=usize::from(!was&&new);
+ assert_eq!(f.matches_name(&t.name),expected(&t.name,"",s));
+ }}
+ assert_eq!((rm,miss),(0,0));assert!(!ToolQuery::new("changed files").matches_tool(&rows[0]));
+ let mut gates=0;
+ for owner in [None,Some(("A","p")),Some(("B","p")),Some(("gone","q"))]{
+ let mut t=rows[0].clone();t.owner=owner.map(|(s,m)|Owner{component_id:s.into(),module_id:m.into()});let mut snap=ConfigBuilderSnapshot{tools:vec![t],plugins:vec![]};
+ for n in ["A","B"]{snap.plugins.push(ConfigBuilderPlugin{id:n.into(),tool_packs:vec![ConfigBuilderToolPack{id:"p".into(),tools:vec!["git_status".into(),"git_status".into()]}]});}
+ for q in ["git status","working git","status","changed files","diff",""]{
+ let view=View{tool_query:q.into()};let f=ToolQuery::new(q);let found=expected("git_status",&snap.tools[0].description,q);
+ let where_=match owner{None|Some(("A","p"))=>Some("A"),Some(("B","p"))=>Some("B"),_=>None};
+ for pl in &snap.plugins{let pk=&pl.tool_packs[0];let want=where_==Some(pl.id.as_str())&&found;assert_eq!(view.pack(&snap,pl,pk,&f),q.is_empty()||want);assert_eq!(view.row(&snap,pl,pk,"git_status",&snap.tools[0],&f),want);gates+=2;}
+ assert_eq!(view.rest(&snap,&snap.tools[0],&f),where_.is_none()&&found);gates+=1;
+ }}
+ println!("{} registered query/row pairs; {} previous matches preserved; {} additional all-word matches; {} separate name-only oracle comparisons; {} native rendered-predicate ownership checks (first declaration/explicit/stale/same pack names). Exact name/description, Unicode lowercasing/whitespace, order, duplicate tokens checked. No alias or stemming.",trials,prior,added,trials,gates);
+}

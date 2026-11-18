@@ -1,0 +1,44 @@
+use std::{rc::Rc,alloc::{GlobalAlloc,Layout,System},sync::atomic::{Ordering::Relaxed,AtomicUsize}};
+use serde::{Deserialize,Serialize};use serde_json::{json,Value};
+/*CHOICE*/
+struct CountAlloc;static CALLS:AtomicUsize=AtomicUsize::new(0);static BYTES:AtomicUsize=AtomicUsize::new(0);
+unsafe impl GlobalAlloc for CountAlloc{
+ unsafe fn alloc(&self,layout:Layout)->*mut u8{CALLS.fetch_add(1,Relaxed);BYTES.fetch_add(layout.size(),Relaxed);unsafe{System.alloc(layout)}}
+ unsafe fn dealloc(&self,ptr:*mut u8,layout:Layout){unsafe{System.dealloc(ptr,layout)}}
+ unsafe fn realloc(&self,ptr:*mut u8,layout:Layout,n:usize)->*mut u8{CALLS.fetch_add(1,Relaxed);BYTES.fetch_add(n,Relaxed);unsafe{System.realloc(ptr,layout,n)}}
+}
+#[global_allocator]static COUNT:CountAlloc=CountAlloc;
+struct Field{default:Option<Value>}struct FieldSpec{path:&'static str,field:Field,value:Option<Value>}
+impl FieldSpec{/*EFFECTIVE*/fn set(&self,x:Option<Value>,cx:&mut App){cx.last=x;cx.calls+=1}}
+#[derive(Default)]struct App{last:Option<Value>,calls:usize}struct Window;
+type Callback=Box<dyn Fn(&bool,&mut Window,&mut App)>;
+struct Entry{id:usize,state:bool,label:String,cb:Option<Callback>}
+#[derive(Default)]struct Block{rows:Vec<Entry>}type AnyElement=Block;
+fn div()->Block{Block::default()}fn h_flex()->Block{div()}fn hashed_id<T>(_:&str,arg:&(T,usize))->usize{arg.1}
+impl Block{fn min_w_0(self)->Self{self}fn max_w_full(self)->Self{self}fn flex_wrap(self)->Self{self}fn w_full(self)->Self{self}fn gap_x_3(self)->Self{self}fn gap_y_1(self)->Self{self}
+fn children(mut self,v:impl IntoIterator<Item=Self>)->Self{for i in v{self.rows.extend(i.rows)}self}
+fn child(mut self,e:Entry)->Self{self.rows.push(e);self}fn into_any_element(self)->Self{self}}
+impl Entry{fn checked(mut self,x:bool)->Self{self.state=x;self}fn min_w_0(self)->Self{self}fn max_w_full(self)->Self{self}fn label(mut self,x:String)->Self{self.label=x;self}
+fn on_click(mut self,f:impl Fn(&bool,&mut Window,&mut App)+'static)->Self{self.cb=Some(Box::new(f));self}}
+mod kit{use super::*;pub(super) fn checkbox(id:usize)->Entry{Entry{id,state:false,label:String::new(),cb:None}}}
+/*BODY*/
+fn make(vals:&[Value])->Vec<ConfigChoice>{serde_json::from_value(json!(vals.iter().enumerate().map(|(i,v)|json!({"title":format!("Пункт {i}/é"),"value":v})).collect::<Vec<_>>())).unwrap()}
+fn spec(own:Option<Value>,default:Option<Value>)->Rc<FieldSpec>{Rc::new(FieldSpec{path:"例/choices",field:Field{default},value:own})}
+fn main(){
+ let atoms=[json!(1),json!("1"),json!(null),json!({"type":"fixed","n":[2,3]}),json!(true)];
+ let mut rows=0;let mut actions=0;let mut forms=0;
+ for vs in [vec![],vec![json!(null)],atoms.to_vec(),vec![atoms[0].clone(),atoms[1].clone(),atoms[0].clone(),atoms[3].clone()],vec![atoms[3].clone(),atoms[3].clone(),atoms[4].clone()]]{
+ let options=make(&vs);
+ for mask in 0..(1<<atoms.len()){let mut sv:Vec<Value>=atoms.iter().enumerate().filter(|(i,_)|mask & (1<<i)!=0).map(|(_,x)|x.clone()).rev().collect();
+ sv.push(json!({"unknown":42}));if let Some(first)=sv.first().cloned(){sv.push(first);}
+ for mode in 0..5{let (o,d)=match mode{0=>(None,None),1=>(None,Some(json!(sv))),2=>(Some(json!(sv)),Some(json!([]))),3=>(Some(json!("wrong shape")),Some(json!(sv))),_=>(Some(json!([])),Some(json!(sv)))};
+ let active:Vec<Value>=if mode==1||mode==2{sv.clone()}else{vec![]};let view=multi_choice(&spec(o,d),&options);assert_eq!(view.rows.len(),vs.len());forms+=1;
+ for (i,r) in view.rows.iter().enumerate(){rows+=1;assert_eq!((r.id,r.state,&r.label),(i,active.contains(&vs[i]),&options[i].title));
+ for check in [false,true,true,false]{let mut cx=App::default();r.cb.as_ref().unwrap()(&check,&mut Window,&mut cx);assert_eq!(cx.calls,1);
+ let mut expected=vec![];for v in &vs{if if v==&vs[i]{check}else{active.contains(v)}{expected.push(v.clone())}}assert_eq!(cx.last,Some(json!(expected)));actions+=1;}}
+ }}}
+ println!("native retained rows: {forms} forms, {rows} checkbox states and {actions} exact callbacks; includes duplicates, mixed JSON, missing/default, unknowns, invalid shape.");
+ for n in [8usize,16,32,64,128]{let vals=(0..n).map(|i|json!({"code":i,"labels":["compilateur très long","статический перечень"]})).collect::<Vec<_>>();let opts=make(&vals);
+ let f=spec(Some(json!(vals.iter().step_by(3).collect::<Vec<_>>())),None);let (ca,ba)=(CALLS.load(Relaxed),BYTES.load(Relaxed));let view=std::hint::black_box(multi_choice(&f,&opts));let (cb,bb)=(CALLS.load(Relaxed),BYTES.load(Relaxed));assert_eq!(view.rows.len(),n);
+ println!("n={n} allocation_requests={} requested_bytes={}",cb-ca,bb-ba);}
+}

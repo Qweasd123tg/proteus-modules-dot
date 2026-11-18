@@ -1,0 +1,74 @@
+#![allow(dead_code)]
+use std::{alloc::{GlobalAlloc,Layout,System}, sync::atomic::{AtomicUsize,Ordering::Relaxed}, rc::Rc};
+use serde_json::{Value,json}; use domain::{ConfigChoice,ConfigField,ConfigValueSchema};
+mod domain { /*CORE_DTOS*/ }
+mod route {
+use super::*;
+ /*ROUTE*/
+ /*TAGS*/
+}
+struct Meter;
+static ALLOCS: AtomicUsize=AtomicUsize::new(0); static BYTES:AtomicUsize=AtomicUsize::new(0); static LIVE:AtomicUsize=AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Meter {
+ unsafe fn alloc(&self,l:Layout)->*mut u8 {let p=unsafe{System.alloc(l)};if !p.is_null(){ALLOCS.fetch_add(1,Relaxed);BYTES.fetch_add(l.size(),Relaxed);LIVE.fetch_add(l.size(),Relaxed);}p}
+ unsafe fn dealloc(&self,p:*mut u8,l:Layout){LIVE.fetch_sub(l.size(),Relaxed);unsafe{System.dealloc(p,l)}}
+ unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8 {let q=unsafe{System.realloc(p,l,n)};if !q.is_null(){ALLOCS.fetch_add(1,Relaxed);BYTES.fetch_add(n,Relaxed);LIVE.fetch_add(n,Relaxed);LIVE.fetch_sub(l.size(),Relaxed);}q}
+}
+#[global_allocator]static METER:Meter=Meter;
+fn meter()->[usize;3]{[ALLOCS.load(Relaxed),BYTES.load(Relaxed),LIVE.load(Relaxed)]}
+#[derive(Default)]struct App {out:Option<Value>}
+struct FieldSpec {path:String,field:ConfigField,value:Option<Value>}
+impl FieldSpec {
+ /*EFFECTIVE*/
+ // Captures a value in a fixture, never changes a user setting.
+ fn set(&self,v:Option<Value>,cx:&mut App){cx.out=v}
+}
+type CB=Box<dyn Fn(&bool,&mut (),&mut App)>;
+#[derive(Default)]struct AnyElement{rows:Vec<AnyElement>,label:String,checked:bool,id:usize,cb:Option<CB>}
+fn hashed_id(_: &str,i:&(&String,usize))->usize{i.1}
+mod kit {use super::*;pub(super) fn checkbox(id:usize)->AnyElement { AnyElement{id,..Default::default()} } }
+fn h_flex()->AnyElement {AnyElement::default()} fn div()->AnyElement {AnyElement::default()}
+impl AnyElement{
+ fn min_w_0(self)->Self{self} fn max_w_full(self)->Self{self} fn into_any_element(self)->Self{self} fn flex_wrap(self)->Self{self} fn w_full(self)->Self{self} fn gap_x_3(self)->Self{self} fn gap_y_1(self)->Self{self}
+ fn checked(mut self,b:bool)->Self{self.checked=b;self} fn label(mut self,s:String)->Self{self.label=s;self}
+ fn child(self,a:Self)->Self{a}
+ fn children(mut self,iter:impl IntoIterator<Item=Self>)->Self{self.rows=iter.into_iter().collect();self}
+ fn on_click(mut self,cb:impl Fn(&bool,&mut (),&mut App)+'static)->Self{self.cb=Some(Box::new(cb));self}
+}
+/*MULTI*/
+fn field(v:Value, def:Option<Value>)->ConfigField {
+ serde_json::from_value(json!({"key":"levels","title":"Levels","description":"Select levels","required":false,"advanced":false,"unit":null,"default":def,"value":v})).unwrap()
+}
+fn spec(vals:&[Value], current:Option<Value>, def:Option<Value>, width:usize)->Rc<FieldSpec>{
+ let opts:Vec<_>=vals.iter().enumerate().map(|(i,v)| json!({"title":format!("{i}:{}","é".repeat(width)),"value":v})).collect();
+ Rc::new(FieldSpec{field:field(json!({"type":"array","items":{"type":"enum","options":opts}}),def),value:current,path:"levels".into()})
+}
+fn make(s:&Rc<FieldSpec>)->AnyElement{
+ assert!(!route::is_tag_field(&s.field));
+ match route::field_kind(&s.field){route::FieldKind::MultiChoice(o)=>multi_choice(s,o),_=>panic!("wrong route")}
+}
+fn main(){
+ // Controls: the all-string array is a different user interface and is not part of this claim.
+ let t=spec(&[json!("a"),json!("b")],None,None,1); assert!(route::is_tag_field(&t.field));
+ let empty=spec(&[],None,None,1);assert!(route::is_tag_field(&empty.field));
+ let options=[vec![json!(5)],vec![json!(1),json!(2),json!(1)],vec![json!("1"),json!(1),Value::Null,json!({"unit":2}),json!(["M",3]),json!(true),json!(false),json!("1")]];
+ let data:Vec<Option<Value>>=vec![None,Some(Value::Null),Some(json!([])),Some(json!([1,1,5])),Some(json!([2,1,"1",2,"unknown"])),Some(json!([null,{"unit":2},["M",3],null])),Some(json!("not an array")),Some(json!([true,false,"1"])),Some(json!({"previous":1}))];
+ let (mut forms,mut boxes,mut callbacks)=(0,0,0);
+ for vals in &options { for rot in 0..vals.len(){let mut vals=vals.clone();vals.rotate_left(rot);
+ for v in &data {for d in &data {
+  let s=spec(&vals,v.clone(),d.clone(),3);let draw=make(&s);let selected=v.as_ref().or(d.as_ref()).and_then(|s|s.as_array()).map(Vec::as_slice).unwrap_or_default();
+  assert_eq!(draw.rows.len(),vals.len());forms+=1;for (i,b)in draw.rows.iter().enumerate(){boxes+=1;
+  assert_eq!(b.id,i);assert_eq!(b.label,format!("{i}:{}","é".repeat(3)));assert_eq!(b.checked,selected.contains(&vals[i]));
+  for on in [true,false,true,false]{let expected:Vec<_>=vals.iter().filter(|p|if **p==vals[i]{on}else{selected.contains(p)}).cloned().collect();
+   let mut cx=App::default();(b.cb.as_ref().unwrap())(&on,&mut (),&mut cx);assert_eq!(cx.out,Some(Value::Array(expected)));callbacks+=1;
+  }}
+ }}}}
+ println!("semantic: {forms} forms, {boxes} check states/titles/ids, {callbacks} repeated callback payloads, all exact");
+ // This measures allocations of the exact renderer body plus the same capture adapter in both builds.
+ // No field deserialization, fixture preparation, event dispatch or GUI paint inside the interval.
+ println!("width  alloc_calls  requested_bytes  live_bytes_at_return");
+ for n in [8,32,128,256] {
+  let values:Vec<_>=(0..n).map(|i|json!(i)).collect();let s=spec(&values,Some(Value::Array(values.iter().step_by(2).cloned().collect())),None,24);
+  let a=meter();let draw=std::hint::black_box(make(&s));let b=meter();let d=[b[0]-a[0],b[1]-a[1],b[2]-a[2]];drop(draw);assert_eq!(a[2],meter()[2]);println!("{n:5} {:12} {:16} {:18}",d[0],d[1],d[2]);
+ }
+}

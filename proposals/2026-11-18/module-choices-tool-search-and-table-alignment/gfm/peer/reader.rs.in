@@ -1,0 +1,22 @@
+use serde_json::{Value,json}; use std::{rc::Rc,cell::RefCell,io::{self,BufRead}};
+#[derive(Copy,Clone,Debug,PartialEq,Default)]enum ColumnumnAlign{#[default]None,Left,Center,Right}
+#[derive(Default)]struct Table {children:Vec<TableRow>,column_aligns:Vec<ColumnumnAlign>}
+#[derive(Default)]struct TableRow{children:Vec<TableCell>}
+struct TableCell{children:Paragraph} struct Paragraph(String);
+impl Paragraph{fn selected_source(&self)->String{self.0.clone()}fn to_markdown(&self)->String{self.0.clone()}}
+mod node{pub(super) use super::ColumnumnAlign;}
+#[derive(Clone,Debug,PartialEq)]struct Atom(String);impl AsRef<str> for Atom{fn as_ref(&self)->&str{&self.0}}
+struct Name {local:Atom}struct Attribute{name:Name,value:Atom} mod html5ever {pub(super) use super::Attribute;}
+struct Node{children:RefCell<Vec<Rc<Node>>>,data:NodeData,text:String} enum NodeData{Element{name:Name,attrs:RefCell<Vec<Attribute>>},Other}struct NodeContext;
+macro_rules! local_name{($s:literal)=>{Atom($s.to_string())}}
+fn parse_table_cell(r:&mut TableRow,n:&Rc<Node>,_:&RefCell<Vec<Attribute>>,_:&mut NodeContext){r.children.push(TableCell{children:Paragraph(n.text.clone())})}
+impl Table { /*COLUMN*/  /*SERIAL*/ }
+/*SELECT*/ /*HELPER*/ /*ROW*/
+fn main(){for l in io::stdin().lock().lines(){let j:Value=serde_json::from_str(&l.unwrap()).unwrap();let mut table=Table::default();
+ for row in j.as_array().unwrap(){let children=row.as_array().unwrap().iter().map(|c|{
+ let attrs=c[1].as_object().unwrap().iter().map(|(k,v)|Attribute{name:Name{local:Atom(k.clone())},value:Atom(v.as_str().unwrap().to_string())}).collect::<Vec<_>>();
+ Rc::new(Node{children:Default::default(),data:NodeData::Element{name:Name{local:Atom(c[0].as_str().unwrap().into())},attrs:attrs.into()},text:c[2].as_str().unwrap().into()})}).collect::<Vec<_>>();
+ parse_table_row(&mut table,&Rc::new(Node{children:children.into(),data:NodeData::Other,text:String::new()}),&mut NodeContext);}
+ let a=table.column_aligns.iter().map(|x|format!("{x:?}")).collect::<Vec<_>>();
+ let geometry=(0..table.children[0].children.len()).map(|i|{let align=table.column_align(i);let grow=10.0;let (lead,trail)=/*SLACK*/;json!([lead,trail])}).collect::<Vec<_>>();
+ println!("{}",json!([a,table.to_markdown(),table_selected_source(&table),geometry]));}}
