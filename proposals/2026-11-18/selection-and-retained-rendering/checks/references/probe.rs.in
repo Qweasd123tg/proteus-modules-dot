@@ -1,0 +1,27 @@
+use markdown::{mdast::Node,Options,ParseOptions,to_html_with_options,to_mdast};
+#[derive(Default)] struct TextMark {code:bool,italic:bool,bold:bool,strikethrough:bool,underline:bool,highlight:Option<u8>,link:Option<LinkMark>}
+struct LinkMark {url:String,title:Option<String>,identifier:Option<String>}
+mod desktop {use super::*; /*WRAPPER*/ }
+fn find(node:&Node)->Option<LinkMark>{
+    if let Node::LinkReference(link)=node { return Some(LinkMark {
+        url:"".into(),title:link.label.clone(),identifier:Some(link.identifier.clone())
+    }); } node.children()?.iter().find_map(find)
+}
+fn html(s:&str)->String {to_html_with_options(s,&Options::gfm()).unwrap()}
+fn main(){
+    for id in ["Manual","A B C","A &amp; B"] {
+        let definition=format!("[{id}]: /guide \"Handbook\"");
+        let source=format!("[the Guide][{id}]\n\n{definition}");
+        let mark=find(&to_mdast(&source,&ParseOptions::gfm()).unwrap()).unwrap();
+        let stored_key=mark.identifier.clone().unwrap();
+        let copied=desktop::wrap_with_mark("Guide",&TextMark{link:Some(mark),..Default::default()});
+        let expected=html(&source).replace("the Guide","Guide");
+        let actual=html(&format!("{copied}\n\n{definition}"));
+        assert_eq!(expected,"<p><a href=\"/guide\" title=\"Handbook\">Guide</a></p>\n");
+        assert_ne!(actual,expected);
+        let suggested=format!("[Guide][{stored_key}]");
+        let hash_survives=html(&format!("{suggested}\n\n{definition}"))==expected;
+        assert_eq!(hash_survives,id=="Manual");
+        println!("{id:?}: current source = {copied:?}; original target/title restored: false; naively writing lookup key {stored_key:?} restores original: {hash_survives}");
+    }
+}

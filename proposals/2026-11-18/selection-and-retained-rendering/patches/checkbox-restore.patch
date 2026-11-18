@@ -1,0 +1,58 @@
+diff --git a/src/ui/settings/fields.rs b/src/ui/settings/fields.rs
+index e038818..ab5856d 100644
+--- a/src/ui/settings/fields.rs
++++ b/src/ui/settings/fields.rs
+@@ -1,6 +1,6 @@
+ //! Rows for module `config_schema` fields.
+ 
+-use std::rc::Rc;
++use std::{collections::HashSet, rc::Rc};
+ 
+ use gpui_kit::component::*;
+ use gpui_kit::prelude::FluentBuilder as _;
+@@ -39,6 +39,14 @@ impl FieldSpec {
+         });
+     }
+ 
++    fn set_choices(&self, next: Vec<Value>, cx: &mut App) {
++        let _ = self.view.update(cx, |this, cx| {
++            let default = self.field.default.as_ref();
++            let saved = this.baseline.value(&self.path).or(default);
++            this.edit_field(&self.path, Some(checkbox_value(next, saved)), default, cx);
++        });
++    }
++
+     /// A value of its own that differs from the default.
+     fn own(&self) -> bool {
+         self.value
+@@ -236,6 +244,21 @@ fn choice_menu(spec: &Rc<FieldSpec>, options: &[ConfigChoice]) -> AnyElement {
+     })
+ }
+ 
++// Checkboxes express membership, not array order. When the same unique choices
++// have been restored, hand the draft its original array rather than a permutation.
++fn checkbox_value(next: Vec<Value>, saved: Option<&Value>) -> Value {
++    if let Some(original) = saved.and_then(Value::as_array)
++        && original.len() == next.len()
++        && original != &next
++    {
++        let mut remaining: HashSet<_> = next.iter().collect();
++        if original.iter().all(|value| remaining.remove(value)) {
++            return Value::Array(original.clone());
++        }
++    }
++    Value::Array(next)
++}
++
+ fn multi_choice(spec: &Rc<FieldSpec>, options: &[ConfigChoice]) -> AnyElement {
+     let selected: Vec<Value> = spec
+         .effective()
+@@ -265,7 +288,7 @@ fn multi_choice(spec: &Rc<FieldSpec>, options: &[ConfigChoice]) -> AnyElement {
+                         })
+                         .cloned()
+                         .collect();
+-                    handler.set(Some(Value::Array(next)), cx);
++                    handler.set_choices(next, cx);
+                 }),
+         )
+     });
