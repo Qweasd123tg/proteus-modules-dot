@@ -1,0 +1,34 @@
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -189,6 +189,7 @@
+         store: RemoteSessionStore,
+         previous: Option<&RemoteJournalCursor>,
+     ) -> Result<(Self, bool)> {
++        let validation_started = std::time::Instant::now();
+         let mut source = store.snapshot()?;
+         let prefix_matches = match previous {
+             Some(previous) => matches!(
+@@ -200,6 +201,7 @@
+             ),
+             None => false,
+         };
++        eprintln!("OPEN_COMPARE prior={} wall_ms={:.3}", previous.map_or(0, RemoteJournalCursor::last_session_seq), validation_started.elapsed().as_secs_f64() * 1000.0);
+         let prefix_seq = previous
+             .filter(|_| prefix_matches)
+             .map(|previous| previous.last_session_seq());
+@@ -208,6 +210,7 @@
+         let mut usage = proteus_session_semantics::UsageProjection::default();
+         let mut context = proteus_session_semantics::ModelContextProjection::default();
+         let mut next_seq = 1;
++        let t = std::time::Instant::now();
+         source.scan(|record| {
+             validation.apply_sequenced(store.session_id(), &record, &mut next_seq)?;
+             usage.apply(&record);
+@@ -223,6 +226,7 @@
+             }
+             Ok(())
+         })?;
++        eprintln!("VALIDATION records={} prefix={prefix_matches} scan_ms={:.3}", next_seq - 1, t.elapsed().as_secs_f64() * 1000.0);
+         let resume = proteus_contracts::contracts::StorageResumeState {
+             conversation: StorageConversation {
+                 revision: source.snapshot.revision,

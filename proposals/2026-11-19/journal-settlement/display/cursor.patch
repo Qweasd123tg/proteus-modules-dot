@@ -1,0 +1,176 @@
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 302a7f09..a87df925 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -172,25 +172,13 @@ pub(super) fn refresh_in_background(server: &AppServerHandle) {
+             let Some(store) = server.runtime.session_store().cloned() else {
+                 return Ok(());
+             };
+-            #[cfg(unix)]
+-            let source = {
+-                let store = store.clone();
+-                tokio::task::spawn_blocking(move || {
+-                    crate::core::session_read_cache::SourceFingerprint::read(&store)
+-                })
+-                .await?
+-            };
+             let Some(read) = server.runtime.refresh_cached_resume().await? else {
+                 return Ok(());
+             };
+             let transcript = tokio::task::spawn_blocking(move || {
+-                let model = SessionReadModel::from_validated(&store, read, |source| {
++                let model = store.project_validated_model(read, |source| {
+                     journal_transcript_from_source(source, None)
+                 })?;
+-                #[cfg(unix)]
+-                if let Some(source) = source {
+-                    store.save_read_model(&source, &model);
+-                }
+                 Ok::<_, anyhow::Error>(CompletedTranscript::from_model(
+                     &store,
+                     model.transcript,
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index 10ca469f..70d32714 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -7,13 +7,12 @@ use proteus_contracts::app_protocol::AppTranscriptMessage;
+ use super::{
+     RemoteSessionStore, StorageService, catalog,
+     snapshot::{RemoteJournalSnapshot, RemoteValidatedRead},
+-    view::{RemoteCacheSource, SessionReadModel, SessionReadView},
++    view::SessionReadView,
+ };
+ 
+ pub(crate) struct PreparedSession {
+     store: RemoteSessionStore,
+     history: PreparedHistory,
+-    source: Option<RemoteCacheSource>,
+     stale: bool,
+ }
+ 
+@@ -25,20 +24,17 @@ enum PreparedHistory {
+ impl PreparedSession {
+     pub(crate) fn from_dir(service: StorageService, session_dir: PathBuf) -> Result<Self> {
+         let store = RemoteSessionStore::open(service, session_dir)?;
+-        if let Some((source, view, fresh)) = store.saved_read_view() {
++        if let Some((_, view, fresh)) = store.saved_read_view() {
+             return Ok(Self {
+                 store,
+                 history: PreparedHistory::Cached(view),
+-                source: Some(source),
+                 stale: !fresh,
+             });
+         }
+         let read = RemoteValidatedRead::open(store.clone())?;
+-        let source = Some(RemoteCacheSource::from_cursor(&read.cursor()));
+         Ok(Self {
+             store,
+             history: PreparedHistory::Validated(read),
+-            source,
+             stale: false,
+         })
+     }
+@@ -64,10 +60,7 @@ impl PreparedSession {
+     ) -> Result<(RemoteSessionStore, SessionReadView, bool, bool)> {
+         let (view, deferred) = match self.history {
+             PreparedHistory::Validated(read) => {
+-                let model = SessionReadModel::from_validated(&self.store, read, render)?;
+-                if let Some(source) = &self.source {
+-                    self.store.save_read_model(source, &model);
+-                }
++                let model = self.store.project_validated_model(read, render)?;
+                 (
+                     SessionReadView::from_model(&self.store, model, false),
+                     false,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index b638fbff..b76d2719 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -120,12 +120,24 @@ impl RemoteSessionStore {
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
+     ) -> Result<SessionReadModel> {
+         let read = RemoteValidatedRead::open(self.clone())?;
+-        let source = RemoteCacheSource::from_cursor(&read.cursor());
++        self.project_validated_model(read, render)
++    }
++
++    pub(crate) fn project_validated_model(
++        &self,
++        read: RemoteValidatedRead,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
++    ) -> Result<SessionReadModel> {
++        // The published rows and append cursor must come from the same strict
++        // read, including on cold startup, recovery and background refresh.
++        let cursor = read.cursor();
++        let source = RemoteCacheSource::from_cursor(&cursor);
+         let model = SessionReadModel::from_validated(self, read, render)?;
+-        self.save_read_model(&source, &model);
++        let _ = cache::save_model(self, &source, &model, Some(&cursor));
+         Ok(model)
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn save_read_model(&self, source: &RemoteCacheSource, model: &SessionReadModel) {
+         let _ = cache::save_model(self, source, model, None);
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 8233554c..e478fc61 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -169,6 +169,10 @@ fn write_content<T: Serialize>(
+ 
+ fn matches(store: &RemoteSessionStore, header: &Header) -> bool {
+     header.format == FORMAT
++        && header
++            .cursor
++            .as_ref()
++            .is_none_or(|cursor| cursor.snapshot == header.source.snapshot)
+         && header.source.snapshot.session == store.descriptor.session
+         && header.summary.session_id == store.session_id()
+         && header.summary.parent_session_id == store.parent_session_id()
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 7b8ababc..3f8b6c7f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -205,3 +205,41 @@ fn rejected_prefix_rebuilds_but_a_suffix_read_error_is_not_a_cache_miss() {
+     assert!(format!("{err:#}").contains("injected record read failure"));
+     assert_eq!(store.saved_display_page().unwrap().total, 2);
+ }
++
++#[test]
++fn first_settle_after_cold_start_uses_only_the_exact_validated_cursor() {
++    let (backend, store) = Backend::store();
++    backend.append(3);
++    let cold = super::super::prepared::PreparedSession::from_dir(
++        backend.clone(),
++        store.session_dir().to_owned(),
++    )
++    .unwrap();
++    let (store, first, deferred, stale) = cold.into_display_view(full).unwrap();
++    assert!(!deferred && !stale);
++    let revision = first.cursor.unwrap().revision;
++    let header = cache::header(&store).unwrap();
++    assert_eq!(header.cursor.unwrap().snapshot, header.source.snapshot);
++    backend.append(1);
++    let appended = project(&store, |_| {
++        panic!("independent first turn used full display")
++    })
++    .unwrap();
++    let base = appended.cursor.unwrap().base.unwrap();
++    assert_eq!((base.revision, base.common_prefix), (revision, 3));
++}
++
++#[test]
++fn an_older_validated_read_cannot_publish_its_view_under_a_newer_source() {
++    let (backend, store) = Backend::store();
++    backend.append(1);
++    let read = RemoteValidatedRead::open(store.clone()).unwrap();
++    backend.append(1);
++    let model = store.project_validated_model(read, full).unwrap();
++    assert_eq!(model.summary.message_count, 1);
++    assert!(cache::header(&store).is_none());
++    let current = store.project_read_model(full).unwrap();
++    assert_eq!(current.summary.message_count, 2);
++    let header = cache::header(&store).unwrap();
++    assert_eq!(header.cursor.unwrap().snapshot, header.source.snapshot);
++}

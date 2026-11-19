@@ -1,0 +1,43 @@
+--- a/crates/proteus-core/src/app_server/runs.rs
++++ b/crates/proteus-core/src/app_server/runs.rs
+@@ -198,7 +198,10 @@
+                 .await;
+             // The reservation remains held until the registry publishes the
+             // terminal state, so no next turn can overtake this projection.
++            eprintln!("SETTLE_BEGIN");
++            let perf_started = std::time::Instant::now();
+             let history = completed_transcript(server.runtime.clone()).await;
++            eprintln!("SETTLE_END wall_ms={:.3} ok={}", perf_started.elapsed().as_secs_f64()*1000., history.is_ok());
+             let mut runs = server.runs.lock().await;
+             let failed_queued = if server.events.has_unstarted_input() {
+                 match completion.as_mut() {
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -75,7 +75,11 @@
+         select: impl Fn(JournalKind) -> bool,
+         mut consume: impl FnMut(JournalRecord) -> Result<()>,
+     ) -> Result<()> {
++        let from = after_seq;
++        let mut pages = 0;
++        let mut read = 0;
+         loop {
++            pages += 1;
+             let response = self.store.request(Request::ReadRecords {
+                 snapshot: self.snapshot.clone(),
+                 after_seq,
+@@ -88,6 +92,7 @@
+                 page.snapshot == self.snapshot,
+                 "storage changed the fixed snapshot while paging"
+             );
++            read += page.records.len();
+             for record in page.records {
+                 ensure!(
+                     record.session_id == self.snapshot.session.session_id
+@@ -112,6 +117,7 @@
+                         after_seq == self.snapshot.revision.session_seq,
+                         "storage returned an incomplete snapshot"
+                     );
++                    eprintln!("SCAN from={from} rows={read} pages={pages}");
+                     return Ok(());
+                 }
+             }

@@ -1,0 +1,488 @@
+diff --git a/storage/session-storage/README.md b/storage/session-storage/README.md
+index 4ea9b81..33d41f9 100644
+--- a/storage/session-storage/README.md
++++ b/storage/session-storage/README.md
+@@ -40,7 +40,14 @@ fingerprint и файловые stamps; первый доступ к канон
+ полный prefix. Последовательные страницы затем читаются одним проходом с одним
+ pending record, без повторного декодирования хвоста. Изменение JSONL-файла
+ сбрасывает подтверждение prefix и требует повторной проверки. `CompareSnapshots` принимает descriptor
+-старого prefix после освобождения старого handle. Страницы ограничены числом
++старого prefix после освобождения старого handle. При полном открытии для сравнения
++запоминается не более одной предыдущей границы: из текущего проверяемого потока
++берутся ревизия и SHA-256 именно в этой точке. Для неё и для конца snapshot не
++нужно заново строить семантическое состояние. SQLite сохраняет отдельную read
++transaction; у JSONL без внешних payloads заново хешируются все фиксированные
++байты, а при наличии blob сохраняется полный прежний путь проверки. При неизвестной
++границе или неподтверждённом snapshot также работает прежняя проверка.
++Страницы ограничены числом
+ записей и 4 MiB суммарных canonical payloads; одна большая запись возвращается
+ целиком, максимум 65 MiB. Процессному компоненту необходим согласованный frame
+ budget для таких записей; данные не обрезаются.
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index f685965..ca5c516 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -100,6 +100,7 @@ struct JsonlSnapshot {
+     fingerprint: String,
+     current_hash: HashContext,
+     consumed: u64,
++    has_external_payloads: bool,
+ }
+ impl JsonlSnapshot {
+     fn open(dir: &Path, id: SessionId, hint: Option<&PrefixHint>) -> Result<Self> {
+@@ -164,6 +165,7 @@ impl JsonlSnapshot {
+             fingerprint,
+             current_hash: HashContext::new(&SHA256),
+             consumed: 0,
++            has_external_payloads: false,
+         })
+     }
+ }
+@@ -261,14 +263,7 @@ impl RecordSnapshot for JsonlSnapshot {
+                 self.consumed == self.length && reader.get_ref().limit() == 0,
+                 "journal shortened during snapshot read"
+             );
+-            let actual: String = self
+-                .current_hash
+-                .clone()
+-                .finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect();
++            let actual = self.consumed_fingerprint();
+             ensure!(
+                 actual == self.fingerprint,
+                 "journal complete prefix changed during snapshot read"
+@@ -286,7 +281,20 @@ impl RecordSnapshot for JsonlSnapshot {
+         self.current_hash.update(&line);
+         line.pop();
+         ensure!(!line.is_empty(), "journal contains an empty complete line");
+-        codec::decode(&self.dir, self.id, &line).map(Some)
++        let (record, external) = codec::decode(&self.dir, self.id, &line)?;
++        self.has_external_payloads |= external;
++        Ok(Some(record))
++    }
++    fn consumed_fingerprint(&self) -> String {
++        crate::io::digest_hex(self.current_hash.clone().finish().as_ref())
++    }
++    fn confirm_verified_data(&self) -> Result<bool> {
++        if self.has_external_payloads {
++            // Even an unchanged journal cannot prove blobs still exist.
++            return Ok(false);
++        }
++        self.verify_fixed_prefix()?;
++        Ok(true)
+     }
+     fn fingerprint(&self) -> &str {
+         &self.fingerprint
+@@ -299,15 +307,7 @@ impl RecordSnapshot for JsonlSnapshot {
+         let mut found = (sequence == 0).then(|| crate::io::sha256_hex(b""));
+         while let Some(record) = self.next()? {
+             if record.session_seq == sequence {
+-                found = Some(
+-                    self.current_hash
+-                        .clone()
+-                        .finish()
+-                        .as_ref()
+-                        .iter()
+-                        .map(|b| format!("{b:02x}"))
+-                        .collect(),
+-                );
++                found = Some(self.consumed_fingerprint());
+             }
+         }
+         Ok(found)
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 46e0af5..1d1a7b3 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -34,6 +34,14 @@ pub(crate) trait RecordSnapshot: Send {
+     }
+     fn reset(&mut self) -> Result<()>;
+     fn next(&mut self) -> Result<Option<JournalRecord>>;
++    /// Digest after the records consumed by this validation pass.
++    fn consumed_fingerprint(&self) -> String;
++    /// Independently confirm that ALL canonical data are still available and
++    /// unchanged. Opt-in: backends with external objects cannot use just the
++    /// journal digest. Called only after a full semantic validation.
++    fn confirm_verified_data(&self) -> Result<bool> {
++        Ok(false)
++    }
+     fn fingerprint(&self) -> &str;
+     fn extent(&self) -> u64;
+     fn prefix_fingerprint(&mut self, sequence: u64) -> Result<Option<String>>;
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index ba0b959..548262c 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -189,14 +189,7 @@ impl RecordSnapshot for SqliteSnapshot {
+             "SELECT sequence,payload FROM journal WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 1",
+             params![i64::try_from(self.after)?, i64::try_from(self.end)?], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+         let Some((sequence, bytes)) = row else {
+-            let actual: String = self
+-                .current_hash
+-                .clone()
+-                .finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect();
++            let actual = self.consumed_fingerprint();
+             ensure!(actual == self.fingerprint, "SQLite snapshot prefix changed");
+             return Ok(None);
+         };
+@@ -217,6 +210,13 @@ impl RecordSnapshot for SqliteSnapshot {
+         self.after = sequence;
+         Ok(Some(record))
+     }
++    fn consumed_fingerprint(&self) -> String {
++        crate::io::digest_hex(self.current_hash.clone().finish().as_ref())
++    }
++    fn confirm_verified_data(&self) -> Result<bool> {
++        // The open read transaction pins both the payloads and their order.
++        Ok(true)
++    }
+     fn fingerprint(&self) -> &str {
+         &self.fingerprint
+     }
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 1ccf5a2..c753bdc 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -99,7 +99,11 @@ pub(crate) fn encode(
+     Ok(line)
+ }
+ 
+-pub(crate) fn decode(session: &Path, session_id: SessionId, line: &[u8]) -> Result<JournalRecord> {
++pub(crate) fn decode(
++    session: &Path,
++    session_id: SessionId,
++    line: &[u8],
++) -> Result<(JournalRecord, bool)> {
+     crate::diagnostics::decoded();
+     let stored: StoredRecord = serde_json::from_slice(line).context("invalid journal record")?;
+     ensure!(
+@@ -111,6 +115,7 @@ pub(crate) fn decode(session: &Path, session_id: SessionId, line: &[u8]) -> Resu
+         stored.session_id == session_id,
+         "journal record belongs to another session"
+     );
++    let external = matches!(stored.payload, StoredPayload::Blob { .. });
+     let entry = match stored.payload {
+         StoredPayload::Inline { value } => {
+             ensure!(
+@@ -135,17 +140,20 @@ pub(crate) fn decode(session: &Path, session_id: SessionId, line: &[u8]) -> Resu
+             JournalEntry::from_kind_and_bytes(stored.kind, &content)?
+         }
+     };
+-    Ok(JournalRecord {
+-        schema_version: stored.schema_version,
+-        record_id: stored.record_id,
+-        session_seq: stored.session_seq,
+-        timestamp_ms: stored.timestamp_ms,
+-        session_id: stored.session_id,
+-        execution_id: stored.execution_id,
+-        thread_id: stored.thread_id,
+-        turn_id: stored.turn_id,
+-        entry,
+-    })
++    Ok((
++        JournalRecord {
++            schema_version: stored.schema_version,
++            record_id: stored.record_id,
++            session_seq: stored.session_seq,
++            timestamp_ms: stored.timestamp_ms,
++            session_id: stored.session_id,
++            execution_id: stored.execution_id,
++            thread_id: stored.thread_id,
++            turn_id: stored.turn_id,
++            entry,
++        },
++        external,
++    ))
+ }
+ 
+ fn validate_blob(hash: &str, path: &Path) -> Result<()> {
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index f04375d..8981f47 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -10,11 +10,11 @@ use std::{
+ pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+ 
+ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+-    digest(&SHA256, bytes)
+-        .as_ref()
+-        .iter()
+-        .map(|b| format!("{b:02x}"))
+-        .collect()
++    digest_hex(digest(&SHA256, bytes).as_ref())
++}
++
++pub(crate) fn digest_hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
+ }
+ 
+ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 0205b52..854c06d 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -28,6 +28,7 @@ impl State {
+             .filter(|cache| cache.stamps == stamps)
+             .cloned();
+         let verified = cached.is_none();
++        let mut previous_boundary = None;
+         let (mut source, revision) = if let Some(cached) = cached {
+             (
+                 self.kind
+@@ -38,9 +39,18 @@ impl State {
+         } else {
+             let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+             let version = source.source_version()?;
++            // A cached sequence only chooses a cut point. Derive its revision
++            // and raw digest from THIS fixed source, not from the old cache.
++            let cut = self.prefixes.get(&session).map(|c| c.revision.session_seq);
+             let mut state = Fold::default();
++            if cut == Some(0) {
++                previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
++            }
+             while let Some(record) = source.next()? {
+                 state.apply(session.session_id, &record)?;
++                if cut == Some(record.session_seq) {
++                    previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
++                }
+             }
+             if source.source_version()? != version {
+                 source.verify_fixed_prefix()?;
+@@ -76,7 +86,7 @@ impl State {
+         self.snapshot_order.push_back(identity.snapshot_id.clone());
+         self.snapshots.insert(
+             identity.snapshot_id.clone(),
+-            SnapshotState::new(identity.clone(), source, verified)?,
++            SnapshotState::new(identity.clone(), source, verified, previous_boundary)?,
+         );
+         Ok(identity)
+     }
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 344f3af..dc7cfb7 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -48,6 +48,9 @@ impl Fold {
+ pub(crate) struct SnapshotState {
+     pub identity: StorageSnapshot,
+     pub source: Box<dyn RecordSnapshot>,
++    // At most one historical boundary, derived inside the same validation
++    // pass as identity. No caller-supplied descriptor or Fold is retained.
++    previous_boundary: Option<(StorageRevision, String)>,
+     verified: bool,
+     verified_version: Option<crate::backend::SourceVersion>,
+     page_after: Option<u64>,
+@@ -58,12 +61,14 @@ impl SnapshotState {
+         identity: StorageSnapshot,
+         source: Box<dyn RecordSnapshot>,
+         verified: bool,
++        previous_boundary: Option<(StorageRevision, String)>,
+     ) -> Result<Self> {
+         let verified_version = source.source_version()?;
+         Ok(Self {
+             identity,
+             source,
+             verified,
++            previous_boundary,
+             verified_version,
+             page_after: None,
+             pending: None,
+@@ -85,6 +90,21 @@ impl SnapshotState {
+         {
+             return Ok(false);
+         }
++        if self.verified {
++            let known = if prefix.revision.session_seq == self.identity.revision.session_seq {
++                Some((&self.identity.revision, &self.identity.content_sha256))
++            } else {
++                self.previous_boundary
++                    .as_ref()
++                    .filter(|(revision, _)| revision.session_seq == prefix.revision.session_seq)
++                    .map(|(revision, hash)| (revision, hash))
++            };
++            if let Some((revision, hash)) = known
++                && self.source.confirm_verified_data()?
++            {
++                return Ok(*revision == prefix.revision && *hash == prefix.content_sha256);
++            }
++        }
+         let Some(hash) = self
+             .source
+             .prefix_fingerprint(prefix.revision.session_seq)?
+diff --git a/storage/session-storage/src/tests/mod.rs b/storage/session-storage/src/tests/mod.rs
+index d9d9b21..6caaed8 100644
+--- a/storage/session-storage/src/tests/mod.rs
++++ b/storage/session-storage/src/tests/mod.rs
+@@ -129,3 +129,5 @@ mod performance;
+ mod paging;
+ 
+ mod model_context;
++
++mod prefix;
+diff --git a/storage/session-storage/src/tests/model_context.rs b/storage/session-storage/src/tests/model_context.rs
+index 4e2ede4..3a46cc8 100644
+--- a/storage/session-storage/src/tests/model_context.rs
++++ b/storage/session-storage/src/tests/model_context.rs
+@@ -179,3 +179,39 @@ fn lease_bound_runtime_context_read_needs_no_snapshot_and_recovers_only_after_hi
+         );
+     }
+ }
++
++#[test]
++fn comparing_a_cut_after_admission_uses_its_history_revision_not_sequence() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("history")]);
++        admit(&mut f);
++        let old = f.snapshot();
++        assert_eq!(
++            (old.revision.session_seq, old.revision.history_revision),
++            (2, 1)
++        );
++        admit(&mut f);
++        let head = f.snapshot();
++        let compare = |prefix| {
++            f.service
++                .execute(SessionStorageRequest::CompareSnapshots {
++                    snapshot: head.clone(),
++                    prefix,
++                })
++                .unwrap()
++        };
++        crate::diagnostics::reset();
++        assert_eq!(
++            compare(old.clone()),
++            SessionStorageResponse::SnapshotPrefix { matches: true }
++        );
++        let mut wrong = old;
++        wrong.revision.history_revision = 2;
++        assert_eq!(
++            compare(wrong),
++            SessionStorageResponse::SnapshotPrefix { matches: false }
++        );
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++    }
++}
+diff --git a/storage/session-storage/src/tests/prefix.rs b/storage/session-storage/src/tests/prefix.rs
+new file mode 100644
+index 0000000..c06d4ef
+--- /dev/null
++++ b/storage/session-storage/src/tests/prefix.rs
+@@ -0,0 +1,111 @@
++use super::*;
++
++fn compare(f: &Fixture, head: &StorageSnapshot, old: &StorageSnapshot) -> anyhow::Result<bool> {
++    let SessionStorageResponse::SnapshotPrefix { matches } =
++        f.service.execute(SessionStorageRequest::CompareSnapshots {
++            snapshot: head.clone(),
++            prefix: old.clone(),
++        })?
++    else {
++        panic!("unexpected response")
++    };
++    Ok(matches)
++}
++
++fn rewrite_text(path: &std::path::Path, from: &str, to: &str) {
++    assert_eq!(from.len(), to.len());
++    let bytes = std::fs::read_to_string(path).unwrap();
++    assert_eq!(bytes.matches(from).count(), 1);
++    std::fs::write(path, bytes.replace(from, to)).unwrap();
++}
++
++#[test]
++fn released_prefix_matches_only_verified_hash_and_revision() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("oldest")]);
++        let oldest = f.snapshot();
++        f.append(vec![text("middle")]);
++        let old = f.snapshot();
++        f.service
++            .execute(SessionStorageRequest::ReleaseSnapshot {
++                snapshot: old.clone(),
++            })
++            .unwrap();
++        f.append(vec![text("tail")]);
++        let head = f.snapshot();
++        crate::diagnostics::reset();
++        assert!(compare(&f, &head, &old).unwrap());
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++        let mut wrong = old.clone();
++        wrong.revision.history_revision -= 1;
++        assert!(!compare(&f, &head, &wrong).unwrap());
++        wrong = old.clone();
++        wrong.content_sha256 = "0".repeat(64);
++        assert!(!compare(&f, &head, &wrong).unwrap());
++        assert!(compare(&f, &head, &head).unwrap());
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++        assert!(compare(&f, &head, &oldest).unwrap());
++        assert!(
++            crate::diagnostics::get().decoded > 0,
++            "unremembered boundary still supported"
++        );
++        let warm = f.snapshot();
++        crate::diagnostics::reset();
++        assert!(compare(&f, &warm, &old).unwrap());
++        assert!(
++            crate::diagnostics::get().decoded > 0,
++            "warm hint is not verification"
++        );
++    }
++}
++
++#[test]
++fn jsonl_boundary_is_derived_from_target_and_protects_its_entire_fixed_extent() {
++    let mut f = Fixture::new(BackendKind::Jsonl);
++    f.append(vec![text("prefix-original")]);
++    let old = f.snapshot();
++    f.append(vec![text("tail-original")]);
++    let path = f.descriptor.record_location.as_ref().unwrap();
++    rewrite_text(path, "prefix-original", "prefix-modified");
++    let head = f.snapshot();
++    assert!(
++        !compare(&f, &head, &old).unwrap(),
++        "old cache cannot attest to current bytes"
++    );
++    rewrite_text(path, "tail-original", "tail-modified");
++    assert!(
++        compare(&f, &head, &old).is_err(),
++        "reject even corruption after requested boundary"
++    );
++    rewrite_text(path, "tail-modified", "tail-original");
++    assert!(compare(&f, &head, &head).unwrap());
++}
++
++#[test]
++fn jsonl_fixed_digest_does_not_attest_to_external_payloads() {
++    let mut f = Fixture::new(BackendKind::Jsonl);
++    f.append(vec![text("before external payload")]);
++    let old = f.snapshot();
++    f.append(vec![text(&"B".repeat(300_000))]);
++    let head = f.snapshot();
++    let path = std::fs::read_dir(f.descriptor.local_path.as_ref().unwrap().join("blobs"))
++        .unwrap()
++        .next()
++        .unwrap()
++        .unwrap()
++        .path();
++    let bytes = std::fs::read(&path).unwrap();
++    let mut invalid = bytes.clone();
++    let pos = invalid.iter().position(|&b| b == b'B').unwrap();
++    invalid[pos] = b'C';
++    std::fs::write(&path, invalid).unwrap();
++    assert!(
++        compare(&f, &head, &old).is_err(),
++        "check external suffix, too"
++    );
++    std::fs::remove_file(&path).unwrap();
++    assert!(compare(&f, &head, &head).is_err());
++    std::fs::write(path, bytes).unwrap();
++    assert!(compare(&f, &head, &old).unwrap());
++}
