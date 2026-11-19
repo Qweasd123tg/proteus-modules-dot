@@ -1,0 +1,65 @@
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 3bebbdb..a2afe7d 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -29,8 +29,17 @@ impl State {
+         let dir = self.checked_path(&session)?;
+         let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_CACHE_BYTES + 1024 * 1024)
+         {
+-            Ok(bytes) => bytes,
+-            Err(_) => return Ok(SessionStorageResponse::Metadata { document: None }),
++            Ok(bytes) => Some(bytes),
++            Err(_) => None,
++        };
++        if let Some(trace) = option_env!("PERF7_CACHE_TRACE") {
++            if let Ok(mut sink) = OpenOptions::new().create(true).append(true).open(trace) {
++                let seq = self.prefixes.get(&session).map(|p| p.revision.session_seq);
++                let _ = writeln!(sink, "READ {} {} {} {}", session.session_id, seq.unwrap_or(0), key, bytes.as_ref().map_or(0, Vec::len));
++            }
++        }
++        let Some(bytes) = bytes else {
++            return Ok(SessionStorageResponse::Metadata { document: None });
+         };
+         let cache: Cache = match serde_json::from_slice(&bytes) {
+             Ok(value) => value,
+@@ -98,7 +107,14 @@ impl State {
+             let _ = std::fs::remove_file(&temp);
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+-        evict(&dir, &path(&dir, &key))?;
++        let watch = std::time::Instant::now();
++        let (inspected, total) = evict(&dir, &path(&dir, &key))?;
++        let micros = watch.elapsed().as_micros();
++        if let Some(trace) = option_env!("PERF7_CACHE_TRACE") {
++            if let Ok(mut sink) = OpenOptions::new().create(true).append(true).open(trace) {
++                let _ = writeln!(sink, "{} {} {} {} {} {} {}", session.session_id, current.revision.session_seq, key, bytes.len(), inspected, total, micros);
++            }
++        }
+         Ok(SessionStorageResponse::CacheWritten {
+             etag: Some(storage_value_etag(&cache.value)?),
+         })
+@@ -106,7 +122,7 @@ impl State {
+ }
+ 
+ /// Quota applies across all content-addressed generations and page keys.
+-fn evict(dir: &Path, keep: &Path) -> Result<()> {
++fn evict(dir: &Path, keep: &Path) -> Result<(usize,u64)> {
+     let mut files = Vec::new();
+     let mut total = 0_u64;
+     for entry in std::fs::read_dir(dir)? {
+@@ -125,6 +141,8 @@ fn evict(dir: &Path, keep: &Path) -> Result<()> {
+             files.push((meta.modified()?, entry.path(), meta.len()));
+         }
+     }
++    let inspected = 1 + files.len();
++    let before = total;
+     files.sort_by_key(|(modified, _, _)| *modified);
+     for (_, path, bytes) in files {
+         if total <= 128 * 1024 * 1024 {
+@@ -136,5 +154,5 @@ fn evict(dir: &Path, keep: &Path) -> Result<()> {
+             Err(e) => return Err(e.into()),
+         }
+     }
+-    Ok(())
++    Ok((inspected, before))
+ }
