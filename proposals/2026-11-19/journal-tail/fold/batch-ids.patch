@@ -1,0 +1,138 @@
+diff --git a/crates/proteus-session-semantics/src/journal/projection.rs b/crates/proteus-session-semantics/src/journal/projection.rs
+index 8a226da8..b640dede 100644
+--- a/crates/proteus-session-semantics/src/journal/projection.rs
++++ b/crates/proteus-session-semantics/src/journal/projection.rs
+@@ -124,8 +124,8 @@ impl JournalValidationState {
+         )
+     }
+ 
+-    fn check_history_ids(&mut self, single_append: bool) -> Result<()> {
+-        let result = if single_append
++    fn check_history_ids(&mut self, appended: usize) -> Result<()> {
++        let result = if appended == 1
+             && !self.history_ids_invalid
+             && let Some((last, prefix)) = self.history.split_last()
+             && last.parts.len() <= 1
+@@ -142,6 +142,9 @@ impl JournalValidationState {
+                         .any(|message| message.parts.iter().any(|old| old.part_id == part_id))
+                 },
+             )
++        } else if appended != 0 && appended < self.history.len() / 2 && !self.history_ids_invalid {
++            let (prefix, added) = self.history.split_at(self.history.len() - appended);
++            validate_appended_ids(prefix, added)
+         } else {
+             validate_active_history_ids(&self.history)
+         };
+@@ -318,6 +321,28 @@ fn validate_active_history_ids(messages: &[CanonicalMessage]) -> Result<()> {
+     Ok(())
+ }
+ 
++/// The retained prefix is already valid. Store only the candidate IDs from
++/// this append, strike IDs seen in the prefix, then consume candidates in
++/// canonical order. A missing ID is precisely the first duplicate that the
++/// full pass would report, whether it was reused in the prefix or the batch.
++fn validate_appended_ids(prefix: &[CanonicalMessage], added: &[CanonicalMessage]) -> Result<()> {
++    let mut messages = added.iter().map(|m| m.id).collect::<HashSet<_>>();
++    let mut parts = added
++        .iter()
++        .flat_map(|m| m.parts.iter().map(|p| p.part_id))
++        .collect::<HashSet<_>>();
++    for message in prefix {
++        messages.remove(&message.id);
++        for part in &message.parts {
++            parts.remove(&part.part_id);
++        }
++    }
++    for message in added {
++        validate_message_ids(message, messages.remove(&message.id), |id| parts.remove(&id))?;
++    }
++    Ok(())
++}
++
+ fn validate_message_ids(
+     message: &CanonicalMessage,
+     new_message_id: bool,
+diff --git a/crates/proteus-session-semantics/src/journal/projection/append_id_tests.rs b/crates/proteus-session-semantics/src/journal/projection/append_id_tests.rs
+index 2c22b1ea..70ce033c 100644
+--- a/crates/proteus-session-semantics/src/journal/projection/append_id_tests.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/append_id_tests.rs
+@@ -94,3 +94,41 @@ fn failed_state_cannot_recertify_an_invalid_prefix_by_appending() {
+     apply(&mut state, HistoryMutationKind::Replace, vec![row("reset")]).unwrap();
+     apply(&mut state, HistoryMutationKind::Append, vec![row("good")]).unwrap();
+ }
++
++#[test]
++fn batch_append_matches_first_duplicate_in_full_check() {
++    let mut state = JournalValidationState::default();
++    let prefix: Vec<_> = (0..24).map(|i| row(&format!("p{i}"))).collect();
++    apply(&mut state, HistoryMutationKind::Replace, prefix.clone()).unwrap();
++    let fresh = row("fresh");
++    let mut old_part = row("other");
++    old_part.parts.push(prefix[2].parts[0].clone());
++    let mut old_message = row("different");
++    old_message.id = prefix[1].id;
++    let mut internal_parts = row("multi");
++    internal_parts.parts.push(internal_parts.parts[0].clone());
++    let mut empty = row("empty");
++    empty.parts.clear();
++    for a in [&fresh, &old_part, &old_message, &internal_parts, &empty] {
++        for b in [&fresh, &old_part, &old_message, &internal_parts, &empty] {
++            let added = vec![a.clone(), b.clone()];
++            let mut full = prefix.clone();
++            full.extend(added.iter().cloned());
++            let expected = validate_active_history_ids(&full).map_err(|e| e.to_string());
++            let mut branch = state.clone();
++            let actual =
++                apply(&mut branch, HistoryMutationKind::Append, added).map_err(|e| e.to_string());
++            assert_eq!(actual, expected);
++            assert_eq!(branch.history(), full);
++            if let Err(err) = expected {
++                let got = apply(
++                    &mut branch,
++                    HistoryMutationKind::Append,
++                    vec![row("a"), row("b")],
++                )
++                .unwrap_err();
++                assert_eq!(err, got.to_string());
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-session-semantics/src/journal/projection/facts.rs b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+index 239fb3bf..17a1ee80 100644
+--- a/crates/proteus-session-semantics/src/journal/projection/facts.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+@@ -146,10 +146,11 @@ impl JournalValidationState {
+                         self.capture_owner = Some((required_thread_id(record)?, turn_id));
+                     }
+                 }
+-                self.check_history_ids(
+-                    mutation.mutation == HistoryMutationKind::Append
+-                        && mutation.messages.len() == 1,
+-                )?;
++                self.check_history_ids(if mutation.mutation == HistoryMutationKind::Append {
++                    mutation.messages.len()
++                } else {
++                    0
++                })?;
+                 if mutation
+                     .compaction
+                     .as_ref()
+@@ -355,7 +356,7 @@ impl JournalValidationState {
+                     && let Some(index) = self.capture_tool_result(&tool.result)?
+                 {
+                     self.history_revision = self.history_revision.saturating_add(1);
+-                    self.check_history_ids(false)?;
++                    self.check_history_ids(0)?;
+                     Self::validate_part_id_stability(
+                         &mut self.known_parts,
+                         &self.history[index..index + 1],
+@@ -384,7 +385,7 @@ impl JournalValidationState {
+                     for result in pending {
+                         if let Some(index) = self.capture_tool_result(&result)? {
+                             self.history_revision = self.history_revision.saturating_add(1);
+-                            self.check_history_ids(false)?;
++                            self.check_history_ids(0)?;
+                             Self::validate_part_id_stability(
+                                 &mut self.known_parts,
+                                 &self.history[index..index + 1],

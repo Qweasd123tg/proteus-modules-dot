@@ -1,0 +1,81 @@
+--- a/crates/proteus-module-sdk/src/lib.rs
++++ b/crates/proteus-module-sdk/src/lib.rs
+@@ -8,6 +8,19 @@
+ //! The worker remains an executable with its configured OS permissions. Host
+ //! callbacks retain the active invocation's authority; SDK use grants no rights.
+ 
++
++pub(crate) mod perf8 {
++use std::time::{Instant,SystemTime,UNIX_EPOCH};
++use std::io::Write;
++pub fn now()->u128 {SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()}
++pub fn log(label:&str, stage:&str, value:usize,start:u128, t:Instant) {
++ let n=t.elapsed().as_nanos();
++ let worker=std::env::current_exe().unwrap(); let side=worker.parent().unwrap().file_name().unwrap().to_str().unwrap();
++ let p=std::path::PathBuf::from(env!("PERF8_SDK_TRACE")); let _=side;
++ let mut f=std::fs::OpenOptions::new().append(true).create(true).open(p).unwrap();
++ writeln!(f,"{start}\t{n}\t{stage}\t{label}\t{value}\t{}\t{}",std::process::id(),std::thread::current().name().unwrap_or("unnamed")).unwrap();
++}
++}
+ mod runtime;
+ mod transport;
+ 
+--- a/crates/proteus-module-sdk/src/runtime.rs
++++ b/crates/proteus-module-sdk/src/runtime.rs
+@@ -250,6 +250,7 @@
+             Arc::clone(&cancellation),
+         );
+         let result = self.component.dispatch(call, &method, &bridge);
++        let start=crate::perf8::now(); let ts=std::time::Instant::now();
+         let response = if cancellation.load(Ordering::SeqCst) {
+             rpc_error(
+                 &invocation_id,
+@@ -261,6 +262,7 @@
+                 Err(error) => rpc_error(&invocation_id, terminal_error(&error)),
+             }
+         };
++        crate::perf8::log(&invocation_id,"rpc_envelope",0,start,ts);
+         if !self.transport.is_closed()
+             && let Err(error) = self.transport.write(&response)
+             && !self.transport.is_closed()
+--- a/crates/proteus-module-sdk/src/transport.rs
++++ b/crates/proteus-module-sdk/src/transport.rs
+@@ -85,10 +85,13 @@
+     pub fn write(&self, value: &Value) -> Result<()> {
+         // Reject an oversized result before writing any part of its frame.
+         // Counting streams the canonical JSON without retaining another payload.
++        let start=crate::perf8::now();let ts=std::time::Instant::now();
+         let mut counter = FrameByteCounter {
+             remaining: self.max_frame_bytes.saturating_sub(1),
+         };
+         serde_json::to_writer(&mut counter, value)?;
++        let name=value.get("id").and_then(|id|id.as_str()).unwrap_or("none"); let n=self.max_frame_bytes-counter.remaining; crate::perf8::log(name,"resp_bound",n,start,ts);
++        let start=crate::perf8::now();let ts=std::time::Instant::now();
+         let mut writer = self
+             .writer
+             .lock()
+@@ -96,6 +99,7 @@
+         serde_json::to_writer(&mut *writer, value)?;
+         writer.write_all(b"\n")?;
+         writer.flush()?;
++        crate::perf8::log(name,"resp_flush",n,start,ts);
+         Ok(())
+     }
+ 
+--- a/crates/proteus-module-sdk/src/session_storage.rs
++++ b/crates/proteus-module-sdk/src/session_storage.rs
+@@ -51,8 +51,13 @@
+         if method != PROCESS_SESSION_STORAGE_EXECUTE_METHOD {
+             bail!("unsupported session storage method: {method}");
+         }
++
++        let op=params.get("operation").and_then(|x|x.as_str()).unwrap_or("unknown").to_owned();
++        let reqt=std::time::Instant::now(); let reqe=crate::perf8::now();
+         let request: SessionStorageRequest = serde_json::from_value(params)?;
++        crate::perf8::log(&op,"req_from_value",0,reqe,reqt);
+         request.validate()?;
+-        Ok(serde_json::to_value(self.storage.execute(request)?)?)
++        let res=self.storage.execute(request)?; let tm=std::time::Instant::now(); let start=crate::perf8::now(); let val=serde_json::to_value(res)?;
++        crate::perf8::log(&op,"resp_to_value",0,start,tm); Ok(val)
+     }
+ }

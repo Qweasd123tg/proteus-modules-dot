@@ -1,0 +1,37 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 77a388a..f6dd24d 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -270,6 +270,8 @@ impl RecordSnapshot for JsonlSnapshot {
+     fn reset_for_page(&mut self, after: u64) -> Result<()> {
+         if let Some(cut) = &self.page_boundary
+             && cut.after == after
++            // A tiny cut before a large new tail is cheaper to scan normally.
++            && cut.offset >= self.length - cut.offset
+             && !self.has_external_payloads
+         {
+             // An offset is not authority: authenticate all pinned bytes before
+diff --git a/storage/session-storage/src/tests/seek.rs b/storage/session-storage/src/tests/seek.rs
+index 496d2df..db0cfe0 100644
+--- a/storage/session-storage/src/tests/seek.rs
++++ b/storage/session-storage/src/tests/seek.rs
+@@ -88,3 +88,19 @@ fn seeking_authenticates_both_sides_of_the_cut_without_trusting_source_stamps()
+     assert_eq!(source.next().unwrap().unwrap(), second);
+     assert!(source.next().unwrap().is_none());
+ }
++
++
++#[test]
++fn small_old_cut_before_large_new_tail_keeps_the_short_scan() {
++    let mut f = Fixture::new(BackendKind::Jsonl);
++    f.append(vec![text("old")]);
++    let old = f.snapshot();
++    f.append(vec![text("first new page")]);
++    f.append(vec![text(&"n".repeat(100_000))]);
++    let head = f.snapshot();
++    crate::diagnostics::reset();
++    let page = read(&f, &head, old.revision.session_seq, 1).unwrap();
++    assert_eq!(page.records[0].session_seq, 2);
++    assert_eq!(crate::diagnostics::get().decoded, 2);
++    assert_eq!(crate::diagnostics::get().fingerprint_bytes, 0);
++}

@@ -1,0 +1,13 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 77a388a..54ef2c4 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -225,7 +225,7 @@ impl RecordSnapshot for JsonlSnapshot {
+         let saved_position = fallback.stream_position()?;
+         let verification = (|| {
+             while offset < self.length {
+-                let count = ((self.length - offset) as usize).min(block.len());
++                let count = (self.length - offset).min(block.len() as u64) as usize;
+                 #[cfg(unix)]
+                 let read = {
+                     use std::os::unix::fs::FileExt;
