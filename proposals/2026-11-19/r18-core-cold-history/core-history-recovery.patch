@@ -1,0 +1,207 @@
+From b41acc435d5314d30db18c9f1d146abdaa9285ca Mon Sep 17 00:00:00 2001
+From: Dooter <dooter@localhost>
+Date: Fri, 20 Nov 2026 04:32:38 +0800
+Subject: [PATCH] Use the validated display fingerprint for cold latest-page
+ recovery
+
+---
+ .../proteus-core/src/app_server/read_model.rs | 33 ++++----
+ .../src/app_server/read_model/tests.rs        |  2 +
+ .../src/app_server/read_model/tests/cold.rs   | 76 +++++++++++++++++++
+ .../src/core/session_store/remote/view.rs     | 17 ++++-
+ .../core/session_store/remote/view/cache.rs   |  7 +-
+ 5 files changed, 119 insertions(+), 16 deletions(-)
+ create mode 100644 crates/proteus-core/src/app_server/read_model/tests/cold.rs
+
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 12d4ade..4b9508f 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -96,22 +96,29 @@ fn rebuild_transcript(
+ ) -> anyhow::Result<(String, Vec<AppTranscriptMessage>)> {
+     use crate::core::session_read_cache::SourceFingerprint;
+ 
+-    let source = SourceFingerprint::read(store)
+-        .ok_or_else(|| anyhow::anyhow!("history source cannot be fingerprinted"))?;
+-    let revision = source
+-        .revision()
+-        .ok_or_else(|| anyhow::anyhow!("history source revision is unavailable"))?;
+-    anyhow::ensure!(
+-        expected.is_none_or(|expected| expected == revision),
+-        "history revision changed; refresh the session snapshot"
+-    );
+-    // Strict journal validation is mandatory; cached conversation state is not
+-    // an authority. project_read_model saves the index only on a stable source.
+-    let model = store.project_read_model(|source| journal_transcript_from_source(source, None))?;
++    // Reject an unavailable named revision before rebuilding anything. An
++    // unnamed cold page needs no preliminary OpenSnapshot: its strict display
++    // read already captures the input fingerprint (also on canonical fallback).
++    let named = if let Some(expected) = expected {
++        let source = SourceFingerprint::try_read(store)?;
++        anyhow::ensure!(
++            source.revision().as_deref() == Some(expected),
++            "history revision changed; refresh the session snapshot"
++        );
++        Some(source)
++    } else {
++        None
++    };
++    let (source, model) = store.project_sourced_read_model(named.as_ref(), |snapshot| {
++        journal_transcript_from_source(snapshot, None)
++    })?;
+     anyhow::ensure!(
+-        SourceFingerprint::read(store).as_ref() == Some(&source),
++        SourceFingerprint::try_read(store)? == source,
+         "history source changed during recovery; refresh the session snapshot"
+     );
++    let revision = source
++        .revision()
++        .ok_or_else(|| anyhow::anyhow!("history source revision is unavailable"))?;
+     // Cache writes are best effort (e.g. disk full). The verified in-memory
+     // result remains usable without retrying indefinitely or requiring a writer lease.
+     Ok((revision, model.transcript))
+diff --git a/crates/proteus-core/src/app_server/read_model/tests.rs b/crates/proteus-core/src/app_server/read_model/tests.rs
+index 627f8f0..70f3009 100644
+--- a/crates/proteus-core/src/app_server/read_model/tests.rs
++++ b/crates/proteus-core/src/app_server/read_model/tests.rs
+@@ -119,3 +119,5 @@ async fn history_recovery_does_not_hide_corrupt_canonical_source() {
+     assert!(store.fresh_read_model().is_none());
+     assert_eq!(std::fs::read(store.journal_path()).unwrap(), damaged);
+ }
++
++mod cold;
+diff --git a/crates/proteus-core/src/app_server/read_model/tests/cold.rs b/crates/proteus-core/src/app_server/read_model/tests/cold.rs
+new file mode 100644
+index 0000000..8332681
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/read_model/tests/cold.rs
+@@ -0,0 +1,76 @@
++//! A cold display can be validated even when an ordinary source probe cannot finish.
++use std::sync::{
++    Arc,
++    atomic::{AtomicBool, Ordering},
++};
++
++use crate::{
++    contracts::{
++        SessionStorage, SessionStorageFailure, SessionStorageRequest as Request,
++        SessionStorageResponse as Response,
++    },
++    core::StorageService,
++};
++
++struct ColdStorage {
++    inner: StorageService,
++    projected: AtomicBool,
++    missing_after_projection: bool,
++}
++
++#[async_trait::async_trait]
++impl SessionStorage for ColdStorage {
++    fn supports_display_projection(&self) -> bool {
++        true
++    }
++
++    async fn execute(&self, request: Request) -> anyhow::Result<Response> {
++        self.execute_blocking(request)
++    }
++
++    fn execute_blocking(&self, request: Request) -> anyhow::Result<Response> {
++        match &request {
++            Request::OpenDisplaySnapshot { .. } => {
++                let response = self.inner.execute_blocking(request)?;
++                self.projected.store(true, Ordering::SeqCst);
++                Ok(response)
++            }
++            Request::OpenSnapshot { .. } if !self.projected.load(Ordering::SeqCst) => {
++                Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
++            }
++            Request::OpenSnapshot { .. } if self.missing_after_projection => {
++                Err(SessionStorageFailure::MissingSession.into())
++            }
++            _ => self.inner.execute_blocking(request),
++        }
++    }
++}
++
++#[tokio::test]
++async fn cold_latest_page_uses_the_display_source_and_checks_it_again_before_returning() {
++    let (_root, _workspace, store, expected, faults) = super::fixture(51).await;
++    faults.set("missing");
++    for missing_after_projection in [false, true] {
++        let mut cold = store.clone();
++        cold.service = Arc::new(ColdStorage {
++            inner: store.service.clone(),
++            projected: false.into(),
++            missing_after_projection,
++        });
++        let result = super::transcript_page(&cold, None, None);
++        if missing_after_projection {
++            assert_eq!(
++                result.unwrap_err().downcast_ref::<SessionStorageFailure>(),
++                Some(&SessionStorageFailure::MissingSession)
++            );
++        } else {
++            let page = result.unwrap();
++            assert_eq!(page.revision, expected.revision);
++            assert_eq!((page.start, page.total), (1, 51));
++            assert_eq!(
++                serde_json::to_value(page.messages).unwrap(),
++                serde_json::to_value(&expected.messages).unwrap()
++            );
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index c543c7d..a23aa4a 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -127,11 +127,26 @@ impl RemoteSessionStore {
+         &self,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
+     ) -> Result<SessionReadModel> {
++        self.project_sourced_read_model(None, render)
++            .map(|(_, model)| model)
++    }
++
++    /// Report the source actually validated and rendered. If the caller is
++    /// repairing a named revision, do not publish a different projection.
++    pub(crate) fn project_sourced_read_model(
++        &self,
++        expected: Option<&RemoteCacheSource>,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
++    ) -> Result<(RemoteCacheSource, SessionReadModel)> {
+         let read = RemoteValidatedRead::open_for_display(self.clone())?;
+         let source = RemoteCacheSource::from_cursor(&read.cursor());
++        anyhow::ensure!(
++            expected.is_none_or(|expected| expected == &source),
++            "history source changed during recovery; refresh the session snapshot"
++        );
+         let model = SessionReadModel::from_validated(self, read, render)?;
+         self.save_read_model(&source, &model);
+-        Ok(model)
++        Ok((source, model))
+     }
+ 
+     pub(crate) fn save_read_model(&self, source: &RemoteCacheSource, model: &SessionReadModel) {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 431d36b..0e4aa6c 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -43,8 +43,11 @@ impl Eq for RemoteCacheSource {}
+ 
+ impl RemoteCacheSource {
+     pub(crate) fn read(store: &RemoteSessionStore) -> Option<Self> {
+-        Some(Self {
+-            snapshot: store.snapshot().ok()?.descriptor().clone(),
++        Self::try_read(store).ok()
++    }
++    pub(crate) fn try_read(store: &RemoteSessionStore) -> Result<Self> {
++        Ok(Self {
++            snapshot: store.journal_snapshot()?,
+         })
+     }
+     pub(crate) fn from_cursor(cursor: &RemoteJournalCursor) -> Self {
+-- 
+2.52.0
+
