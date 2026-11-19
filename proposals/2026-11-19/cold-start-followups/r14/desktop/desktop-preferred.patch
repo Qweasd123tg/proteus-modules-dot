@@ -1,0 +1,290 @@
+diff --git a/BUILDING.md b/BUILDING.md
+index ead8e95..8f4815c 100644
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -108,7 +108,10 @@ python3 scripts/run.py --build-extensions /path/to/workspace
+ `run.py` собирает dev-клиент через Cargo и использует готовый backend, модули и
+ расширения из базы. `PROTEUS_BIN` и `PROTEUS_EXTENSIONS_DIR` могут задать готовые
+ компоненты явно. Только `--build-extensions` запускает упаковщик расширений.
+-Для подключения через `--origin` локальный backend и его модули не требуются.
++При восстановлении Desktop передаёт собственному HTTP-процессу каталог одной
++из необходимых вкладок как подсказку `PROTEUS_HTTP_PREFERRED_SESSION`.
++Старый Core без этой оптимизации запускается как прежде. Чужому серверу при
++`--origin` подсказка не передаётся; локальный backend и его модули не требуются.
+ Аргументы после `--` передаются приложению без обработки runner.
+ 
+ Терминальный движок Ghostty собирается как нативная библиотека. Если он выбран
+diff --git a/src/backend.rs b/src/backend.rs
+index 576e50e..9afc068 100644
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -32,7 +32,11 @@ pub struct Backend {
+ }
+ 
+ impl Backend {
+-    pub fn launch(profile: Option<&str>, workspace: &Path) -> Result<Self> {
++    pub fn launch(
++        profile: Option<&str>,
++        workspace: &Path,
++        preferred: Option<&Path>,
++    ) -> Result<Self> {
+         let token = uuid::Uuid::new_v4().simple().to_string();
+         let binary = proteus_binary();
+         let mut command = Command::new(&binary);
+@@ -43,6 +47,14 @@ impl Backend {
+             let paths = std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&inherited));
+             command.env("PATH", std::env::join_paths(paths)?);
+         }
++        // This optional HTTP supervisor hint is ignored by older bundled cores.
++        // Never inherit another process's choice on a fresh or unrelated launch.
++        const PREFERRED: &str = "PROTEUS_HTTP_PREFERRED_SESSION";
++        if let Some(path) = preferred {
++            command.env(PREFERRED, path);
++        } else {
++            command.env_remove(PREFERRED);
++        }
+         if let Some(profile) = profile {
+             command.arg("--config").arg(profile);
+         }
+diff --git a/src/connection.rs b/src/connection.rs
+index 7ba87c2..dcdf369 100644
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -1,3 +1,4 @@
++use std::path::{Path, PathBuf};
+ use std::sync::mpsc;
+ use std::thread::JoinHandle;
+ use std::time::{Duration, Instant};
+@@ -46,7 +47,8 @@ impl Drop for BackendGuard {
+ 
+ fn spawn_backend(
+     profile: Option<String>,
+-    workspace: std::path::PathBuf,
++    workspace: PathBuf,
++    preferred: Option<PathBuf>,
+ ) -> Result<(Api, BackendGuard)> {
+     let (ready_tx, ready_rx) = mpsc::channel();
+     let (stop_tx, stop_rx) = mpsc::channel::<()>();
+@@ -54,7 +56,7 @@ fn spawn_backend(
+     let thread = std::thread::Builder::new()
+         .name("proteus-backend".into())
+         .spawn(
+-            move || match Backend::launch(profile.as_deref(), &workspace) {
++            move || match Backend::launch(profile.as_deref(), &workspace, preferred.as_deref()) {
+                 Ok(mut backend) => {
+                     let api = Api::new(&backend.origin, &backend.token);
+                     if ready_tx.send(Ok(api)).is_err() {
+@@ -87,6 +89,13 @@ fn spawn_backend(
+ }
+ 
+ pub fn connect(options: &LaunchOptions) -> Result<(Api, Option<BackendGuard>)> {
++    connect_with_preference(options, None)
++}
++
++pub(crate) fn connect_with_preference(
++    options: &LaunchOptions,
++    preferred: Option<&Path>,
++) -> Result<(Api, Option<BackendGuard>)> {
+     match &options.target {
+         Target::Attach { origin, token } => {
+             let origin = proteus_client_common::normalize_local_origin(origin)
+@@ -94,7 +103,11 @@ pub fn connect(options: &LaunchOptions) -> Result<(Api, Option<BackendGuard>)> {
+             Ok((Api::new(&origin, token), None))
+         }
+         Target::Spawn { profile } => {
+-            let (api, guard) = spawn_backend(profile.clone(), options.workspace.clone())?;
++            let (api, guard) = spawn_backend(
++                profile.clone(),
++                options.workspace.clone(),
++                preferred.map(Path::to_owned),
++            )?;
+             Ok((api, Some(guard)))
+         }
+     }
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+index 696b780..04753a7 100644
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -106,15 +106,18 @@ fn needs_core(agent: AgentKind, required: &[ChatKey]) -> bool {
+ }
+ 
+ pub(super) fn boot(options: &LaunchOptions, saved: ChatSpaces) -> Result<Boot> {
+-    boot_spaces_with(options, saved, connection::connect, |program, cwd| {
+-        Ok(CodexService::spawn(program, cwd)?)
+-    })
++    boot_spaces_with(
++        options,
++        saved,
++        connection::connect_with_preference,
++        |program, cwd| Ok(CodexService::spawn(program, cwd)?),
++    )
+ }
+ 
+ fn boot_spaces_with(
+     options: &LaunchOptions,
+     saved: ChatSpaces,
+-    connect: impl FnOnce(&LaunchOptions) -> Result<(Api, Option<BackendGuard>)>,
++    connect: impl FnOnce(&LaunchOptions, Option<&Path>) -> Result<(Api, Option<BackendGuard>)>,
+     spawn_codex: impl FnOnce(PathBuf, PathBuf) -> Result<CodexService>,
+ ) -> Result<Boot> {
+     boot_with_owner(
+@@ -130,7 +133,7 @@ fn boot_spaces_with(
+ fn boot_with(
+     options: &LaunchOptions,
+     saved: TabLayout,
+-    connect: impl FnOnce(&LaunchOptions) -> Result<(Api, Option<BackendGuard>)>,
++    connect: impl FnOnce(&LaunchOptions, Option<&Path>) -> Result<(Api, Option<BackendGuard>)>,
+     spawn_codex: impl FnOnce(PathBuf, PathBuf) -> Result<CodexService>,
+ ) -> Result<Boot> {
+     boot_with_owner(options, saved, None, connect, spawn_codex)
+@@ -140,7 +143,7 @@ fn boot_with_owner(
+     options: &LaunchOptions,
+     saved: TabLayout,
+     owner: Option<&str>,
+-    connect: impl FnOnce(&LaunchOptions) -> Result<(Api, Option<BackendGuard>)>,
++    connect: impl FnOnce(&LaunchOptions, Option<&Path>) -> Result<(Api, Option<BackendGuard>)>,
+     spawn_codex: impl FnOnce(PathBuf, PathBuf) -> Result<CodexService>,
+ ) -> Result<Boot> {
+     let _trace = crate::startup_trace::span("workspace.boot");
+@@ -158,7 +161,11 @@ fn boot_with_owner(
+         })
+         .collect();
+     let mut boot = if needs_core(options.agent, &required) {
+-        let (api, backend) = connect(options)?;
++        let preferred = required.iter().find_map(|key| match key {
++            ChatKey::Proteus(dir) if dir.is_absolute() => Some(dir.as_path()),
++            _ => None,
++        });
++        let (api, backend) = connect(options, preferred)?;
+         crate::startup_trace::mark("backend.ready");
+         if fresh {
+             fresh_core(api, backend, &options.workspace)?
+diff --git a/src/ui/workspace/startup/tests.rs b/src/ui/workspace/startup/tests.rs
+index 364ed51..1b3f00f 100644
+--- a/src/ui/workspace/startup/tests.rs
++++ b/src/ui/workspace/startup/tests.rs
+@@ -59,6 +59,45 @@ fn startup_resumes_split_chats_without_resuming_hidden_tabs_or_reordering_them()
+     );
+ }
+ 
++#[test]
++fn owned_restore_prefers_a_required_address_not_an_unrelated_hidden_chat() {
++    let server = Server::start(&["/sessions/hidden", "/sessions/visible"]);
++    let mut saved = TabLayout::default();
++    saved.open("chat:/sessions/hidden", |_| false);
++    saved.open("chat:/sessions/visible", |_| false);
++    let mut options = codex_options();
++    options.target = crate::launch::Target::Spawn { profile: None };
++    let boot = boot_with(
++        &options,
++        saved,
++        |_, preferred| {
++            assert_eq!(preferred, Some(Path::new("/sessions/visible")));
++            Ok((server.api(), None))
++        },
++        |_, _| panic!("no Codex chat is required"),
++    )
++    .unwrap();
++    assert_eq!(boot.resumed, paths(&["/sessions/visible"]));
++}
++
++#[test]
++fn stale_saved_chat_resumes_the_bootstrap_fallback() {
++    let server = Server::start(&["/sessions/latest"]);
++    let mut saved = TabLayout::default();
++    saved.open("chat:/sessions/deleted", |_| false);
++    let boot = restore(server.api(), None, saved).unwrap();
++    assert!(boot.resumed.is_empty());
++    assert_eq!(boot.startup.as_deref(), Some(Path::new("/sessions/latest")));
++    assert_eq!(
++        server.calls(),
++        [
++            ("/resume".into(), json!("/sessions/deleted")),
++            ("/bootstrap".into(), Value::Null),
++            ("/resume".into(), json!("/sessions/latest")),
++        ]
++    );
++}
++
+ #[test]
+ fn focused_document_resumes_only_the_hidden_command_target() {
+     let server = Server::start(&["/sessions/other", "/sessions/target"]);
+@@ -121,7 +160,13 @@ fn opening_another_config_creates_fresh_history_without_restoring_saved_tabs_or_
+     let boot = boot_spaces_with(
+         &options,
+         saved,
+-        |_| Ok((server.api(), None)),
++        |_, preferred| {
++            assert!(
++                preferred.is_none(),
++                "a fresh profile must not select old history"
++            );
++            Ok((server.api(), None))
++        },
+         |_, _| panic!("fresh config must not restore the other agent"),
+     )
+     .unwrap();
+@@ -172,7 +217,7 @@ fn codex_only_restore_keeps_hidden_core_tabs_without_starting_core_or_reading_ca
+     let boot = boot_with(
+         &options,
+         saved,
+-        |_| panic!("Codex restore must not launch Core"),
++        |_, _| panic!("Codex restore must not launch Core"),
+         |_, _| Ok(codex_peer("opaque:target", false)),
+     )
+     .unwrap();
+@@ -190,7 +235,7 @@ fn fresh_codex_launch_creates_own_thread_without_choosing_other_clients_history(
+     let boot = boot_with(
+         &codex_options(),
+         TabLayout::default(),
+-        |_| panic!("Fresh Codex launch must not start Core"),
++        |_, _| panic!("Fresh Codex launch must not start Core"),
+         |_, _| Ok(codex_peer("", false)),
+     )
+     .unwrap();
+@@ -206,7 +251,7 @@ fn failed_codex_thread_is_local_and_does_not_create_a_replacement_thread() {
+     let boot = boot_with(
+         &codex_options(),
+         saved,
+-        |_| panic!("Missing Codex thread must not start Core"),
++        |_, _| panic!("Missing Codex thread must not start Core"),
+         |_, _| Ok(codex_peer("opaque:missing", true)),
+     )
+     .unwrap();
+@@ -226,7 +271,7 @@ fn missing_codex_thread_preserves_healthy_split_restoration() {
+     let boot = boot_with(
+         &codex_options(),
+         saved,
+-        |_| panic!("Codex restore must not launch Core"),
++        |_, _| panic!("Codex restore must not launch Core"),
+         |_, _| Ok(codex_peer_many(&["opaque:healthy", "opaque:missing"], true)),
+     )
+     .unwrap();
+@@ -242,7 +287,7 @@ fn lost_codex_transport_still_fails_restoration() {
+     let result = boot_with(
+         &codex_options(),
+         saved,
+-        |_| panic!("Codex restore must not launch Core"),
++        |_, _| panic!("Codex restore must not launch Core"),
+         |_, _| Ok(codex_peer("opaque:disconnected", false)),
+     );
+     assert!(result.is_err());
+@@ -331,7 +376,7 @@ fn codex_restart_resumes_child_and_owner_but_no_inactive_area() {
+     let boot = boot_spaces_with(
+         &codex_options(),
+         spaces,
+-        |_| panic!("Inactive Core area must not launch Core"),
++        |_, _| panic!("Inactive Core area must not launch Core"),
+         |_, _| Ok(codex_peer_many(&["opaque:child", "opaque:root"], false)),
+     )
+     .unwrap();
+@@ -542,6 +587,9 @@ fn respond(stream: TcpStream, catalog: &[AppSessionSummary], calls: &Mutex<Vec<(
+             json!({"session_dir":catalog.first().map(|session| &session.session_dir),"cwd":"/workspace"})
+         }
+         "/sessions" => serde_json::to_value(catalog).unwrap(),
++        "/resume" if !catalog.iter().any(|s| Some(s.session_dir.as_path()) == dir.as_str().map(Path::new)) => {
++            json!({"type":"response", "id":body["id"], "ok":false, "error":"session unavailable", "output":null})
++        }
+         "/resume" => json!({
+             "type": "response", "id": body["id"], "ok": true, "error": null,
+             "output": {"session_dir": dir, "workspace_path": catalog.iter().find(|summary| summary.session_dir == Path::new(dir.as_str().unwrap())).map(|summary| &summary.workspace_path).unwrap(), "activity": {

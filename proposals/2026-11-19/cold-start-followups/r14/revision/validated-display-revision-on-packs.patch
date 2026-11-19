@@ -1,0 +1,227 @@
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 12d4ade..3629ea3 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -22,32 +22,6 @@ impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
+     }
+ }
+ 
+-impl CompletedTranscript {
+-    pub fn from_model(
+-        store: &SessionStore,
+-        transcript: Vec<AppTranscriptMessage>,
+-        stale: bool,
+-    ) -> Self {
+-        #[cfg(unix)]
+-        if let Some(page) = if stale {
+-            store.saved_display_page()
+-        } else {
+-            store.saved_transcript_page(None, None)
+-        } {
+-            return Self {
+-                messages: page.messages,
+-                cursor: Some(AppTranscriptCursor {
+-                    revision: page.revision,
+-                    before: page.start,
+-                    base: page.base,
+-                }),
+-            };
+-        }
+-        let _ = (store, stale);
+-        transcript.into()
+-    }
+-}
+-
+ /// Read a complete named display revision. A disposable cache miss must not
+ /// make the canonical history unreadable, but a newer source is not that revision.
+ #[cfg(unix)]
+@@ -197,17 +171,13 @@ pub(super) fn refresh_in_background(
+                 return Ok(());
+             };
+             let transcript = tokio::task::spawn_blocking(move || {
+-                let source =
+-                    crate::core::session_read_cache::SourceFingerprint::from_cursor(&read.cursor());
+-                let model = SessionReadModel::from_validated(&store, read, |source| {
++                let view = store.project_validated_view(read, cfg!(unix), |source| {
+                     journal_transcript_from_source(source, None)
+                 })?;
+-                store.save_read_model(&source, &model);
+-                Ok::<_, anyhow::Error>(CompletedTranscript::from_model(
+-                    &store,
+-                    model.transcript,
+-                    false,
+-                ))
++                Ok::<_, anyhow::Error>(CompletedTranscript {
++                    messages: view.transcript,
++                    cursor: view.cursor,
++                })
+             })
+             .await??;
+             server.events.refresh_history(&baseline, transcript)?;
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index 930df0a..5bfca54 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -7,7 +7,7 @@ use proteus_contracts::app_protocol::AppTranscriptMessage;
+ use super::{
+     RemoteSessionStore, StorageService, catalog,
+     snapshot::{RemoteJournalSnapshot, RemoteValidatedRead},
+-    view::{RemoteCacheSource, SessionReadModel, SessionReadView},
++    view::{RemoteCacheSource, SessionReadView},
+ };
+ 
+ pub(crate) struct PreparedSession {
+@@ -65,10 +65,7 @@ impl PreparedSession {
+     )> {
+         let (view, cached_source) = match self.history {
+             PreparedHistory::Validated(read) => {
+-                let source = RemoteCacheSource::from_cursor(&read.cursor());
+-                let model = SessionReadModel::from_validated(&self.store, read, render)?;
+-                self.store.save_read_model(&source, &model);
+-                (SessionReadView::from_model(&self.store, model, false), None)
++                (self.store.project_validated_view(read, true, render)?, None)
+             }
+             PreparedHistory::Cached(source, view) => (view, Some(source)),
+         };
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index c543c7d..140490d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -52,38 +52,6 @@ pub(crate) struct SessionTranscriptAppend {
+     pub conversation_appended: usize,
+ }
+ 
+-impl SessionReadView {
+-    pub(crate) fn from_model(
+-        store: &RemoteSessionStore,
+-        model: SessionReadModel,
+-        stale: bool,
+-    ) -> Self {
+-        let page = if stale {
+-            store.saved_display_page()
+-        } else {
+-            store.saved_transcript_page(None, None)
+-        };
+-        let (transcript, cursor) = match page {
+-            Some(page) => (
+-                page.messages,
+-                Some(AppTranscriptCursor {
+-                    revision: page.revision,
+-                    before: page.start,
+-                    base: page.base,
+-                }),
+-            ),
+-            None => (model.transcript, None),
+-        };
+-        Self {
+-            summary: model.summary,
+-            revision: model.conversation.revision,
+-            usage: model.usage,
+-            transcript,
+-            cursor,
+-        }
+-    }
+-}
+-
+ impl SessionReadModel {
+     pub(crate) fn from_validated(
+         store: &RemoteSessionStore,
+@@ -119,6 +87,44 @@ impl SessionReadModel {
+ }
+ 
+ impl RemoteSessionStore {
++    pub(crate) fn project_validated_view(
++        &self,
++        read: RemoteValidatedRead,
++        paged: bool,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
++    ) -> Result<SessionReadView> {
++        let source = RemoteCacheSource::from_cursor(&read.cursor());
++        let model = SessionReadModel::from_validated(self, read, render)?;
++        self.save_read_model(&source, &model);
++        // A concurrent projection may have advanced HEAD. Only this immutable
++        // revision can provide a page for the model's summary, revision and usage.
++        let page = if paged {
++            source
++                .revision()
++                .and_then(|revision| self.saved_transcript_page(None, Some(&revision)))
++        } else {
++            None
++        };
++        let (transcript, cursor) = match page {
++            Some(page) => (
++                page.messages,
++                Some(AppTranscriptCursor {
++                    revision: page.revision,
++                    before: page.start,
++                    base: page.base,
++                }),
++            ),
++            None => (model.transcript, None),
++        };
++        Ok(SessionReadView {
++            summary: model.summary,
++            revision: model.conversation.revision,
++            usage: model.usage,
++            transcript,
++            cursor,
++        })
++    }
++
+     pub(crate) fn fresh_read_model(&self) -> Option<SessionReadModel> {
+         cache::load_model(self)
+     }
+@@ -159,6 +165,7 @@ impl RemoteSessionStore {
+         cache::transcript_page(self, before, revision, false)
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn saved_display_page(&self) -> Option<AppTranscriptPage> {
+         cache::transcript_page(self, None, None, true)
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 92e4c81..6a3b59e 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -3,6 +3,41 @@ mod support;
+ use super::*;
+ use support::{Backend, append, full};
+ 
++#[test]
++fn prepared_view_never_mixes_an_older_summary_with_a_newer_transcript() {
++    use super::super::prepared::PreparedSession;
++
++    for retain_old_page in [false, true] {
++        let (backend, store) = Backend::store();
++        backend.append(51);
++        let prepared =
++            PreparedSession::from_dir(backend.clone(), store.session_dir().to_owned()).unwrap();
++        let old_revision = RemoteCacheSource::read(&store).unwrap().revision().unwrap();
++        if retain_old_page {
++            store.project_read_model(full).unwrap();
++        }
++        // A second reader publishes a newer head before startup renders its fixed snapshot.
++        backend.append(1);
++        store.project_read_model(full).unwrap();
++
++        let opens = backend.0.lock().unwrap().handles;
++        let (_, view, _) = prepared.into_display_view(full).unwrap();
++        assert_eq!(view.revision, 1);
++        assert_eq!(view.summary.message_count, 51);
++        assert_eq!(view.transcript.last().unwrap().text, "message-0-50");
++        assert_eq!(backend.0.lock().unwrap().handles, opens);
++        if retain_old_page {
++            let cursor = view.cursor.expect("retained immutable page");
++            assert_eq!(cursor.revision, old_revision);
++            assert_eq!(cursor.before, 1);
++            assert_eq!(view.transcript.len(), 50);
++        } else {
++            assert!(view.cursor.is_none());
++            assert_eq!(view.transcript.len(), 51);
++        }
++    }
++}
++
+ #[test]
+ fn cold_display_reuses_the_validated_records_without_another_storage_traversal() {
+     let (backend, store) = Backend::store();

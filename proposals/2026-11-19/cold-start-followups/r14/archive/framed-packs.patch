@@ -1,0 +1,367 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a9dbb28..5ccb498 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2,6 +2,12 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
+ [[package]]
+ name = "agent-client-protocol"
+ version = "2.1.0"
+@@ -1209,6 +1215,15 @@ version = "0.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
+ 
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++]
++
+ [[package]]
+ name = "mio"
+ version = "1.2.0"
+@@ -1485,6 +1500,7 @@ dependencies = [
+  "hyper",
+  "hyper-util",
+  "libc",
++ "miniz_oxide",
+  "proteus-contracts",
+  "proteus-module-protocol",
+  "proteus-process-host",
+diff --git a/crates/proteus-core/Cargo.toml b/crates/proteus-core/Cargo.toml
+index c9b23e1..6b8af74 100644
+--- a/crates/proteus-core/Cargo.toml
++++ b/crates/proteus-core/Cargo.toml
+@@ -13,6 +13,7 @@ memory-diagnostics = []
+ 
+ [dependencies]
+ base64 = "0.22"
++miniz_oxide = "0.8.9"
+ agent-client-protocol = "=2.1.0"
+ rmcp = { version = "=3.3.0", default-features = false, features = ["client"] }
+ proteus-contracts = { path = "../proteus-contracts" }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index 7e98a39..f030473 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -235,13 +235,17 @@ pub(in crate::core::session_store::remote::view) fn visit_section<T: Deserialize
+         index += count;
+         let upper = offset + pages.iter().map(|p| p.rows).sum::<usize>();
+         if upper > start {
+-            let bodies = match pack {
+-                Some(pack) => pack.read(store)?,
+-                None => vec![super::read_content_value(store, &pages[0].hash)?],
++            let (encoding, bodies) = match pack {
++                Some(pack) => pack.read(store, pages)?,
++                None => (
++                    packs::Encoding::Json,
++                    vec![super::read_content_value(store, &pages[0].hash)?],
++                ),
+             };
+             for (page, body) in pages.iter().zip(bodies) {
+                 let next = offset + page.rows;
+                 if next > start && offset < end {
++                    let body = encoding.decode(body, page.bytes)?;
+                     if pack.is_some() && super::hash(&body).as_deref() != Some(&page.hash) {
+                         return None;
+                     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+index db1dd51..eb7094c 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+@@ -3,7 +3,12 @@
+ //! original key and payload. No duplicate copy of a packed leaf is required.
+ use super::super::{hash, read_value, write_content_value};
+ use super::*;
+-use serde_json::Value;
++use base64::{Engine as _, engine::general_purpose::STANDARD};
++use miniz_oxide::{deflate::compress_to_vec, inflate::decompress_to_vec_with_limit};
++use serde_json::{Map, Value};
++
++// Compact JSON of {"deflate_v1":[]} plus quoted base64 strings and commas.
++const FRAME_OVERHEAD: usize = br#"{"deflate_v1":[]}"#.len();
+ 
+ const MAX_LEAVES: usize = 8;
+ const MAX_BYTES: usize = 256 * 1024;
+@@ -16,19 +21,57 @@ pub(super) struct PackRef {
+     pub(super) hash: String,
+ }
+ 
++#[derive(Clone, Copy)]
++pub(super) enum Encoding {
++    Json,
++    DeflateV1,
++}
++
++impl Encoding {
++    /// Only inflate overlapping leaves. The manifest's declared logical size is
++    /// independently constrained by the physical pack cap before allocation.
++    pub(super) fn decode(self, body: Value, bytes: usize) -> Option<Value> {
++        match self {
++            Self::Json => Some(body),
++            Self::DeflateV1 => {
++                let data = STANDARD.decode(body.as_str()?).ok()?;
++                let raw = decompress_to_vec_with_limit(&data, bytes.min(MAX_BYTES)).ok()?;
++                if raw.len() != bytes {
++                    return None;
++                }
++                serde_json::from_slice(&raw).ok()
++            }
++        }
++    }
++}
++
+ impl PackRef {
+-    pub(super) fn read(&self, store: &RemoteSessionStore) -> Option<Vec<Value>> {
++    pub(super) fn read(
++        &self,
++        store: &RemoteSessionStore,
++        pages: &[PageRef],
++    ) -> Option<(Encoding, Vec<Value>)> {
+         let value = read_value(store, &format!("display-data-{}", self.hash))?;
+         // A disposable header's byte counts are not authority for a returned
+         // object's size. Reject an oversized body before hashing its contents.
+-        encoded_len(&value, MAX_BYTES)?;
++        let size = encoded_len(&value, MAX_BYTES)?;
+         if hash(&value).as_deref() != Some(&self.hash) {
+             return None;
+         }
+-        let Value::Array(leaves) = value else {
+-            return None;
+-        };
+-        (leaves.len() == self.count).then_some(leaves)
++        match value {
++            Value::Array(leaves) if leaves.len() == self.count => Some((Encoding::Json, leaves)),
++            Value::Object(mut object) if object.len() == 1 => {
++                let Value::Array(leaves) = object.remove("deflate_v1")? else {
++                    return None;
++                };
++                let smallest = pages.iter().map(|page| page.bytes).min()?;
++                (size <= 2 * smallest
++                    && leaves.len() == self.count
++                    && leaves.iter().all(Value::is_string))
++                    .then_some((Encoding::DeflateV1, leaves))
++            }
++            _ => None,
++        }
+     }
+ }
+ 
+@@ -70,10 +113,12 @@ pub(super) fn valid_spans(section: &Section) -> bool {
+ #[derive(Default)]
+ pub(super) struct PendingPack {
+     first: usize,
+-    values: Vec<Value>,
+-    // Each item contributes its serialized bytes plus one separator. An outer
+-    // array of n items therefore occupies exactly 1 + sum(item_len + 1).
+-    bytes: usize,
++    // Only the first logical body might be published as a singleton.
++    first_body: Option<Value>,
++    frames: Vec<String>,
++    logical_bytes: usize,
++    wire_bytes: usize,
++    smallest: usize,
+ }
+ 
+ impl PendingPack {
+@@ -86,19 +131,44 @@ impl PendingPack {
+         historical: bool,
+     ) -> Option<()> {
+         let index = section.pages.len() - 1;
+-        let bytes = section.pages[index].bytes + 1;
+-        let packable = historical && bytes < MAX_BYTES;
+-        if !packable || self.values.len() == MAX_LEAVES || 1 + self.bytes + bytes > MAX_BYTES {
++        let bytes = section.pages[index].bytes;
++        if !historical || bytes + 2 > MAX_BYTES {
+             self.flush(store, source, section)?;
++            return write_content_value(store, source, &section.pages[index].hash, value);
+         }
+-        if !packable {
++        let raw = serde_json::to_vec(&value).ok()?;
++        // A custom Serialize impl need not emit identical bytes on both paths.
++        // Keep the original representation when the manifest's byte count differs.
++        if raw.len() != bytes {
++            self.flush(store, source, section)?;
+             return write_content_value(store, source, &section.pages[index].hash, value);
+         }
+-        if self.values.is_empty() {
++        let frame = STANDARD.encode(compress_to_vec(&raw, 1));
++        let cost = frame.len() + 2;
++        let wire = self.wire_bytes + cost + 1;
++        // Keep a full-pack read within twice the smallest included leaf. Poorly
++        // compressible or mixed-size pages naturally form shorter packs.
++        if !self.frames.is_empty()
++            && (self.frames.len() == MAX_LEAVES
++                || self.logical_bytes + bytes + 1 > MAX_BYTES
++                || wire > MAX_BYTES
++                || wire > 2 * self.smallest.min(bytes))
++        {
++            self.flush(store, source, section)?;
++        }
++        if self.frames.is_empty() {
+             self.first = index;
++            self.smallest = bytes;
++            self.logical_bytes = 2 + bytes;
++            self.wire_bytes = FRAME_OVERHEAD + cost;
++            self.first_body = Some(value);
++        } else {
++            self.first_body = None;
++            self.smallest = self.smallest.min(bytes);
++            self.logical_bytes += 1 + bytes;
++            self.wire_bytes += 1 + cost;
+         }
+-        self.values.push(value);
+-        self.bytes += bytes;
++        self.frames.push(frame);
+         Some(())
+     }
+ 
+@@ -108,18 +178,19 @@ impl PendingPack {
+         source: &RemoteCacheSource,
+         section: &mut Section,
+     ) -> Option<()> {
+-        self.bytes = 0;
+-        let count = self.values.len();
++        let frames = std::mem::take(&mut self.frames);
++        let count = frames.len();
+         match count {
+             0 => Some(()),
+             1 => write_content_value(
+                 store,
+                 source,
+                 &section.pages[self.first].hash,
+-                self.values.pop()?,
++                self.first_body.take()?,
+             ),
+             _ => {
+-                let value = Value::Array(std::mem::take(&mut self.values));
++                let leaves = Value::Array(frames.into_iter().map(Value::String).collect());
++                let value = Value::Object(Map::from_iter([("deflate_v1".into(), leaves)]));
+                 let digest = hash(&value)?;
+                 write_content_value(store, source, &digest, value)?;
+                 section.packs.push(PackRef {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs
+index 4faf873..0c2d04b 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs
+@@ -12,7 +12,7 @@ fn key(digest: &str) -> String {
+ fn physical_packs_preserve_logical_leaves_and_skip_the_latest_window() {
+     let (backend, store) = Backend::store();
+     let source = RemoteCacheSource::read(&store).unwrap();
+-    let rows: Vec<_> = (0..953).map(|n| format!("row-{n}")).collect();
++    let rows: Vec<_> = (0..953).map(|n| format!("row-{n} {}", "repeat".repeat(8))).collect();
+     let section = cache::write_transcript(&store, &source, &rows).unwrap();
+     let manifest = serde_json::to_value(&section).unwrap();
+     let packs = manifest["packs"].as_array().unwrap();
+@@ -105,8 +105,22 @@ fn invalid_archive_objects_and_spans_are_cache_misses_not_mixed_rows() {
+     let (backend, store) = Backend::store();
+     let source = RemoteCacheSource::read(&store).unwrap();
+     let rows: Vec<_> = (0..953).collect::<Vec<u32>>();
+-    let section = cache::write_transcript(&store, &source, &rows).unwrap();
+-    let manifest = serde_json::to_value(&section).unwrap();
++    // Recreate the pre-frame R12 layout with its original physical digests.
++    let leaves = cache::write_section(&store, &source, &rows).unwrap();
++    let mut manifest = serde_json::to_value(leaves).unwrap();
++    let mut packs = vec![];
++    for (first, count) in [(0, 8), (8, 8), (16, 2)] {
++        let body = json!(rows[first * 50..(first + count) * 50].chunks(50).collect::<Vec<_>>());
++        let hash = digest(&body);
++        backend.0.lock().unwrap().cache.insert(key(&hash), body);
++        packs.push(json!({"first": first, "count": count, "hash": hash}));
++    }
++    manifest["packs"] = json!(packs);
++    let section = serde_json::from_value(manifest.clone()).unwrap();
++    assert_eq!(
++        cache::read_section::<u32>(&store, &section, 394, 444).unwrap(),
++        rows[394..444]
++    );
+     let pack_key = key(manifest["packs"][0]["hash"].as_str().unwrap());
+     let mut bad = manifest.clone();
+     bad["pages"][0]["hash"] = bad["pages"][1]["hash"].clone();
+@@ -187,3 +201,54 @@ fn historical_packs_obey_actual_json_byte_cap_and_large_leaf_remains_readable()
+         rows[248..268]
+     );
+ }
++
++#[test]
++fn framed_pack_reads_recheck_backing_and_bound_logical_leaf_bytes() {
++    let (backend, store) = Backend::store();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    let rows: Vec<_> = (0..953)
++        .map(|n| format!("row-{n} {}", "repeat".repeat(32)))
++        .collect();
++    let section = cache::write_transcript(&store, &source, &rows).unwrap();
++    let manifest = serde_json::to_value(&section).unwrap();
++    let pack = &manifest["packs"][0];
++    let physical_key = key(pack["hash"].as_str().unwrap());
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 0, 1).unwrap(),
++        rows[..1]
++    );
++    let original = backend
++        .0
++        .lock()
++        .unwrap()
++        .cache
++        .remove(&physical_key)
++        .unwrap();
++    assert!(cache::read_section::<String>(&store, &section, 0, 1).is_none());
++    let mut swapped = original.clone();
++    swapped["deflate_v1"].as_array_mut().unwrap().swap(0, 1);
++    backend
++        .0
++        .lock()
++        .unwrap()
++        .cache
++        .insert(physical_key.clone(), swapped.clone());
++    assert!(cache::read_section::<String>(&store, &section, 0, 1).is_none());
++    let swapped_hash = digest(&swapped);
++    backend
++        .0
++        .lock()
++        .unwrap()
++        .cache
++        .insert(key(&swapped_hash), swapped);
++    let mut changed = manifest.clone();
++    changed["packs"][0]["hash"] = json!(swapped_hash);
++    let changed = serde_json::from_value(changed).unwrap();
++    assert!(cache::read_section::<String>(&store, &changed, 0, 1).is_none());
++
++    backend.0.lock().unwrap().cache.insert(physical_key, original);
++    let mut shorter = manifest;
++    shorter["pages"][0]["bytes"] = json!(shorter["pages"][0]["bytes"].as_u64().unwrap() - 1);
++    let shorter = serde_json::from_value(shorter).unwrap();
++    assert!(cache::read_section::<String>(&store, &shorter, 0, 1).is_none());
++}
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 6b81933..844518d 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -615,8 +615,14 @@ writer. Read-only чтение сохраняет исходный журнал.
+ уже сохранённые группы не перечитываются для переупаковки. Старую и текущую
+ историю читатель различает по заголовку запрошенной ревизии; он сверяет
+ SHA-256 объекта и запрошенных страниц. Утрата объекта означает промах кеша,
+-а не разрешение читать строки из другой ревизии. Размер ответа клиенту,
+-журнал и квоты storage от этой группировки не меняются.
++а не разрешение читать строки из другой ревизии.
++Новые группы хранят каждую логическую страницу как отдельный DEFLATE-кадр в
++base64. Размер тела группы не превосходит удвоенного размера её наименьшей
++несжатой страницы; плохо сжимаемые страницы образуют меньшие группы или
++сохраняются отдельно. Читатель по-прежнему загружает и проверяет целый объект,
++но распаковывает лишь пересекающиеся страницы с ограничением на выходной размер.
++Существующие несжатые группы читаются как прежде, без фоновой миграции. Размер
++ответа клиенту, журнал и квоты storage от этой группировки не меняются.
+ 
+ Core удерживает выбранный storage service в течение runtime. Reload с изменённым
+ selection, launch descriptor или `module_config.session_storage` отклоняется.

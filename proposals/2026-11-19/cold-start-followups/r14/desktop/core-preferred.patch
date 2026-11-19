@@ -1,0 +1,273 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 6fcc95e..e4da971 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -575,6 +575,16 @@ impl AgentAppServer {
+         })
+         .await
+         .map_err(|error| anyhow!("session restore task failed: {error}"))??;
++        Self::launch_prepared_with_storage(config, cwd, config_path, resumed, storage).await
++    }
++
++    async fn launch_prepared_with_storage(
++        config: AppConfig,
++        cwd: PathBuf,
++        config_path: Option<&Path>,
++        resumed: crate::core::PreparedSession,
++        storage: StorageService,
++    ) -> Result<AppServerHandle> {
+         Box::pin(Self::launch_inner(
+             config,
+             cwd,
+diff --git a/crates/proteus-core/src/app_server/http.rs b/crates/proteus-core/src/app_server/http.rs
+index cb4dd47..de5c150 100644
+--- a/crates/proteus-core/src/app_server/http.rs
++++ b/crates/proteus-core/src/app_server/http.rs
+@@ -88,22 +88,28 @@ pub async fn run_http_app_server(
+         config.modules.session_storage.is_some(),
+         "HTTP app-server requires a session storage module; select modules.session_storage and configure its component export in the profile"
+     );
+-    let server = super::startup::launch_selected(
++    let (shutdown, mut shutdown_rx) = broadcast::channel(1);
++    let security = HttpSecurity::from_config(&http_config);
++    let preferred = if http_config.ready_stdout {
++        std::env::var_os("PROTEUS_HTTP_PREFERRED_SESSION").map(PathBuf::from)
++    } else {
++        None
++    };
++    let (server, default_workspace) = super::startup::launch_http_selected(
+         config,
+         cwd,
+         config_path.as_deref(),
+         resume_session_dir,
+         fresh_session,
++        preferred,
+     )
+     .await?;
+-    let (shutdown, mut shutdown_rx) = broadcast::channel(1);
+-    let security = HttpSecurity::from_config(&http_config);
+-    if server.session_dir_path().is_none() {
+-        return Err(anyhow!(
+-            "HTTP app-server could not create a persistent session with the configured storage module"
+-        ));
+-    }
+-    let state = HttpAppState::new(server, shutdown, security).await;
++    anyhow::ensure!(
++        server.session_dir_path().is_some(),
++        "HTTP app-server could not create a persistent session with the configured storage module"
++    );
++    let state =
++        HttpAppState::new_for_workspace(server, default_workspace, shutdown, security).await;
+     let listener = TcpListener::bind(http_config.bind).await?;
+     if http_config.ready_stdout {
+         use std::io::Write;
+diff --git a/crates/proteus-core/src/app_server/http/state.rs b/crates/proteus-core/src/app_server/http/state.rs
+index a3e8b97..dd1b057 100644
+--- a/crates/proteus-core/src/app_server/http/state.rs
++++ b/crates/proteus-core/src/app_server/http/state.rs
+@@ -40,15 +40,26 @@ impl HttpAppState {
+             .ok_or_else(|| anyhow::anyhow!("no session storage module is selected"))
+     }
+ 
++    #[cfg(test)]
+     pub(super) async fn new(
+         server: AppServerHandle,
+         shutdown: broadcast::Sender<()>,
+         security: HttpSecurity,
++    ) -> Self {
++        let workspace = server.cwd.clone();
++        Self::new_for_workspace(server, workspace, shutdown, security).await
++    }
++
++    pub(super) async fn new_for_workspace(
++        server: AppServerHandle,
++        cwd: PathBuf,
++        shutdown: broadcast::Sender<()>,
++        security: HttpSecurity,
+     ) -> Self {
+         let initial_server = server.clone();
+         let launch = HttpLaunchContext {
+             config: server.config.read().await.clone(),
+-            cwd: server.cwd.clone(),
++            cwd,
+             config_path: server.config_path.clone(),
+             profile_was_present: server
+                 .config_path
+diff --git a/crates/proteus-core/src/app_server/http/tests/addressing.rs b/crates/proteus-core/src/app_server/http/tests/addressing.rs
+index d896378..6fcea47 100644
+--- a/crates/proteus-core/src/app_server/http/tests/addressing.rs
++++ b/crates/proteus-core/src/app_server/http/tests/addressing.rs
+@@ -339,6 +339,75 @@ async fn session_routes_reject_missing_unknown_and_ambiguous_addresses() {
+     server.shutdown().await;
+ }
+ 
++#[tokio::test]
++async fn supervised_saved_chat_skips_unrelated_live_handle_and_keeps_launch_workspace() {
++    let a = tempfile::tempdir().unwrap();
++    let b = tempfile::tempdir().unwrap();
++    let root = tempfile::tempdir().unwrap();
++    let config_path = root.path().join("config.toml");
++    let storage = crate::test_model::storage(a.path());
++    let mut dirs = Vec::new();
++    for (workspace, text) in [(a.path(), "unrelated A"), (b.path(), "required B")] {
++        let store = crate::core::SessionStore::new(
++            storage.clone(),
++            root.path(),
++            workspace,
++            crate::domain::new_session_id(),
++        )
++        .unwrap();
++        store
++            .append_history(
++                crate::domain::new_thread_id(),
++                None,
++                &[crate::model_standard::CanonicalMessage::text(
++                    crate::model_standard::MessageRole::User,
++                    text,
++                )],
++            )
++            .await
++            .unwrap();
++        dirs.push(store.session_dir().to_owned());
++    }
++    let missing = root.path().join("deleted");
++    for (hint, initial, count) in [
++        (None, &dirs[0], 2),
++        (Some(dirs[1].clone()), &dirs[1], 1),
++        (Some(missing), &dirs[0], 2),
++    ] {
++        let (server, default_workspace) = crate::app_server::startup::launch_http_selected(
++            crate::test_model::config(),
++            a.path().to_owned(),
++            Some(&config_path),
++            None,
++            false,
++            hint,
++        )
++        .await
++        .unwrap();
++        assert_eq!(server.session_dir_path().as_ref(), Some(initial));
++        let (shutdown, _) = broadcast::channel(1);
++        let state =
++            HttpAppState::new_for_workspace(server, default_workspace, shutdown, test_security())
++                .await;
++        // Real handler path used by Desktop, including reuse for its second /resume.
++        let opened =
++            command_value(post_at(&state, "/resume", json!({"session_dir":dirs[1]})).await);
++        assert_eq!(opened["workspace_path"], json!(b.path()));
++        assert_eq!(opened["session_dir"], json!(dirs[1]));
++        let live = state.server_for_session_dir(&dirs[1]).await.unwrap();
++        assert_eq!(live.transcript().await.unwrap()[0].text, "required B");
++        assert_eq!(state.all_servers().await.len(), count);
++        let bootstrap = read_json_at(&state, "/bootstrap").await;
++        assert_eq!(bootstrap["session_dir"], json!(initial));
++        assert_eq!(bootstrap["cwd"], json!(a.path()));
++        let new_session = command_value(post_at(&state, "/new-session", json!({})).await);
++        assert_eq!(new_session["workspace_path"], json!(a.path()));
++        for live in state.all_servers().await {
++            live.shutdown().await;
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn lifecycle_uses_the_explicit_source_workspace_and_keeps_deletion_in_the_config_store() {
+     let workspace_a = tempfile::tempdir().unwrap();
+diff --git a/crates/proteus-core/src/app_server/startup.rs b/crates/proteus-core/src/app_server/startup.rs
+index d753169..a012206 100644
+--- a/crates/proteus-core/src/app_server/startup.rs
++++ b/crates/proteus-core/src/app_server/startup.rs
+@@ -24,6 +24,63 @@ pub(super) async fn launch_selected(
+     }
+ }
+ 
++/// Select an initial HTTP handle without coupling the supervisor's default
++/// workspace to a best-effort saved chat. Explicit CLI choices stay strict.
++pub(super) async fn launch_http_selected(
++    config: AppConfig,
++    cwd: PathBuf,
++    config_path: Option<&Path>,
++    resume: Option<PathBuf>,
++    fresh: bool,
++    preferred: Option<PathBuf>,
++) -> Result<(AppServerHandle, PathBuf)> {
++    let Some(path) = preferred.filter(|p| p.is_absolute() && resume.is_none() && !fresh) else {
++        let server = launch_selected(config, cwd, config_path, resume, fresh).await?;
++        let workspace = server.cwd.clone();
++        return Ok((server, workspace));
++    };
++
++    let storage = super::selected_storage(&config, &cwd)
++        .await?
++        .ok_or_else(|| anyhow::anyhow!("no session storage module is selected"))?;
++    let attempt = async {
++        let selected = storage.clone();
++        let prepared = tokio::task::spawn_blocking(move || {
++            let prepared = crate::core::PreparedSession::from_dir(selected, path.clone())?;
++            // Desktop accepts exactly the saved directory, not a journal alias.
++            anyhow::ensure!(
++                prepared.session_dir() == path,
++                "not the saved session directory"
++            );
++            Ok::<_, anyhow::Error>(prepared)
++        })
++        .await??;
++        AgentAppServer::launch_prepared_with_storage(
++            config.clone(),
++            cwd.clone(),
++            config_path,
++            prepared,
++            storage.clone(),
++        )
++        .await
++    }
++    .await;
++    let server = match attempt {
++        Ok(server) => server,
++        Err(error) => {
++            eprintln!("warning: could not restore preferred HTTP session: {error:#}");
++            AgentAppServer::launch_or_resume_latest_with_storage(
++                config,
++                cwd.clone(),
++                config_path,
++                Some(storage),
++            )
++            .await?
++        }
++    };
++    Ok((server, cwd))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index 930df0a..0dfefa9 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -40,7 +40,6 @@ impl PreparedSession {
+         })
+     }
+ 
+-    #[cfg(test)]
+     pub(crate) fn session_dir(&self) -> &Path {
+         self.store.session_dir()
+     }
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 2f12f7a..ca51839 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -95,6 +95,13 @@ token отклоняется до запуска runtime и bind.
+ после сборки runtime и фактического bind сервер печатает и flush-ит одну JSON
+ строку `{"type":"http_ready","origin":"http://127.0.0.1:<port>"}`. Остальные
+ строки stdout остаются диагностикой; credential в readiness не входит.
++В этом режиме supervisor может передать абсолютный каталог нужной вкладки в
++`PROTEUS_HTTP_PREFERRED_SESSION`: Core сначала пытается открыть её вместо
++последней сессии workspace. При недоступном адресе действует обычный выбор
++последней непустой сессии проекта либо новой. Сохранённая сессия другого
++проекта не меняет `/bootstrap.cwd` или workspace нового чата без источника.
++Явные `--resume-session` и `--new-session` имеют приоритет. Без
++`--ready-stdout` переменная не участвует в выборе.
+ Supervisor передаёт `--token` и нужные `--allow-origin` явно; для проверки
+ и завершения есть `/bootstrap` и authenticated `POST /shutdown`.
+ [Приложение](https://github.com/Proteus-harness/Proteus-desktop/blob/main/README.md) запускает сервер с собственным
