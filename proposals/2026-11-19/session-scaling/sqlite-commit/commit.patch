@@ -1,0 +1,156 @@
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 1ccf5a2..ce76881 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -39,12 +39,13 @@ enum StoredPayload {
+     },
+ }
+ 
+-pub(crate) fn canonicalize_entry(entry: &JournalEntry) -> Result<JournalEntry> {
++pub(crate) fn canonicalize_entry(entry: JournalEntry) -> Result<JournalEntry> {
+     let kind = entry.kind();
+     let mut payload = entry.payload_value()?;
++    drop(entry);
+     proteus_session_semantics::redact_sensitive_values(&mut payload);
+     ensure!(
+-        serde_json::to_vec(&payload)?.len() <= MAX_PAYLOAD_BYTES,
++        encoded_bytes(&payload)? <= MAX_PAYLOAD_BYTES,
+         "journal payload exceeds maximum"
+     );
+     JournalEntry::from_kind_and_payload(kind, payload).map_err(Into::into)
+@@ -163,3 +164,22 @@ fn validate_blob(hash: &str, path: &Path) -> Result<()> {
+         _ => bail!("journal blob path must be blobs/<sha256>.json"),
+     }
+ }
++
++pub(crate) fn encoded_bytes(value: &impl serde::Serialize) -> Result<usize> {
++    struct Counter(usize);
++    impl std::io::Write for Counter {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            self.0 = self
++                .0
++                .checked_add(bytes.len())
++                .ok_or_else(|| std::io::Error::other("encoded record size overflow"))?;
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    let mut count = Counter(0);
++    serde_json::to_writer(&mut count, value)?;
++    Ok(count.0)
++}
+diff --git a/storage/session-storage/src/service/commits.rs b/storage/session-storage/src/service/commits.rs
+index 002681f..8cdb319 100644
+--- a/storage/session-storage/src/service/commits.rs
++++ b/storage/session-storage/src/service/commits.rs
+@@ -2,7 +2,7 @@ use super::*;
+ use proteus_contracts::domain::RecordId;
+ impl State {
+     pub(super) fn commit(&mut self, commit: StorageCommit) -> Result<SessionStorageResponse> {
+-        let raw = JournalRecord {
++        let mut record = JournalRecord {
+             schema_version: JOURNAL_SCHEMA_VERSION,
+             record_id: commit.operation_id,
+             session_seq: commit
+@@ -17,34 +17,25 @@ impl State {
+             turn_id: commit.attribution.turn_id,
+             entry: commit.entry,
+         };
+-        if let JournalEntry::HookInvoked(trace) = &raw.entry {
+-            proteus_session_semantics::journal::hooks::validate_raw_trace(&raw, trace)?;
++        if let JournalEntry::HookInvoked(trace) = &record.entry {
++            proteus_session_semantics::journal::hooks::validate_raw_trace(&record, trace)?;
+         }
+-        let canonical = crate::codec::canonicalize_entry(&raw.entry)?;
+-        let actual = self.writer_fold(&commit.lease)?.revision();
+-        if actual != commit.expected
+-            || self
+-                .writer_fold(&commit.lease)?
+-                .validation
+-                .contains_record_id(&commit.operation_id)
+-        {
++        record.entry = crate::codec::canonicalize_entry(record.entry)?;
++        let fold = self.writer_fold(&commit.lease)?;
++        let actual = fold.revision();
++        if actual != commit.expected || fold.validation.contains_record_id(&record.record_id) {
+             if let Some(ack) = self.commit_status(&commit.lease.session, commit.operation_id)? {
+                 let previous_history = match &ack.record.entry {
+                     JournalEntry::HistoryMutated(m) => m.previous_revision,
+                     _ => ack.revision.history_revision,
+                 };
+                 ensure!(
+-                    ack.record.session_seq
+-                        == commit
+-                            .expected
+-                            .session_seq
+-                            .checked_add(1)
+-                            .context("sequence overflow")?
++                    ack.record.session_seq == record.session_seq
+                         && previous_history == commit.expected.history_revision,
+                     "operation retry changed its original expected revision"
+                 );
+                 ensure!(
+-                    ack.record.entry == canonical
++                    ack.record.entry == record.entry
+                         && ack.record.timestamp_ms == commit.timestamp_ms
+                         && ack.record.execution_id == commit.attribution.execution_id
+                         && ack.record.thread_id == commit.attribution.thread_id
+@@ -59,20 +50,6 @@ impl State {
+                 actual
+             );
+         }
+-        let record = JournalRecord {
+-            schema_version: JOURNAL_SCHEMA_VERSION,
+-            record_id: commit.operation_id,
+-            session_seq: actual
+-                .session_seq
+-                .checked_add(1)
+-                .context("journal sequence overflow")?,
+-            timestamp_ms: commit.timestamp_ms,
+-            session_id: commit.lease.session.session_id,
+-            execution_id: commit.attribution.execution_id,
+-            thread_id: commit.attribution.thread_id,
+-            turn_id: commit.attribution.turn_id,
+-            entry: canonical,
+-        };
+         let dir = self.writer_path(&commit.lease)?;
+         let writer = self.writer(&commit.lease)?;
+         // This state is private until ACK. On any failure discard it and replay
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 344f3af..cc457df 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -154,7 +154,7 @@ impl SnapshotState {
+             if record.session_seq <= after {
+                 continue;
+             }
+-            let record_bytes = encoded_bytes(&record)?;
++            let record_bytes = crate::codec::encoded_bytes(&record)?;
+             ensure!(
+                 record_bytes <= SESSION_STORAGE_MAX_RECORD_BYTES,
+                 "canonical record exceeds maximum"
+@@ -264,22 +264,3 @@ pub(crate) fn preview(messages: &[CanonicalMessage]) -> Option<String> {
+         format!("{}...", selected.chars().take(160).collect::<String>())
+     })
+ }
+-
+-fn encoded_bytes(value: &impl serde::Serialize) -> Result<usize> {
+-    struct Counter(usize);
+-    impl std::io::Write for Counter {
+-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            self.0 = self
+-                .0
+-                .checked_add(bytes.len())
+-                .ok_or_else(|| std::io::Error::other("encoded record size overflow"))?;
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> std::io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    let mut count = Counter(0);
+-    serde_json::to_writer(&mut count, value)?;
+-    Ok(count.0)
+-}

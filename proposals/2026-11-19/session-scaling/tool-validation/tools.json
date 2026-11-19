@@ -1,0 +1,444 @@
+[
+  {
+    "name": "read_file",
+    "description": "Read a UTF-8 file inside the current workspace, optionally by line range. Unnumbered ranges preserve separators between returned lines but omit the last selected line ending; numbered output uses LF separators. Output and each line are limited to 2 MiB; ranged reads scan at most 16 MiB. Truncated ranges report total_lines as unknown.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based first line to read. Defaults to 1."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of lines to return."
+        },
+        "line_numbers": {
+          "type": "boolean",
+          "description": "Prefix each returned line with its 1-based line number."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "read",
+        "file",
+        "code"
+      ],
+      "aliases": [
+        "cat",
+        "open file",
+        "inspect file",
+        "view source"
+      ]
+    }
+  },
+  {
+    "name": "write_file",
+    "description": "Write UTF-8 content to a file inside the current workspace. Creates missing parent directories and overwrites existing files.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "WritesFiles",
+    "supports_parallel_tool_calls": false,
+    "timeout_ms": 60000,
+    "metadata": {
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "write",
+        "file"
+      ],
+      "aliases": [
+        "write file",
+        "create file",
+        "overwrite file"
+      ],
+      "approval": {
+        "cache_scopes": [
+          "workspace_write"
+        ]
+      }
+    }
+  },
+  {
+    "name": "edit_file",
+    "description": "Replace an exact text snippet in an existing file inside the workspace. `old_string` must match the file content exactly (including whitespace and indentation) and must be unique unless `replace_all` is true. Use `write_file` to create new files or fully rewrite existing ones.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "Exact text to replace."
+        },
+        "new_string": {
+          "type": "string",
+          "description": "Replacement text (must differ from old_string)."
+        },
+        "replace_all": {
+          "type": "boolean",
+          "description": "Replace all occurrences of old_string (default false)."
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "WritesFiles",
+    "supports_parallel_tool_calls": false,
+    "timeout_ms": 60000,
+    "metadata": {
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "edit",
+        "file",
+        "write"
+      ],
+      "aliases": [
+        "edit file",
+        "replace text",
+        "modify file"
+      ],
+      "approval": {
+        "cache_scopes": [
+          "workspace_write"
+        ]
+      }
+    }
+  },
+  {
+    "name": "list_dir",
+    "description": "List entries (files and subdirectories) inside a workspace directory",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Directory path relative to workspace. Defaults to workspace root."
+        }
+      },
+      "required": []
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "directory",
+        "list",
+        "files"
+      ],
+      "aliases": [
+        "ls",
+        "list directory",
+        "show folder"
+      ]
+    }
+  },
+  {
+    "name": "grep",
+    "description": "Search for a regex pattern in workspace files using ripgrep. Returns lines that match.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Regex pattern to search for (ripgrep syntax)."
+        },
+        "path": {
+          "type": "string",
+          "description": "Directory to search in, relative to workspace. Defaults to workspace root."
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum matching lines to return. Defaults to 50."
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "search",
+        "grep",
+        "regex",
+        "code"
+      ],
+      "aliases": [
+        "ripgrep",
+        "find text",
+        "search code",
+        "search files"
+      ]
+    }
+  },
+  {
+    "name": "find_files",
+    "description": "Find workspace files by glob pattern using ripgrep --files. Prefer this over shell find/ls for read-only file discovery.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Glob pattern, for example \"**/*.rs\" or \"crates/**/Cargo.toml\"."
+        },
+        "path": {
+          "type": "string",
+          "description": "Workspace-relative search root. Defaults to workspace root."
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional glob patterns to exclude."
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum paths to return. Defaults to 100 and is capped at 1000."
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "find",
+        "glob",
+        "files"
+      ],
+      "aliases": [
+        "find files",
+        "list matching files",
+        "file glob"
+      ]
+    }
+  },
+  {
+    "name": "read_many_files",
+    "description": "Read multiple UTF-8 files inside the current workspace with a shared byte budget.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workspace-relative file paths to read. Maximum 20 files."
+        },
+        "max_bytes_total": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Total output byte budget. Defaults to 122880 and is capped at 204800."
+        },
+        "max_bytes_per_file": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-file byte budget. Defaults to 40960 and is capped at 102400."
+        },
+        "line_numbers": {
+          "type": "boolean",
+          "description": "Prefix each returned line with its 1-based line number."
+        }
+      },
+      "required": [
+        "paths"
+      ]
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "filesystem",
+      "tags": [
+        "filesystem",
+        "read",
+        "files",
+        "code"
+      ],
+      "aliases": [
+        "read files",
+        "open multiple files",
+        "inspect files"
+      ]
+    }
+  },
+  {
+    "name": "git_status",
+    "description": "Show the current git branch and working tree status in short format.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum output bytes to return. Defaults to 65536 and is capped at 204800."
+        }
+      }
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "git",
+      "tags": [
+        "git",
+        "status",
+        "workspace"
+      ],
+      "aliases": [
+        "git status",
+        "working tree",
+        "changed files"
+      ]
+    }
+  },
+  {
+    "name": "git_diff",
+    "description": "Show a bounded git diff for the workspace, optionally scoped to staged changes or a relative path.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "cached": {
+          "type": "boolean",
+          "description": "When true, show staged changes with git diff --cached."
+        },
+        "stat": {
+          "type": "boolean",
+          "description": "When true, show --stat instead of patch text."
+        },
+        "path": {
+          "type": "string",
+          "description": "Optional workspace-relative pathspec. Absolute paths and parent traversal are rejected."
+        },
+        "context_lines": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unified diff context lines. Defaults to 3 and is capped at 20."
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum output bytes to return. Defaults to 65536 and is capped at 204800."
+        }
+      }
+    },
+    "surface": {
+      "kind": "function",
+      "strict": false,
+      "output_schema": null
+    },
+    "safety": "ReadOnly",
+    "supports_parallel_tool_calls": true,
+    "timeout_ms": 60000,
+    "metadata": {
+      "hot": true,
+      "category": "git",
+      "tags": [
+        "git",
+        "diff",
+        "patch",
+        "changes"
+      ],
+      "aliases": [
+        "git diff",
+        "show changes",
+        "review diff"
+      ]
+    }
+  }
+]
