@@ -1,0 +1,5 @@
+# Negative control: count JSON bytes without allocating the JSON buffer
+
+Tested on top of the #220 candidate Modules worker, same #220 Core display+cursor candidate. Use the counting serializer already employed for page size to check the encoded byte length of a JSONL inline payload and to check the redacted commit payload, instead of building a Vec and only reading its length. This does not change byte budgets, page semantics, or JSON shape. The exact-size byte outputs match in five targeted Unicode, escaping, nested, number and Value-normalization cases; 34 library tests passed. The experiment is not a reason to lower any limit.
+
+In AB/BA full-app-server turns on CPU 8 with 5,000 display rows, standard model context, same mock output, and no native GUI: stock 317.4/327.6 ms, candidate 318.9/428.5 ms. At 2,000 rows: stock 155.6/139.9 ms, candidate 169.7/141.7 ms. No latency benefit confirmed. An allocation reduction for this exact sub-step is not evidence of lower application RSS. Not recommended as a performance patch by this experiment; timings retained to avoid attributing unrelated wins to byte-counter changes.

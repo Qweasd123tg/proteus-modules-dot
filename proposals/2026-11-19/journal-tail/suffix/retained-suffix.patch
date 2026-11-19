@@ -1,0 +1,461 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/append.rs b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+index b470b680760a32f2832e58123de518aa7fcb79c5..a8dc88a3f32b6da3340bffb51c4bc367db04274f 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/append.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+@@ -31,9 +31,16 @@ pub(crate) fn journal_transcript_append_from_source(
+     baseline: &[[u8; 32]],
+     final_history_len: usize,
+ ) -> Result<Option<SessionTranscriptAppend>> {
++    let mut retained = source.take_small_verified_suffix();
++    if let Some(records) = &mut retained {
++        records.retain(|record| is_display_kind(record.entry.kind()));
++    }
+     let Some(conversation_appended) = independent_append(
+         prefix,
+-        |visit| source.scan_verified_suffix(is_display_kind, visit),
++        |visit| match &mut retained {
++            Some(records) => records.iter_mut().try_for_each(visit),
++            None => source.scan_verified_suffix(is_display_kind, |mut record| visit(&mut record)),
++        },
+         baseline,
+         final_history_len,
+     )?
+@@ -41,11 +48,14 @@ pub(crate) fn journal_transcript_append_from_source(
+         return Ok(None);
+     };
+     let transcript = transcript_from_scan(
+-        |visit| {
+-            source.scan_verified_suffix(is_display_kind, |mut record| {
++        |visit| match &retained {
++            // Inspection already removed the verified checkpoint baseline in
++            // place. Every render pass borrows this same bounded set of records.
++            Some(records) => records.iter().try_for_each(visit),
++            None => source.scan_verified_suffix(is_display_kind, |mut record| {
+                 strip_checkpoint_baseline(&mut record, baseline.len())?;
+-                visit(record)
+-            })
++                visit(&record)
++            }),
+         },
+         None,
+     )?;
+@@ -57,13 +67,13 @@ pub(crate) fn journal_transcript_append_from_source(
+ 
+ fn independent_append(
+     mut prefix: PrefixIdentities,
+-    mut scan: impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
++    mut scan: impl FnMut(&mut dyn FnMut(&mut JournalRecord) -> Result<()>) -> Result<()>,
+     baseline: &[[u8; 32]],
+     final_history_len: usize,
+ ) -> Result<Option<usize>> {
+     let conversation_appended = final_history_len.checked_sub(baseline.len());
+     let mut independent = conversation_appended.is_some();
+-    scan(&mut |mut record| {
++    scan(&mut |record| {
+         // Finish reading even after an overlap: fixed-snapshot page or hydration
+         // errors must still be reported before falling back or publishing.
+         if let JournalEntry::HistoryMutated(mutation) = &record.entry {
+@@ -89,12 +99,12 @@ fn independent_append(
+                         }
+                         // Only an exact retained canonical prefix may
+                         // repeat old identities. Inspect all new parts.
+-                        strip_checkpoint_baseline(&mut record, baseline.len())?;
++                        strip_checkpoint_baseline(record, baseline.len())?;
+                     }
+                 }
+             }
+         }
+-        independent &= prefix.visit(&record, true);
++        independent &= prefix.visit(record, true);
+         Ok(())
+     })?;
+     Ok(if independent {
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/append/tests.rs b/crates/proteus-core/src/app_server/transcript/journal/append/tests.rs
+index 6d9d130374c97c75d3a8e5e17eb2a5205927def2..84fc69ecacdf40474744e5754bab76809180b584 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/append/tests.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/append/tests.rs
+@@ -58,7 +58,7 @@ fn append_records(
+                 if is_display_kind(record.entry.kind()) {
+                     let mut record = record.clone();
+                     strip_checkpoint_baseline(&mut record, baseline.len())?;
+-                    visit(record)?;
++                    visit(&record)?;
+                 }
+             }
+             Ok(())
+@@ -87,7 +87,7 @@ fn inspect_records(
+         |visit| {
+             for record in &records[split..] {
+                 if is_display_kind(record.entry.kind()) {
+-                    visit(record.clone())?;
++                    visit(&mut record.clone())?;
+                 }
+             }
+             Ok(())
+@@ -473,7 +473,7 @@ fn a_scan_failure_is_reported_even_after_the_suffix_is_known_to_overlap() {
+     let error = independent_append(
+         prefix,
+         |visit| {
+-            visit(repeated.clone())?;
++            visit(&mut repeated.clone())?;
+             anyhow::bail!("changed source");
+         },
+         &[],
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 5237b3d5c2f720a40179afe72b40996370d9939b..04399f611548b29afe2a5044f22b43ab965c2c0f 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -1,9 +1,9 @@
+ //! Payload-bounded transcript projection over a fixed, already validated prefix.
+ //!
+ //! Forward references (late commits, root thread attribution, final tool results)
+-//! require global facts. Keep only their identities between passes; each hydrated
+-//! journal payload is dropped before reading the next one. The returned rows are
+-//! unpublished until every pass succeeds.
++//! require global facts. Keep only their identities between streamed passes.
++//! A small previously validated append can instead lend the same bounded records
++//! to all passes. The returned rows are unpublished until every pass succeeds.
+ use anyhow::Result;
+ 
+ use crate::{
+@@ -27,7 +27,7 @@ pub(crate) fn journal_transcript_from_source(
+     live_turn_id: Option<TurnId>,
+ ) -> Result<Vec<AppTranscriptMessage>> {
+     transcript_from_scan(
+-        |visit| source.scan_selected(is_display_kind, visit),
++        |visit| source.scan_selected(is_display_kind, |record| visit(&record)),
+         live_turn_id,
+     )
+ }
+@@ -51,7 +51,7 @@ pub(super) fn is_display_kind(kind: JournalKind) -> bool {
+ }
+ 
+ pub(super) fn transcript_from_scan(
+-    mut scan: impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
++    mut scan: impl FnMut(&mut dyn FnMut(&JournalRecord) -> Result<()>) -> Result<()>,
+     live_turn_id: Option<TurnId>,
+ ) -> Result<Vec<AppTranscriptMessage>> {
+     let mut start = 0;
+@@ -134,7 +134,7 @@ pub(super) fn transcript_from_scan(
+     // Resolve first occurrences in journal order, including model-message
+     // records and retained parts rehosted by replacement or compaction.
+     scan(&mut |record| {
+-        timestamps.collect_record::<true>(&record);
++        timestamps.collect_record::<true>(record);
+         if record.session_seq >= start
+             && visibility.is_root_record(record.thread_id, record.turn_id)
+             && let JournalEntry::ModelResponseRecorded(response) = &record.entry
+@@ -170,7 +170,7 @@ pub(super) fn transcript_from_scan(
+     };
+     scan(&mut |record| {
+         if record.session_seq >= start {
+-            replay.render_record(&record, live_turn_id);
++            replay.render_record(record, live_turn_id);
+         }
+         Ok(())
+     })?;
+@@ -186,7 +186,7 @@ pub(super) fn from_records(
+         |visit| {
+             for record in records {
+                 if is_display_kind(record.entry.kind()) {
+-                    visit(record.clone())?;
++                    visit(record)?;
+                 }
+             }
+             Ok(())
+@@ -228,7 +228,7 @@ mod tests {
+         let error = transcript_from_scan(
+             |visit| {
+                 passes += 1;
+-                visit(record.clone())?;
++                visit(&record)?;
+                 anyhow::ensure!(passes != 4, "failure after rendering a row");
+                 Ok(())
+             },
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index 425d17b8639abfe4b9a296147e71c6b90e5cf9e7..6e4c779cc9a20de2dda335acc89e4329ac5d1fef 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -6,6 +6,9 @@ use proteus_contracts::{
+ };
+ use serde::{Deserialize, Serialize};
+ 
++mod suffix;
++use suffix::SmallSuffix;
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+ pub(crate) struct RemoteJournalCursor {
+@@ -15,6 +18,7 @@ pub(crate) struct RemoteJournalSnapshot {
+     store: RemoteSessionStore,
+     snapshot: StorageSnapshot,
+     verified_prefix_seq: Option<u64>,
++    small_suffix: Option<SmallSuffix>,
+ }
+ impl std::fmt::Debug for RemoteJournalSnapshot {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+@@ -39,6 +43,7 @@ impl RemoteJournalSnapshot {
+             store,
+             snapshot,
+             verified_prefix_seq: None,
++            small_suffix: None,
+         })
+     }
+     pub(crate) fn descriptor(&self) -> &StorageSnapshot {
+@@ -59,26 +64,33 @@ impl RemoteJournalSnapshot {
+         }
+     }
+     pub(crate) fn scan(&mut self, consume: impl FnMut(JournalRecord) -> Result<()>) -> Result<()> {
+-        self.scan_from(0, |_| true, consume)
++        self.scan_from(0, None, |_| true, consume)
+     }
+     pub(crate) fn scan_selected(
+         &mut self,
+         select: fn(JournalKind) -> bool,
+         consume: impl FnMut(JournalRecord) -> Result<()>,
+     ) -> Result<()> {
+-        self.scan_from(0, select, consume)
++        self.scan_from(0, None, select, consume)
+     }
+     fn scan_from(
+         &mut self,
+         mut after_seq: u64,
++        split_at: Option<u64>,
+         select: impl Fn(JournalKind) -> bool,
+         mut consume: impl FnMut(JournalRecord) -> Result<()>,
+     ) -> Result<()> {
+         loop {
++            // Preserve the verified suffix read boundary (including its storage
++            // errors) when the validator also supplies the display pass.
++            let limit = split_at
++                .filter(|end| *end > after_seq)
++                .map_or(64, |end| (end - after_seq).min(64) as u32);
++            let page_start = after_seq;
+             let response = self.store.request(Request::ReadRecords {
+                 snapshot: self.snapshot.clone(),
+                 after_seq,
+-                limit: 64,
++                limit,
+             })?;
+             let Response::Records { page } = response else {
+                 bail!("storage returned an unexpected record page response")
+@@ -87,6 +99,10 @@ impl RemoteJournalSnapshot {
+                 page.snapshot == self.snapshot,
+                 "storage changed the fixed snapshot while paging"
+             );
++            ensure!(
++                page.records.len() <= limit as usize,
++                "storage exceeded record page bound"
++            );
+             for record in page.records {
+                 ensure!(
+                     record.session_id == self.snapshot.session.session_id
+@@ -102,7 +118,9 @@ impl RemoteJournalSnapshot {
+             match page.next_after_seq {
+                 Some(next) => {
+                     ensure!(
+-                        next == after_seq && after_seq < self.snapshot.revision.session_seq,
++                        next == after_seq
++                            && after_seq > page_start
++                            && after_seq < self.snapshot.revision.session_seq,
+                         "storage record page made no progress"
+                     );
+                 }
+@@ -140,7 +158,10 @@ impl RemoteJournalSnapshot {
+         let after_seq = self
+             .verified_prefix_seq
+             .ok_or_else(|| anyhow!("journal suffix requires a verified prefix"))?;
+-        self.scan_from(after_seq, select, consume)
++        self.scan_from(after_seq, None, select, consume)
++    }
++    pub(crate) fn take_small_verified_suffix(&mut self) -> Option<Vec<JournalRecord>> {
++        self.small_suffix.take().map(SmallSuffix::into_records)
+     }
+ }
+ impl Drop for RemoteJournalSnapshot {
+@@ -199,24 +220,41 @@ impl RemoteValidatedRead {
+         let mut usage = proteus_session_semantics::UsageProjection::default();
+         let mut context = proteus_session_semantics::ModelContextProjection::default();
+         let mut next_seq = 1;
+-        source.scan(|record| {
+-            validation.apply_sequenced(store.session_id(), &record, &mut next_seq)?;
+-            usage.apply(&record);
+-            context.apply(&record);
+-            if prefix_seq.is_some_and(|last| record.session_seq <= last) {
+-                observe_prefix(&record);
+-            }
+-            if prefix_seq == Some(record.session_seq) {
+-                prefix_history_fingerprints = Some(
+-                    validation
+-                        .history()
+-                        .iter()
+-                        .map(proteus_session_semantics::history_message_sha256)
+-                        .collect::<Result<_>>()?,
+-                );
+-            }
+-            Ok(())
+-        })?;
++        let mut small_suffix = prefix_seq
++            .and_then(|seq| SmallSuffix::for_range(seq, source.snapshot.revision.session_seq));
++        let split_at = prefix_seq.filter(|_| small_suffix.is_some());
++        source.scan_from(
++            0,
++            split_at,
++            |_| true,
++            |record| {
++                validation.apply_sequenced(store.session_id(), &record, &mut next_seq)?;
++                usage.apply(&record);
++                context.apply(&record);
++                if prefix_seq.is_some_and(|last| record.session_seq <= last) {
++                    observe_prefix(&record);
++                }
++                if prefix_seq == Some(record.session_seq) {
++                    prefix_history_fingerprints = Some(
++                        validation
++                            .history()
++                            .iter()
++                            .map(proteus_session_semantics::history_message_sha256)
++                            .collect::<Result<_>>()?,
++                    );
++                }
++                if split_at.is_some_and(|last| record.session_seq > last)
++                    && let Some(buffer) = &mut small_suffix
++                    && !buffer.try_push(record)
++                {
++                    // Oversize isn't a failed journal read. Drop all held payloads
++                    // immediately and keep the original streaming append renderer.
++                    small_suffix = None;
++                }
++                Ok(())
++            },
++        )?;
++        source.small_suffix = small_suffix;
+         let resume = proteus_contracts::contracts::StorageResumeState {
+             conversation: StorageConversation {
+                 revision: source.snapshot.revision,
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/suffix.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/suffix.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d781c7d734cc9041814c2a95da71b4477d911348
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/suffix.rs
+@@ -0,0 +1,52 @@
++//! One short-lived owned replay buffer, only for a strictly read append.
++//! Budgets are record count and canonical encoded bytes, not heap estimates.
++use std::io::{self, Write};
++
++use super::JournalRecord;
++
++const MAX_RECORDS: u64 = 16;
++const MAX_BYTES: usize = 256 * 1024;
++
++pub(super) struct SmallSuffix {
++    records: Vec<JournalRecord>,
++    remaining: usize,
++}
++
++impl SmallSuffix {
++    pub(super) fn for_range(previous: u64, end: u64) -> Option<Self> {
++        let count = end.checked_sub(previous)?;
++        // Preserve ordinary scan/error behavior for an empty suffix.
++        (1..=MAX_RECORDS).contains(&count).then(|| Self {
++            records: Vec::with_capacity(count as usize),
++            remaining: MAX_BYTES,
++        })
++    }
++    pub(super) fn try_push(&mut self, record: JournalRecord) -> bool {
++        let mut budget = Budget(self.remaining);
++        if self.records.len() >= MAX_RECORDS as usize
++            || serde_json::to_writer(&mut budget, &record).is_err()
++        {
++            return false;
++        }
++        self.remaining = budget.0;
++        self.records.push(record);
++        true
++    }
++    pub(super) fn into_records(self) -> Vec<JournalRecord> {
++        self.records
++    }
++}
++
++struct Budget(usize);
++impl Write for Budget {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        self.0 = self
++            .0
++            .checked_sub(bytes.len())
++            .ok_or_else(|| io::Error::other("display suffix exceeds its byte budget"))?;
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 3f8b6c7ff247f50787bd640d41d2626c62d01413..4c3a5080a929fbc256383fc2f74d5f33a01f689f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -165,7 +165,7 @@ fn cache_fingerprints_ignore_independent_worker_object_order() {
+ }
+ 
+ #[test]
+-fn independent_display_append_reads_prefix_only_in_the_strict_pass() {
++fn bounded_display_append_reads_prefix_and_suffix_once() {
+     let (backend, store) = Backend::store();
+     for _ in 0..130 {
+         backend.append(1);
+@@ -177,7 +177,53 @@ fn independent_display_append_reads_prefix_only_in_the_strict_pass() {
+     assert_eq!(view.cursor.unwrap().base.unwrap().common_prefix, 130);
+     let state = backend.0.lock().unwrap();
+     assert_eq!(state.comparisons, 1);
+-    assert_eq!(state.read_offsets, [0, 64, 128, 130, 130, 130, 130, 130]);
++    assert_eq!(state.read_offsets, [0, 64, 128, 130]);
++}
++
++#[test]
++fn exceeding_either_suffix_budget_keeps_the_streaming_append_path() {
++    use proteus_contracts::{
++        model_standard::{CanonicalMessage, MessageRole},
++        storage::journal::JournalEntry,
++    };
++
++    for count in [2, 17] {
++        let (backend, store) = Backend::store();
++        backend.append(1);
++        project(&store, full).unwrap();
++        for _ in 0..count {
++            backend.append(1);
++        }
++        {
++            let mut state = backend.0.lock().unwrap();
++            state.read_offsets.clear();
++            if count == 2 {
++                // Either record fits on its own, but their sum does not.
++                for record in &mut state.records[1..] {
++                    let JournalEntry::HistoryMutated(mutation) = &mut record.entry else {
++                        unreachable!()
++                    };
++                    mutation.messages = vec![CanonicalMessage::text(
++                        MessageRole::User,
++                        "a".repeat(132 * 1024),
++                    )];
++                }
++            }
++        }
++        let view = project(&store, |_| panic!("oversize should still stream its suffix")).unwrap();
++        assert_eq!(view.cursor.unwrap().base.unwrap().common_prefix, 1);
++        let reads = backend.0.lock().unwrap().read_offsets.clone();
++        assert_eq!(
++            reads.iter().filter(|offset| **offset == 1).count(),
++            if count == 2 { 6 } else { 5 }
++        );
++        let cached = store.fresh_read_model().unwrap();
++        let expected = store.project_read_model(full).unwrap();
++        assert_eq!(
++            serde_json::to_value(cached).unwrap(),
++            serde_json::to_value(expected).unwrap()
++        );
++    }
+ }
+ 
+ #[test]

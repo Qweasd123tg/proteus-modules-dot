@@ -1,0 +1,147 @@
+--- a/storage/session-storage/src/diagnostics.rs
++++ b/storage/session-storage/src/diagnostics.rs
+@@ -1,33 +1,22 @@
+-//! Test-only observability of actual record decoding and fingerprint I/O.
+-#[cfg(test)]
+-#[derive(Default, Clone, Copy, Debug)]
+-pub(crate) struct Counters {
+-    pub decoded: u64,
+-    pub fingerprint_bytes: u64,
++
++use std::{cell::Cell, time::{Instant, SystemTime, UNIX_EPOCH}, io::Write};
++#[derive(Default, Debug, Copy, Clone)]
++pub(crate) struct Counts {
++  pub(crate) decoded:u64, pub(crate) fingerprint_bytes:u64, pub(crate) decoded_line_bytes:u64, pub(crate) folded:u64,
++  pub(crate) returned:u64,pub(crate) returned_measured_bytes:u64, pub(crate) decode_ns:u64,pub(crate) apply_ns:u64,pub(crate) sizing_ns:u64,
+ }
+-#[cfg(test)]
+-thread_local! { static COUNTERS:std::cell::Cell<Counters>=std::cell::Cell::new(Counters { decoded:0,fingerprint_bytes:0 }); }
+-#[cfg(test)]
+-pub(crate) fn reset() {
+-    COUNTERS.set(Counters::default());
++thread_local! {static CS:Cell<Counts>=Cell::new(Counts::default());}
++pub(crate) fn decoded() { update(|mut c|{c.decoded+=1;c}); }
++pub(crate) fn fingerprint(n:usize) { update(|mut c|{c.fingerprint_bytes+=n as u64;c}); }
++pub(crate) fn reset() {CS.set(Counts::default());}
++pub(crate) fn get()->Counts{CS.get()}
++pub(crate) fn update(f:impl FnOnce(Counts)->Counts){CS.set(f(CS.get()));}
++pub(crate) fn start()->Instant{Instant::now()}
++pub(crate) fn elapsed(t:Instant)->u64{ t.elapsed().as_nanos() as u64 }
++pub(crate) fn epoch()->u128{SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()}
++pub(crate) fn report(tag:&str, after:u64, seq:u64, nr:usize, started:u128, dur:u64, c:Counts){
++  let mut f=std::fs::OpenOptions::new().create(true).append(true).open(TRACE).unwrap();
++  writeln!(f,"{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
++  started,dur,tag,after,seq,nr,c.decoded,c.decoded_line_bytes,c.folded,c.fingerprint_bytes,c.decode_ns,c.apply_ns,c.returned,c.returned_measured_bytes,c.sizing_ns,std::process::id()).unwrap();
+ }
+-#[cfg(test)]
+-pub(crate) fn get() -> Counters {
+-    COUNTERS.get()
+-}
+-pub(crate) fn decoded() {
+-    #[cfg(test)]
+-    COUNTERS.set(Counters {
+-        decoded: COUNTERS.get().decoded + 1,
+-        ..COUNTERS.get()
+-    });
+-}
+-pub(crate) fn fingerprint(bytes: usize) {
+-    #[cfg(test)]
+-    COUNTERS.set(Counters {
+-        fingerprint_bytes: COUNTERS.get().fingerprint_bytes + bytes as u64,
+-        ..COUNTERS.get()
+-    });
+-    #[cfg(not(test))]
+-    let _ = bytes;
+-}
++const TRACE:&str=env!("PERF8_STORAGE_TRACE");
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -281,7 +281,9 @@
+         self.current_hash.update(&line);
+         line.pop();
+         ensure!(!line.is_empty(), "journal contains an empty complete line");
++        let ds=crate::diagnostics::start();
+         let (record, external) = codec::decode(&self.dir, self.id, &line)?;
++        crate::diagnostics::update(|mut c|{c.decode_ns+=crate::diagnostics::elapsed(ds);c.decoded_line_bytes+=count as u64;c});
+         self.has_external_payloads |= external;
+         Ok(Some(record))
+     }
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -12,6 +12,7 @@
+ }
+ impl Fold {
+     pub fn apply(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
++        let ts=crate::diagnostics::start();
+         let mut next = self
+             .session_seq
+             .checked_add(1)
+@@ -20,6 +21,7 @@
+         self.model_context.apply(record);
+         self.usage.apply(record);
+         self.session_seq = record.session_seq;
++        crate::diagnostics::update(|mut c|{c.folded+=1;c.apply_ns+=crate::diagnostics::elapsed(ts);c});
+         Ok(())
+     }
+     pub fn revision(&self) -> StorageRevision {
+@@ -174,7 +176,8 @@
+             if record.session_seq <= after {
+                 continue;
+             }
+-            let record_bytes = encoded_bytes(&record)?;
++            let ts=crate::diagnostics::start(); let record_bytes = encoded_bytes(&record)?;
++            crate::diagnostics::update(|mut c|{c.returned+=1;c.returned_measured_bytes+=record_bytes as u64;c.sizing_ns+=crate::diagnostics::elapsed(ts);c});
+             ensure!(
+                 record_bytes <= SESSION_STORAGE_MAX_RECORD_BYTES,
+                 "canonical record exceeds maximum"
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -83,11 +83,44 @@
+     /// Each admitted transaction completes under this service lock even if an
+     /// RPC caller stops waiting. Stable operation ids reconcile its durable result.
+     pub fn execute(&self, request: SessionStorageRequest) -> Result<SessionStorageResponse> {
++        use crate::diagnostics as d;
++        use SessionStorageRequest::*;
++        let (tag,after,seq) = match &request {
++            ReadRecords{snapshot,after_seq,..}=>("ReadRecords",*after_seq,snapshot.revision.session_seq),
++            CompareSnapshots{snapshot,prefix}=>("CompareSnapshots",prefix.revision.session_seq,snapshot.revision.session_seq),
++            Create{..}=>("Create",0,0),
++Open{..}=>("Open",0,0),
++Describe{..}=>("Describe",0,0),
++List{..}=>("List",0,0),
++AcquireWriter{..}=>("AcquireWriter",0,0),
++ReleaseWriter{..}=>("ReleaseWriter",0,0),
++HibernateWriter{..}=>("HibernateWriter",0,0),
++Commit{..}=>("Commit",0,0),
++CommitStatus{..}=>("CommitStatus",0,0),
++OpenSnapshot{..}=>("OpenSnapshot",0,0),
++ReleaseSnapshot{..}=>("ReleaseSnapshot",0,0),
++ReadConversation{..}=>("ReadConversation",0,0),
++ReadUsage{..}=>("ReadUsage",0,0),
++Resume{..}=>("Resume",0,0),
++ReadExecutionState{..}=>("ReadExecutionState",0,0),
++ReadCommittedTurn{..}=>("ReadCommittedTurn",0,0),
++ReadModelContextBeforeTurn{..}=>("ReadModelContextBeforeTurn",0,0),
++ReadWriterModelContextBeforeTurn{..}=>("ReadWriterModelContextBeforeTurn",0,0),
++ReadMetadata{..}=>("ReadMetadata",0,0),
++ReadCache{..}=>("ReadCache",0,0),
++WriteCache{..}=>("WriteCache",0,0),
++CompareExchangeMetadata{..}=>("CompareExchangeMetadata",0,0),
++PutBlob{..}=>("PutBlob",0,0),
++ReadBlob{..}=>("ReadBlob",0,0),
++ReadBlobByHash{..}=>("ReadBlobByHash",0,0),
++Delete{..}=>("Delete",0,0),
++
++        }; d::reset(); let started=d::epoch(); let tm=d::start();
+         request.validate()?;
+-        self.state
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))?
+-            .execute(request)
++        let res=self.state.lock().map_err(|_| anyhow::anyhow!("storage service lock poisoned"))?.execute(request);
++        let ns=d::elapsed(tm); let c=d::get();
++        let nr=match &res{ Ok(SessionStorageResponse::Records{page})=>page.records.len(), _=>0 };
++        d::report(tag,after,seq,nr,started,ns,c); res
+     }
+ }
+ impl State {
