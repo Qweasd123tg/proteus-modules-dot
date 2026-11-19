@@ -1,0 +1,864 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 431d36b..2c5d010 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -23,7 +23,8 @@ const PREFIX: &str = "display-view-v1-prefix";
+ mod pages;
+ use pages::valid_section;
+ pub(super) use pages::{
+-    Section, append_section, extend_known_section, read_section, write_section,
++    Section, append_section, extend_known_section, read_section, visit_section, write_section,
++    write_transcript,
+ };
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -128,9 +129,12 @@ pub(super) fn read_content<T: DeserializeOwned>(
+     store: &RemoteSessionStore,
+     expected: &str,
+ ) -> Option<T> {
++    serde_json::from_value(read_content_value(store, expected)?).ok()
++}
++
++fn read_content_value(store: &RemoteSessionStore, expected: &str) -> Option<Value> {
+     let value = read_value(store, &format!("display-data-{expected}"))?;
+-    (hash(&value).as_deref() == Some(expected)).then_some(())?;
+-    serde_json::from_value(value).ok()
++    (hash(&value).as_deref() == Some(expected)).then_some(value)
+ }
+ 
+ pub(super) fn read_prefix(store: &RemoteSessionStore, expected: &str) -> Option<PrefixIdentities> {
+@@ -184,13 +188,22 @@ pub(super) fn write_content<T: Serialize>(
+ ) -> Option<String> {
+     let value = bounded_value(value)?;
+     let digest = hash(&value)?;
++    write_content_value(store, source, &digest, value)?;
++    Some(digest)
++}
++
++fn write_content_value(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    digest: &str,
++    value: Value,
++) -> Option<()> {
+     let key = format!("display-data-{digest}");
+     // Unchanged payload pages remain in the backend; only new content is sent.
+-    if read_value(store, &key).is_some_and(|existing| hash(&existing) == Some(digest.clone())) {
+-        return Some(digest);
++    if read_value(store, &key).is_some_and(|existing| hash(&existing).as_deref() == Some(digest)) {
++        return Some(());
+     }
+-    write_value(store, source, &key, value)?;
+-    Some(digest)
++    write_value(store, source, &key, value)
+ }
+ 
+ fn matches(store: &RemoteSessionStore, header: &Header) -> bool {
+@@ -342,7 +355,7 @@ pub(super) fn save_model(
+     }
+     let previous = header(store);
+     let conversation = write_section(store, source, &model.conversation.messages)?;
+-    let transcript = write_section(store, source, &model.transcript)?;
++    let transcript = write_transcript(store, source, &model.transcript)?;
+     let context = write_section(store, source, &model.conversation.model_context)?;
+     let base = previous.as_ref().and_then(|previous| {
+         Some(AppTranscriptBase {
+@@ -388,11 +401,12 @@ fn common_prefix(
+ ) -> Option<usize> {
+     let mut common = 0;
+     for (before, after) in old.pages.iter().zip(&new.pages) {
+-        if before.hash == after.hash {
++        if before.hash == after.hash && before.rows == after.rows {
+             common += before.rows;
+             continue;
+         }
+-        let old_rows: Vec<Value> = read_content(store, &before.hash)?;
++        let old_rows: Vec<Value> =
++            read_section(store, old, common, common.checked_add(before.rows)?)?;
+         for old_row in &old_rows {
+             let Some(new_row) = rows.get(common) else {
+                 return Some(common);
+@@ -475,14 +489,12 @@ fn rebuild_tools(
+ ) -> Option<AppLatestToolState> {
+     let mut tools = BTreeMap::new();
+     let mut requested = None;
+-    for start in (0..header.transcript.rows).step_by(PAGE_ROWS) {
+-        let rows: Vec<CompactRow> = read_section(
+-            store,
+-            &header.transcript,
+-            start,
+-            (start + PAGE_ROWS).min(header.transcript.rows),
+-        )?;
+-        for row in rows {
++    visit_section(
++        store,
++        &header.transcript,
++        0,
++        header.transcript.rows,
++        |row: CompactRow| {
+             if let Some(tool) = row.tool
+                 && accepted(&tool.status)
+             {
+@@ -501,8 +513,9 @@ fn rebuild_tools(
+                     write_content(store, &header.source, &state)?,
+                 );
+             }
+-        }
+-    }
++            Some(())
++        },
++    )?;
+     if RemoteCacheSource::read(store).as_ref() != Some(&header.source) {
+         return None;
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index 15c015d..7e98a39 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -4,7 +4,10 @@ use std::io::Write;
+ use proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES;
+ use serde::{Deserialize, Serialize, de::DeserializeOwned};
+ 
+-use super::{PAGE_ROWS, RemoteCacheSource, RemoteSessionStore, read_content, write_content};
++use super::{PAGE_ROWS, RemoteCacheSource, RemoteSessionStore, read_content};
++
++mod packs;
++use packs::{PackRef, PendingPack};
+ 
+ const NORMAL_PAGE_BYTES: usize = 4 * 1024 * 1024;
+ const MAX_PAGES: usize = 65_536;
+@@ -22,51 +25,65 @@ pub(in crate::core::session_store::remote::view) struct PageRef {
+ pub(in crate::core::session_store::remote::view) struct Section {
+     pub(in crate::core::session_store::remote::view) rows: usize,
+     pub(in crate::core::session_store::remote::view) pages: Vec<PageRef>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    packs: Vec<PackRef>,
+ }
+ 
+-fn encoded_len<T: Serialize>(value: &T) -> Option<usize> {
+-    struct Counter(usize);
++fn encoded_len<T: Serialize>(value: &T, limit: usize) -> Option<usize> {
++    struct Counter {
++        used: usize,
++        limit: usize,
++    }
+     impl Write for Counter {
+         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            if bytes.len() > SESSION_STORAGE_MAX_CACHE_BYTES.saturating_sub(self.0) {
++            if bytes.len() > self.limit.saturating_sub(self.used) {
+                 return Err(std::io::Error::other(
+                     "display cache row exceeds byte budget",
+                 ));
+             }
+-            self.0 += bytes.len();
++            self.used += bytes.len();
+             Ok(bytes.len())
+         }
+         fn flush(&mut self) -> std::io::Result<()> {
+             Ok(())
+         }
+     }
+-    let mut counter = Counter(0);
++    let mut counter = Counter { used: 0, limit };
+     serde_json::to_writer(&mut counter, value).ok()?;
+-    Some(counter.0)
++    Some(counter.used)
+ }
+ 
+ fn write_pages<'a, T: Serialize + 'a>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+     rows: impl Iterator<Item = &'a T>,
+-) -> Option<Vec<PageRef>> {
+-    let mut pages = Vec::new();
++    section: &mut Section,
++    pack_before: usize,
++) -> Option<()> {
++    let mut pending = PendingPack::default();
+     let mut page = Vec::with_capacity(PAGE_ROWS);
+     let mut bytes = 2usize;
++    let mut submit = |page: &[&T], bytes: usize| {
++        if section.pages.len() >= MAX_PAGES {
++            return None;
++        }
++        section.rows = section.rows.checked_add(page.len())?;
++        let value = serde_json::to_value(page).ok()?;
++        let hash = super::hash(&value)?;
++        section.pages.push(PageRef {
++            hash,
++            rows: page.len(),
++            bytes,
++        });
++        pending.push(store, source, section, value, section.rows <= pack_before)
++    };
+     for row in rows {
+-        let row_bytes = encoded_len(row)?;
++        let row_bytes = encoded_len(row, SESSION_STORAGE_MAX_CACHE_BYTES)?;
+         if !page.is_empty()
+             && (page.len() == PAGE_ROWS
+                 || bytes.saturating_add(row_bytes).saturating_add(1) > NORMAL_PAGE_BYTES)
+         {
+-            pages.push(PageRef {
+-                hash: write_content(store, source, &page)?,
+-                rows: page.len(),
+-                bytes,
+-            });
+-            if pages.len() >= MAX_PAGES {
+-                return None;
+-            }
++            submit(&page, bytes)?;
+             page.clear();
+             bytes = 2;
+         }
+@@ -79,13 +96,9 @@ fn write_pages<'a, T: Serialize + 'a>(
+         page.push(row);
+     }
+     if !page.is_empty() {
+-        pages.push(PageRef {
+-            hash: write_content(store, source, &page)?,
+-            rows: page.len(),
+-            bytes,
+-        });
++        submit(&page, bytes)?;
+     }
+-    Some(pages)
++    pending.flush(store, source, section)
+ }
+ 
+ pub(in crate::core::session_store::remote::view) fn write_section<T: Serialize>(
+@@ -93,11 +106,25 @@ pub(in crate::core::session_store::remote::view) fn write_section<T: Serialize>(
+     source: &RemoteCacheSource,
+     rows: &[T],
+ ) -> Option<Section> {
+-    let pages = write_pages(store, source, rows.iter())?;
+-    Some(Section {
+-        rows: rows.len(),
+-        pages,
+-    })
++    let mut section = Section::default();
++    write_pages(store, source, rows.iter(), &mut section, 0)?;
++    Some(section)
++}
++
++pub(in crate::core::session_store::remote::view) fn write_transcript<T: Serialize>(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    rows: &[T],
++) -> Option<Section> {
++    let mut section = Section::default();
++    write_pages(
++        store,
++        source,
++        rows.iter(),
++        &mut section,
++        rows.len().saturating_sub(PAGE_ROWS),
++    )?;
++    Some(section)
+ }
+ 
+ /// Existing complete pages are immutable; only a bounded partial tail is read.
+@@ -116,12 +143,14 @@ pub(in crate::core::session_store::remote::view) fn append_section<
+         return Some(previous.clone());
+     }
+     let rows = previous.rows.checked_add(added.len())?;
+-    let mut pages = previous.pages.clone();
+-    let partial: Vec<T> = if pages
++    let mut section = previous.clone();
++    let partial: Vec<T> = if section
++        .pages
+         .last()
+         .is_some_and(|page| page.rows < PAGE_ROWS && page.bytes < NORMAL_PAGE_BYTES)
+     {
+-        let page = pages.pop()?;
++        let page = section.pages.pop()?;
++        section.rows -= page.rows;
+         let values: Vec<T> = read_content(store, &page.hash)?;
+         if values.len() != page.rows {
+             return None;
+@@ -130,15 +159,14 @@ pub(in crate::core::session_store::remote::view) fn append_section<
+     } else {
+         vec![]
+     };
+-    pages.extend(write_pages(
++    write_pages(
+         store,
+         source,
+         partial.iter().chain(added.iter()),
+-    )?);
+-    if pages.len() > MAX_PAGES {
+-        return None;
+-    }
+-    Some(Section { rows, pages })
++        &mut section,
++        rows.saturating_sub(PAGE_ROWS),
++    )?;
++    Some(section)
+ }
+ 
+ /// Canonical history is already available from strict validation. Its partial
+@@ -155,22 +183,16 @@ pub(in crate::core::session_store::remote::view) fn extend_known_section<T: Seri
+     if rows.len() == previous.rows {
+         return Some(previous.clone());
+     }
+-    let mut pages = previous.pages.clone();
+-    let mut start = previous.rows;
+-    if pages
++    let mut section = previous.clone();
++    if section
++        .pages
+         .last()
+         .is_some_and(|page| page.rows < PAGE_ROWS && page.bytes < NORMAL_PAGE_BYTES)
+     {
+-        start = start.checked_sub(pages.pop()?.rows)?;
++        section.rows -= section.pages.pop()?.rows;
+     }
+-    pages.extend(write_pages(store, source, rows[start..].iter())?);
+-    if pages.len() > MAX_PAGES {
+-        return None;
+-    }
+-    Some(Section {
+-        rows: rows.len(),
+-        pages,
+-    })
++    write_pages(store, source, rows[section.rows..].iter(), &mut section, 0)?;
++    Some(section)
+ }
+ 
+ pub(in crate::core::session_store::remote::view) fn read_section<T: DeserializeOwned>(
+@@ -179,33 +201,66 @@ pub(in crate::core::session_store::remote::view) fn read_section<T: DeserializeO
+     start: usize,
+     end: usize,
+ ) -> Option<Vec<T>> {
++    let mut result = None;
++    visit_section(store, section, start, end, |row| {
++        result
++            .get_or_insert_with(|| Vec::with_capacity(end - start))
++            .push(row);
++        Some(())
++    })?;
++    Some(result.unwrap_or_default())
++}
++
++/// Only overlapping logical leaves are decoded. Each overlapping physical object is read
++/// once, including when repairing the compact tool index over an entire archive.
++pub(in crate::core::session_store::remote::view) fn visit_section<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    section: &Section,
++    start: usize,
++    end: usize,
++    mut visit: impl FnMut(T) -> Option<()>,
++) -> Option<()> {
+     if start > end || end > section.rows || !valid_section(section) {
+         return None;
+     }
+-    let mut result = Vec::with_capacity(end - start);
+     if start == end {
+-        return Some(result);
++        return Some(());
+     }
+-    let mut offset = 0usize;
+-    for page in &section.pages {
+-        let upper = offset.checked_add(page.rows)?;
+-        if upper <= start {
+-            offset = upper;
+-            continue;
+-        }
+-        if offset >= end {
+-            break;
+-        }
+-        let rows: Vec<T> = read_content(store, &page.hash)?;
+-        if rows.len() != page.rows {
+-            return None;
++    let mut packs = section.packs.iter().peekable();
++    let (mut index, mut offset) = (0, 0);
++    while offset < end {
++        let pack = packs.next_if(|pack| pack.first == index);
++        let count = pack.map_or(1, |p| p.count);
++        let pages = &section.pages[index..index + count];
++        index += count;
++        let upper = offset + pages.iter().map(|p| p.rows).sum::<usize>();
++        if upper > start {
++            let bodies = match pack {
++                Some(pack) => pack.read(store)?,
++                None => vec![super::read_content_value(store, &pages[0].hash)?],
++            };
++            for (page, body) in pages.iter().zip(bodies) {
++                let next = offset + page.rows;
++                if next > start && offset < end {
++                    if pack.is_some() && super::hash(&body).as_deref() != Some(&page.hash) {
++                        return None;
++                    }
++                    let rows: Vec<T> = serde_json::from_value(body).ok()?;
++                    if rows.len() != page.rows {
++                        return None;
++                    }
++                    let first = start.saturating_sub(offset);
++                    let last = (end - offset).min(page.rows);
++                    for value in rows.into_iter().skip(first).take(last - first) {
++                        visit(value)?;
++                    }
++                }
++                offset = next;
++            }
+         }
+-        let lower = start.saturating_sub(offset);
+-        let count = (end - offset).min(rows.len()).checked_sub(lower)?;
+-        result.extend(rows.into_iter().skip(lower).take(count));
+         offset = upper;
+     }
+-    (result.len() == end - start).then_some(result)
++    Some(())
+ }
+ 
+ pub(super) fn valid_section(section: &Section) -> bool {
+@@ -222,4 +277,5 @@ pub(super) fn valid_section(section: &Section) -> bool {
+             .iter()
+             .try_fold(0usize, |rows, page| rows.checked_add(page.rows))
+             == Some(section.rows)
++        && packs::valid_spans(section)
+ }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+new file mode 100644
+index 0000000..db1dd51
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+@@ -0,0 +1,134 @@
++//! Several sealed logical leaves can share one content-addressed storage value.
++//! Singletons (especially every leaf touching the latest UI page) retain their
++//! original key and payload. No duplicate copy of a packed leaf is required.
++use super::super::{hash, read_value, write_content_value};
++use super::*;
++use serde_json::Value;
++
++const MAX_LEAVES: usize = 8;
++const MAX_BYTES: usize = 256 * 1024;
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct PackRef {
++    pub(super) first: usize,
++    pub(super) count: usize,
++    pub(super) hash: String,
++}
++
++impl PackRef {
++    pub(super) fn read(&self, store: &RemoteSessionStore) -> Option<Vec<Value>> {
++        let value = read_value(store, &format!("display-data-{}", self.hash))?;
++        // A disposable header's byte counts are not authority for a returned
++        // object's size. Reject an oversized body before hashing its contents.
++        encoded_len(&value, MAX_BYTES)?;
++        if hash(&value).as_deref() != Some(&self.hash) {
++            return None;
++        }
++        let Value::Array(leaves) = value else {
++            return None;
++        };
++        (leaves.len() == self.count).then_some(leaves)
++    }
++}
++
++pub(super) fn valid_spans(section: &Section) -> bool {
++    if section.packs.is_empty() {
++        return true;
++    }
++    // Never cover the latest PAGE_ROWS, even if they span many byte-split leaves.
++    let mut tail = section.pages.len();
++    let mut tail_rows = 0;
++    while tail > 0 && tail_rows < PAGE_ROWS {
++        tail -= 1;
++        tail_rows += section.pages[tail].rows;
++    }
++    let mut after = 0;
++    section.packs.iter().all(|pack| {
++        if !(2..=MAX_LEAVES).contains(&pack.count)
++            || pack.first < after
++            || pack.hash.len() != 64
++            || !pack.hash.bytes().all(|b| b.is_ascii_hexdigit())
++        {
++            return false;
++        }
++        let Some(end) = pack
++            .first
++            .checked_add(pack.count)
++            .filter(|&end| end <= tail)
++        else {
++            return false;
++        };
++        after = end;
++        section.pages[pack.first..end]
++            .iter()
++            .try_fold(1usize, |n, p| n.checked_add(1)?.checked_add(p.bytes))
++            .is_some_and(|n| n <= MAX_BYTES)
++    })
++}
++
++#[derive(Default)]
++pub(super) struct PendingPack {
++    first: usize,
++    values: Vec<Value>,
++    // Each item contributes its serialized bytes plus one separator. An outer
++    // array of n items therefore occupies exactly 1 + sum(item_len + 1).
++    bytes: usize,
++}
++
++impl PendingPack {
++    pub(super) fn push(
++        &mut self,
++        store: &RemoteSessionStore,
++        source: &RemoteCacheSource,
++        section: &mut Section,
++        value: Value,
++        historical: bool,
++    ) -> Option<()> {
++        let index = section.pages.len() - 1;
++        let bytes = section.pages[index].bytes + 1;
++        let packable = historical && bytes < MAX_BYTES;
++        if !packable || self.values.len() == MAX_LEAVES || 1 + self.bytes + bytes > MAX_BYTES {
++            self.flush(store, source, section)?;
++        }
++        if !packable {
++            return write_content_value(store, source, &section.pages[index].hash, value);
++        }
++        if self.values.is_empty() {
++            self.first = index;
++        }
++        self.values.push(value);
++        self.bytes += bytes;
++        Some(())
++    }
++
++    pub(super) fn flush(
++        &mut self,
++        store: &RemoteSessionStore,
++        source: &RemoteCacheSource,
++        section: &mut Section,
++    ) -> Option<()> {
++        self.bytes = 0;
++        let count = self.values.len();
++        match count {
++            0 => Some(()),
++            1 => write_content_value(
++                store,
++                source,
++                &section.pages[self.first].hash,
++                self.values.pop()?,
++            ),
++            _ => {
++                let value = Value::Array(std::mem::take(&mut self.values));
++                let digest = hash(&value)?;
++                write_content_value(store, source, &digest, value)?;
++                section.packs.push(PackRef {
++                    first: self.first,
++                    count,
++                    hash: digest,
++                });
++                Some(())
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 3eb386c..92e4c81 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -227,3 +227,56 @@ fn cache_fingerprints_ignore_independent_worker_object_order() {
+     assert_eq!(store.saved_transcript_page(None, None).unwrap().total, 51);
+     assert!(store.fresh_read_model().is_some());
+ }
++
++mod packs;
++
++#[test]
++fn full_reprojection_compares_changed_archived_leaf_and_preserves_pinned_history() {
++    let (backend, store) = Backend::store();
++    backend.append(953);
++    let original = store.project_read_model(full).unwrap();
++    let old_header = cache::header(&store).unwrap();
++    let old_revision = old_header.source.revision().unwrap();
++    let changed = 401usize;
++    backend.append(1);
++    let mut current = SessionReadModel::from_validated(
++        &store,
++        RemoteValidatedRead::open(store.clone()).unwrap(),
++        full,
++    )
++    .unwrap();
++    current.transcript[changed].text = "replacement".to_string();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    store.save_read_model(&source, &current);
++    let current_page = store.saved_transcript_page(Some(425), None).unwrap();
++    let base = current_page.base.unwrap();
++    assert_eq!(base.revision, old_revision);
++    assert_eq!(base.common_prefix, changed);
++    assert_eq!(
++        current_page.messages[changed - current_page.start].text,
++        "replacement"
++    );
++    let pinned = store
++        .saved_transcript_page(Some(425), Some(&old_revision))
++        .unwrap();
++    assert_eq!(
++        pinned.messages[changed - pinned.start].text,
++        original.transcript[changed].text
++    );
++    // Evicting only the old pack must never resolve this revision against the
++    // newer pack, even though both manifests refer to leaf index 8.
++    let old = serde_json::to_value(old_header.transcript).unwrap();
++    let digest = old["packs"][1]["hash"].as_str().unwrap();
++    backend
++        .0
++        .lock()
++        .unwrap()
++        .cache
++        .remove(&format!("display-data-{digest}"));
++    assert!(
++        store
++            .saved_transcript_page(Some(425), Some(&old_revision))
++            .is_none()
++    );
++    assert!(store.saved_transcript_page(Some(425), None).is_some());
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs
+new file mode 100644
+index 0000000..4faf873
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs
+@@ -0,0 +1,189 @@
++use super::{Backend, RemoteCacheSource, cache};
++use serde_json::{Value, json};
++
++fn digest(value: &Value) -> String {
++    proteus_contracts::contracts::storage_value_etag(value).unwrap()
++}
++fn key(digest: &str) -> String {
++    format!("display-data-{digest}")
++}
++
++#[test]
++fn physical_packs_preserve_logical_leaves_and_skip_the_latest_window() {
++    let (backend, store) = Backend::store();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    let rows: Vec<_> = (0..953).map(|n| format!("row-{n}")).collect();
++    let section = cache::write_transcript(&store, &source, &rows).unwrap();
++    let manifest = serde_json::to_value(&section).unwrap();
++    let packs = manifest["packs"].as_array().unwrap();
++    assert_eq!(
++        packs
++            .iter()
++            .map(|p| p["count"].as_u64().unwrap())
++            .collect::<Vec<_>>(),
++        [8, 8, 2]
++    );
++    for (page, rows) in manifest["pages"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .zip(rows.chunks(50))
++    {
++        assert_eq!(page["hash"], digest(&json!(rows)));
++    }
++    let pack_keys: Vec<_> = packs
++        .iter()
++        .map(|p| key(p["hash"].as_str().unwrap()))
++        .collect();
++    {
++        let mut state = backend.0.lock().unwrap();
++        assert_eq!(
++            state.writes.len(),
++            5,
++            "three packs and two unaligned tail leaves"
++        );
++        state.cache_reads.clear();
++    }
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 903, 953).unwrap(),
++        rows[903..]
++    );
++    {
++        let mut state = backend.0.lock().unwrap();
++        assert_eq!(state.cache_reads.len(), 2);
++        assert!(state.cache_reads.iter().all(|key| !pack_keys.contains(key)));
++        state.cache_reads.clear();
++    }
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 395, 445).unwrap(),
++        rows[395..445]
++    );
++    assert_eq!(backend.0.lock().unwrap().cache_reads, pack_keys[..2]);
++    backend.0.lock().unwrap().cache_reads.clear();
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 0, 953).unwrap(),
++        rows
++    );
++    assert_eq!(backend.0.lock().unwrap().cache_reads.len(), 5);
++    {
++        let mut state = backend.0.lock().unwrap();
++        state.cache_reads.clear();
++        state.writes.clear();
++    }
++    let next = cache::append_section(&store, &source, &section, &[String::from("added")]).unwrap();
++    {
++        let state = backend.0.lock().unwrap();
++        assert!(
++            state
++                .cache_reads
++                .iter()
++                .chain(&state.writes)
++                .all(|key| !pack_keys.contains(key))
++        );
++    }
++    assert_eq!(
++        cache::read_section::<String>(&store, &next, 953, 954).unwrap(),
++        ["added"]
++    );
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 950, 953).unwrap(),
++        rows[950..]
++    );
++    let legacy = cache::write_section(&store, &source, &rows).unwrap();
++    let legacy = serde_json::to_value(legacy).unwrap();
++    assert!(legacy.get("packs").is_none());
++    assert_eq!(legacy["pages"], manifest["pages"]);
++    let legacy = serde_json::from_value(legacy).unwrap();
++    assert_eq!(
++        cache::read_section::<String>(&store, &legacy, 0, 953).unwrap(),
++        rows
++    );
++}
++
++#[test]
++fn invalid_archive_objects_and_spans_are_cache_misses_not_mixed_rows() {
++    let (backend, store) = Backend::store();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    let rows: Vec<_> = (0..953).collect::<Vec<u32>>();
++    let section = cache::write_transcript(&store, &source, &rows).unwrap();
++    let manifest = serde_json::to_value(&section).unwrap();
++    let pack_key = key(manifest["packs"][0]["hash"].as_str().unwrap());
++    let mut bad = manifest.clone();
++    bad["pages"][0]["hash"] = bad["pages"][1]["hash"].clone();
++    let bad = serde_json::from_value(bad).unwrap();
++    assert!(cache::read_section::<u32>(&store, &bad, 0, 1).is_none());
++    for (i, first, count) in [(0, 0u64, 9), (1, 7, 8), (2, 17, 2), (0, u64::MAX, 2)] {
++        let mut bad = manifest.clone();
++        bad["packs"][i]["first"] = json!(first);
++        bad["packs"][i]["count"] = json!(count);
++        // A target with narrower usize rejects the index during deserialization.
++        if let Ok(bad) = serde_json::from_value(bad) {
++            assert!(cache::read_section::<u32>(&store, &bad, 903, 953).is_none());
++        }
++    }
++    let mut body = backend.0.lock().unwrap().cache.remove(&pack_key).unwrap();
++    assert!(cache::read_section::<u32>(&store, &section, 0, 1).is_none());
++    assert_eq!(
++        cache::read_section::<u32>(&store, &section, 903, 953).unwrap(),
++        rows[903..]
++    );
++    body[0][7] = json!("not an integer");
++    backend
++        .0
++        .lock()
++        .unwrap()
++        .cache
++        .insert(pack_key, body.clone());
++    assert!(cache::read_section::<u32>(&store, &section, 0, 1).is_none());
++
++    // Even a hash-consistent but malformed *overlapping leaf* is a miss.
++    // The malformed row need not be the one requested by this page.
++    for invalid in [json!("not an integer"), json!("x".repeat(256 * 1024))] {
++        body[0][7] = invalid;
++        let mut bad = manifest.clone();
++        bad["packs"][0]["hash"] = json!(digest(&body));
++        bad["pages"][0]["hash"] = json!(digest(&body[0]));
++        backend
++            .0
++            .lock()
++            .unwrap()
++            .cache
++            .insert(key(&digest(&body)), body.clone());
++        let bad = serde_json::from_value(bad).unwrap();
++        if body[0][7].as_str().unwrap().len() > 256 {
++            assert!(cache::read_section::<Value>(&store, &bad, 0, 1).is_none());
++        } else {
++            assert!(cache::read_section::<u32>(&store, &bad, 0, 1).is_none());
++        }
++    }
++}
++
++#[test]
++fn historical_packs_obey_actual_json_byte_cap_and_large_leaf_remains_readable() {
++    let (backend, store) = Backend::store();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    let mut rows: Vec<_> = (0..600)
++        .map(|n| format!("{}-{n}", "x".repeat(1700)))
++        .collect();
++    rows[260] = "x".repeat(300 * 1024);
++    let section = cache::write_transcript(&store, &source, &rows).unwrap();
++    let manifest = serde_json::to_value(&section).unwrap();
++    let state = backend.0.lock().unwrap();
++    for pack in manifest["packs"].as_array().unwrap() {
++        let bytes = &state.cache[&key(pack["hash"].as_str().unwrap())];
++        assert!(serde_json::to_vec(bytes).unwrap().len() <= 256 * 1024);
++        assert!((2..=3).contains(&pack["count"].as_u64().unwrap()));
++    }
++    let large = &manifest["pages"][5];
++    assert!(large["bytes"].as_u64().unwrap() > 256 * 1024);
++    assert!(
++        state
++            .cache
++            .contains_key(&key(large["hash"].as_str().unwrap()))
++    );
++    drop(state);
++    assert_eq!(
++        cache::read_section::<String>(&store, &section, 248, 268).unwrap(),
++        rows[248..268]
++    );
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+index 81069a8..fb317b6 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+@@ -28,6 +28,7 @@ pub(super) struct State {
+     pub(super) records: Vec<JournalRecord>,
+     pub(super) cache: HashMap<String, Value>,
+     pub(super) writes: Vec<String>,
++    pub(super) cache_reads: Vec<String>,
+     pub(super) record_reads: usize,
+     pub(super) fail_head: bool,
+     pub(super) handles: u64,
+@@ -55,6 +56,7 @@ impl Backend {
+             records: vec![],
+             cache: HashMap::new(),
+             writes: vec![],
++            cache_reads: vec![],
+             record_reads: 0,
+             handles: 0,
+             fail_head: false,
+@@ -168,6 +170,7 @@ impl SessionStorage for Backend {
+                 })
+             }
+             Request::ReadCache { key, source, .. } => {
++                state.cache_reads.push(key.clone());
+                 let value = if source.as_ref().is_none_or(|source| current(&state, source)) {
+                     state.cache.get(&key).cloned()
+                 } else {
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 31b6384..6b81933 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -608,6 +608,16 @@ writer. Read-only чтение сохраняет исходный журнал.
+ представление из обычного полного snapshot. Продолжение сессии по-прежнему
+ проверяется под writer lease.
+ 
++При сохранении экранной проекции Core сохраняет архивные страницы transcript
++группами: один неизменяемый объект кеша содержит до восьми страниц и не более
++256 KiB в компактном JSON. Крупная страница и каждая страница, затрагивающая
++последние 50 строк, остаются отдельными объектами. При добавлении сообщений
++уже сохранённые группы не перечитываются для переупаковки. Старую и текущую
++историю читатель различает по заголовку запрошенной ревизии; он сверяет
++SHA-256 объекта и запрошенных страниц. Утрата объекта означает промах кеша,
++а не разрешение читать строки из другой ревизии. Размер ответа клиенту,
++журнал и квоты storage от этой группировки не меняются.
++
+ Core удерживает выбранный storage service в течение runtime. Reload с изменённым
+ selection, launch descriptor или `module_config.session_storage` отклоняется.
+ HTTP server также проверяет эту привязку при открытии новых сессий из изменённого
