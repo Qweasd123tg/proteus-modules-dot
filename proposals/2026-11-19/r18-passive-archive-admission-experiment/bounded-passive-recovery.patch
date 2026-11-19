@@ -1,0 +1,295 @@
+From a4c8782b3f95324f323819473698a2c20e08ef35 Mon Sep 17 00:00:00 2001
+From: Dooter <dooter@localhost>
+Date: Fri, 20 Nov 2026 04:48:10 +0800
+Subject: [PATCH] Bound concurrent passive HTTP archive page recovery
+
+---
+ crates/proteus-core/src/app_server/http.rs    |   2 +
+ .../src/app_server/http/archive_pages.rs      | 146 ++++++++++++++++++
+ .../proteus-core/src/app_server/http/reads.rs |  16 +-
+ .../src/app_server/http/sessions.rs           |  24 ++-
+ .../proteus-core/src/app_server/http/state.rs |   4 +
+ docs/guides/runtime-and-events.md             |  10 +-
+ 6 files changed, 185 insertions(+), 17 deletions(-)
+ create mode 100644 crates/proteus-core/src/app_server/http/archive_pages.rs
+
+diff --git a/crates/proteus-core/src/app_server/http.rs b/crates/proteus-core/src/app_server/http.rs
+index cb4dd47..3232cd6 100644
+--- a/crates/proteus-core/src/app_server/http.rs
++++ b/crates/proteus-core/src/app_server/http.rs
+@@ -19,6 +19,8 @@ use super::AgentAppServer;
+ use super::{AppServerEvent, AppServerHandle, AppSessionActivity, StdioRequest};
+ 
+ mod analysis;
++#[cfg(unix)]
++mod archive_pages;
+ mod commands;
+ mod config;
+ mod lifecycle;
+diff --git a/crates/proteus-core/src/app_server/http/archive_pages.rs b/crates/proteus-core/src/app_server/http/archive_pages.rs
+new file mode 100644
+index 0000000..f1c2d40
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/http/archive_pages.rs
+@@ -0,0 +1,146 @@
++//! Admission for missing passive HTTP history pages, not a storage-wide lock.
++use std::{fmt, path::PathBuf, sync::Arc};
++
++use anyhow::{Context, Result};
++use proteus_contracts::app_protocol::AppTranscriptPage;
++use tokio::sync::Semaphore;
++
++use super::HttpAppState;
++use crate::{app_server::read_model::transcript_page, core::SessionStore};
++
++#[derive(Debug)]
++pub(super) struct QueueFull;
++
++impl fmt::Display for QueueFull {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("archive history recovery queue is full; retry later")
++    }
++}
++
++impl std::error::Error for QueueFull {}
++
++// A full rebuild materializes the whole source. Budget one such passive
++// request per HTTP storage binding, not one per socket or per archive.
++// Limit waiting misses separately so a burst cannot create an unbounded queue.
++pub(super) struct RecoveryAdmission {
++    worker: Arc<Semaphore>,
++    capacity: Semaphore,
++}
++
++impl Default for RecoveryAdmission {
++    fn default() -> Self {
++        Self {
++            worker: Arc::new(Semaphore::new(1)),
++            capacity: Semaphore::new(8),
++        }
++    }
++}
++
++impl RecoveryAdmission {
++    async fn run<T: Send + 'static>(
++        &self,
++        work: impl FnOnce() -> Result<T> + Send + 'static,
++    ) -> Result<T> {
++        let slot = self.capacity.try_acquire().map_err(|_| QueueFull)?;
++        let worker = self.worker.clone().acquire_owned().await?;
++        drop(slot);
++        // If a client goes away after dispatch, the source still consumes memory
++        // until this closure ends. The HTTP future must not own this permit.
++        tokio::task::spawn_blocking(move || {
++            let _worker = worker;
++            work()
++        })
++        .await
++        .context("archive history recovery task failed")?
++    }
++}
++
++enum Probe {
++    Ready(AppTranscriptPage),
++    Miss(SessionStore, Option<String>),
++}
++
++pub(super) async fn read(
++    state: &HttpAppState,
++    dir: PathBuf,
++    before: Option<usize>,
++    revision: Option<String>,
++) -> Result<AppTranscriptPage> {
++    let storage = state.storage_service()?;
++    let active = state.server_for_session_dir(&dir).await.is_some();
++    let probe = tokio::task::spawn_blocking(move || -> Result<Probe> {
++        let store = SessionStore::open(storage, dir)?;
++        // Active and immutable cached reads do not wait behind cold archives.
++        if active {
++            Ok(Probe::Ready(transcript_page(
++                &store,
++                before,
++                revision.as_deref(),
++            )?))
++        } else if let Some(page) = store.saved_transcript_page(before, revision.as_deref()) {
++            Ok(Probe::Ready(page))
++        } else {
++            Ok(Probe::Miss(store, revision))
++        }
++    })
++    .await
++    .context("history page task failed")??;
++    match probe {
++        Probe::Ready(page) => Ok(page),
++        // transcript_page probes again after admission: a preceding request
++        // might already have repaired this exact source or pinned revision.
++        Probe::Miss(store, revision) => {
++            state
++                .archive_pages
++                .run(move || transcript_page(&store, before, revision.as_deref()))
++                .await
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::sync::oneshot;
++
++    #[tokio::test]
++    async fn disconnect_releases_waiter_but_not_running_recovery() {
++        let admission = Arc::new(RecoveryAdmission {
++            worker: Arc::new(Semaphore::new(1)),
++            capacity: Semaphore::new(1),
++        });
++        let (started, running) = oneshot::channel();
++        let (finish, finished) = std::sync::mpsc::channel();
++        let server = admission.clone();
++        let first = tokio::spawn(async move {
++            server
++                .run(move || {
++                    let _ = started.send(());
++                    finished.recv()?;
++                    Ok(())
++                })
++                .await
++        });
++        running.await.unwrap();
++        first.abort();
++        assert!(first.await.unwrap_err().is_cancelled());
++        {
++            let waiting = admission.run(|| -> Result<()> { anyhow::bail!("canceled job ran") });
++            tokio::pin!(waiting);
++            tokio::select! {
++                biased;
++                _ = &mut waiting => panic!("running work lost its permit"),
++                _ = std::future::ready(()) => {}
++            }
++            assert!(
++                admission
++                    .run(|| Ok(()))
++                    .await
++                    .unwrap_err()
++                    .is::<QueueFull>()
++            );
++        }
++        finish.send(()).unwrap();
++        assert_eq!(admission.run(|| Ok(7)).await.unwrap(), 7);
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/http/reads.rs b/crates/proteus-core/src/app_server/http/reads.rs
+index 70cb593..75e5f40 100644
+--- a/crates/proteus-core/src/app_server/http/reads.rs
++++ b/crates/proteus-core/src/app_server/http/reads.rs
+@@ -26,7 +26,9 @@ pub(super) async fn route_get(
+     match read(state, path, query).await {
+         Ok(response) => response,
+         Err(error) => error_response(
+-            if error.is::<crate::app_server::read_model::ToolStateNotReady>() {
++            if archive_queue_full(&error) {
++                StatusCode::SERVICE_UNAVAILABLE
++            } else if error.is::<crate::app_server::read_model::ToolStateNotReady>() {
+                 StatusCode::CONFLICT
+             } else {
+                 StatusCode::BAD_REQUEST
+@@ -36,6 +38,18 @@ pub(super) async fn route_get(
+     }
+ }
+ 
++fn archive_queue_full(error: &anyhow::Error) -> bool {
++    #[cfg(unix)]
++    {
++        error.is::<super::archive_pages::QueueFull>()
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = error;
++        false
++    }
++}
++
+ async fn read(state: &HttpAppState, path: &str, query: Option<&str>) -> Result<HttpResponse> {
+     let response = match path {
+         "/terminals/read" => {
+diff --git a/crates/proteus-core/src/app_server/http/sessions.rs b/crates/proteus-core/src/app_server/http/sessions.rs
+index 10ba848..cb7882a 100644
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -255,21 +255,15 @@ pub(super) async fn history_page_json(
+         .await?;
+     let [before, revision] = super::workspace::query_params(query, ["before", "revision"])?;
+     let before = before.map(|value| value.parse::<usize>()).transpose()?;
+-    let storage = state.storage_service()?;
+-    tokio::task::spawn_blocking(move || {
+-        let store = SessionStore::open(storage, dir)?;
+-        #[cfg(unix)]
+-        {
+-            crate::app_server::read_model::transcript_page(&store, before, revision.as_deref())
+-        }
+-        #[cfg(not(unix))]
+-        {
+-            let _ = (store, before, revision);
+-            anyhow::bail!("paged history requires a source fingerprint on this platform")
+-        }
+-    })
+-    .await
+-    .map_err(|error| anyhow!("history page task failed: {error}"))?
++    #[cfg(unix)]
++    {
++        super::archive_pages::read(state, dir, before, revision).await
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = (dir, before, revision);
++        anyhow::bail!("paged history requires a source fingerprint on this platform")
++    }
+ }
+ 
+ pub(super) async fn server_for_session(
+diff --git a/crates/proteus-core/src/app_server/http/state.rs b/crates/proteus-core/src/app_server/http/state.rs
+index a3e8b97..676115b 100644
+--- a/crates/proteus-core/src/app_server/http/state.rs
++++ b/crates/proteus-core/src/app_server/http/state.rs
+@@ -23,6 +23,8 @@ pub(super) struct HttpLaunchContext {
+ pub(super) struct HttpAppState {
+     pub(super) launch: Arc<HttpLaunchContext>,
+     pub(super) storage: Option<crate::core::StorageService>,
++    #[cfg(unix)]
++    pub(super) archive_pages: Arc<super::archive_pages::RecoveryAdmission>,
+     // Only operations on the same session must wait for terminal settlement.
+     // Owners/waiters keep gates alive; the registry keeps only weak references.
+     session_lifecycle: Arc<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+@@ -64,6 +66,8 @@ impl HttpAppState {
+         let state = Self {
+             launch: Arc::new(launch),
+             storage: server.storage.clone(),
++            #[cfg(unix)]
++            archive_pages: Arc::default(),
+             session_lifecycle: Arc::default(),
+             session_servers: Arc::new(Mutex::new(session_servers)),
+             activity_events,
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index 2f12f7a..3a5a705 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1543,7 +1543,15 @@ turn, пока её индекс не заменён. Полный `/history` с
+ восстановить только при совпадении fingerprint канонического источника до и
+ после чтения; новые строки не выдаются под старой ревизией. При невозможности
+ сохранить производный индекс проверенный результат возвращается из памяти,
+-без цикла повторов.
++без цикла повторов. На Unix промахи `/history/page` у неактивных сессий
++восстанавливаются по одному на HTTP-сервер; до восьми ожидают, последующие
++получают HTTP 503 и могут повторить запрос. Попавшая в очередь страница
++проверяется ещё раз после допуска. Это не глобальная очередь хранилища:
++чтение готовой страницы, чтение активной сессии и запись не получают её
++разрешения. У страницы без указанной ревизии проверка готового кеша сверяет
++источник до и после чтения; эти запросы к storage выполняются вне очереди
++восстановления и могут ждать общий mutex рабочего процесса вместе с записью.
++Лимит не устанавливает приоритет отправки и не гарантирует её задержку.
+ Клиент заранее догружает страницы при приближении к краю окна в обе стороны.
+ Окно просмотра удерживает до 200 строк с бюджетом payload 8 MiB; видимые строки
+ и одна страница остаются целыми, даже когда они превышают бюджет. Дальний край
+-- 
+2.52.0
+
