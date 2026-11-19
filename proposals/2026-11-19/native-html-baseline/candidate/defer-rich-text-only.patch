@@ -1,0 +1,177 @@
+diff --git a/src/ui/extensions/declarative/rich_text.rs b/src/ui/extensions/declarative/rich_text.rs
+index d4090e5743a7bd4a6bf46eacbdaf7b003f306dd5..b931e9f5aa6bc2eabac603bdefa45d9f6ea5baef 100644
+--- a/src/ui/extensions/declarative/rich_text.rs
++++ b/src/ui/extensions/declarative/rich_text.rs
+@@ -19,7 +19,7 @@ impl RichText {
+     }
+ 
+     fn new(html: &str, cx: &mut Context<DeclarativeView>) -> Self {
+-        let state = cx.new(|cx| TextViewState::html(html, cx).scrollable(false));
++        let state = cx.new(|cx| TextViewState::html_for_replacements(html, cx).scrollable(false));
+         let changed = cx.observe(&state, |_, _, cx| cx.notify());
+         Self {
+             state,
+diff --git a/vendor/gpui-base/src/text/markdown_ext.rs b/vendor/gpui-base/src/text/markdown_ext.rs
+index f04215c855dfb2a48cb0c9df2908a3ff4e3ff8be..9a94f5f4ff358c77fb6eaac5af7912e90894016e 100644
+--- a/vendor/gpui-base/src/text/markdown_ext.rs
++++ b/vendor/gpui-base/src/text/markdown_ext.rs
+@@ -373,6 +373,10 @@ impl MarkdownExtensions {
+         }
+     }
+ 
++    pub(crate) fn has_html_inline_parsers(&self) -> bool {
++        !self.html_inline_parsers.is_empty()
++    }
++
+     pub(crate) fn revision(&self) -> u64 {
+         self.revision
+     }
+diff --git a/vendor/gpui-base/src/text/state.rs b/vendor/gpui-base/src/text/state.rs
+index a590e391d4ffa62076ee66e91e5cf6bcda530817..4848bd2f17385020277c30626fd253a88dc70842 100644
+--- a/vendor/gpui-base/src/text/state.rs
++++ b/vendor/gpui-base/src/text/state.rs
+@@ -148,6 +148,7 @@ pub struct TextViewState {
+     /// Content format (markdown / html), used for bounded synchronous parsing
+     /// of small full-replace updates.
+     format: TextViewFormat,
++    defer_html_baseline: bool,
+     text: String,
+     /// The text a `TextView` element last handed over, to recognize the same
+     /// string next frame without comparing its bytes.
+@@ -174,16 +175,27 @@ pub struct TextViewState {
+ impl TextViewState {
+     /// Create a Markdown TextViewState.
+     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
+-        Self::new(TextViewFormat::Markdown, text, cx)
++        Self::new(TextViewFormat::Markdown, text, false, cx)
+     }
+ 
+     /// Create a HTML TextViewState.
+     pub fn html(text: &str, cx: &mut Context<Self>) -> Self {
+-        Self::new(TextViewFormat::Html, text, cx)
++        Self::new(TextViewFormat::Html, text, false, cx)
+     }
+ 
+-    /// Create a new TextViewState.
+-    fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
++    /// Create an HTML view normally updated with full replacements via [`Self::set_text`].
++    /// The first layout is unchanged. A later explicit [`Self::push_str`] is supported,
++    /// but may first parse the last short replacement on the background worker.
++    pub fn html_for_replacements(text: &str, cx: &mut Context<Self>) -> Self {
++        Self::new(TextViewFormat::Html, text, true, cx)
++    }
++
++    fn new(
++        format: TextViewFormat,
++        text: &str,
++        defer_html_baseline: bool,
++        cx: &mut Context<Self>,
++    ) -> Self {
+         let focus_handle = cx.focus_handle();
+         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
+ 
+@@ -246,6 +258,7 @@ impl TextViewState {
+             stream_fade: StreamFadeTracker::default(),
+             fade_tick: None,
+             format,
++            defer_html_baseline,
+             parsed_error: None,
+             text: text.to_string(),
+             element_text: None,
+@@ -540,7 +553,7 @@ impl TextViewState {
+             self.parsed_content.document.clear_selection();
+         }
+         let parse_synchronously = !append && text.len() <= MAX_SYNC_FULL_REPLACE_BYTES;
+-        let update_options = UpdateOptions {
++        let mut update_options = UpdateOptions {
+             revision: self.revision,
+             append,
+             mode: if append {
+@@ -560,6 +573,13 @@ impl TextViewState {
+         if parse_synchronously {
+             match parse_content(self.format, ParsedContent::default(), &update_options) {
+                 Ok(content) => {
++                    // Ordinary HTML is deterministic. An explicit push_str still needs an
++                    // independent baseline, but a view that only sets HTML never uses it.
++                    if self.defer_html_baseline
++                        && !update_options.markdown_extensions.has_html_inline_parsers()
++                    {
++                        update_options.mode = ParseMode::DeferHtmlBaseline;
++                    }
+                     self.reconcile_range_highlights(&content.document, self.revision, false);
+                     self.stream_fade.record(
+                         &self.parsed_content.document,
+@@ -1238,9 +1258,16 @@ pub(crate) struct ParsedContent {
+     pub(crate) node_cx: node::NodeContext,
+ }
+ 
++enum WorkerBaseline {
++    Parsed(ParsedContent),
++    // A successful synchronous HTML replacement without custom parse hooks.
++    // Keep its bounded input, not view-owned nodes or the previous document.
++    DeferredHtml(UpdateOptions),
++}
++
+ struct UpdateFuture {
+     format: TextViewFormat,
+-    content: ParsedContent,
++    content: WorkerBaseline,
+     rx: Pin<Box<Receiver<UpdateOptions>>>,
+     tx_result: Sender<ParsedUpdate>,
+ }
+@@ -1253,7 +1280,7 @@ impl UpdateFuture {
+     ) -> Self {
+         Self {
+             format,
+-            content: Default::default(),
++            content: WorkerBaseline::Parsed(ParsedContent::default()),
+             rx: Box::pin(rx),
+             tx_result,
+         }
+@@ -1270,17 +1297,28 @@ impl Future for UpdateFuture {
+                     let hit_coalesce_budget =
+                         merge_pending_options(&mut options, self.rx.as_ref().get_ref());
+ 
+-                    let res = parse_content(self.format, self.content.clone(), &options);
+-                    if let Ok(content) = &res {
+-                        self.content = content.clone();
++                    if options.mode == ParseMode::DeferHtmlBaseline {
++                        self.content = WorkerBaseline::DeferredHtml(options);
++                    } else {
++                        let baseline = match &self.content {
++                            WorkerBaseline::Parsed(content) => Ok(content.clone()),
++                            WorkerBaseline::DeferredHtml(saved) if options.append => {
++                                parse_content(self.format, ParsedContent::default(), saved)
++                            }
++                            WorkerBaseline::DeferredHtml(_) => Ok(ParsedContent::default()),
++                        };
++                        let res = baseline.and_then(|base| parse_content(self.format, base, &options));
++                        if let Ok(content) = &res {
++                            self.content = WorkerBaseline::Parsed(content.clone());
++                        }
++                        _ = self.tx_result.try_send(ParsedUpdate {
++                            revision: options.revision,
++                            full_parse: !options.append,
++                            selection_compatible: options.mode == ParseMode::Compatible,
++                            baseline_ack: options.mode == ParseMode::BaselineAck,
++                            result: res,
++                        });
+                     }
+-                    _ = self.tx_result.try_send(ParsedUpdate {
+-                        revision: options.revision,
+-                        full_parse: !options.append,
+-                        selection_compatible: options.mode == ParseMode::Compatible,
+-                        baseline_ack: options.mode == ParseMode::BaselineAck,
+-                        result: res,
+-                    });
+                     if hit_coalesce_budget {
+                         cx.waker().wake_by_ref();
+                         return Poll::Pending;
+@@ -1328,6 +1366,7 @@ struct ParsedUpdate {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ enum ParseMode {
+     BaselineAck,
++    DeferHtmlBaseline,
+     Replace,
+     Compatible,
+ }
