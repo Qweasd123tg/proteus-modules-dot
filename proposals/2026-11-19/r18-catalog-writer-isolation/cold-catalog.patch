@@ -1,0 +1,579 @@
+diff --git a/storage/session-storage/README.md b/storage/session-storage/README.md
+index 6ad58bf..532f92a 100644
+--- a/storage/session-storage/README.md
++++ b/storage/session-storage/README.md
+@@ -61,6 +61,17 @@ budget для таких записей; данные не обрезаются.
+ не чинит. История до замены читается по generic part identity, без разбора
+ формата OpenAI или другого провайдера.
+ 
++## Каталог
++
++При отсутствии проверенного индекса `List` читает журнал, не удерживая общий
++mutex сервиса. Одновременно выполняется не более одного обхода каталога на
++экземпляр хранилища. Перед публикацией результата модуль заново проверяет
++incarnation, метки журнала/metadata и состав blobs. Изменившаяся сессия
++проверяется повторно под общей блокировкой; удалённая или пересозданная не
++получает старый индекс. Если проверить полный состав blobs нельзя, чтение
++этой сессии сразу выполняется под общей блокировкой. Обычный список
++пропускает ошибочные сессии, а аудит возвращает ошибку и не доверяет кешу.
++
+ ## Metadata, Blobs И Кеши
+ 
+ Metadata CAS хранит ссылку на content-addressed значение и receipt операции одним
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index 01cd562..e8e9970 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -41,6 +41,8 @@ pub enum BackendKind {
+ pub struct StorageService {
+     kind: BackendKind,
+     state: Mutex<State>,
++    // Bound cold catalog work independently of foreground writers.
++    catalog_scan: Mutex<()>,
+ }
+ struct State {
+     kind: BackendKind,
+@@ -72,6 +74,7 @@ impl StorageService {
+     pub fn new(kind: BackendKind) -> Self {
+         Self {
+             kind,
++            catalog_scan: Mutex::new(()),
+             state: Mutex::new(State {
+                 kind,
+                 writers: HashMap::new(),
+@@ -105,31 +108,36 @@ impl StorageService {
+                     false,
+                 )?,
+             }),
++            List {
++                config_root,
++                workspace_path,
++                audit,
++            } => self.list(&config_root, workspace_path.as_deref(), audit),
+             ReadCache {
+                 session,
+                 key,
+                 source,
+             } => cache::read_cache(session, key, source),
+-            request => self
+-                .state
+-                .lock()
+-                .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))?
+-                .execute(request),
++            request => self.lock_state()?.execute(request),
+         }
+     }
+ 
++    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>> {
++        self.state
++            .lock()
++            .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))
++    }
++
++    fn lock_catalog(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
++        self.catalog_scan
++            .lock()
++            .map_err(|_| anyhow::anyhow!("catalog scan lock poisoned"))
++    }
++
+     /// Validate one session and persist its disposable catalog index.
+     pub fn prime_catalog(&self, path: &Path) -> Result<()> {
+-        let mut state = self
+-            .state
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))?;
+-        let descriptor = state.open(path)?;
+-        let dir = descriptor
+-            .local_path
+-            .clone()
+-            .context("session has no local path")?;
+-        state.catalog_summary(&dir, descriptor, false)?;
++        let _scan = self.lock_catalog()?;
++        self.catalog_summary(path, false)?;
+         Ok(())
+     }
+ }
+@@ -146,11 +154,6 @@ impl State {
+             Describe { session } => Ok(SessionStorageResponse::Session {
+                 descriptor: self.describe(&session)?,
+             }),
+-            List {
+-                config_root,
+-                workspace_path,
+-                audit,
+-            } => self.list(&config_root, workspace_path.as_deref(), audit),
+             AcquireWriter { session } => self.acquire(session),
+             ReleaseWriter { lease } => {
+                 let writer = self.writer(&lease)?;
+@@ -254,8 +257,8 @@ impl State {
+                     .context("model context requested outside the latest admitted turn")?;
+                 Ok(SessionStorageResponse::ModelContext { observations })
+             }
+-            Open { .. } | ReadCache { .. } | ListCandidates { .. } => {
+-                unreachable!("stateless storage request")
++            Open { .. } | ReadCache { .. } | ListCandidates { .. } | List { .. } => {
++                unreachable!("handled by StorageService")
+             }
+             WriteCache {
+                 session,
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index ec3d747..293ad26 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -2,6 +2,8 @@
+ use super::*;
+ use std::{fs::Metadata, time::UNIX_EPOCH};
+ pub(super) mod durable;
++#[cfg(test)]
++mod tests;
+ 
+ #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub(super) struct FileStamp {
+@@ -148,74 +150,160 @@ impl State {
+         self.remember_summary(prefix.stamps.clone(), summary);
+     }
+ 
+-    pub(super) fn catalog_summary(
++    fn cached_summary(
+         &mut self,
+         dir: &Path,
+-        descriptor: StorageSessionDescriptor,
+-        audit: bool,
+-    ) -> Result<StorageSessionSummary> {
+-        let stamps = source_stamp(dir, self.kind)?;
+-        if !audit {
+-            if let Some(cached) = self.catalog.get(&descriptor.session)
+-                && cached.stamps == stamps
+-                && self
+-                    .prefixes
+-                    .get(&descriptor.session)
+-                    .is_some_and(|prefix| prefix.valid_at(dir, &stamps))
+-            {
+-                return Ok(cached.summary.clone());
+-            }
+-            if let Some((summary, prefix)) = durable::load(dir, &descriptor, &stamps) {
+-                self.remember_prefix(descriptor.session.clone(), prefix);
+-                self.remember_summary(stamps, summary.clone());
+-                return Ok(summary);
++        descriptor: &StorageSessionDescriptor,
++        stamps: &SourceStamp,
++    ) -> Option<StorageSessionSummary> {
++        if let Some(cached) = self.catalog.get(&descriptor.session)
++            && &cached.stamps == stamps
++            && self
++                .prefixes
++                .get(&descriptor.session)
++                .is_some_and(|prefix| prefix.valid_at(dir, stamps))
++        {
++            let mut summary = cached.summary.clone();
++            summary.descriptor = descriptor.clone();
++            return Some(summary);
++        }
++        let (summary, prefix) = durable::load(dir, descriptor, stamps)?;
++        self.remember_prefix(descriptor.session.clone(), prefix);
++        self.remember_summary(stamps.clone(), summary.clone());
++        Some(summary)
++    }
++
++    fn remember_summary(&mut self, stamps: SourceStamp, summary: StorageSessionSummary) {
++        let session = summary.descriptor.session.clone();
++        self.catalog_order.retain(|old| old != &session);
++        while self.catalog.len() >= 1024 {
++            if let Some(old) = self.catalog_order.pop_front() {
++                self.catalog.remove(&old);
++            } else {
++                break;
+             }
+         }
+-        let blobs = durable::blob_stamps(dir);
+-        let mut source = self
+-            .kind
+-            .backend()
+-            .snapshot(dir, descriptor.session.session_id)?;
++        self.catalog_order.push_back(session.clone());
++        self.catalog
++            .insert(session, CachedSummary { stamps, summary });
++    }
++}
++
++// The readonly replay owns no service handles and publishes no state or files.
++struct CatalogRead {
++    descriptor: StorageSessionDescriptor,
++    stamps: SourceStamp,
++    blobs: Option<durable::BlobStamps>,
++}
++
++type Projection = (StorageSessionSummary, super::views::PrefixCache);
++
++impl CatalogRead {
++    fn replay(&self, kind: BackendKind, dir: &Path) -> Result<Projection> {
++        let session = self.descriptor.session.session_id;
++        let mut source = kind.backend().snapshot(dir, session)?;
+         let mut fold = Fold::default();
+         while let Some(record) = source.next()? {
+-            fold.apply(descriptor.session.session_id, &record)?;
++            fold.apply(session, &record)?;
+         }
+         let prefix = super::views::PrefixCache {
+-            stamps: stamps.clone(),
++            stamps: self.stamps.clone(),
+             revision: fold.revision(),
+             hint: crate::backend::PrefixHint {
+                 extent: source.extent(),
+                 fingerprint: source.fingerprint().to_owned(),
+             },
+-            blob_digest: blobs.as_ref().map(durable::blob_stamp_digest),
+-        };
+-        self.remember_prefix(descriptor.session.clone(), prefix.clone());
+-        let summary = StorageSessionSummary {
+-            descriptor: descriptor.clone(),
+-            message_count: fold.validation.history().len(),
+-            preview: crate::snapshot::preview(fold.validation.history()),
++            blob_digest: self.blobs.as_ref().map(durable::blob_stamp_digest),
+         };
++        Ok((
++            StorageSessionSummary {
++                descriptor: self.descriptor.clone(),
++                message_count: fold.validation.history().len(),
++                preview: crate::snapshot::preview(fold.validation.history()),
++            },
++            prefix,
++        ))
++    }
++
++    fn publish(
++        self,
++        state: &mut State,
++        dir: &Path,
++        result: Projection,
++        audit: bool,
++    ) -> StorageSessionSummary {
++        let (summary, prefix) = result;
++        state.remember_prefix(summary.descriptor.session.clone(), prefix.clone());
+         if !audit {
+-            if let Some(blobs) = blobs {
++            if let Some(blobs) = self.blobs {
+                 durable::save(dir, &summary, &prefix, blobs);
+             }
+-            self.remember_summary(stamps, summary.clone());
++            state.remember_summary(self.stamps, summary.clone());
+         }
+-        Ok(summary)
++        summary
+     }
++}
+ 
+-    fn remember_summary(&mut self, stamps: SourceStamp, summary: StorageSessionSummary) {
+-        let session = summary.descriptor.session.clone();
+-        self.catalog_order.retain(|old| old != &session);
+-        while self.catalog.len() >= 1024 {
+-            if let Some(old) = self.catalog_order.pop_front() {
+-                self.catalog.remove(&old);
+-            } else {
+-                break;
+-            }
++impl StorageService {
++    pub(super) fn catalog_summary(
++        &self,
++        path: &Path,
++        audit: bool,
++    ) -> Result<StorageSessionSummary> {
++        let mut state = self.lock_state()?;
++        let descriptor = state.open(path)?;
++        // prime_catalog also accepts a journal path. Work only in the resolved directory.
++        let dir = descriptor
++            .local_path
++            .clone()
++            .context("session has no local path")?;
++        let stamps = source_stamp(&dir, self.kind)?;
++        if !audit && let Some(hit) = state.cached_summary(&dir, &descriptor, &stamps) {
++            return Ok(hit);
+         }
+-        self.catalog_order.push_back(session.clone());
+-        self.catalog
+-            .insert(session, CachedSummary { stamps, summary });
++        let read = CatalogRead {
++            descriptor,
++            stamps,
++            blobs: durable::blob_stamps(&dir),
++        };
++        if read.blobs.is_none() {
++            // Without a bounded inventory we cannot fence a detached replay.
++            let projection = read.replay(self.kind, &dir)?;
++            return Ok(read.publish(&mut state, &dir, projection, audit));
++        }
++        drop(state);
++        let projection = read.replay(self.kind, &dir);
++        self.finish_catalog(&dir, read, projection, audit)
++    }
++
++    fn finish_catalog(
++        &self,
++        dir: &Path,
++        read: CatalogRead,
++        projection: Result<Projection>,
++        audit: bool,
++    ) -> Result<StorageSessionSummary> {
++        let mut state = self.lock_state()?;
++        let descriptor = state.open(dir)?;
++        ensure!(
++            descriptor.session == read.descriptor.session,
++            "catalog session incarnation changed"
++        );
++        let stamps = source_stamp(dir, self.kind)?;
++        let blobs = durable::blob_stamps(dir);
++        if stamps != read.stamps || blobs != read.blobs {
++            // The same session changed during replay. Re-read this candidate
++            // once under the ordinary writer fence, never the entire catalog.
++            let current = CatalogRead {
++                descriptor,
++                stamps,
++                blobs,
++            };
++            let result = current.replay(self.kind, dir)?;
++            return Ok(current.publish(&mut state, dir, result, audit));
++        }
++        let (mut summary, prefix) = projection?;
++        summary.descriptor = descriptor;
++        Ok(read.publish(&mut state, dir, (summary, prefix), audit))
+     }
+ }
+diff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs
+new file mode 100644
+index 0000000..7e6103d
+--- /dev/null
++++ b/storage/session-storage/src/service/catalog/tests.rs
+@@ -0,0 +1,81 @@
++//! Deterministically interleave a completed, unpublished cold replay with real writes.
++use super::*;
++use crate::tests::{Fixture, backends, text};
++
++fn pending(f: &Fixture) -> (PathBuf, CatalogRead, Projection) {
++    let dir = f.descriptor.local_path.clone().unwrap();
++    let descriptor = sessions::open(f.service.kind, &dir).unwrap();
++    let read = CatalogRead {
++        descriptor,
++        stamps: source_stamp(&dir, f.service.kind).unwrap(),
++        blobs: durable::blob_stamps(&dir),
++    };
++    let result = read.replay(f.service.kind, &dir).unwrap();
++    (dir, read, result)
++}
++
++#[test]
++fn intervening_commit_revalidates_before_publishing_a_cold_catalog() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("old")]);
++        let (dir, read, old) = pending(&f);
++        assert_eq!(old.0.message_count, 1);
++        f.append(vec![text("new")]);
++        let current = f
++            .service
++            .finish_catalog(&dir, read, Ok(old), false)
++            .unwrap();
++        assert_eq!(current.message_count, 2);
++        let cold = StorageService::new(kind);
++        crate::diagnostics::reset();
++        assert_eq!(cold.catalog_summary(&dir, false).unwrap(), current);
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++    }
++}
++
++#[test]
++fn retired_replay_cannot_publish_into_a_recreated_session() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("retired")]);
++        let (dir, read, old) = pending(&f);
++        f.service
++            .execute(SessionStorageRequest::Delete {
++                lease: f.lease.clone(),
++                operation_id: Uuid::new_v4(),
++            })
++            .unwrap();
++        assert!(!dir.exists());
++        let SessionStorageResponse::Session { descriptor } = f
++            .service
++            .execute(SessionStorageRequest::Create {
++                config_root: f.root.path().into(),
++                workspace_path: f.descriptor.workspace_path.clone(),
++                session_id: f.descriptor.session.session_id,
++                parent_session_id: None,
++            })
++            .unwrap()
++        else {
++            panic!("expected session")
++        };
++        assert_ne!(descriptor.session, read.descriptor.session);
++        f.service
++            .execute(SessionStorageRequest::AcquireWriter {
++                session: descriptor.session,
++            })
++            .unwrap();
++        let index = dir.join(".storage-catalog-v1.json");
++        let before = std::fs::read(&index).ok();
++        assert!(
++            f.service
++                .finish_catalog(&dir, read, Ok(old), false)
++                .is_err()
++        );
++        assert_eq!(before, std::fs::read(&index).ok());
++        assert_eq!(
++            f.service.catalog_summary(&dir, true).unwrap().message_count,
++            0
++        );
++    }
++}
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 3ab2575..5b1fdc2 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -80,6 +80,25 @@ pub(super) fn candidates(
+     workspace: Option<&Path>,
+     audit: bool,
+ ) -> Result<Vec<StorageSessionDescriptor>> {
++    let mut result = Vec::new();
++    for path in candidate_paths(root, workspace, audit)? {
++        match open(kind, &path) {
++            Ok(descriptor) => result.push(descriptor),
++            Err(error) if audit => return Err(error),
++            Err(_) => continue,
++        }
++    }
++    result.sort_by(catalog_order);
++    Ok(result)
++}
++
++fn catalog_order(a: &StorageSessionDescriptor, b: &StorageSessionDescriptor) -> std::cmp::Ordering {
++    b.updated_at_ms
++        .cmp(&a.updated_at_ms)
++        .then_with(|| b.session.key.cmp(&a.session.key))
++}
++
++fn candidate_paths(root: &Path, workspace: Option<&Path>, audit: bool) -> Result<Vec<PathBuf>> {
+     let sessions = root.join("sessions");
+     let workspace_dirs = if let Some(workspace) = workspace {
+         vec![sessions.join(workspace_dir::encode_workspace_path(workspace)?)]
+@@ -110,20 +129,33 @@ pub(super) fn candidates(
+             if !path.is_dir() {
+                 continue;
+             }
+-            let descriptor = match open(kind, &path) {
+-                Ok(d) => d,
++            result.push(path);
++        }
++    }
++    Ok(result)
++}
++
++impl StorageService {
++    pub(super) fn list(
++        &self,
++        root: &Path,
++        workspace: Option<&Path>,
++        audit: bool,
++    ) -> Result<SessionStorageResponse> {
++        let _scan = self.lock_catalog()?;
++        let mut result = Vec::new();
++        for path in candidate_paths(root, workspace, audit)? {
++            match self.catalog_summary(&path, audit) {
++                Ok(summary) => result.push(summary),
+                 Err(error) if audit => return Err(error),
+                 Err(_) => continue,
+-            };
+-            result.push(descriptor);
++            }
+         }
++        // A commit can reorder sessions while the list is being built. Sort the
++        // descriptors we actually return, not timestamps from discovery.
++        result.sort_by(|a, b| catalog_order(&a.descriptor, &b.descriptor));
++        Ok(SessionStorageResponse::Sessions { sessions: result })
+     }
+-    result.sort_by(|a, b| {
+-        b.updated_at_ms
+-            .cmp(&a.updated_at_ms)
+-            .then_with(|| b.session.key.cmp(&a.session.key))
+-    });
+-    Ok(result)
+ }
+ 
+ impl State {
+@@ -197,27 +229,6 @@ impl State {
+         );
+         Ok(descriptor)
+     }
+-    pub(super) fn list(
+-        &mut self,
+-        root: &Path,
+-        workspace: Option<&Path>,
+-        audit: bool,
+-    ) -> Result<SessionStorageResponse> {
+-        let mut result = Vec::new();
+-        for descriptor in candidates(self.kind, root, workspace, audit)? {
+-            let path = descriptor
+-                .local_path
+-                .clone()
+-                .context("session has no local path")?;
+-            match self.catalog_summary(&path, descriptor, audit) {
+-                Ok(summary) => result.push(summary),
+-                Err(error) if audit => return Err(error),
+-                Err(_) => continue,
+-            }
+-        }
+-        Ok(SessionStorageResponse::Sessions { sessions: result })
+-    }
+-
+     pub(super) fn acquire(&mut self, session: SessionLocator) -> Result<SessionStorageResponse> {
+         if let Some(writer) = self.writers.get_mut(&session) {
+             let mut lease = writer.lease.clone();
+diff --git a/storage/session-storage/src/tests/mod.rs b/storage/session-storage/src/tests/mod.rs
+index 8de5cb6..2724171 100644
+--- a/storage/session-storage/src/tests/mod.rs
++++ b/storage/session-storage/src/tests/mod.rs
+@@ -7,17 +7,17 @@ use proteus_contracts::{
+     },
+ };
+ 
+-struct Fixture {
+-    service: StorageService,
+-    root: tempfile::TempDir,
++pub(crate) struct Fixture {
++    pub(crate) service: StorageService,
++    pub(crate) root: tempfile::TempDir,
+     _workspace: tempfile::TempDir,
+-    descriptor: StorageSessionDescriptor,
+-    lease: StorageWriterLease,
++    pub(crate) descriptor: StorageSessionDescriptor,
++    pub(crate) lease: StorageWriterLease,
+     revision: StorageRevision,
+     thread: proteus_contracts::domain::ThreadId,
+ }
+ impl Fixture {
+-    fn new(kind: BackendKind) -> Self {
++    pub(crate) fn new(kind: BackendKind) -> Self {
+         let root = tempfile::tempdir().unwrap();
+         let workspace = tempfile::tempdir().unwrap();
+         let service = StorageService::new(kind);
+@@ -54,7 +54,7 @@ impl Fixture {
+             thread: new_thread_id(),
+         }
+     }
+-    fn append(&mut self, messages: Vec<CanonicalMessage>) -> StorageCommit {
++    pub(crate) fn append(&mut self, messages: Vec<CanonicalMessage>) -> StorageCommit {
+         let commit = StorageCommit {
+             lease: self.lease.clone(),
+             operation_id: new_record_id(),
+@@ -113,10 +113,10 @@ impl Fixture {
+         conversation
+     }
+ }
+-fn backends() -> [BackendKind; 2] {
++pub(crate) fn backends() -> [BackendKind; 2] {
+     [BackendKind::Jsonl, BackendKind::Sqlite]
+ }
+-fn text(value: &str) -> CanonicalMessage {
++pub(crate) fn text(value: &str) -> CanonicalMessage {
+     CanonicalMessage::text(MessageRole::User, value)
+ }
+ 
