@@ -1,0 +1,177 @@
+From 0f7d618a7617e0f4e034d5304f27accdcf9a5e69 Mon Sep 17 00:00:00 2001
+From: Dooter <dot@localhost>
+Date: Fri, 20 Nov 2026 05:35:46 +0800
+Subject: [PATCH] Build transcript commit evidence only for replayed response
+ parts
+
+---
+ .../app_server/transcript/journal/source.rs   | 55 +++++++++++--------
+ .../journal/tests/replay_frontier.rs          | 52 ++++++++++++++++++
+ 2 files changed, 85 insertions(+), 22 deletions(-)
+
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 1c2c9e3..d5a0b62 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -36,7 +36,7 @@ pub(super) fn transcript_from_scan(
+     let mut start = 0;
+     let mut history_only = true;
+     let mut visibility = TranscriptVisibility::default();
+-    let mut committed_parts = std::collections::HashSet::new();
++    let mut last_response_with_parts = None;
+     let mut final_results = std::collections::HashSet::new();
+     let mut subagent_bindings = std::collections::HashMap::new();
+     scan(&mut |record| {
+@@ -58,16 +58,19 @@ pub(super) fn transcript_from_scan(
+         }
+         history_only &= matches!(record.entry, JournalEntry::HistoryMutated(_));
+         match &record.entry {
+-            JournalEntry::HistoryMutated(mutation) => {
+-                for message in &mutation.messages {
+-                    for part in &message.parts {
+-                        committed_parts.insert(part.part_id);
+-                        // A hosted card can take its date from a later tool call.
+-                        if matches!(part.payload, ContentPart::HostedToolActivity { .. }) {
+-                            history_only = false;
+-                        }
+-                    }
+-                }
++            // A hosted card can take its date from a later tool call.
++            JournalEntry::HistoryMutated(mutation) if history_only && start == 0 => {
++                history_only = !mutation
++                    .messages
++                    .iter()
++                    .flat_map(|m| &m.parts)
++                    .any(|p| matches!(p.payload, ContentPart::HostedToolActivity { .. }));
++            }
++            JournalEntry::ModelResponseRecorded(item)
++                if let ModelResponseOutcome::Response { response } = &item.outcome
++                    && response.messages.iter().any(|m| !m.parts.is_empty()) =>
++            {
++                last_response_with_parts = Some(record.session_seq);
+             }
+             JournalEntry::SubagentSessionBoundRecorded(binding) => {
+                 subagent_bindings.insert(binding.source_call_id.clone(), binding.clone());
+@@ -86,7 +89,6 @@ pub(super) fn transcript_from_scan(
+     // as collecting the full date index first. In particular the minimum is by
+     // sequence, not wall clock. Resets retain the scoped, bounded index below.
+     if history_only && start == 0 {
+-        drop(committed_parts);
+         let mut replay = TranscriptReplay {
+             state: TranscriptProjectionState::default(),
+             visibility,
+@@ -104,6 +106,10 @@ pub(super) fn transcript_from_scan(
+     // Workflow lifecycle calls, including those before the frontier, can make
+     // a replayed model response visible. Nested calls only reveal their own
+     // display rows. Timestamp keys only need replayed messages.
++    // Only a replayed model response can consume the committed-part index.
++    // Its evidence may precede a reset or follow the response itself.
++    let need_commits = last_response_with_parts.is_some_and(|seq| seq >= start);
++    let mut committed_parts = std::collections::HashSet::new();
+     let mut timestamps = TranscriptTimestamps::default();
+     scan(&mut |record| {
+         if let JournalEntry::ToolCallRecorded(tool) = &record.entry
+@@ -119,22 +125,27 @@ pub(super) fn transcript_from_scan(
+                 visibility.workflow_root_calls.insert(tool.call.id.clone());
+             }
+         }
+-        if record.session_seq >= start {
+-            match &record.entry {
+-                JournalEntry::HistoryMutated(mutation) => {
+-                    for message in &mutation.messages {
++        match &record.entry {
++            JournalEntry::HistoryMutated(mutation) => {
++                for message in &mutation.messages {
++                    if need_commits {
++                        for part in &message.parts {
++                            committed_parts.insert(part.part_id);
++                        }
++                    }
++                    if record.session_seq >= start {
+                         timestamps.require_message(message);
+                     }
+                 }
+-                JournalEntry::ModelResponseRecorded(response) => {
+-                    if let ModelResponseOutcome::Response { response } = &response.outcome {
+-                        for message in &response.messages {
+-                            timestamps.require_message(message);
+-                        }
++            }
++            JournalEntry::ModelResponseRecorded(item) if record.session_seq >= start => {
++                if let ModelResponseOutcome::Response { response } = &item.outcome {
++                    for message in &response.messages {
++                        timestamps.require_message(message);
+                     }
+                 }
+-                _ => {}
+             }
++            _ => {}
+         }
+         Ok(())
+     })?;
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+index 9af92e9..8bb66a1 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+@@ -383,6 +383,58 @@ fn a_skipped_history_part_can_still_make_a_later_response_visible() {
+     assert_eq!(rows[0].timestamp_ms, Some(first_date));
+ }
+ 
++#[test]
++fn a_late_commit_reveals_sibling_output_only_until_the_next_reset() {
++    let mut fixture = Fixture::new();
++    fixture.history(HistoryMutationKind::Replace, vec![], false, false);
++    fixture.open();
++    let exchange_id = new_exchange_id();
++    let commit = CanonicalMessage::text(MessageRole::Assistant, "committed");
++    let sibling = CanonicalMessage::text(MessageRole::Assistant, "only in response");
++    fixture.push(
++        JournalEntry::ModelRequestRecorded(ModelRequestRecorded {
++            exchange_id,
++            origin: ModelCallOrigin::Direct,
++            owner: crate::contracts::OperationOwner::Workflow,
++            request: CanonicalModelRequest::new(ModelRef::new("fake", "model"), vec![]),
++        }),
++        true,
++        true,
++    );
++    fixture.push(
++        JournalEntry::ModelResponseRecorded(ModelResponseRecorded {
++            exchange_id,
++            outcome: ModelResponseOutcome::Response {
++                response: CanonicalModelResponse::from_messages(
++                    vec![sibling, commit.clone()],
++                    vec![],
++                    FinishReason::Stop,
++                ),
++            },
++        }),
++        true,
++        true,
++    );
++    assert!(
++        source::from_records(&fixture.projection().records, None)
++            .unwrap()
++            .is_empty()
++    );
++    fixture.history(HistoryMutationKind::Append, vec![commit], false, false);
++    let rows = source::from_records(&fixture.projection().records, None).unwrap();
++    assert_eq!(
++        rows.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
++        ["only in response", "committed"]
++    );
++    fixture.history(HistoryMutationKind::Replace, vec![], false, false);
++    assert!(
++        source::from_records(&fixture.projection().records, None)
++            .unwrap()
++            .is_empty()
++    );
++    fixture.assert_prefixes(&[None, Some(fixture.turn)]);
++}
++
+ #[test]
+ fn an_invalid_prefix_is_not_made_valid_by_a_later_reset() {
+     let mut fixture = Fixture::new();
+-- 
+2.52.0
+
