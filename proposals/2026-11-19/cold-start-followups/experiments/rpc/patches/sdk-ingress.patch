@@ -1,0 +1,84 @@
+diff --git a/crates/proteus-module-sdk/src/runtime.rs b/crates/proteus-module-sdk/src/runtime.rs
+index 9e38f57..159504e 100644
+--- a/crates/proteus-module-sdk/src/runtime.rs
++++ b/crates/proteus-module-sdk/src/runtime.rs
+@@ -1,3 +1,5 @@
++mod params;
++
+ use std::{
+     collections::{BTreeMap, BTreeSet, HashMap},
+     sync::{
+@@ -180,7 +182,7 @@ impl ModuleRuntime {
+             bail!("invalid component invocation method {method:?}");
+         }
+         self.validate_invocation_id(&request_id)?;
+-        let call: ProcessComponentInvocation = serde_json::from_value(params)
++        let call = params::decode(params)
+             .context("invalid process component invocation params")?;
+         let cancellation = Arc::new(AtomicBool::new(false));
+         {
+diff --git a/crates/proteus-module-sdk/src/runtime/params.rs b/crates/proteus-module-sdk/src/runtime/params.rs
+new file mode 100644
+index 0000000..37620e3
+--- /dev/null
++++ b/crates/proteus-module-sdk/src/runtime/params.rs
+@@ -0,0 +1,59 @@
++use anyhow::Result;
++use proteus_contracts::contracts::ProcessComponentInvocation;
++use serde_json::Value;
++
++/// The routing envelope is typed; its payload is already decoded JSON. Move it
++/// as-is rather than rebuilding its object/array containers via Value's visitor.
++pub(super) fn decode(mut value: Value) -> Result<ProcessComponentInvocation> {
++    let payload = value.get_mut("params").map(Value::take);
++    let mut call: ProcessComponentInvocation = serde_json::from_value(value)?;
++    if let Some(payload) = payload {
++        call.params = payload;
++    }
++    Ok(call)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn decoded_invocation_preserves_opaque_params_and_strict_routing() {
++        let base = json!({
++            "export": {"slot":"tool", "module_id":"probe"},
++            "lineage": {"root_invocation_id":"h:1:1", "parent_invocation_id":null, "depth":0},
++            "params": null,
++        });
++        assert_eq!(decode(base.clone()).unwrap().params, Value::Null);
++        let mut inputs = vec![base.clone(), Value::Null, json!([])];
++        for payload in [
++            json!([null, {"nested":["строка", 1, false]}]),
++            json!(7),
++            json!(""),
++        ] {
++            let mut request = base.clone();
++            request["params"] = payload;
++            inputs.push(request);
++        }
++        for field in ["params", "lineage", "export"] {
++            let mut request = base.clone();
++            request.as_object_mut().unwrap().remove(field);
++            inputs.push(request);
++        }
++        let mut extra = base;
++        extra["extra"] = true.into();
++        inputs.push(extra);
++        for input in inputs {
++            let expected = serde_json::from_value::<ProcessComponentInvocation>(input.clone());
++            let actual = decode(input);
++            match (expected, actual) {
++                (Ok(expected), Ok(actual)) => assert_eq!(expected, actual),
++                (Err(expected), Err(actual)) => {
++                    assert_eq!(expected.to_string(), actual.to_string());
++                }
++                pair => panic!("changed invocation decoding: {pair:?}"),
++            }
++        }
++    }
++}

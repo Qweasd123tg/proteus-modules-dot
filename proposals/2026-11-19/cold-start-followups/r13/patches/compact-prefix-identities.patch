@@ -1,0 +1,277 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 2c5d010..04439f8 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -140,7 +140,7 @@ fn read_content_value(store: &RemoteSessionStore, expected: &str) -> Option<Valu
+ pub(super) fn read_prefix(store: &RemoteSessionStore, expected: &str) -> Option<PrefixIdentities> {
+     let value = read_value(store, PREFIX)?;
+     (hash(&value).as_deref() == Some(expected)).then_some(())?;
+-    serde_json::from_value(value).ok()
++    PrefixIdentities::decode_cache(value)
+ }
+ 
+ pub(super) fn write_prefix(
+@@ -150,7 +150,7 @@ pub(super) fn write_prefix(
+ ) -> Option<String> {
+     // Only the latest projection appends to this index. Keep one copy even
+     // when old revisions still serve their immutable display pages.
+-    let value = bounded_value(prefix)?;
++    let value = bounded_value(&prefix.encode_cache()?)?;
+     let digest = hash(&value)?;
+     write_value(store, source, PREFIX, value)?;
+     Some(digest)
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+index c50ac74..6e4d864 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+@@ -7,6 +7,8 @@ use crate::{
+ use serde::{Deserialize, Serialize};
+ use std::collections::HashSet;
+ 
++mod packed;
++
+ /// Prefix-only identities. New identities are deliberately not inserted during
+ /// suffix inspection: repeats and forward references within one new turn need
+ /// the complete suffix renderer, but cannot affect previously cached rows.
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+new file mode 100644
+index 0000000..89a3192
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+@@ -0,0 +1,138 @@
++//! The append certificate stores exact keys, not lossy fingerprints of IDs.
++//! Its outer cache envelope still validates the complete JSON value by SHA.
++use super::*;
++use base64::{Engine as _, engine::general_purpose::STANDARD};
++use proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES as LIMIT;
++use serde_json::Value;
++use uuid::Uuid;
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(in crate::core::session_store::remote::view) struct Packed<C> {
++    format: u8,
++    history: String,
++    turns: String,
++    exchanges: String,
++    messages: String,
++    // Each 17-byte record is UUID plus a strict 0/1 explicit membership flag.
++    parts: String,
++    calls: C,
++}
++
++fn pack<const N: usize>(records: impl Iterator<Item = [u8; N]>, n: usize) -> String {
++    let mut bytes = Vec::with_capacity(n * N);
++    for item in records {
++        bytes.extend_from_slice(&item);
++    }
++    STANDARD.encode(bytes)
++}
++
++fn ids(set: &HashSet<Uuid>) -> String {
++    pack(set.iter().map(|id| *id.as_bytes()), set.len())
++}
++
++fn unpack<const N: usize>(s: String, mut visit: impl FnMut([u8; N]) -> Option<()>) -> Option<()> {
++    let raw = STANDARD.decode(s).ok()?;
++    let chunks = raw.chunks_exact(N);
++    if !chunks.remainder().is_empty() {
++        return None;
++    }
++    for bytes in chunks {
++        visit(bytes.try_into().ok()?)?;
++    }
++    Some(())
++}
++
++impl PrefixIdentities {
++    pub(in crate::core::session_store::remote::view) fn encode_cache(
++        &self,
++    ) -> Option<Packed<&HashSet<CallId>>> {
++        // Bound all binary allocations before creating them. The caller also
++        // checks the actual serialized JSON byte count (including escapes).
++        let mut left = LIMIT;
++        for (count, width) in [
++            (self.history.len(), 32),
++            (self.turns.len(), 16),
++            (self.exchanges.len(), 16),
++            (self.messages.len(), 16),
++            (self.parts.len(), 17),
++        ] {
++            left = left.checked_sub(base64::encoded_len(count.checked_mul(width)?, true)?)?;
++        }
++        for call in &self.calls {
++            left = left.checked_sub(call.len().checked_add(2)?)?;
++        }
++        if !self.explicit_committed_parts.is_subset(&self.parts) {
++            return None;
++        }
++        let parts = pack(
++            self.parts.iter().map(|id| {
++                let mut record = [0; 17];
++                record[..16].copy_from_slice(id.as_bytes());
++                record[16] = u8::from(self.explicit_committed_parts.contains(id));
++                record
++            }),
++            self.parts.len(),
++        );
++        Some(Packed {
++            format: 1,
++            history: pack(self.history.iter().copied(), self.history.len()),
++            turns: ids(&self.turns),
++            exchanges: ids(&self.exchanges),
++            messages: ids(&self.messages),
++            parts,
++            calls: &self.calls,
++        })
++    }
++
++    pub(in crate::core::session_store::remote::view) fn decode_cache(value: Value) -> Option<Self> {
++        // Legacy values have no format tag. Never retry a malformed tagged value
++        // as legacy; old readers can rebuild this optional append certificate.
++        if !value.as_object()?.contains_key("format") {
++            return serde_json::from_value(value).ok();
++        }
++        let data: Packed<Vec<CallId>> = serde_json::from_value(value).ok()?;
++        if data.format != 1 {
++            return None;
++        }
++        let mut left = LIMIT;
++        for field in [
++            &data.history,
++            &data.turns,
++            &data.exchanges,
++            &data.messages,
++            &data.parts,
++        ] {
++            left = left.checked_sub(field.len())?;
++        }
++        let mut result = Self::default();
++        for call in data.calls {
++            left = left.checked_sub(call.len().checked_add(2)?)?;
++            result.calls.insert(call).then_some(())?;
++        }
++        unpack(data.history, |hash| {
++            result.history.push(hash);
++            Some(())
++        })?;
++        for (encoded, set) in [
++            (data.turns, &mut result.turns),
++            (data.exchanges, &mut result.exchanges),
++            (data.messages, &mut result.messages),
++        ] {
++            unpack(encoded, |id| set.insert(Uuid::from_bytes(id)).then_some(()))?;
++        }
++        unpack(data.parts, |record: [u8; 17]| {
++            let id = Uuid::from_slice(&record[..16]).ok()?;
++            result.parts.insert(id).then_some(())?;
++            match record[16] {
++                0 => Some(()),
++                1 => result.explicit_committed_parts.insert(id).then_some(()),
++                _ => None,
++            }
++        })?;
++        Some(result)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+new file mode 100644
+index 0000000..83669c6
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+@@ -0,0 +1,92 @@
++use super::*;
++use serde_json::json;
++
++fn fixture() -> PrefixIdentities {
++    let known = Uuid::from_u128(100);
++    PrefixIdentities {
++        history: vec![[12; 32], [1; 32], [12; 32]],
++        turns: HashSet::from([Uuid::from_u128(9), known]),
++        exchanges: HashSet::from([known]),
++        messages: HashSet::from([Uuid::from_u128(2), known]),
++        parts: HashSet::from([known, Uuid::from_u128(4)]),
++        explicit_committed_parts: HashSet::from([known]),
++        calls: HashSet::from([String::new(), "not/UUID: э\n✨".into()]),
++    }
++}
++
++fn value(prefix: &PrefixIdentities) -> Value {
++    serde_json::to_value(prefix.encode_cache().unwrap()).unwrap()
++}
++
++#[test]
++fn tagged_and_old_certificates_preserve_all_exact_sets_and_hash_order() {
++    let original = fixture();
++    let new = value(&original);
++    assert!(serde_json::from_value::<PrefixIdentities>(new.clone()).is_err());
++    let old = serde_json::to_value(&original).unwrap();
++    for v in [new, old] {
++        let mut read = PrefixIdentities::decode_cache(v).unwrap();
++        assert_eq!(read.history, original.history);
++        assert_eq!(read.turns, original.turns);
++        assert_eq!(read.exchanges, original.exchanges);
++        assert_eq!(read.messages, original.messages);
++        assert_eq!(read.parts, original.parts);
++        assert_eq!(
++            read.explicit_committed_parts,
++            original.explicit_committed_parts
++        );
++        assert_eq!(read.calls, original.calls);
++        let mut message =
++            CanonicalMessage::text(crate::model_standard::MessageRole::User, "suffix");
++        assert!(read.message(&message, true));
++        message.parts[0].part_id = Uuid::from_u128(4);
++        assert!(
++            !read.message(&message, true),
++            "non-explicit known part still fences append"
++        );
++    }
++    let empty = PrefixIdentities::default();
++    let rebuilt = PrefixIdentities::decode_cache(value(&empty)).unwrap();
++    assert!(rebuilt.calls.is_empty() && rebuilt.history.is_empty() && rebuilt.parts.is_empty());
++}
++
++#[test]
++fn invalid_tag_encoding_membership_or_duplicate_is_a_cache_miss() {
++    let original = fixture();
++    let empty = value(&PrefixIdentities::default());
++    for (field, bad) in [
++        ("format", json!(2)),
++        ("format", json!("1")),
++        ("history", json!(STANDARD.encode([4; 31]))),
++        ("turns", json!("%%%%")),
++        ("messages", json!(STANDARD.encode([9; 17]))),
++        ("turns", json!(STANDARD.encode([1; 32]))),
++        ("calls", json!(["same", "same"])),
++        ("parts", json!(STANDARD.encode([2; 17]))),
++        ("parts", json!(STANDARD.encode([0; 34]))),
++        ("surprise", json!(true)),
++    ] {
++        let mut v = empty.clone();
++        v[field] = bad;
++        assert!(PrefixIdentities::decode_cache(v).is_none(), "{field}");
++    }
++    let mut no_messages = empty.clone();
++    no_messages.as_object_mut().unwrap().remove("messages");
++    assert!(PrefixIdentities::decode_cache(no_messages).is_none());
++    let mut hybrid = serde_json::to_value(original).unwrap();
++    hybrid["format"] = json!(0);
++    assert!(PrefixIdentities::decode_cache(hybrid).is_none());
++}
++
++#[test]
++fn invalid_subset_and_over_budget_fields_are_not_published_or_used() {
++    let mut original = fixture();
++    original
++        .explicit_committed_parts
++        .insert(Uuid::from_u128(999));
++    assert!(original.encode_cache().is_none());
++
++    let mut v = value(&PrefixIdentities::default());
++    v["history"] = Value::String("A".repeat(LIMIT + 1));
++    assert!(PrefixIdentities::decode_cache(v).is_none());
++}

@@ -1,0 +1,129 @@
+diff --git a/packages/model/src/popup.rs b/packages/model/src/popup.rs
+index 2d1769b..eb44aaf 100644
+--- a/packages/model/src/popup.rs
++++ b/packages/model/src/popup.rs
+@@ -1,5 +1,7 @@
+ //! The popup: model, reasoning stepper and extra session settings.
+ 
++use std::collections::HashMap;
++
+ use proteus_extension::ui::{
+     Node, button, disclosure, divider, muted, note, picker, row, select, stack, text,
+ };
+@@ -70,10 +72,6 @@ pub fn render(host: &Host, models_open: bool) -> Value {
+ }
+ 
+ fn models(host: &Host, model: Option<&Value>, name: &str, back: bool) -> Vec<Value> {
+-    let title = match settings::provider(host).filter(|provider| !provider.is_empty()) {
+-        Some(provider) => format!("Model · {provider}"),
+-        None => "Model".to_owned(),
+-    };
+     let options = model.map(|model| model.list("options")).unwrap_or(&[]);
+     if options.is_empty() {
+         return vec![
+@@ -81,14 +79,35 @@ fn models(host: &Host, model: Option<&Value>, name: &str, back: bool) -> Vec<Val
+             muted("Выбор модели недоступен"),
+         ];
+     }
++    let catalog = settings::config(host).list("model_options");
++    let common = catalog
++        .first()
++        .map(|item| item.str("provider"))
++        .filter(|first| catalog.iter().all(|item| item.str("provider") == *first));
++    let title = match common {
++        Some(provider) if !provider.is_empty() => format!("Model · {provider}"),
++        _ => "Model".to_owned(),
++    };
++    // Values stay borrowed for this render. Repeated names keep the first
++    // catalog match, just as a per-choice linear search would.
++    let mut providers = HashMap::new();
++    if common.is_none() {
++        for item in catalog {
++            providers
++                .entry(item.at("name"))
++                .or_insert_with(|| item.str("provider"));
++        }
++    }
+     let choices: Vec<_> = options
+         .iter()
+         .map(|option| {
+             let value = option.at("value");
+-            (
+-                value.clone(),
+-                settings::model_label(host, value, option.str("name")),
+-            )
++            let name = option.str("name");
++            let label = match providers.get(value) {
++                Some(provider) => format!("{provider}/{name}"),
++                None => name.to_owned(),
++            };
++            (value.clone(), label)
+         })
+         .collect();
+     let rows = vec![
+diff --git a/packages/model/src/settings.rs b/packages/model/src/settings.rs
+index 2165e0a..ffc050a 100644
+--- a/packages/model/src/settings.rs
++++ b/packages/model/src/settings.rs
+@@ -93,29 +93,6 @@ fn current_option(host: &Host) -> &Value {
+         .unwrap_or(&Value::Null)
+ }
+ 
+-/// The only provider of all models, if there is one.
+-pub fn provider(host: &Host) -> Option<String> {
+-    let providers: BTreeSet<&str> = config(host)
+-        .list("model_options")
+-        .iter()
+-        .map(|option| option.str("provider"))
+-        .collect();
+-    if providers.len() == 1 {
+-        providers.first().map(|provider| (*provider).to_owned())
+-    } else {
+-        None
+-    }
+-}
+-
+-/// Model names get their provider when models come from several.
+-pub fn model_label(host: &Host, value: &Value, name: &str) -> String {
+-    let options = config(host).list("model_options");
+-    match options.iter().find(|option| option.at("name") == value) {
+-        Some(option) if provider(host).is_none() => format!("{}/{name}", option.str("provider")),
+-        _ => name.to_owned(),
+-    }
+-}
+-
+ /// Select settings beyond mode, model and reasoning.
+ pub fn extra(host: &Host) -> Vec<Value> {
+     host.session_settings()
+diff --git a/packages/model/src/tests.rs b/packages/model/src/tests.rs
+index 1ae2d18..51eb067 100644
+--- a/packages/model/src/tests.rs
++++ b/packages/model/src/tests.rs
+@@ -226,3 +226,27 @@ fn several_providers_prefix_model_names() {
+     assert!(chooser["back_action"].is_null());
+     assert_eq!(chooser.at("options")[1]["label"], "b/y");
+ }
++
++#[test]
++fn picker_labels_keep_first_catalog_match_and_unknown_model_names() {
++    let host = host(json!({
++        "model_options": [
++            {"provider":"first", "name":"x"},
++            {"provider":"second", "name":"x"},
++            {"provider":"second", "name":"y"},
++        ],
++        "session_settings": [select("model", "y", &["y", "unknown", "x"])]
++    }));
++    let root = popup::render(&host, true);
++    let chooser = &root.at("children")[0];
++    assert_eq!(chooser["title"], "Model");
++    let choices: Vec<_> = chooser
++        .list("options")
++        .iter()
++        .map(|choice| (choice.str("label"), choice.bool("selected")))
++        .collect();
++    assert_eq!(
++        choices,
++        [("second/y", true), ("unknown", false), ("first/x", false)]
++    );
++}

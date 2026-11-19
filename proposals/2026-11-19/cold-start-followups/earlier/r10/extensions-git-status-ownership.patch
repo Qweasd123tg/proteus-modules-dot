@@ -1,0 +1,252 @@
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index a11984d..2388e8e 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -3,6 +3,8 @@
+ //! Arguments double as tab titles (`document.label` is `{filename}`):
+ //! `src/a.rs · diff`, `Все изменения`, `Коммит abc1234`, `Граф коммитов`.
+ 
++use std::rc::Rc;
++
+ use proteus_extension::ui::{
+     Node, button, confirm, diff, fill, muted, note, row, spacer, stack, text,
+ };
+@@ -119,14 +121,13 @@ impl Git {
+     }
+ 
+     fn diff_document(&mut self, host: &Host, path: &str) -> proteus_extension::Result<Vec<Value>> {
+-        let entry = self
+-            .changes()
++        let changes = Rc::clone(&self.changes);
++        let entry = changes
+             .list("entries")
+             .iter()
+-            .find(|entry| entry.str("path") == path)
+-            .cloned();
++            .find(|entry| entry.str("path") == path);
+         let mut header = Vec::new();
+-        if let Some(entry) = &entry {
++        if let Some(entry) = entry {
+             header.push(spacer());
+             match model::staging(entry) {
+                 Staging::Staged => header.push(
+@@ -161,14 +162,15 @@ impl Git {
+         }
+         header.push(icon_button("copy", "copy", path, "Копировать путь"));
+         let diff = self.working_diff(host, path)?;
+-        Ok(vec![row(header), patch_view("diff", &diff, entry.as_ref())])
++        Ok(vec![row(header), patch_view("diff", &diff, entry)])
+     }
+ 
+     fn changes_document(&mut self, host: &Host) -> proteus_extension::Result<Vec<Value>> {
+-        let entries = self.changes().list("entries").to_vec();
++        let changes = Rc::clone(&self.changes);
++        let entries = changes.list("entries");
+         let (added, deleted) = (
+-            self.changes().i64("added").unwrap_or(0),
+-            self.changes().i64("deleted").unwrap_or(0),
++            changes.i64("added").unwrap_or(0),
++            changes.i64("deleted").unwrap_or(0),
+         );
+         let header = row(vec![
+             text(format!("Изменения: {}", entries.len())),
+diff --git a/packages/git/src/main.rs b/packages/git/src/main.rs
+index 926b2a2..f008ca0 100644
+--- a/packages/git/src/main.rs
++++ b/packages/git/src/main.rs
+@@ -11,6 +11,7 @@ mod panel;
+ mod tests;
+ 
+ use std::collections::{HashMap, HashSet};
++use std::rc::Rc;
+ use std::time::{Duration, Instant};
+ 
+ use proteus_extension::ui::muted;
+@@ -32,7 +33,9 @@ pub struct Log {
+ 
+ #[derive(Default)]
+ pub struct Git {
+-    changes: Option<Value>,
++    /// The API replaces this immutable status snapshot as a whole. A panel or
++    /// action may borrow its entries while mutating other extension state.
++    changes: Rc<Value>,
+     deadline: Option<Instant>,
+     branches: Option<Vec<Value>>,
+     /// History of the current branch and, for the graph document, of every ref.
+@@ -125,8 +128,8 @@ impl Extension for Git {
+             return Ok(());
+         }
+         self.refresh(host)?;
+-        let changes = self.changes();
+-        let branch = branch_name(&changes);
++        let changes = &self.changes;
++        let branch = branch_name(changes);
+         match surface {
+             Surface::Badge => {
+                 let mut lines = vec![format!("Изменений: {}", changes.list("entries").len())];
+@@ -172,7 +175,6 @@ impl Extension for Git {
+         if host.surface(view) == Some(Surface::Preview) {
+             return Ok(());
+         }
+-        let entries = self.changes().list("entries").to_vec();
+         if action != "message" {
+             self.error = None;
+         }
+@@ -206,7 +208,7 @@ impl Extension for Git {
+             "toggle_editor" => self.editor_collapsed = !self.editor_collapsed,
+             "signoff" => self.signoff = !self.signoff,
+             "no_verify" => self.no_verify = !self.no_verify,
+-            "commit" => self.commit(host, value.as_str(), &entries),
++            "commit" => self.commit(host, value.as_str()),
+             "stage" | "unstage" | "discard" => {
+                 let paths = paths(value);
+                 if !paths.is_empty() {
+@@ -222,7 +224,9 @@ impl Extension for Git {
+                 self.write(host, &path, json!({"all": true}));
+             }
+             "discard_tracked" => {
+-                let paths: Vec<&str> = entries
++                let paths: Vec<&str> = self
++                    .changes
++                    .list("entries")
+                     .iter()
+                     .filter(|entry| !model::created(entry) && !model::conflict(entry))
+                     .map(|entry| entry.str("path"))
+@@ -235,7 +239,8 @@ impl Extension for Git {
+                 let paths = if action == "trash" {
+                     paths(value)
+                 } else {
+-                    entries
++                    self.changes
++                        .list("entries")
+                         .iter()
+                         .filter(|entry| model::untracked(entry))
+                         .map(|entry| entry.str("path").to_owned())
+@@ -334,7 +339,15 @@ impl Extension for Git {
+                 self.deadline = None;
+                 self.invalidate_refs();
+             }
+-            "tree" => self.tree(host, value.str("id"), value.str("event"), &entries),
++            "tree" => {
++                let changes = Rc::clone(&self.changes);
++                self.tree(
++                    host,
++                    value.str("id"),
++                    value.str("event"),
++                    changes.list("entries"),
++                );
++            }
+             "log" | "graph_log" => {
+                 let hash = value.str("id").to_owned();
+                 self.commit = Some(hash.clone());
+@@ -375,10 +388,6 @@ pub fn branch_name(changes: &Value) -> String {
+ }
+ 
+ impl Git {
+-    fn changes(&self) -> Value {
+-        self.changes.clone().unwrap_or_default()
+-    }
+-
+     fn refresh(&mut self, host: &Host) -> Result {
+         if self
+             .deadline
+@@ -411,7 +420,7 @@ impl Git {
+             self.invalidate_refs();
+             self.head = Some(head);
+         }
+-        self.changes = Some(changes);
++        self.changes = Rc::new(changes);
+         self.deadline = Some(Instant::now() + POLL);
+     }
+ 
+@@ -455,7 +464,7 @@ impl Git {
+         self.amend = !self.amend;
+         if self.amend {
+             if self.message.trim().is_empty() {
+-                let short = self.changes().at("head").str("short").to_owned();
++                let short = self.changes.at("head").str("short").to_owned();
+                 let message = self
+                     .commit_details(host, &short)
+                     .map(|commit| {
+@@ -466,7 +475,7 @@ impl Git {
+                             format!("{summary}\n\n{body}")
+                         }
+                     })
+-                    .unwrap_or_else(|_| self.changes().at("head").str("summary").to_owned());
++                    .unwrap_or_else(|_| self.changes.at("head").str("summary").to_owned());
+                 self.message = message.clone();
+                 self.amend_message = Some(message);
+             }
+@@ -475,10 +484,11 @@ impl Git {
+         }
+     }
+ 
+-    fn commit(&mut self, host: &Host, typed: Option<&str>, entries: &[Value]) {
++    fn commit(&mut self, host: &Host, typed: Option<&str>) {
+         if let Some(typed) = typed {
+             self.message = typed.to_owned();
+         }
++        let entries = self.changes.list("entries");
+         let message = model::message(&self.message, entries);
+         let button =
+             model::commit_button(model::Counts::of(entries), self.amend, message.is_some());
+@@ -508,7 +518,7 @@ impl Git {
+     }
+ 
+     fn sync_line(&self) -> Option<String> {
+-        let changes = self.changes();
++        let changes = &self.changes;
+         Some(
+             match changes.opt_str("upstream").filter(|up| !up.is_empty()) {
+                 None => "Ветка не опубликована".to_owned(),
+diff --git a/packages/git/src/panel.rs b/packages/git/src/panel.rs
+index 9a2c23d..89f512e 100644
+--- a/packages/git/src/panel.rs
++++ b/packages/git/src/panel.rs
+@@ -1,6 +1,8 @@
+ // Адаптировано из Zed: crates/git_ui/src/git_panel.rs, crates/git_ui/src/git_ui.rs
+ //! The panel (changes and history tabs) and the branch picker popup.
+ 
++use std::rc::Rc;
++
+ use proteus_extension::ui::{
+     Node, bar, button, confirm, empty, fill, icon, input, item, menu, menu_header, muted, note,
+     panel_editor, prompt, row, spacer, split_button, stats, tree,
+@@ -334,15 +336,15 @@ impl Git {
+     }
+ 
+     pub fn panel(&mut self, host: &Host, view: &str, branch: &str) -> Result<Value> {
+-        let changes = self.changes();
++        let changes = Rc::clone(&self.changes);
+         if !changes.bool("repository") {
+             return Ok(fill(vec![empty("Нет git-репозитория")]));
+         }
+-        let entries = changes.list("entries").to_vec();
+-        let mut changes_tab = self.changes_tab(&changes, &entries);
++        let entries = changes.list("entries");
++        let mut changes_tab = self.changes_tab(&changes, entries);
+         changes_tab.extend(self.error.as_ref().map(danger));
+         changes_tab.push(self.footer(host, &changes, branch)?);
+-        changes_tab.push(self.commit_editor(&changes, &entries));
++        changes_tab.push(self.commit_editor(&changes, entries));
+         changes_tab.extend(self.last_commit(host, &changes));
+         let history_tab = self.history_tab(host, view, &changes);
+         let tabs = json!({"type": "tabs", "action": "tab", "tabs": [
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 42fd843..8922950 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -372,10 +372,9 @@ fn checkboxes_stage_and_unstage() {
+ #[test]
+ fn commit_sends_options_and_amend_prefills_the_message() {
+     let mut fake = Fake::new();
+-    fake.git.changes.as_mut().unwrap()["entries"]
+-        .as_array_mut()
+-        .unwrap()
+-        .pop();
++    let mut changes = changes();
++    changes["entries"].as_array_mut().unwrap().pop();
++    fake.git.update(changes);
+     fake.act("amend", Value::Null);
+     assert_eq!(fake.git.message, "Last\n\nBody");
+     fake.act("signoff", Value::Null);
