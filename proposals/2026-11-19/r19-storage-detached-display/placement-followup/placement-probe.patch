@@ -1,0 +1,91 @@
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 573126a..965c3d3 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -67,7 +67,7 @@ impl StorageService {
+             after_freeze();
+         }
+         let blobs = catalog::durable::blob_stamps(&dir);
+-        let built = build(session.clone(), frozen, cut, budget)?;
++        let built = placement::dispatch(session.clone(), frozen, cut, budget)?;
+ 
+         // Strict conflict on a changed source, including an intervening append.
+         // A pinned transaction/fd can prove the old view but not today's HEAD.
+@@ -178,3 +178,77 @@ fn build(
+     }
+     Ok(result)
+ }
++
++// Local benchmark probe. The existing cold-scan guard covers dispatch and
++// receive, so no additional display builds can queue within this service.
++mod placement {
++    use super::*;
++    use std::sync::{OnceLock, mpsc};
++
++    struct Job {
++        session: SessionLocator,
++        frozen: Box<dyn FrozenSource>,
++        cut: Option<u64>,
++        budget: u64,
++        reply: mpsc::SyncSender<Result<Built>>,
++    }
++
++    pub(super) fn dispatch(
++        session: SessionLocator,
++        frozen: Box<dyn FrozenSource>,
++        cut: Option<u64>,
++        budget: u64,
++    ) -> Result<Built> {
++        let mode = std::env::var("PROTEUS_DIAG_FOLD_PLACEMENT");
++        match mode.as_deref() {
++            Ok("same") => {
++                static EXECUTOR: OnceLock<std::io::Result<mpsc::SyncSender<Job>>> = OnceLock::new();
++                let tx = EXECUTOR.get_or_init(|| {
++                    let (tx, rx) = mpsc::sync_channel::<Job>(0);
++                    std::thread::Builder::new()
++                        .name("diag-display-replay".into())
++                        .spawn(move || {
++                            while let Ok(job) = rx.recv() {
++                                let result = traced(job.session, job.frozen, job.cut, job.budget);
++                                let _ = job.reply.send(result);
++                            }
++                        })?;
++                    Ok(tx)
++                });
++                let tx = tx
++                    .as_ref()
++                    .map_err(|e| anyhow::anyhow!("diagnostic executor: {e}"))?;
++                let (reply, rx) = mpsc::sync_channel(0);
++                tx.send(Job {
++                    session,
++                    frozen,
++                    cut,
++                    budget,
++                    reply,
++                })
++                .map_err(|_| anyhow::anyhow!("diagnostic executor stopped"))?;
++                rx.recv().context("diagnostic executor dropped reply")?
++            }
++            Ok("direct") => traced(session, frozen, cut, budget),
++            _ => build(session, frozen, cut, budget),
++        }
++    }
++
++    fn traced(
++        session: SessionLocator,
++        frozen: Box<dyn FrozenSource>,
++        cut: Option<u64>,
++        budget: u64,
++    ) -> Result<Built> {
++        let id = std::thread::current().id();
++        let start = std::time::Instant::now();
++        eprintln!("DIAG_FOLD begin {id:?}");
++        let result = build(session, frozen, cut, budget);
++        eprintln!(
++            "DIAG_FOLD end {id:?} {} {}",
++            start.elapsed().as_micros(),
++            result.as_ref().ok().is_some_and(|b| b.projection.is_some())
++        );
++        result
++    }
++}
