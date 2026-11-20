@@ -1,0 +1,93 @@
+--- a/examples/performance/multi-agent/driver.rs
++++ b/examples/performance/multi-agent/driver.rs
+@@ -33,6 +33,8 @@
+     peers: usize,
+     rounds: usize,
+     idle_cap: usize,
++    #[serde(default)]
++    verify_park_resume: bool,
+     /// Benchmark-only seeded sessions use one distinct role/config per peer.
+     #[serde(default)]
+     peer_configs: Vec<PathBuf>,
+@@ -104,7 +106,7 @@
+     )?)?;
+     ensure!((1..=10).contains(&input.peers) && (1..=20).contains(&input.rounds));
+     ensure!(
+-        input.rounds == 1 || input.idle_cap >= input.peers,
++        input.rounds == 1 || input.idle_cap >= input.peers || input.verify_park_resume,
+         "resumed rounds require resident slots for all peers"
+     );
+     ensure!(
+@@ -112,6 +114,11 @@
+             || (input.peer_configs.len() == input.peers
+                 && input.peer_configs.iter().collect::<HashSet<_>>().len() == input.peers),
+         "fixture mode requires exactly one distinct config per peer"
++    );
++    ensure!(
++        !input.verify_park_resume
++            || (input.rounds == 2 && (input.idle_cap == 0 || input.idle_cap == input.peers)),
++        "parking experiment expects two rounds and cap zero or N"
+     );
+     ensure!(input.resident_idle_ms <= 60_000);
+     ensure!((1..=600_000).contains(&input.role_timeout_ms));
+@@ -158,7 +165,7 @@
+     };
+     let control: AgentControlConfig = serde_json::from_value(json!({
+         "binary":input.binary,"max_parallel":10,"max_idle_processes":input.idle_cap,
+-        "roles":roles
++        "roles":roles,"max_depth":1,"durable_parking":input.verify_park_resume && input.idle_cap == 0
+     }))?;
+     let owner = AgentControlRuntime::from_config(&control)?;
+     let runner = owner.service().context("agent control not configured")?;
+@@ -189,6 +196,17 @@
+                 request = request.with_metadata(json!({"task_id":task_id}));
+             }
+             let handle = runner.spawn(request, context.clone()).await?;
++            if input.verify_park_resume {
++                let id = handle.child_thread_id.to_string();
++                ensure!(
++                    round == 0 || task_id.as_ref() == Some(&id),
++                    "resume returned a different task handle"
++                );
++                events.mark(
++                    "task_submitted",
++                    json!({"round":round,"peer":peer,"task_id":id,"requested":task_id}),
++                );
++            }
+             let runner = runner.clone();
+             waiting
+                 .spawn(async move { Ok::<_, anyhow::Error>((peer, runner.wait(&handle).await?)) });
+@@ -212,13 +230,20 @@
+                 result.summary.contains("SYNTHETIC_PAYLOAD_"),
+                 "tool payload is missing from the model answer"
+             );
+-            if input.idle_cap >= input.peers {
++            if input.idle_cap >= input.peers || input.verify_park_resume {
+                 ensure!(
+                     result.metadata["resumable"] == true,
+-                    "resident peer unexpectedly evicted"
++                    "completed peer did not advertise a resumable task"
+                 );
+             }
+             task_ids[peer] = result.child_thread_id.map(|id| id.to_string());
++            if input.verify_park_resume {
++                ensure!(task_ids[peer].is_some(), "missing completed task id");
++                events.mark(
++                    "task_result",
++                    json!({"round":round,"peer":peer,"task_id":task_ids[peer]}),
++                );
++            }
+             events.mark(
+                 "peer_finished",
+                 json!({"round":round,"peer":peer,"metadata":result.metadata}),
+@@ -233,6 +258,10 @@
+         }
+         events.mark("round_settled", json!({"round":round}));
+         tokio::time::sleep(Duration::from_millis(500)).await;
++        if input.verify_park_resume && round == 0 {
++            events.mark("interround_idle", json!({}));
++            tokio::time::sleep(Duration::from_millis(input.resident_idle_ms)).await;
++        }
+     }
+     events.mark("resident_idle", json!({}));
+     tokio::time::sleep(Duration::from_millis(input.resident_idle_ms)).await;

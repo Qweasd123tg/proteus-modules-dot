@@ -1,0 +1,2567 @@
+From fb0b180a778ec33c23a0af11db9abc86d04f57a9 Mon Sep 17 00:00:00 2001
+From: Dooter <dot@localhost>
+Date: Fri, 20 Nov 2026 20:07:02 +0800
+Subject: [PATCH] Experiment: park settled leaf peers on exact server-owned
+ writer receipts
+
+
+diff --git a/crates/proteus-contracts/src/app_protocol/requests.rs b/crates/proteus-contracts/src/app_protocol/requests.rs
+index 55086cb..0da5f4b 100644
+--- a/crates/proteus-contracts/src/app_protocol/requests.rs
++++ b/crates/proteus-contracts/src/app_protocol/requests.rs
+@@ -39,6 +39,10 @@ pub enum StdioRequest {
+     NewSession {
+         id: Option<String>,
+     },
++    /// Read-only checkpoint of this stdio peer; never accepts a path or task selector.
++    ChildSessionCheckpoint {
++        id: Option<String>,
++    },
+     HistorySummary {
+         id: Option<String>,
+     },
+@@ -110,6 +114,7 @@ impl StdioRequest {
+             | Self::DeleteQueuedMessage { id, .. }
+             | Self::ClearHistory { id }
+             | Self::NewSession { id }
++            | Self::ChildSessionCheckpoint { id }
+             | Self::HistorySummary { id }
+             | Self::UsageSummary { id }
+             | Self::Remember { id, .. }
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index e4da971..423d05c 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -28,6 +28,7 @@ mod commands;
+ mod config_builder;
+ mod config_history;
+ mod handle;
++mod peer_settings;
+ mod profile;
+ mod profile_watch;
+ mod read_model;
+@@ -472,6 +473,7 @@ impl AgentAppServer {
+             None,
+             None,
+             None,
++            true,
+         ))
+         .await
+     }
+@@ -490,6 +492,7 @@ impl AgentAppServer {
+             None,
+             Some(parent_session_id),
+             None,
++            true,
+         ))
+         .await
+     }
+@@ -528,6 +531,7 @@ impl AgentAppServer {
+             resumed,
+             None,
+             storage,
++            true,
+         ))
+         .await
+     }
+@@ -558,6 +562,7 @@ impl AgentAppServer {
+             None,
+             None,
+             storage,
++            true,
+         ))
+         .await
+     }
+@@ -593,6 +598,7 @@ impl AgentAppServer {
+             Some(resumed),
+             None,
+             Some(storage),
++            true,
+         ))
+         .await
+     }
+@@ -612,6 +618,7 @@ impl AgentAppServer {
+             None,
+             None,
+             None,
++            true,
+         ))
+         .await
+     }
+@@ -624,6 +631,7 @@ impl AgentAppServer {
+         resumed_session: Option<crate::core::PreparedSession>,
+         parent_session_id: Option<crate::domain::SessionId>,
+         storage: Option<StorageService>,
++        watch_profile: bool,
+     ) -> Result<AppServerHandle> {
+         if let Some(session_store) = resumed_session.as_ref() {
+             cwd = session_store.workspace_path()?;
+@@ -741,7 +749,9 @@ impl AgentAppServer {
+         session_model::restore(&handle, selection_is_new).await?;
+         Box::pin(session_behavior::restore(&handle, selection_is_new)).await?;
+         handle.command_catalog().await?;
+-        profile_watch::start(&handle).await;
++        if watch_profile {
++            profile_watch::start(&handle).await;
++        }
+         if let Some(source) = cached_display_source {
+             read_model::refresh_in_background(&handle, source);
+         }
+diff --git a/crates/proteus-core/src/app_server/http/commands.rs b/crates/proteus-core/src/app_server/http/commands.rs
+index fd3e317..85819fc 100644
+--- a/crates/proteus-core/src/app_server/http/commands.rs
++++ b/crates/proteus-core/src/app_server/http/commands.rs
+@@ -78,6 +78,9 @@ async fn execute_session_request(
+             result
+         }
+         StdioRequest::ClearHistory { .. } => server.clear_history().await.map(|_| None),
++        StdioRequest::ChildSessionCheckpoint { .. } => Err(anyhow::anyhow!(
++            "child checkpoint is a stdio connection control"
++        )),
+         StdioRequest::NewSession { .. } => Err(anyhow::anyhow!(
+             "new_session is a stdio connection control; use the HTTP session API"
+         )),
+diff --git a/crates/proteus-core/src/app_server/peer_settings.rs b/crates/proteus-core/src/app_server/peer_settings.rs
+new file mode 100644
+index 0000000..4591d92
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/peer_settings.rs
+@@ -0,0 +1,23 @@
++use anyhow::{Result, ensure};
++
++impl super::AppServerHandle {
++    /// Includes the current published profile as well as the effective model,
++    /// stream, behavior, permission and actual tool surface. Never retain the
++    /// raw configuration, module secrets, or a live registry in a parked entry.
++    pub(crate) async fn peer_effective_fingerprint(&self) -> Result<String> {
++        let _transition = self.settings_transition.lock().await;
++        ensure!(
++            self.profile_error.lock().await.is_none(),
++            "child profile reload has failed"
++        );
++        let config = self.config.read().await;
++        let baseline = crate::core::peer_authority_fingerprint(
++            &config,
++            self.config_path.as_deref(),
++            &self.cwd,
++        )?;
++        let behavior = self.behavior.read().await;
++        let runtime = self.runtime.peer_settings_fingerprint().await?;
++        crate::core::peer_digest(&("peer-effective-v1", baseline, &*behavior, runtime))
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/session_behavior.rs b/crates/proteus-core/src/app_server/session_behavior.rs
+index c94e3e5..f7fccac 100644
+--- a/crates/proteus-core/src/app_server/session_behavior.rs
++++ b/crates/proteus-core/src/app_server/session_behavior.rs
+@@ -10,7 +10,7 @@ use crate::{
+     model_standard::InstructionKind,
+ };
+ 
+-const FILE: &str = "behavior-selection.json";
++pub(super) const FILE: &str = "behavior-selection.json";
+ const MAX_BYTES: u64 = 16 * 1024;
+ pub(super) const DEFAULT: &str = "_default";
+ 
+diff --git a/crates/proteus-core/src/app_server/session_model.rs b/crates/proteus-core/src/app_server/session_model.rs
+index 40543bd..19c0175 100644
+--- a/crates/proteus-core/src/app_server/session_model.rs
++++ b/crates/proteus-core/src/app_server/session_model.rs
+@@ -10,7 +10,7 @@ use crate::{
+     domain::{ModelRef, ReasoningConfig},
+ };
+ 
+-const FILE: &str = "model-configuration.json";
++pub(super) const FILE: &str = "model-configuration.json";
+ const MAX_BYTES: u64 = 16 * 1024;
+ 
+ #[derive(Clone, Serialize, Deserialize)]
+diff --git a/crates/proteus-core/src/app_server/session_selection.rs b/crates/proteus-core/src/app_server/session_selection.rs
+index 856a763..7a3acbe 100644
+--- a/crates/proteus-core/src/app_server/session_selection.rs
++++ b/crates/proteus-core/src/app_server/session_selection.rs
+@@ -14,7 +14,7 @@ use crate::{
+     domain::{ModelRef, ReasoningConfig},
+ };
+ 
+-const FILE: &str = "model-selection.json";
++pub(super) const FILE: &str = "model-selection.json";
+ const MAX_BYTES: u64 = 16 * 1024;
+ 
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+diff --git a/crates/proteus-core/src/app_server/stdio.rs b/crates/proteus-core/src/app_server/stdio.rs
+index a3332db..8196bfa 100644
+--- a/crates/proteus-core/src/app_server/stdio.rs
++++ b/crates/proteus-core/src/app_server/stdio.rs
+@@ -1,6 +1,6 @@
+ use std::path::PathBuf;
+ 
+-use anyhow::Result;
++use anyhow::{Context, Result};
+ use serde_json::Value;
+ use tokio::{
+     io::{AsyncBufReadExt, AsyncWriteExt},
+@@ -15,6 +15,7 @@ use crate::{
+ use super::runs::SendDispatch;
+ use super::{StdioOutput, StdioRequest};
+ 
++mod parked;
+ mod session;
+ 
+ pub async fn run_stdio_app_server(
+@@ -24,10 +25,63 @@ pub async fn run_stdio_app_server(
+     resume_session_dir: Option<PathBuf>,
+     fresh_session: bool,
+     parent_session_id: Option<crate::domain::SessionId>,
++) -> Result<()> {
++    run_stdio_peer_server(
++        config,
++        cwd,
++        config_path,
++        resume_session_dir,
++        fresh_session,
++        parent_session_id,
++        None,
++        false,
++    )
++    .await
++}
++
++#[doc(hidden)]
++pub async fn run_stdio_peer_server(
++    config: AppConfig,
++    cwd: PathBuf,
++    config_path: Option<PathBuf>,
++    resume_session_dir: Option<PathBuf>,
++    fresh_session: bool,
++    parent_session_id: Option<crate::domain::SessionId>,
++    resume_child_checkpoint: Option<String>,
++    parkable_child: bool,
+ ) -> Result<()> {
+     let original_config = config.clone();
+     let original_cwd = cwd.clone();
+-    let mut server = if let Some(parent_session_id) = parent_session_id {
++    let expected: Option<crate::peer_checkpoint::ParkedCheckpoint> = resume_child_checkpoint
++        .as_deref()
++        .map(serde_json::from_str)
++        .transpose()?;
++    // Ordinary peers do not hash configs. Only opting in captures the actual
++    // loaded config and profile path at startup, before a file can be replaced.
++    anyhow::ensure!(
++        !parkable_child || (fresh_session && parent_session_id.is_some()),
++        "invalid parkable child startup"
++    );
++    let baseline = (parkable_child || expected.is_some())
++        .then(|| {
++            crate::core::peer_authority_fingerprint(&config, config_path.as_deref(), &cwd).ok()
++        })
++        .flatten();
++    let mut server = if let Some(expected) = &expected {
++        anyhow::ensure!(
++            !fresh_session && parent_session_id.is_none(),
++            "invalid cold peer startup"
++        );
++        parked::launch(
++            config,
++            cwd,
++            config_path.as_deref(),
++            resume_session_dir,
++            baseline.as_deref().context("child profile cannot resume")?,
++            expected,
++        )
++        .await?
++    } else if let Some(parent_session_id) = parent_session_id {
+         anyhow::ensure!(
+             fresh_session && resume_session_dir.is_none(),
+             "parent session requires a fresh stdio session"
+@@ -87,7 +141,38 @@ pub async fn run_stdio_app_server(
+         let id = request.id();
+ 
+         match request {
++            StdioRequest::ChildSessionCheckpoint { .. } => {
++                let result = async {
++                    anyhow::ensure!(
++                        commands.is_empty(),
++                        "child checkpoint requires an idle command stream"
++                    );
++                    anyhow::ensure!(
++                        parent_session_id.is_some() || expected.is_some(),
++                        "checkpoint requires a process child"
++                    );
++                    let ready = parked::checkpoint(
++                        &server,
++                        baseline
++                            .as_deref()
++                            .context("child did not opt in to checkpoints")?,
++                    )
++                    .await?;
++                    Ok(Some(serde_json::to_value(ready)?))
++                }
++                .await;
++                send_stdio_response(&output_tx, id, result).await;
++            }
+             StdioRequest::NewSession { .. } => {
++                if expected.is_some() {
++                    send_stdio_response(
++                        &output_tx,
++                        id,
++                        Err(anyhow::anyhow!("a cold peer cannot rotate sessions")),
++                    )
++                    .await;
++                    continue;
++                }
+                 if !commands.is_empty() {
+                     send_stdio_response(
+                         &output_tx,
+diff --git a/crates/proteus-core/src/app_server/stdio/parked.rs b/crates/proteus-core/src/app_server/stdio/parked.rs
+new file mode 100644
+index 0000000..8fd948e
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/stdio/parked.rs
+@@ -0,0 +1,172 @@
++//! A cold process never chooses a workspace or a session. Validate the actual
++//! loaded profile before starting a storage worker; open only the parked
++//! descriptor, then retain its verified writer lease through normal admission.
++use std::path::{Path, PathBuf};
++
++use super::super::{AgentAppServer, AppServerHandle, selected_storage};
++use crate::{
++    core::{AppConfig, PreparedSession, SessionStore},
++    peer_checkpoint::{ParkedCheckpoint, PeerReady},
++};
++use anyhow::{Context, Result, ensure};
++use proteus_contracts::app_protocol::AppSubagentSession;
++
++pub(super) async fn launch(
++    config: AppConfig,
++    cwd: PathBuf,
++    config_path: Option<&Path>,
++    dir: Option<PathBuf>,
++    baseline: &str,
++    expected: &ParkedCheckpoint,
++) -> Result<AppServerHandle> {
++    expected.validate()?;
++    ensure!(
++        baseline == expected.authority_sha256,
++        "parked child profile changed"
++    );
++    ensure!(
++        dir.as_deref() == Some(&expected.session.session_dir)
++            && cwd.canonicalize()? == expected.workspace_path,
++        "parked child launch identity changed"
++    );
++    let storage = selected_storage(&config, &cwd)
++        .await?
++        .context("no child session storage")?;
++    let selected = storage.clone();
++    let dir = expected.session.session_dir.clone();
++    let store = tokio::task::spawn_blocking(move || SessionStore::open(selected, dir)).await??;
++    ensure!(
++        store.session_id() == expected.session.session_id
++            && store.session_dir() == expected.session.session_dir
++            && store.workspace_path()? == expected.workspace_path
++            && store.parent_session_id() == Some(expected.parent_session_id),
++        "parked child storage identity changed"
++    );
++
++    // Acquires the writer and strictly checks the journal without adding any
++    // records. The SAME store/writer is moved into the resumed runtime.
++    store.pin_parked_writer().await?;
++    let (revision, content) = durable_head(&store).await?;
++    ensure!(
++        revision == expected.revision && content == expected.content_sha256,
++        "parked child journal changed"
++    );
++    let prepared =
++        tokio::task::spawn_blocking(move || PreparedSession::from_store(store)).await??;
++    let server = Box::pin(AgentAppServer::launch_inner(
++        config,
++        cwd,
++        config_path,
++        None,
++        Some(prepared),
++        None,
++        Some(storage),
++        false,
++    ))
++    .await?;
++    ensure!(
++        server.peer_effective_fingerprint().await? == expected.effective_sha256,
++        "parked child effective settings changed"
++    );
++    Ok(server)
++}
++
++pub(super) async fn checkpoint(server: &AppServerHandle, baseline: &str) -> Result<PeerReady> {
++    server
++        .runs
++        .lock()
++        .await
++        .ensure_idle_for_model_configuration()?;
++    let pending = server.pending_requests().await;
++    ensure!(
++        pending.approvals.is_empty()
++            && pending.user_inputs.is_empty()
++            && pending.queued_user_messages.is_empty(),
++        "child has pending interaction"
++    );
++    let store = server
++        .runtime
++        .session_store()
++        .context("child has no durable store")?;
++    let (revision, content_sha256) = durable_head(store).await?;
++    let checkpoint = ParkedCheckpoint {
++        session: AppSubagentSession {
++            session_id: store.session_id(),
++            session_dir: store.session_dir().to_owned(),
++        },
++        parent_session_id: store
++            .parent_session_id()
++            .context("child has no persisted parent")?,
++        workspace_path: store.workspace_path()?,
++        revision,
++        content_sha256,
++        authority_sha256: baseline.to_owned(),
++        effective_sha256: server.peer_effective_fingerprint().await?,
++    };
++    checkpoint.validate()?;
++    ensure!(
++        server.cwd_path().canonicalize()? == checkpoint.workspace_path,
++        "child workspace differs from its store"
++    );
++    Ok(PeerReady {
++        checkpoint,
++        root_thread_id: server.runtime.root_thread_id(),
++    })
++}
++
++async fn durable_head(store: &SessionStore) -> Result<(crate::contracts::StorageRevision, String)> {
++    // The writer belongs to this process and remains in the store. Concurrent
++    // external writers must not slip between proof collection and first Send.
++    let (history, interrupted) = store.execution_state().await?;
++    ensure!(
++        history > 0 && interrupted.is_empty(),
++        "child history is empty or interrupted"
++    );
++    let store = store.clone();
++    tokio::task::spawn_blocking(move || read_settled_head(store, history)).await?
++}
++
++fn read_settled_head(
++    store: SessionStore,
++    history_revision: u64,
++) -> Result<(crate::contracts::StorageRevision, String)> {
++    use crate::contracts::{SessionStorageRequest as Request, SessionStorageResponse as Response};
++    use proteus_contracts::storage::journal::{JournalEntry, TurnSettlementStatus};
++    let snapshot = store.snapshot()?;
++    let head = snapshot.descriptor();
++    ensure!(
++        head.revision.history_revision == history_revision && head.revision.session_seq > 0,
++        "child history and journal disagree"
++    );
++    let Response::Records { page } = store.request(Request::ReadRecords {
++        snapshot: head.clone(),
++        after_seq: head.revision.session_seq - 1,
++        limit: 1,
++    })?
++    else {
++        anyhow::bail!("storage did not return the child settlement")
++    };
++    ensure!(
++        page.snapshot == *head && page.next_after_seq.is_none() && page.records.len() == 1,
++        "missing exact terminal child record"
++    );
++    let last = &page.records[0];
++    ensure!(
++        last.session_id == store.session_id()
++            && last.session_seq == head.revision.session_seq
++            && last.turn_id.is_some()
++            && matches!(&last.entry, JournalEntry::TurnSettled(s)
++                if s.status == TurnSettlementStatus::Success && s.output.is_some() && s.error.is_none()),
++        "child journal does not end in successful settlement"
++    );
++    // These selection documents live outside the canonical journal. Seal them
++    // under its writer lease too, before any resumed assembly consults them.
++    let content = crate::core::peer_digest(&(
++        "settled-peer-content-v1",
++        &head.content_sha256,
++        store.read_metadata(super::super::session_selection::FILE)?,
++        store.read_metadata(super::super::session_model::FILE)?,
++        store.read_metadata(super::super::session_behavior::FILE)?,
++    ))?;
++    Ok((head.revision, content))
++}
+diff --git a/crates/proteus-core/src/core/agent_control/process/child.rs b/crates/proteus-core/src/core/agent_control/process/child.rs
+index 7b0d0d6..821b356 100644
+--- a/crates/proteus-core/src/core/agent_control/process/child.rs
++++ b/crates/proteus-core/src/core/agent_control/process/child.rs
+@@ -17,6 +17,9 @@ use tokio::{
+     process::{Child, ChildStdin, Command},
+ };
+ 
++mod parked;
++pub(super) use crate::peer_checkpoint::ParkedCheckpoint;
++
+ use super::output::{ChildOutputs, OutputHealth};
+ use crate::{contracts::CancellationToken, domain::ThreadId};
+ use tokio::time::Instant;
+@@ -31,6 +34,7 @@ pub(super) struct ChildProcess {
+     session: Option<(AppSubagentSession, ThreadId)>,
+     // Remains set if an outer deadline drops send before a complete JSONL frame.
+     write_in_flight: bool,
++    cold: Option<ParkedCheckpoint>,
+ }
+ 
+ impl ChildProcess {
+@@ -41,16 +45,58 @@ impl ChildProcess {
+         cwd: &Path,
+         parent_session_id: crate::domain::SessionId,
+         depth_budget: u64,
++        parking: bool,
++    ) -> Result<Self> {
++        Self::spawn_process(
++            binary,
++            config_ref,
++            extra_args,
++            cwd,
++            parent_session_id,
++            depth_budget,
++            parking,
++            None,
++        )
++    }
++
++    fn spawn_process(
++        binary: &Path,
++        config_ref: &str,
++        extra_args: &[String],
++        cwd: &Path,
++        parent_session_id: crate::domain::SessionId,
++        depth_budget: u64,
++        parking: bool,
++        cold: Option<ParkedCheckpoint>,
+     ) -> Result<Self> {
+         let mut command = Command::new(binary);
+         command
+             .arg("--config")
+             .arg(config_ref)
+             .arg("--cwd")
+-            .arg(cwd)
+-            .arg("--new-session")
+-            .arg("--parent-session-id")
+-            .arg(parent_session_id.to_string())
++            .arg(cwd);
++        if let Some(checkpoint) = &cold {
++            checkpoint.validate()?;
++            anyhow::ensure!(
++                checkpoint.parent_session_id == parent_session_id
++                    && checkpoint.workspace_path == cwd.canonicalize()?,
++                "parked child scope mismatch"
++            );
++            command
++                .arg("--resume-session")
++                .arg(&checkpoint.session.session_dir)
++                .arg("--resume-child-checkpoint")
++                .arg(serde_json::to_string(checkpoint)?);
++        } else {
++            if parking {
++                command.arg("--parkable-child");
++            }
++            command
++                .arg("--new-session")
++                .arg("--parent-session-id")
++                .arg(parent_session_id.to_string());
++        }
++        command
+             .args(extra_args)
+             .arg("server")
+             .arg("stdio")
+@@ -84,6 +130,7 @@ impl ChildProcess {
+             cancellation: None,
+             session: None,
+             write_in_flight: false,
++            cold,
+         })
+     }
+ 
+@@ -136,7 +183,11 @@ impl ChildProcess {
+     pub async fn next_output(&mut self) -> Result<Option<StdioOutput>> {
+         let output = self.outputs.next().await?;
+         if let Some(output) = &output {
+-            observe_session(&mut self.session, output);
++            if let Some(expected) = &self.cold {
++                Self::reject_foreign_cold_output(expected, output)?;
++            } else {
++                observe_session(&mut self.session, output);
++            }
+         }
+         Ok(output)
+     }
+@@ -147,6 +198,11 @@ impl ChildProcess {
+ 
+     /// Выгребает накопившиеся с прошлого turn-а outputs, не блокируясь.
+     pub fn drain_stale_outputs(&mut self) -> Result<()> {
++        // The first cold frame may already be queued. Do not discard identity
++        // or error evidence before the correlated ready handshake.
++        if self.cold.is_some() {
++            return self.outputs.health().check();
++        }
+         self.outputs
+             .drain(|output| observe_session(&mut self.session, output))
+     }
+@@ -180,6 +236,19 @@ impl ChildProcess {
+     }
+ 
+     pub(super) async fn ensure_session(&mut self) -> Result<AppSubagentSession> {
++        if self.session.is_none()
++            && let Some(expected) = self.cold.clone()
++        {
++            let proof =
++                tokio::time::timeout(std::time::Duration::from_secs(5), self.read_checkpoint())
++                    .await
++                    .context("cold child readiness timed out")??;
++            anyhow::ensure!(
++                proof.checkpoint == expected,
++                "resumed child rejected exact checkpoint"
++            );
++            self.session = Some((proof.checkpoint.session, proof.root_thread_id));
++        }
+         while self.session.is_none() {
+             match self.next_control_output().await? {
+                 StdioOutput::Event { event } if matches!(*event, AppServerEvent::Shutdown) => {
+@@ -226,6 +295,7 @@ impl ChildProcess {
+     }
+ 
+     pub(super) async fn new_session(&mut self) -> Result<AppSubagentSession> {
++        anyhow::ensure!(self.cold.is_none(), "a cold peer cannot rotate sessions");
+         let request_id = crate::domain::new_call_id();
+         let previous = self.session.take();
+         self.send(&StdioRequest::NewSession {
+@@ -298,6 +368,7 @@ impl ChildProcess {
+             cancellation: None,
+             session: None,
+             write_in_flight: false,
++            cold: None,
+         }
+     }
+ }
+diff --git a/crates/proteus-core/src/core/agent_control/process/child/parked.rs b/crates/proteus-core/src/core/agent_control/process/child/parked.rs
+new file mode 100644
+index 0000000..7c840b5
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/process/child/parked.rs
+@@ -0,0 +1,130 @@
++//! Correlated proof from the one already-addressed child. A generic snapshot
++//! lacks the persisted dir/parent/workspace and may omit the physical root.
++use super::*;
++use crate::{domain::SessionId, peer_checkpoint::PeerReady};
++impl ChildProcess {
++    pub(in super::super) fn spawn_resumed(
++        binary: &Path,
++        config_ref: &str,
++        extra_args: &[String],
++        cwd: &Path,
++        parent_session_id: SessionId,
++        depth_budget: u64,
++        expected: &ParkedCheckpoint,
++    ) -> Result<Self> {
++        Self::spawn_process(
++            binary,
++            config_ref,
++            extra_args,
++            cwd,
++            parent_session_id,
++            depth_budget,
++            false,
++            Some(expected.clone()),
++        )
++    }
++
++    pub(in super::super) async fn park_checkpoint(
++        &mut self,
++        expected_parent: SessionId,
++        expected_cwd: &Path,
++    ) -> Result<ParkedCheckpoint> {
++        anyhow::ensure!(
++            self.has_complete_write(),
++            "child has an incomplete control write"
++        );
++        let (session, root) = self.session.clone().context("unbound child cannot park")?;
++        let proof = self.read_checkpoint().await?;
++        let checkpoint = proof.checkpoint;
++        anyhow::ensure!(
++            checkpoint.session == session
++                && proof.root_thread_id == root
++                && checkpoint.parent_session_id == expected_parent
++                && checkpoint.workspace_path == expected_cwd.canonicalize()?,
++            "child checkpoint does not match its parent binding"
++        );
++        Ok(checkpoint)
++    }
++
++    pub(super) async fn read_checkpoint(&mut self) -> Result<PeerReady> {
++        let id = crate::domain::new_call_id();
++        self.send(&StdioRequest::ChildSessionCheckpoint {
++            id: Some(id.clone()),
++        })
++        .await?;
++        loop {
++            match self.next_control_output().await? {
++                StdioOutput::Response {
++                    id: Some(r),
++                    ok,
++                    output,
++                    ..
++                } if r == id => {
++                    // Do not report child-owned data, paths or config in these errors.
++                    anyhow::ensure!(ok, "child did not acknowledge a durable checkpoint");
++                    let proof: PeerReady =
++                        serde_json::from_value(output.context("child checkpoint is absent")?)?;
++                    proof.checkpoint.validate()?;
++                    return Ok(proof);
++                }
++                StdioOutput::Event { event } if matches!(*event, AppServerEvent::Shutdown) => {
++                    anyhow::bail!("child shut down before checkpoint")
++                }
++                _ => {}
++            }
++        }
++    }
++
++    pub(super) fn reject_foreign_cold_output(
++        expected: &ParkedCheckpoint,
++        output: &StdioOutput,
++    ) -> Result<()> {
++        if let StdioOutput::Event { event } = output {
++            let id = match event.as_ref() {
++                AppServerEvent::SessionSnapshot { snapshot } => Some(snapshot.session_id),
++                AppServerEvent::PendingRequestsUpdated { snapshot } => Some(snapshot.session_id),
++                AppServerEvent::Runtime { envelope } => {
++                    anyhow::ensure!(
++                        !matches!(envelope.event, crate::domain::Event::SessionStarted { .. }),
++                        "cold child unexpectedly started a fresh session"
++                    );
++                    Some(envelope.session_id)
++                }
++                _ => None,
++            };
++            anyhow::ensure!(
++                id.is_none_or(|id| id == expected.session.session_id),
++                "cold child stream changed session"
++            );
++        }
++        Ok(())
++    }
++
++    pub(in super::super) async fn terminate_verified(&mut self) -> Result<()> {
++        // Let the peer release its selected storage writer and join ordinary
++        // workers before reaping. A nonresponsive peer is killed only for
++        // cleanup; its checkpoint must not be advertised as resumable.
++        let clean = tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            anyhow::ensure!(self.has_complete_write(), "child framing was interrupted");
++            self.send(&StdioRequest::Shutdown {
++                id: Some(crate::domain::new_call_id()),
++            })
++            .await?;
++            let status = self.child.wait().await?;
++            anyhow::ensure!(status.success(), "child did not exit cleanly");
++            Ok::<_, anyhow::Error>(())
++        })
++        .await;
++        if !matches!(clean, Ok(Ok(()))) {
++            if self.child.try_wait()?.is_none() {
++                self.child.start_kill()?;
++            }
++            self.child
++                .wait()
++                .await
++                .context("cannot confirm subagent process exit")?;
++            anyhow::bail!("could not verify clean child shutdown");
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/proteus-core/src/core/agent_control/process/mod.rs b/crates/proteus-core/src/core/agent_control/process/mod.rs
+index c8ce041..16befac 100644
+--- a/crates/proteus-core/src/core/agent_control/process/mod.rs
++++ b/crates/proteus-core/src/core/agent_control/process/mod.rs
+@@ -25,6 +25,9 @@ mod messaging;
+ mod model_selection;
+ mod outcome;
+ mod output;
++mod park_after_turn;
++mod parked;
++mod parking_authority;
+ mod pool;
+ mod reservation;
+ mod run_turn;
+@@ -78,6 +81,7 @@ struct RunnerInner {
+     binary: PathBuf,
+     remaining_depth: u64,
+     max_parallel: usize,
++    durable_parking: bool,
+     cancel_grace: Duration,
+     pool: StdMutex<ProcessPool>,
+     pending: StdMutex<PendingChildren>,
+@@ -108,6 +112,10 @@ impl ProcessAgentControl {
+         history_notifier: HistoryNotifier,
+     ) -> Result<Self> {
+         let remaining_depth = config::effective_depth_budget(parsed.max_depth)?;
++        anyhow::ensure!(
++            !parsed.durable_parking || (parsed.max_idle_processes == 0 && remaining_depth <= 1),
++            "durable_parking requires max_idle_processes = 0 and a leaf agent depth budget"
++        );
+         let profiles = build_agent_profiles(&parsed.roles)?;
+         let binary = match parsed.binary {
+             Some(binary) => binary,
+@@ -136,6 +144,7 @@ impl ProcessAgentControl {
+                 binary,
+                 remaining_depth,
+                 max_parallel: parsed.max_parallel,
++                durable_parking: parsed.durable_parking,
+                 cancel_grace: Duration::from_millis(parsed.cancel_grace_ms),
+                 pool: StdMutex::new(ProcessPool::new(parsed.max_idle_processes)),
+                 pending: StdMutex::new(PendingChildren::default()),
+@@ -196,22 +205,28 @@ impl RunnerInner {
+             .models
+             .resolve(&self.roles[&request.role].config, request, ctx)?;
+ 
+-        let (child_thread_id, resume) =
+-            match request.metadata.get("task_id").and_then(Value::as_str) {
+-                Some(task_id) => {
+-                    let child_thread_id = task_id.parse::<ThreadId>().with_context(|| {
+-                        format!("invalid task_id for resumable subagent: {task_id}")
+-                    })?;
+-                    let reservation = self.lock_pool()?.reserve_resume(
+-                        task_id,
+-                        ctx.session_id,
+-                        &request.role,
+-                        &request.task.cwd,
+-                    )?;
+-                    (child_thread_id, Some(reservation))
+-                }
+-                None => (new_thread_id(), None),
+-            };
++        let supplied_id = request.metadata.get("task_id");
++        if self.durable_parking {
++            anyhow::ensure!(
++                supplied_id.is_none_or(Value::is_string),
++                "task_id must be a string"
++            );
++        }
++        let (child_thread_id, resume) = match supplied_id.and_then(Value::as_str) {
++            Some(task_id) => {
++                let child_thread_id = task_id.parse::<ThreadId>().with_context(|| {
++                    format!("invalid task_id for resumable subagent: {task_id}")
++                })?;
++                let reservation = self.lock_pool()?.reserve_resume(
++                    task_id,
++                    ctx.session_id,
++                    &request.role,
++                    &request.task.cwd,
++                )?;
++                (child_thread_id, Some(reservation))
++            }
++            None => (new_thread_id(), None),
++        };
+ 
+         let history = resume
+             .as_ref()
+@@ -239,6 +254,12 @@ impl RunnerInner {
+     ) -> Result<PooledChild> {
+         let mut pool = self.lock_pool()?;
+         match resume {
++            Some(reservation) if reservation.parked => pool.lease_parked(
++                reservation,
++                &self.binary,
++                &role.config,
++                self.remaining_depth - 1,
++            ),
+             Some(reservation) => pool.lease_reserved(reservation),
+             None => pool.lease_fresh(
+                 &self.binary,
+@@ -247,6 +268,7 @@ impl RunnerInner {
+                 cwd,
+                 parent_session_id,
+                 self.remaining_depth - 1,
++                self.durable_parking,
+             ),
+         }
+     }
+@@ -427,15 +449,29 @@ impl RunnerInner {
+                 // Процесс возвращается в пул до освобождения permit-а,
+                 // чтобы следующий ожидающий нашёл его в idle, а не спавнил
+                 // лишний процесс сверх max_processes.
+-                let resumable = self
+-                    .release_process(
++                let resumable = if self.durable_parking
++                    && status == AgentLifecycleStatus::Completed
++                    && child_alive
++                    && session.is_some()
++                    && leased.authority.is_some()
++                {
++                    self.park_after_turn(
++                        leased,
++                        child_thread_id.to_string(),
++                        history,
++                        &child_ctx.execution.scope.cancellation,
++                    )
++                    .await?
++                } else {
++                    self.release_process(
+                         leased,
+                         child_alive,
+                         ctx.session_id,
+                         child_thread_id.to_string(),
+                         history,
+                     )
+-                    .await?;
++                    .await?
++                };
+                 drop(permit);
+ 
+                 ctx.emit(Event::SubagentFinished {
+diff --git a/crates/proteus-core/src/core/agent_control/process/park_after_turn.rs b/crates/proteus-core/src/core/agent_control/process/park_after_turn.rs
+new file mode 100644
+index 0000000..2296757
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/process/park_after_turn.rs
+@@ -0,0 +1,48 @@
++//! A parking attempt is an optional postcondition of a settled turn, not a
++//! condition for its success. Never rerun a completed turn to obtain a receipt.
++use super::{HistoryRetention, PooledChild, RunnerInner};
++use crate::contracts::CancellationToken;
++use anyhow::Result;
++use std::time::Duration;
++use tokio::time::timeout;
++
++impl RunnerInner {
++    pub(super) async fn park_after_turn(
++        &self,
++        mut leased: PooledChild,
++        task_id: String,
++        history: HistoryRetention,
++        cancel: &CancellationToken,
++    ) -> Result<bool> {
++        let budget = self
++            .roles
++            .get(&leased.role)
++            .and_then(|role| role.config.timeout_ms)
++            .map(Duration::from_millis)
++            .unwrap_or(Duration::from_secs(5))
++            .min(Duration::from_secs(5));
++        let checkpoint = tokio::select! {
++            biased;
++            _ = cancel.cancelled() => None,
++            result = timeout(budget, leased.child.park_checkpoint(leased.parent_session_id, &leased.cwd))
++                => result.ok().and_then(|check| check.ok()),
++        };
++        // No parked entry exists while this old peer could still own its
++        // session's writer. A timeout, failed wait or late cancellation only
++        // forfeits *resumability*, not the proven completed turn.
++        let reaped = matches!(
++            timeout(Duration::from_secs(5), leased.child.terminate_verified()).await,
++            Ok(Ok(()))
++        );
++        let mut pool = self.lock_pool()?;
++        if let Some(checkpoint) = checkpoint
++            && reaped
++            && !cancel.is_cancelled()
++        {
++            return pool.park(leased, checkpoint, task_id, history);
++        }
++        history.expire();
++        pool.discard(leased);
++        Ok(false)
++    }
++}
+diff --git a/crates/proteus-core/src/core/agent_control/process/parked.rs b/crates/proteus-core/src/core/agent_control/process/parked.rs
+new file mode 100644
+index 0000000..f111ec7
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/process/parked.rs
+@@ -0,0 +1,138 @@
++//! Parent-lifetime, bounded receipts for leaf peers reaped after a successful
++//! turn. The store belongs to the same mutex as resident process admission.
++//! It accepts no session paths, launch profiles or resume receipts from callers.
++
++use anyhow::{Context, Result, anyhow, ensure};
++use std::{
++    collections::VecDeque,
++    path::{Path, PathBuf},
++};
++
++use super::{
++    super::history::HistoryRetention, child::ParkedCheckpoint, parking_authority::ParkingAuthority,
++    pool::ResumeReservation,
++};
++use crate::domain::SessionId;
++
++// Global, including reservations from pending spawn futures. Does not change
++// the existing per-session collaboration, pending, process or mailbox limits.
++const MAX_PARKED: usize = 64;
++
++pub(super) struct ParkedTask {
++    pub checkpoint: ParkedCheckpoint,
++    pub parent: SessionId,
++    pub cwd: PathBuf,
++    pub role: String,
++    pub authority: ParkingAuthority,
++    pub history: HistoryRetention,
++}
++
++struct Entry {
++    id: String,
++    task: ParkedTask,
++    ticket: Option<u64>,
++}
++
++#[derive(Default)]
++pub(super) struct ParkedTasks {
++    order: VecDeque<Entry>,
++    next_ticket: u64,
++}
++
++impl ParkedTasks {
++    pub fn reserve(
++        &mut self,
++        id: &str,
++        parent: SessionId,
++        role: &str,
++        cwd: &Path,
++    ) -> Result<Option<ResumeReservation>> {
++        let Some(entry) = self.order.iter_mut().find(|e| e.id == id) else {
++            return Ok(None);
++        };
++        ensure!(
++            entry.task.parent == parent,
++            "unknown task_id (expired or from another session)"
++        );
++        ensure!(
++            entry.task.role == role,
++            "task_id belongs to a different agent profile"
++        );
++        ensure!(
++            std::fs::canonicalize(cwd).context("resolve resume workspace")? == entry.task.cwd,
++            "task_id belongs to a different workspace"
++        );
++        ensure!(
++            entry.ticket.is_none(),
++            "task_id belongs to a subagent resume that is still starting"
++        );
++        let ticket = self.next_ticket;
++        self.next_ticket = ticket
++            .checked_add(1)
++            .context("parking reservation identifier exhausted")?;
++        entry.ticket = Some(ticket);
++        Ok(Some(ResumeReservation {
++            parked: true,
++            process_id: ticket,
++            task_id: id.to_owned(),
++            history: entry.task.history.clone(),
++        }))
++    }
++
++    fn reserved_index(&self, res: &ResumeReservation) -> Result<usize> {
++        self.order
++            .iter()
++            .position(|e| e.id == res.task_id && e.ticket == Some(res.process_id))
++            .ok_or_else(|| anyhow!("parked subagent resume reservation was lost"))
++    }
++
++    pub fn cancel(&mut self, res: &ResumeReservation) -> Result<()> {
++        let i = self.reserved_index(res)?;
++        self.order[i].ticket = None;
++        Ok(())
++    }
++
++    pub fn take(&mut self, res: &ResumeReservation) -> Result<ParkedTask> {
++        let i = self.reserved_index(res)?;
++        Ok(self.order.remove(i).expect("index found").task)
++    }
++
++    pub fn insert(&mut self, id: String, task: ParkedTask) -> bool {
++        // A leased task cannot already have a parked copy. Do not overwrite
++        // any outstanding reservation on a bookkeeping error.
++        if self.order.iter().any(|e| e.id == id) {
++            task.history.expire();
++            return false;
++        }
++        if self.order.len() == MAX_PARKED {
++            let Some(i) = self.order.iter().position(|e| e.ticket.is_none()) else {
++                task.history.expire();
++                return false;
++            };
++            self.order
++                .remove(i)
++                .expect("index found")
++                .task
++                .history
++                .expire();
++        }
++        self.order.push_back(Entry {
++            id,
++            task,
++            ticket: None,
++        });
++        true
++    }
++}
++
++impl Drop for ParkedTasks {
++    fn drop(&mut self) {
++        for e in &self.order {
++            e.task.history.expire();
++        }
++    }
++}
++
++#[cfg(all(test, unix))]
++#[path = "parked_tests.rs"]
++mod tests;
+diff --git a/crates/proteus-core/src/core/agent_control/process/parked_tests.rs b/crates/proteus-core/src/core/agent_control/process/parked_tests.rs
+new file mode 100644
+index 0000000..500b679
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/process/parked_tests.rs
+@@ -0,0 +1,79 @@
++//! Queue and bound invariants independent of any child subprocess.
++use super::*;
++use crate::{contracts::StorageRevision, domain::new_session_id};
++use proteus_contracts::app_protocol::AppSubagentSession;
++
++fn task(cwd: &Path, parent: SessionId) -> ParkedTask {
++    let role: super::super::config::ProcessRoleConfig = serde_json::from_value(serde_json::json!({
++        "name":"r","description":"","config":"fixture"
++    }))
++    .unwrap();
++    ParkedTask {
++        checkpoint: ParkedCheckpoint {
++            session: AppSubagentSession {
++                session_id: new_session_id(),
++                session_dir: cwd.to_owned(),
++            },
++            parent_session_id: parent,
++            workspace_path: cwd.to_owned(),
++            revision: StorageRevision {
++                session_seq: 1,
++                history_revision: 1,
++            },
++            content_sha256: "0".repeat(64),
++            authority_sha256: "1".repeat(64),
++            effective_sha256: "2".repeat(64),
++        },
++        parent,
++        cwd: cwd.into(),
++        role: "r".into(),
++        history: HistoryRetention::new(),
++        authority: ParkingAuthority::capture(&role, cwd, &std::env::current_exe().unwrap())
++            .unwrap(),
++    }
++}
++
++#[test]
++fn cancelled_old_ticket_cannot_steal_a_new_reservation() {
++    let cwd = tempfile::tempdir().unwrap();
++    let cwd = cwd.path();
++    let parent = new_session_id();
++    let mut book = ParkedTasks::default();
++    let record = task(cwd, parent);
++    let history = record.history.clone();
++    assert!(book.insert("a".into(), record));
++    let old = book.reserve("a", parent, "r", cwd).unwrap().unwrap();
++    assert!(book.reserve("a", parent, "r", cwd).is_err());
++    book.cancel(&old).unwrap();
++    let current = book.reserve("a", parent, "r", cwd).unwrap().unwrap();
++    assert!(book.cancel(&old).is_err());
++    assert!(book.take(&old).is_err());
++    let consumed = book.take(&current).unwrap();
++    assert!(consumed.history.same_history(&history));
++    assert!(book.reserve("a", parent, "r", cwd).unwrap().is_none());
++}
++
++#[test]
++fn at_capacity_reservations_are_never_displaced_and_unreservable_history_expires() {
++    let cwd = tempfile::tempdir().unwrap();
++    let cwd = cwd.path();
++    let parent = new_session_id();
++    let mut book = ParkedTasks::default();
++    let mut active = Vec::new();
++    for n in 0..MAX_PARKED {
++        let id = n.to_string();
++        assert!(book.insert(id.clone(), task(cwd, parent)));
++        active.push(book.reserve(&id, parent, "r", cwd).unwrap().unwrap());
++    }
++    let omitted = task(cwd, parent);
++    let observer = omitted.history.clone();
++    assert!(!book.insert("new".into(), omitted));
++    assert!(!observer.is_retained());
++    let last = active.pop().unwrap();
++    book.cancel(&last).unwrap();
++    assert!(book.insert("new".into(), task(cwd, parent)));
++    assert!(!last.history.is_retained());
++    assert!(active.iter().all(|res| res.history.is_retained()));
++    drop(book);
++    assert!(active.iter().all(|res| !res.history.is_retained()));
++}
+diff --git a/crates/proteus-core/src/core/agent_control/process/parking_authority.rs b/crates/proteus-core/src/core/agent_control/process/parking_authority.rs
+new file mode 100644
+index 0000000..208bada
+--- /dev/null
++++ b/crates/proteus-core/src/core/agent_control/process/parking_authority.rs
+@@ -0,0 +1,107 @@
++//! Cheap parent-owned witness. Capture at physical process creation, not just
++//! after settlement: a replacement directory can have the same pathname.
++use std::path::{Path, PathBuf};
++
++use anyhow::{Result, ensure};
++
++use super::config::ProcessRoleConfig;
++
++type FileIdentity = (PathBuf, u64, u64);
++type BinaryStamp = (u64, i64, i64, i64, i64);
++type BinaryWitness = (FileIdentity, BinaryStamp);
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(super) struct ParkingAuthority {
++    role: String,
++    cwd: FileIdentity,
++    binary: BinaryWitness,
++}
++
++impl ParkingAuthority {
++    pub(super) fn capture(role: &ProcessRoleConfig, cwd: &Path, binary: &Path) -> Result<Self> {
++        // A PATH search is intentionally not emulated by the parent.
++        ensure!(
++            binary.is_absolute(),
++            "parked peer requires an absolute executable"
++        );
++        Ok(Self {
++            role: crate::core::peer_digest(role)?,
++            cwd: directory_witness(cwd)?,
++            binary: binary_witness(binary)?,
++        })
++    }
++
++    pub(super) fn verify(&self, role: &ProcessRoleConfig, cwd: &Path, binary: &Path) -> Result<()> {
++        ensure!(
++            self == &Self::capture(role, cwd, binary)?,
++            "parked peer role, workspace or executable changed"
++        );
++        Ok(())
++    }
++}
++
++#[cfg(unix)]
++fn directory_witness(path: &Path) -> Result<FileIdentity> {
++    use std::os::unix::fs::MetadataExt;
++    let path = path.canonicalize()?;
++    let stat = std::fs::metadata(&path)?;
++    ensure!(stat.is_dir(), "parked peer workspace is not a directory");
++    Ok((path, stat.dev(), stat.ino()))
++}
++
++#[cfg(unix)]
++fn binary_witness(path: &Path) -> Result<BinaryWitness> {
++    use std::os::unix::fs::MetadataExt;
++    let path = path.canonicalize()?;
++    let stat = std::fs::metadata(&path)?;
++    ensure!(stat.is_file(), "parked peer executable is not a file");
++    Ok((
++        (path, stat.dev(), stat.ino()),
++        (
++            stat.len(),
++            stat.mtime(),
++            stat.mtime_nsec(),
++            stat.ctime(),
++            stat.ctime_nsec(),
++        ),
++    ))
++}
++
++#[cfg(not(unix))]
++fn binary_witness(_path: &Path) -> Result<BinaryWitness> {
++    anyhow::bail!("stable parked-peer executable identities are unavailable on this platform")
++}
++
++#[cfg(not(unix))]
++fn directory_witness(_path: &Path) -> Result<FileIdentity> {
++    anyhow::bail!("stable parked-peer filesystem identities are unavailable on this platform")
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn replacing_workspace_at_same_path_denies_cold_resume() {
++        let dir = tempfile::tempdir().unwrap();
++        let cwd = dir.path().join("cwd");
++        std::fs::create_dir(&cwd).unwrap();
++        let binary = dir.path().join("peer");
++        std::fs::write(&binary, "first").unwrap();
++        let role: ProcessRoleConfig = serde_json::from_value(serde_json::json!({
++            "name": "peer", "description": "", "config": "example"
++        }))
++        .unwrap();
++        let witness = ParkingAuthority::capture(&role, &cwd, &binary).unwrap();
++        witness.verify(&role, &cwd, &binary).unwrap();
++        let mut other = role.clone();
++        other.args.push("--another-profile-arg".into());
++        assert!(witness.verify(&other, &cwd, &binary).is_err());
++        std::fs::write(&binary, "rewritten").unwrap();
++        assert!(witness.verify(&role, &cwd, &binary).is_err());
++        let witness = ParkingAuthority::capture(&role, &cwd, &binary).unwrap();
++        std::fs::rename(&cwd, dir.path().join("old")).unwrap();
++        std::fs::create_dir(&cwd).unwrap();
++        assert!(witness.verify(&role, &cwd, &binary).is_err());
++    }
++}
+diff --git a/crates/proteus-core/src/core/agent_control/process/pool.rs b/crates/proteus-core/src/core/agent_control/process/pool.rs
+index 2d9faa6..655dc0f 100644
+--- a/crates/proteus-core/src/core/agent_control/process/pool.rs
++++ b/crates/proteus-core/src/core/agent_control/process/pool.rs
+@@ -15,6 +15,11 @@ use anyhow::{Context, Result, anyhow, bail};
+ 
+ use super::super::history::HistoryRetention;
+ use super::{child::ChildProcess, config::ProcessRoleConfig};
++use super::{
++    child::ParkedCheckpoint,
++    parked::{ParkedTask, ParkedTasks},
++    parking_authority::ParkingAuthority,
++};
+ use crate::domain::SessionId;
+ 
+ pub(super) struct ProcessPool {
+@@ -25,6 +30,7 @@ pub(super) struct ProcessPool {
+     next_process_id: u64,
+     clock: u64,
+     max_idle_processes: usize,
++    parked: ParkedTasks,
+ }
+ 
+ pub(super) struct PooledChild {
+@@ -34,6 +40,7 @@ pub(super) struct PooledChild {
+     pub role: String,
+     pub parent_session_id: SessionId,
+     pub used: bool,
++    pub authority: Option<ParkingAuthority>,
+ }
+ 
+ struct IdleChild {
+@@ -57,8 +64,9 @@ struct ResumableProcessTask {
+ 
+ #[derive(Debug, Clone)]
+ pub(super) struct ResumeReservation {
+-    process_id: u64,
+-    task_id: String,
++    pub(super) process_id: u64,
++    pub(super) task_id: String,
++    pub(super) parked: bool,
+     pub history: HistoryRetention,
+ }
+ 
+@@ -77,6 +85,7 @@ impl ProcessPool {
+             next_process_id: 0,
+             clock: 0,
+             max_idle_processes,
++            parked: ParkedTasks::default(),
+         }
+     }
+ 
+@@ -90,6 +99,9 @@ impl ProcessPool {
+         role: &str,
+         cwd: &Path,
+     ) -> Result<ResumeReservation> {
++        if let Some(reservation) = self.parked.reserve(task_id, session_id, role, cwd)? {
++            return Ok(reservation);
++        }
+         let requested_cwd = canonical_cwd(cwd);
+         let task = self
+             .resumable
+@@ -130,6 +142,7 @@ impl ProcessPool {
+                 process_id: task.process_id,
+                 task_id: task_id.to_owned(),
+                 history: task.history,
++                parked: false,
+             });
+         }
+         if self.reserved.contains_key(&task.process_id) {
+@@ -171,6 +184,13 @@ impl ProcessPool {
+         &mut self,
+         reservation: &ResumeReservation,
+     ) -> Result<ReleaseOutcome> {
++        if reservation.parked {
++            self.parked.cancel(reservation)?;
++            return Ok(ReleaseOutcome {
++                retained: true,
++                evicted: vec![],
++            });
++        }
+         let reserved = self
+             .reserved
+             .remove(&reservation.process_id)
+@@ -197,6 +217,7 @@ impl ProcessPool {
+         cwd: &Path,
+         parent_session_id: SessionId,
+         child_depth_budget: u64,
++        durable_parking: bool,
+     ) -> Result<PooledChild> {
+         let cwd_key = canonical_cwd(cwd);
+         let mut index = 0;
+@@ -220,8 +241,12 @@ impl ProcessPool {
+             index += 1;
+         }
+ 
+-        let id = self.next_process_id;
+-        self.next_process_id = self.next_process_id.wrapping_add(1);
++        let id = self.next_id()?;
++        let authority = if durable_parking {
++            Some(ParkingAuthority::capture(role, cwd, binary)?)
++        } else {
++            None
++        };
+         let child = ChildProcess::spawn(
+             binary,
+             &role.config,
+@@ -229,6 +254,7 @@ impl ProcessPool {
+             cwd,
+             parent_session_id,
+             child_depth_budget,
++            durable_parking,
+         )
+         .with_context(|| format!("failed to spawn process agent profile {role_name}"))?;
+         self.leased.insert(id);
+@@ -239,9 +265,81 @@ impl ProcessPool {
+             role: role_name.to_owned(),
+             parent_session_id,
+             used: false,
++            authority,
+         })
+     }
+ 
++    fn next_id(&mut self) -> Result<u64> {
++        let id = self.next_process_id;
++        self.next_process_id = id
++            .checked_add(1)
++            .context("process agent identifier exhausted")?;
++        Ok(id)
++    }
++
++    /// The reserved receipt is consumed even on setup failure. Never silently
++    /// retry an uncertain restore or allocate a fresh history in its place.
++    pub(super) fn lease_parked(
++        &mut self,
++        reservation: &ResumeReservation,
++        binary: &Path,
++        role: &ProcessRoleConfig,
++        depth: u64,
++    ) -> Result<PooledChild> {
++        let task = self.parked.take(reservation)?;
++        task.authority.verify(role, &task.cwd, binary)?;
++        let id = self.next_id()?;
++        let child = ChildProcess::spawn_resumed(
++            binary,
++            &role.config,
++            &role.args,
++            &task.cwd,
++            task.parent,
++            depth,
++            &task.checkpoint,
++        )?;
++        self.leased.insert(id);
++        Ok(PooledChild {
++            child,
++            id,
++            cwd: task.cwd,
++            parent_session_id: task.parent,
++            role: task.role,
++            used: true,
++            authority: Some(task.authority),
++        })
++    }
++
++    /// Called only after the old peer has been successfully reaped. Failed
++    /// probes/reaps must use discard() instead and cannot publish a receipt.
++    pub(super) fn park(
++        &mut self,
++        mut child: PooledChild,
++        checkpoint: ParkedCheckpoint,
++        task_id: String,
++        history: HistoryRetention,
++    ) -> Result<bool> {
++        anyhow::ensure!(
++            self.leased.remove(&child.id),
++            "parking without a process lease"
++        );
++        let authority = child
++            .authority
++            .take()
++            .context("missing parking authority")?;
++        Ok(self.parked.insert(
++            task_id,
++            ParkedTask {
++                checkpoint,
++                parent: child.parent_session_id,
++                cwd: child.cwd,
++                role: child.role,
++                authority,
++                history,
++            },
++        ))
++    }
++
+     /// Returns a terminal child to the bounded idle pool and installs exactly
+     /// one resumable task binding for its current history. The returned flag is
+     /// authoritative: cap pressure may immediately evict this same child.
+diff --git a/crates/proteus-core/src/core/agent_control/process/tests.rs b/crates/proteus-core/src/core/agent_control/process/tests.rs
+index 2ff8a33..06b0c70 100644
+--- a/crates/proteus-core/src/core/agent_control/process/tests.rs
++++ b/crates/proteus-core/src/core/agent_control/process/tests.rs
+@@ -93,6 +93,7 @@ async fn reserved_and_leased_children_are_never_idle_eviction_victims() {
+         parent_session_id: session_id,
+         role: "helper".to_owned(),
+         used: true,
++        authority: None,
+     };
+     let first_release = pool.release(
+         first,
+@@ -114,6 +115,7 @@ async fn reserved_and_leased_children_are_never_idle_eviction_victims() {
+         parent_session_id: session_id,
+         role: "helper".to_owned(),
+         used: true,
++        authority: None,
+     };
+     let second_release = pool.release(
+         second,
+@@ -139,6 +141,7 @@ async fn reserved_and_leased_children_are_never_idle_eviction_victims() {
+         parent_session_id: session_id,
+         role: "helper".to_owned(),
+         used: true,
++        authority: None,
+     };
+     let mut third_release = pool.release(
+         third,
+diff --git a/crates/proteus-core/src/core/config.rs b/crates/proteus-core/src/core/config.rs
+index 283ffa7..ee8e06f 100644
+--- a/crates/proteus-core/src/core/config.rs
++++ b/crates/proteus-core/src/core/config.rs
+@@ -161,6 +161,10 @@ pub struct AgentControlConfig {
+     pub max_parallel: usize,
+     #[serde(default = "default_agent_max_idle_processes")]
+     pub max_idle_processes: usize,
++    /// Opt in to restoring settled, zero-residency leaf process agents while
++    /// this controller lives. Never authorizes process recovery from client input.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub durable_parking: bool,
+ }
+ 
+ impl Default for AgentControlConfig {
+@@ -175,6 +179,7 @@ impl Default for AgentControlConfig {
+             cancel_grace_ms: default_agent_cancel_grace_ms(),
+             max_parallel: default_agent_max_parallel(),
+             max_idle_processes: default_agent_max_idle_processes(),
++            durable_parking: false,
+         }
+     }
+ }
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 227e1c3..1ce9dce 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -19,6 +19,8 @@ mod model_call_scope;
+ mod model_context;
+ mod model_service;
+ mod module_catalog;
++mod peer_authority;
++pub(crate) use peer_authority::{peer_authority_fingerprint, peer_digest};
+ mod permission_mode;
+ mod prompt_replay;
+ mod provider_hosted_tools;
+diff --git a/crates/proteus-core/src/core/peer_authority.rs b/crates/proteus-core/src/core/peer_authority.rs
+new file mode 100644
+index 0000000..234c7a8
+--- /dev/null
++++ b/crates/proteus-core/src/core/peer_authority.rs
+@@ -0,0 +1,73 @@
++//! Pins the parsed configuration of an explicitly parked process peer. The
++//! digest is an equality witness, not a bearer credential or a session key.
++use std::{io, path::Path};
++
++use anyhow::{Context, Result, ensure};
++use ring::digest::{Context as Sha256, SHA256};
++use serde::Serialize;
++
++pub(crate) fn peer_digest(value: &impl Serialize) -> Result<String> {
++    struct Writer(Sha256);
++    impl io::Write for Writer {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.0.update(bytes);
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++    let mut writer = Writer(Sha256::new(&SHA256));
++    serde_json::to_writer(&mut writer, value)?;
++    Ok(writer
++        .0
++        .finish()
++        .as_ref()
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect())
++}
++
++pub(crate) fn peer_authority_fingerprint(
++    config: &super::AppConfig,
++    config_path: Option<&Path>,
++    cwd: &Path,
++) -> Result<String> {
++    let path = config_path.context("parking requires a resolved child profile")?;
++    // The plugin manifests may contribute executable settings independently
++    // of AppConfig. This prototype cannot pin their actually assembled inputs.
++    ensure!(
++        config.addons.plugins.is_empty(),
++        "plugin-backed profiles cannot park"
++    );
++    let source = super::physical_config_path(path).canonicalize()?;
++    let cwd = cwd.canonicalize()?;
++    peer_digest(&(
++        "peer-baseline-v1",
++        source,
++        super::config_selection(path)?,
++        cwd,
++        config,
++        &config.behavior_tools,
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn equal_loaded_policy_and_profile_selector_required() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("peer.toml");
++        std::fs::write(&path, "").unwrap();
++        let mut config = crate::core::AppConfig::default();
++        let hash = |config: &_, path: &Path| {
++            peer_authority_fingerprint(config, Some(path), dir.path()).unwrap()
++        };
++        let prior = hash(&config, &path);
++        let other = crate::core::config_reference(&path, "alternative").unwrap();
++        assert_ne!(hash(&config, &other), prior);
++        config.tools.enabled.push("another-tool".into());
++        assert_ne!(hash(&config, &path), prior);
++    }
++}
+diff --git a/crates/proteus-core/src/core/runtime.rs b/crates/proteus-core/src/core/runtime.rs
+index f1df40d..f3ec301 100644
+--- a/crates/proteus-core/src/core/runtime.rs
++++ b/crates/proteus-core/src/core/runtime.rs
+@@ -33,6 +33,7 @@ mod history;
+ mod hooks;
+ mod images;
+ mod paths;
++mod peer_settings;
+ mod reload;
+ mod residency;
+ mod resume;
+@@ -449,6 +450,10 @@ impl AgentRuntime {
+         self.session.steering.queued_messages().await
+     }
+ 
++    pub(crate) fn root_thread_id(&self) -> ThreadId {
++        self.session.thread_id
++    }
++
+     pub fn session_id(&self) -> crate::domain::SessionId {
+         self.session.session_id
+     }
+diff --git a/crates/proteus-core/src/core/runtime/peer_settings.rs b/crates/proteus-core/src/core/runtime/peer_settings.rs
+new file mode 100644
+index 0000000..863ae07
+--- /dev/null
++++ b/crates/proteus-core/src/core/runtime/peer_settings.rs
+@@ -0,0 +1,25 @@
++//! A comparable projection of *live* settings; do not use journal summaries
++//! or the launch configuration to infer a transient delegated model choice.
++use anyhow::{Context, Result, ensure};
++
++impl super::AgentRuntime {
++    pub(crate) async fn peer_settings_fingerprint(&self) -> Result<String> {
++        ensure!(
++            self.services.terminals.is_empty().await,
++            "child retains process-local terminal handles"
++        );
++        let captured = self.capture_execution_snapshot().await;
++        let mut config = captured
++            .config_snapshot
++            .context("parking requires a durable execution configuration")?;
++        // Construction timestamp is not execution authority.
++        config.ts = 0;
++        let stream = captured
++            .runtime
++            .registry
++            .model_config
++            .as_ref()
++            .map(|m| m.stream);
++        crate::core::peer_digest(&("peer-runtime-v1", config, stream))
++    }
++}
+diff --git a/crates/proteus-core/src/core/runtime/terminals.rs b/crates/proteus-core/src/core/runtime/terminals.rs
+index 0c501b0..c684849 100644
+--- a/crates/proteus-core/src/core/runtime/terminals.rs
++++ b/crates/proteus-core/src/core/runtime/terminals.rs
+@@ -15,6 +15,12 @@ pub(super) struct TerminalRegistry {
+     admission: Mutex<()>,
+ }
+ impl TerminalRegistry {
++    // Even a finished process may have buffered output behind its controller.
++    // Parking cannot promise that a new process can still read that handle.
++    pub(super) async fn is_empty(&self) -> bool {
++        self.entries.lock().await.is_empty()
++    }
++
+     pub async fn control(
+         &self,
+         id: Uuid,
+@@ -250,9 +256,11 @@ mod eviction_tests {
+             columns: 80,
+             rows: 24,
+         };
++        assert!(registry.is_empty().await);
+         let live = registry
+             .publish(descriptor(), Arc::new(Record(false)))
+             .await?;
++        assert!(!registry.is_empty().await);
+         let expired = registry
+             .publish(descriptor(), Arc::new(Record(true)))
+             .await?;
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index b7fea6b..df77371 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -23,6 +23,10 @@ enum PreparedHistory {
+ impl PreparedSession {
+     pub(crate) fn from_dir(service: StorageService, session_dir: PathBuf) -> Result<Self> {
+         let store = RemoteSessionStore::open(service, session_dir)?;
++        Self::from_store(store)
++    }
++
++    pub(crate) fn from_store(store: RemoteSessionStore) -> Result<Self> {
+         if let Some((source, view)) = store.saved_read_view() {
+             return Ok(Self {
+                 store,
+diff --git a/crates/proteus-core/src/core/session_store/remote/writer.rs b/crates/proteus-core/src/core/session_store/remote/writer.rs
+index 038d25f..b24de8d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/writer.rs
++++ b/crates/proteus-core/src/core/session_store/remote/writer.rs
+@@ -35,6 +35,9 @@ pub(super) struct RemoteWriter {
+     lease: Option<StorageWriterLease>,
+     revision: StorageRevision,
+     retired: bool,
++    // A disposable cold peer must never attach a second writer to its
++    // previously witnessed history, even if a component is restarted.
++    pinned: bool,
+     display_capture: Option<DisplayCapture>,
+ }
+ 
+@@ -77,6 +80,7 @@ impl RemoteWriter {
+             lease: None,
+             revision: StorageRevision::default(),
+             retired: false,
++            pinned: false,
+             display_capture: None,
+         }
+     }
+@@ -86,6 +90,7 @@ impl RemoteWriter {
+         if let Some(lease) = &self.lease {
+             return Ok(lease.clone());
+         }
++        ensure!(!self.pinned, "parked session writer lease was lost");
+         self.display_capture = None;
+         match self
+             .service
+@@ -107,6 +112,12 @@ impl RemoteWriter {
+         }
+     }
+ 
++    async fn pin_lease(&mut self) -> Result<()> {
++        self.acquire().await?;
++        self.pinned = true;
++        Ok(())
++    }
++
+     async fn read_state(
+         &mut self,
+         request: impl Fn(StorageWriterLease) -> Request,
+@@ -115,6 +126,9 @@ impl RemoteWriter {
+         match self.service.execute(request(lease)).await {
+             Err(error) if lease_lost(&error) => {
+                 self.lease = None;
++                if self.pinned {
++                    return Err(error.context("parked session writer lease was lost"));
++                }
+                 let lease = self.acquire().await?;
+                 self.service.execute(request(lease)).await
+             }
+@@ -179,6 +193,13 @@ impl RemoteWriter {
+                     .await;
+                 if lease_lost(&original) {
+                     self.lease = None;
++                    if self.pinned {
++                        // CommitStatus is read-only. Even if it finds this exact
++                        // operation, the rest of a cold turn cannot use a new lease.
++                        return Err(
++                            original.context("parked session writer lease was lost during commit")
++                        );
++                    }
+                 }
+                 match status {
+                     Ok(Response::CommitStatus { ack: Some(ack) }) => ack,
+@@ -241,6 +262,10 @@ impl Drop for RemoteWriter {
+ }
+ 
+ impl RemoteSessionStore {
++    pub(crate) async fn pin_parked_writer(&self) -> Result<()> {
++        self.writer.lock().await.pin_lease().await
++    }
++
+     async fn transaction<T: Send + 'static>(
+         &self,
+         operation: impl for<'a> FnOnce(
+@@ -603,3 +628,6 @@ impl RemoteSessionStore {
+         .await
+     }
+ }
++
++#[cfg(test)]
++mod parked_tests;
+diff --git a/crates/proteus-core/src/core/session_store/remote/writer/parked_tests.rs b/crates/proteus-core/src/core/session_store/remote/writer/parked_tests.rs
+new file mode 100644
+index 0000000..af258cb
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/writer/parked_tests.rs
+@@ -0,0 +1,121 @@
++use super::*;
++use crate::process_adapters::{ProcessInvocationError, ProcessInvocationFailure};
++use proteus_contracts::contracts::SessionLocator;
++use proteus_module_protocol::v3::ComponentFailure;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use uuid::Uuid;
++
++/// After the first operational lease is lost, the replacement exposes a
++/// different history. Only the ordinary (non-parked) path may acquire it.
++#[derive(Default)]
++struct ReplacingStorage {
++    invalid_lease_reply: bool,
++    lost: AtomicBool,
++    acquires: AtomicU64,
++    reads: AtomicU64,
++}
++
++fn revision(generation: u64) -> StorageRevision {
++    StorageRevision {
++        session_seq: generation * 2,
++        history_revision: generation,
++    }
++}
++
++#[async_trait::async_trait]
++impl crate::contracts::SessionStorage for ReplacingStorage {
++    async fn execute(&self, request: Request) -> Result<Response> {
++        self.execute_blocking(request)
++    }
++
++    fn execute_blocking(&self, request: Request) -> Result<Response> {
++        match request {
++            Request::AcquireWriter { session } => {
++                let generation = self.acquires.fetch_add(1, Ordering::SeqCst) + 1;
++                Ok(Response::Writer {
++                    lease: StorageWriterLease {
++                        session,
++                        token: Uuid::new_v4(),
++                        generation: Uuid::from_u128(generation.into()),
++                    },
++                    revision: revision(generation),
++                })
++            }
++            Request::ReadExecutionState { lease } => {
++                self.reads.fetch_add(1, Ordering::SeqCst);
++                let generation = u64::try_from(lease.generation.as_u128())?;
++                if generation == 1 && self.lost.load(Ordering::SeqCst) {
++                    if self.invalid_lease_reply {
++                        return Err(SessionStorageFailure::InvalidWriterLease.into());
++                    }
++                    return Err(ProcessInvocationError::new(
++                        "storage fixture",
++                        "read execution state",
++                        ProcessInvocationFailure::ComponentLost(ComponentFailure::ProcessExit),
++                    )
++                    .into());
++                }
++                Ok(Response::ExecutionState {
++                    revision: revision(generation),
++                    interrupted_turns: Vec::new(),
++                })
++            }
++            Request::ReleaseWriter { .. } => Ok(Response::Done),
++            request => panic!("unexpected fake storage request: {request:?}"),
++        }
++    }
++}
++
++fn fixture(invalid_lease_reply: bool) -> (Arc<ReplacingStorage>, RemoteWriter) {
++    let storage = Arc::new(ReplacingStorage {
++        invalid_lease_reply,
++        ..ReplacingStorage::default()
++    });
++    let writer = RemoteWriter::new(
++        storage.clone(),
++        SessionLocator {
++            session_id: crate::domain::new_session_id(),
++            key: "parking-unit-test".to_owned(),
++        },
++    );
++    (storage, writer)
++}
++
++async fn read_revision(writer: &mut RemoteWriter) -> Result<StorageRevision> {
++    match writer
++        .read_state(|lease| Request::ReadExecutionState { lease })
++        .await?
++    {
++        Response::ExecutionState { revision, .. } => Ok(revision),
++        response => panic!("unexpected fake storage response: {response:?}"),
++    }
++}
++
++#[tokio::test]
++async fn pinned_writer_never_reacquires_after_storage_loss() {
++    for invalid_lease_reply in [false, true] {
++        let (storage, mut writer) = fixture(invalid_lease_reply);
++        writer.pin_lease().await.unwrap();
++        assert_eq!(read_revision(&mut writer).await.unwrap(), revision(1));
++        storage.lost.store(true, Ordering::SeqCst);
++
++        let loss = read_revision(&mut writer).await.unwrap_err();
++        assert!(lease_lost(&loss), "{loss:#}");
++        assert!(read_revision(&mut writer).await.is_err());
++        assert_eq!(storage.acquires.load(Ordering::SeqCst), 1);
++        assert_eq!(storage.reads.load(Ordering::SeqCst), 2);
++    }
++}
++
++#[tokio::test]
++async fn ordinary_writer_still_reacquires_after_storage_loss() {
++    for invalid_lease_reply in [false, true] {
++        let (storage, mut writer) = fixture(invalid_lease_reply);
++        assert_eq!(read_revision(&mut writer).await.unwrap(), revision(1));
++        storage.lost.store(true, Ordering::SeqCst);
++
++        assert_eq!(read_revision(&mut writer).await.unwrap(), revision(2));
++        assert_eq!(storage.acquires.load(Ordering::SeqCst), 2);
++        assert_eq!(storage.reads.load(Ordering::SeqCst), 3);
++    }
++}
+diff --git a/crates/proteus-core/src/lib.rs b/crates/proteus-core/src/lib.rs
+index 6ffa36f..9ea4408 100644
+--- a/crates/proteus-core/src/lib.rs
++++ b/crates/proteus-core/src/lib.rs
+@@ -4,6 +4,7 @@ pub mod app_server;
+ pub mod core;
+ #[cfg(feature = "memory-diagnostics")]
+ pub(crate) mod memory_diagnostics;
++mod peer_checkpoint;
+ pub mod process_adapters;
+ pub(crate) mod stubs;
+ pub(crate) mod tools;
+diff --git a/crates/proteus-core/src/main.rs b/crates/proteus-core/src/main.rs
+index cdc7fee..edfe00f 100644
+--- a/crates/proteus-core/src/main.rs
++++ b/crates/proteus-core/src/main.rs
+@@ -10,7 +10,7 @@ use proteus_contracts::{
+     contracts::ToolRegistry,
+     domain::{AgentOutput, ModuleManifest, PermissionMode, SessionId, ToolSafety},
+ };
+-use proteus_core::app_server::{http::run_http_app_server, stdio::run_stdio_app_server};
++use proteus_core::app_server::{http::run_http_app_server, stdio::run_stdio_peer_server};
+ use proteus_core::core::{
+     AgentControlRuntime, AppConfig, AssemblyPlan, ModuleCatalog, ModuleEpoch, TopologyBuildInput,
+     TopologySnapshot, TopologyWarning, build_topology_snapshot, register_provider_hosted_tools,
+@@ -67,6 +67,16 @@ struct Cli {
+     cwd: Option<PathBuf>,
+     #[arg(long)]
+     resume_session: Option<PathBuf>,
++    /// Parent-only cold peer guard. This is never accepted as tool metadata.
++    #[arg(
++        long,
++        hide = true,
++        requires = "resume_session",
++        conflicts_with = "new_session"
++    )]
++    resume_child_checkpoint: Option<String>,
++    #[arg(long, hide = true, requires = "parent_session_id")]
++    parkable_child: bool,
+     /// Всегда стартовать свежую session вместо resume последней workspace
+     /// session (используется subagent process runner-ом для детей).
+     #[arg(long)]
+@@ -112,6 +122,11 @@ fn validate_parent_session(cli: &Cli, command: &CliCommand) -> Result<()> {
+             || (matches!(command, CliCommand::ServerStdio) && !cli.interactive),
+         "--parent-session-id is only valid with --new-session server stdio"
+     );
++    anyhow::ensure!(
++        cli.resume_child_checkpoint.is_none()
++            || (matches!(command, CliCommand::ServerStdio) && !cli.interactive),
++        "child checkpoint requires an explicit stdio resume"
++    );
+     Ok(())
+ }
+ 
+@@ -206,13 +221,15 @@ async fn run_cli() -> Result<()> {
+         return proteus_core::app_server::acp::run_acp_server(config, config_path).await;
+     }
+     if matches!(command, CliCommand::ServerStdio) {
+-        return run_stdio_app_server(
++        return run_stdio_peer_server(
+             config,
+             cwd,
+             config_path,
+             cli.resume_session,
+             cli.new_session,
+             cli.parent_session_id,
++            cli.resume_child_checkpoint,
++            cli.parkable_child,
+         )
+         .await;
+     }
+diff --git a/crates/proteus-core/src/peer_checkpoint.rs b/crates/proteus-core/src/peer_checkpoint.rs
+new file mode 100644
+index 0000000..9fe8452
+--- /dev/null
++++ b/crates/proteus-core/src/peer_checkpoint.rs
+@@ -0,0 +1,51 @@
++//! Private parent/child control proof. The logical binding stays in the
++//! parent's pool; no control request can open a locator from a client.
++use proteus_contracts::{
++    app_protocol::AppSubagentSession,
++    contracts::StorageRevision,
++    domain::{SessionId, ThreadId},
++};
++use serde::{Deserialize, Serialize};
++use std::path::PathBuf;
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct ParkedCheckpoint {
++    pub session: AppSubagentSession,
++    pub parent_session_id: SessionId,
++    pub workspace_path: PathBuf,
++    pub revision: StorageRevision,
++    // Journal content and the session-level selection documents (not snapshot_id).
++    pub content_sha256: String,
++    pub authority_sha256: String,
++    pub effective_sha256: String,
++}
++
++impl ParkedCheckpoint {
++    pub(crate) fn validate(&self) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.parent_session_id != self.session.session_id
++                && self.session.session_dir.is_absolute()
++                && self.workspace_path.is_absolute()
++                && self.revision.session_seq > 0
++                && self.revision.history_revision > 0
++                && [
++                    &self.content_sha256,
++                    &self.authority_sha256,
++                    &self.effective_sha256
++                ]
++                .into_iter()
++                .all(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
++            "invalid durable child checkpoint"
++        );
++        Ok(())
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct PeerReady {
++    pub checkpoint: ParkedCheckpoint,
++    // Physical runtime incarnation, not a durable session or logical task id.
++    pub root_thread_id: ThreadId,
++}
+diff --git a/crates/proteus-core/tests/fixtures/parking_probe.py b/crates/proteus-core/tests/fixtures/parking_probe.py
+new file mode 100644
+index 0000000..f800723
+--- /dev/null
++++ b/crates/proteus-core/tests/fixtures/parking_probe.py
+@@ -0,0 +1,76 @@
++"""Model-free workflow reads only its supplied history; a separate tool appends one effect."""
++import json
++import os
++import sys
++import uuid
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "examples/modules"))
++from component_runtime import ProtocolError, run_component
++
++# Each configured component is a separate process with a single export.
++ledger = None
++
++
++def initialize(params):
++    global ledger
++    export, = params["exports"]
++    ledger = (export.get("module_config") or {}).get("ledger")
++    descriptor = {k: export[k] for k in ("slot", "module_id", "contract_version", "composition")}
++    return {"protocol_version": "v3", "component_id": params["component_id"],
++            "exports": [dict(descriptor, module_features=[], config_schema=None)]}
++
++
++def assistant(text):
++    return {"id": str(uuid.uuid4()), "role": "Assistant", "phase": None, "parts": [
++        {"part_id": str(uuid.uuid4()), "provenance": "model", "scope": "conversation",
++         "payload": {"Text": {"text": text}}}], "name": None, "tool_call_id": None, "metadata": None}
++
++
++def invoke(context, method, params):
++    if context.export["slot"] == "tool":
++        if method == "list":
++            return {"result": [{"spec": {
++                "name": "read_probe", "description": "Return a synthetic read; instrumented in the private fixture ledger",
++                "input_schema": {"type": "object", "properties": {}},
++                "surface": {"kind": "function", "strict": False, "output_schema": None},
++                "safety": "ReadOnly", "supports_parallel_tool_calls": False,
++                "timeout_ms": 5000, "metadata": {}}, "model_visible": True, "user_command": None}]}
++        if method != "invoke" or params["call"]["name"] != "read_probe":
++            raise ProtocolError("unexpected receipt tool call")
++        # Out-of-band test instrumentation only; no workspace writes. Replaying
++        # even the same read produces two receipts, unlike an idempotent file write.
++        call_id = params["call"]["id"]
++        with Path(ledger).open("a", encoding="utf-8") as out:
++            out.write(call_id + "\n")
++        return {"result": {"call_id": call_id, "ok": True, "output": "appended",
++                           "content": [], "error": None, "metadata": {}}}
++
++    if method != "run":
++        raise ProtocolError("expected workflow run")
++    task = params["task"]
++    command = task["text"].splitlines()[-1]
++    if command == "seed":
++        call = {"id": str(uuid.uuid4()), "name": "read_probe", "args": {},
++                "surface": "function", "raw_arguments": None}
++        result = context.host_call("host.tools.execute", {"task": task, "call": call})
++        if not result["ok"]:
++            raise ProtocolError(f"receipt tool failed: {result}")
++        # This value is not in the follow-up prompt, the receipt or static fixture data.
++        answer = "A:" + str(uuid.uuid4())
++    elif command == "unrelated":
++        answer = "B:" + str(uuid.uuid4())
++    elif command == "recall":
++        prior = [part["payload"]["Text"]["text"] for msg in params["history"]
++                 if msg["role"] == "Assistant" for part in msg["parts"] if "Text" in part["payload"]]
++        if len(prior) != 1:
++            raise ProtocolError(f"expected exactly one previous assistant answer, got {prior!r}")
++        answer = prior[0]
++    else:
++        raise ProtocolError("unknown probe command")
++    output = json.dumps({"peer_pid": os.getppid(), "answer": answer})
++    return {"status": "success", "result": {"output": {"text": output, "metadata": None},
++            "new_messages": [assistant(answer)], "history_replacement": None, "compactions": []}}
++
++
++run_component(initialize, invoke)
+diff --git a/crates/proteus-core/tests/process_agent_pool/collaboration.rs b/crates/proteus-core/tests/process_agent_pool/collaboration.rs
+index a43dcae..16b452e 100644
+--- a/crates/proteus-core/tests/process_agent_pool/collaboration.rs
++++ b/crates/proteus-core/tests/process_agent_pool/collaboration.rs
+@@ -179,3 +179,7 @@ pub(super) async fn fresh_task_expires_facade_history(config_path: &Path, cwd: &
+     assert_eq!(resumed.agents[0].child_thread_id, Some(fresh_task_id));
+     assert_eq!(resumed.agents[0].generation, 2);
+ }
++
++#[cfg(unix)]
++#[path = "durable_parking.rs"]
++mod durable_parking;
+diff --git a/crates/proteus-core/tests/process_agent_pool/durable_parking.rs b/crates/proteus-core/tests/process_agent_pool/durable_parking.rs
+new file mode 100644
+index 0000000..4fd61da
+--- /dev/null
++++ b/crates/proteus-core/tests/process_agent_pool/durable_parking.rs
+@@ -0,0 +1,317 @@
++//! Named collaboration follow-up after an actual OS process exit, without re-executing old work.
++use super::*;
++use crate::{AgentLifecycleStatus, test_model};
++use proteus_contracts::{
++    app_protocol::AppSubagentSession,
++    contracts::AgentRecordSnapshot,
++    domain::{Event, ThreadId, new_thread_id},
++};
++use std::{fs, path::PathBuf};
++
++fn probe_config(home: &Path, ledger: &Path) -> PathBuf {
++    let configs = home.join("configs");
++    fs::create_dir_all(&configs).unwrap();
++    let config = configs.join("config.toml");
++    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
++    let probe = json!(fixtures.join("parking_probe.py"));
++    let reference = json!(test_model::reference_module());
++    fs::write(
++        &config,
++        format!(
++            r#"
++active_provider = "fake"
++[providers.fake]
++provider = "fake"
++model = "fake-tool-model"
++[modules]
++workflow = "parking_probe"
++policy = "allow_all"
++[tools]
++enabled = ["read_probe"]
++[components.test-policy]
++command = {reference}
++[components.test-policy.exports.policy.allow_all]
++[components.probe-workflow]
++command = "python3"
++args = ["-B", {probe}]
++[components.probe-workflow.exports.workflow.parking_probe]
++[components.probe-tool]
++command = "python3"
++args = ["-B", {probe}]
++[components.probe-tool.exports.tool.parking_receipt]
++[module_config.tool.parking_receipt]
++ledger = {}
++"#,
++            json!(ledger)
++        ) + &test_model::toml_component(),
++    )
++    .unwrap();
++    test_model::storage_config_file(&config);
++    config
++}
++
++async fn turn(
++    tools: &ToolRegistry,
++    ctx: &ToolContext,
++    tool: &str,
++    args: Value,
++) -> AgentRecordSnapshot {
++    let accepted = invoke(tools, ctx, tool, args).await;
++    assert!(accepted.ok, "{accepted:?}");
++    let mut snapshot = wait(tools, ctx).await;
++    let row = snapshot.agents.pop().unwrap();
++    assert_eq!(row.status, AgentLifecycleStatus::Completed, "{row:?}");
++    row
++}
++
++fn pid_and_answer(row: &AgentRecordSnapshot) -> (u64, String) {
++    let output = row.summary.as_deref().expect("workflow receipt");
++    let value: Value = serde_json::from_str(output).expect(output);
++    let pid = value["peer_pid"].as_u64().unwrap();
++    #[cfg(target_os = "linux")]
++    assert!(
++        !Path::new("/proc").join(pid.to_string()).exists(),
++        "wait returned while owned peer {pid} was still resident"
++    );
++    (pid, value["answer"].as_str().unwrap().to_owned())
++}
++
++async fn bindings(events: &InMemoryEventStore, thread: ThreadId) -> Vec<AppSubagentSession> {
++    events
++        .envelopes()
++        .await
++        .into_iter()
++        .filter_map(|e| match e.event {
++            Event::SubagentSessionBound {
++                child_thread_id,
++                session_id,
++                session_dir,
++            } if child_thread_id == thread => Some(AppSubagentSession {
++                session_id,
++                session_dir,
++            }),
++            _ => None,
++        })
++        .collect()
++}
++
++fn records(bytes: &[u8]) -> Vec<Value> {
++    serde_json::Deserializer::from_slice(bytes)
++        .into_iter::<Value>()
++        .map(Result::unwrap)
++        .collect()
++}
++
++#[tokio::test]
++async fn parked_named_agent_reopens_original_history_without_replaying_effect() {
++    let home = tempfile::tempdir().unwrap();
++    let workspace = tempfile::tempdir().unwrap();
++    let ledger = home.path().join("receipts.txt");
++    let config = probe_config(home.path(), &ledger);
++    let setup: AgentControlConfig = serde_json::from_value(json!({
++        "binary":proteus_binary(), "surface":"collaboration", "max_idle_processes":0, "durable_parking":true,
++        "roles":[{"name":"helper","description":"fixture","parallel_safe":true,"config":config,"timeout_ms":60_000},
++                 {"name":"other","description":"other fixture role","parallel_safe":true,"config":config,"timeout_ms":60_000}]
++    })).unwrap();
++    let runtime = AgentControlRuntime::from_config(&setup).unwrap();
++    let runner = runtime.service().unwrap();
++    let mut tools = ToolRegistry::new();
++    runtime.register_tools(&mut tools, 60_000).unwrap();
++    let events = Arc::new(InMemoryEventStore::new());
++    let owner = test_runtime_context(events.clone());
++    let task = AgentTask::new("delegate", workspace.path().into());
++    let mut ctx = ToolContext::new(
++        workspace.path().into(),
++        ExecutionAttribution::detached(new_execution_id()),
++    );
++    ctx.task = Some(task.clone());
++    ctx.agent_control = Some(Arc::new(ProcessHost {
++        service: runner.clone(),
++        ctx: owner.clone(),
++    }));
++
++    let a = turn(
++        &tools,
++        &ctx,
++        "spawn_agent",
++        json!({"task_name":"first","message":"seed","agent_type":"helper"}),
++    )
++    .await;
++    let (old_pid, secret) = pid_and_answer(&a);
++    assert!(secret.starts_with("A:"));
++    let a_id = a.child_thread_id.expect("parked A remains addressable");
++    let a_links = bindings(&events, a_id).await;
++    assert_eq!(a_links.len(), 1);
++    let a_file = a_links[0].session_dir.join("journal.jsonl");
++    let prefix = fs::read(&a_file).unwrap();
++    let effect = fs::read_to_string(&ledger).unwrap();
++    assert_eq!(effect.lines().count(), 1);
++    let a_records = records(&prefix);
++    assert_eq!(a_records.last().unwrap()["kind"], "turn_settled");
++    assert_eq!(
++        a_records
++            .iter()
++            .filter(|r| r["kind"] == "tool_result_recorded"
++                && r["payload"]["value"]["result"]["call_id"] == effect.trim_end()
++                && r["payload"]["value"]["result"]["ok"] == true)
++            .count(),
++        1
++    );
++
++    let b = turn(
++        &tools,
++        &ctx,
++        "spawn_agent",
++        json!({"task_name":"second","message":"unrelated","agent_type":"helper"}),
++    )
++    .await;
++    let (b_pid, independent) = pid_and_answer(&b);
++    assert_ne!(b_pid, old_pid);
++    assert!(independent.starts_with("B:"));
++    let b_id = b.child_thread_id.expect("parked B remains addressable");
++    assert_ne!(a_id, b_id);
++    let b_links = bindings(&events, b_id).await;
++    assert_eq!(b_links.len(), 1);
++    assert_ne!(a_links[0].session_id, b_links[0].session_id);
++    assert_ne!(a_links[0].session_dir, b_links[0].session_dir);
++    let b_file = b_links[0].session_dir.join("journal.jsonl");
++    let b_prefix = fs::read(&b_file).unwrap();
++
++    let other = tempfile::tempdir().unwrap();
++    let mut foreign = owner.clone();
++    foreign.session_id = proteus_contracts::domain::new_session_id();
++    let event_count = events.envelopes().await.len();
++    for (id, role, task, parent) in [
++        (new_thread_id(), "helper", task.clone(), owner.clone()),
++        (a_id, "helper", task.clone(), foreign),
++        (a_id, "other", task.clone(), owner.clone()),
++        (
++            a_id,
++            "helper",
++            AgentTask::new("delegate", other.path().into()),
++            owner.clone(),
++        ),
++    ] {
++        runner
++            .spawn(
++                AgentControlRequest::new(role, "recall", task).with_metadata(json!({"task_id":id})),
++                parent,
++            )
++            .await
++            .expect_err("unknown/foreign parking request rejected before dispatch");
++    }
++    assert_eq!(events.envelopes().await.len(), event_count);
++    assert_eq!(fs::read(&a_file).unwrap(), prefix);
++
++    let resumed = turn(
++        &tools,
++        &ctx,
++        "followup_task",
++        json!({"target":"first","message":"recall"}),
++    )
++    .await;
++    let (new_pid, recalled) = pid_and_answer(&resumed);
++    assert_ne!(new_pid, old_pid);
++    assert_ne!(new_pid, b_pid);
++    assert_eq!(recalled, secret);
++    assert_eq!(resumed.path, a.path);
++    assert_eq!(resumed.generation, 2);
++    assert_eq!(resumed.child_thread_id, Some(a_id));
++    let final_links = bindings(&events, a_id).await;
++    assert_eq!(
++        final_links,
++        vec![a_links[0].clone(); 2],
++        "unchanged durable session UUID and directory"
++    );
++    assert_eq!(fs::read(&b_file).unwrap(), b_prefix);
++    assert_eq!(
++        fs::read_to_string(&ledger).unwrap(),
++        effect,
++        "no duplicate tool execution"
++    );
++
++    let final_history = fs::read(&a_file).unwrap();
++    let delta = records(
++        final_history
++            .strip_prefix(&prefix[..])
++            .expect("exact canonical prefix"),
++    );
++    let turn_id = &delta.first().unwrap()["turn_id"];
++    assert!(!turn_id.is_null());
++    assert_ne!(turn_id, &a_records.last().unwrap()["turn_id"]);
++    assert_eq!(delta.first().unwrap()["kind"], "turn_opened");
++    assert_eq!(delta.last().unwrap()["kind"], "turn_settled");
++    for kind in ["turn_opened", "turn_settled"] {
++        assert_eq!(delta.iter().filter(|r| r["kind"] == kind).count(), 1);
++    }
++    assert!(delta.iter().all(|r| &r["turn_id"] == turn_id
++        && r["session_id"] == json!(a_links[0].session_id)
++        && !matches!(
++            r["kind"].as_str(),
++            Some("tool_call_recorded" | "tool_result_recorded" | "tool_effect_recorded")
++        )));
++    // A legitimate independent CLI turn advances B while the parent's parked
++    // descriptor still refers to the earlier settled prefix. The old logical
++    // reference must not silently adopt the new state (or create a new child).
++    let advanced = tokio::time::timeout(
++        std::time::Duration::from_secs(20),
++        tokio::process::Command::new(proteus_binary())
++            .arg("--config")
++            .arg(&config)
++            .arg("--cwd")
++            .arg(workspace.path())
++            .arg("--resume-session")
++            .arg(&b_links[0].session_dir)
++            .arg("unrelated")
++            .kill_on_drop(true)
++            .output(),
++    )
++    .await
++    .unwrap()
++    .unwrap();
++    assert!(
++        advanced.status.success(),
++        "{}",
++        String::from_utf8_lossy(&advanced.stderr)
++    );
++    let advanced_prefix = fs::read(&b_file).unwrap();
++    assert!(advanced_prefix.starts_with(&b_prefix) && advanced_prefix.len() > b_prefix.len());
++    let stale = invoke(
++        &tools,
++        &ctx,
++        "followup_task",
++        json!({"target":"second","message":"seed"}),
++    )
++    .await;
++    if stale.ok {
++        let denied = wait(&tools, &ctx).await;
++        assert_eq!(
++            denied.agents[0].status,
++            AgentLifecycleStatus::Errored,
++            "{denied:?}"
++        );
++    }
++    assert_eq!(
++        fs::read(&b_file).unwrap(),
++        advanced_prefix,
++        "stale descriptor must not submit another turn"
++    );
++    assert_eq!(fs::read_to_string(&ledger).unwrap(), effect);
++    assert_eq!(
++        bindings(&events, b_id).await.len(),
++        1,
++        "unverified resume must not publish a binding"
++    );
++    let sessions = proteus_core::core::list_workspace_session_summaries(
++        test_model::storage(workspace.path()),
++        home.path(),
++        workspace.path(),
++    )
++    .unwrap();
++    assert_eq!(sessions.len(), 2, "no fresh fallback session");
++    eprintln!(
++        "cold-followup completed: pids={old_pid},{b_pid},{new_pid}; generations=1,1,2; A prefix={} bytes; appended={} records; physical effect count=1; B untouched",
++        prefix.len(),
++        delta.len()
++    );
++}
+diff --git a/docs/architecture/subagents.md b/docs/architecture/subagents.md
+index b665ff7..b3ab96d 100644
+--- a/docs/architecture/subagents.md
++++ b/docs/architecture/subagents.md
+@@ -202,6 +202,48 @@ source/target отклоняются до enqueue. `AgentControlMessage` хра
+ в model-visible user message. Authority при доставке не объединяется: peer
+ продолжает исполнять tools только через собственные registry, policy и safety.
+ 
++### Эксперимент: продолжение leaf-agent без резидентного процесса
++
++По умолчанию правила выше не меняются. Для изолированного доверенного
++профиля на Unix можно явно включить `agent_control.durable_parking = true`
++совместно с `max_idle_processes = 0` и `max_depth = 1`. Это не восстановление
++после рестарта родителя и не поддержка сотни одновременно работающих процессов.
++
++После успешного завершения и закрытия mailbox родитель просит у ребёнка
++контрольную запись. Для неё нужны успешный последний `TurnSettled`,
++отсутствие прерванных операций, открытых терминалов и ожидающих интерактивных
++запросов. В ней связываются фактические session ID/каталог, workspace,
++immediate parent, ревизия и хеш содержимого журнала, отпечатки загруженного
++профиля и эффективных настроек. Родитель также фиксирует исходную роль,
++канонический workspace и идентичность исполняемого файла. Сервер не принимает
++эквивалент этой записи или путь журнала из task metadata. После подтверждённого
++выхода старого процесса он хранит только запись, без загруженного runtime.
++Недоказанная парковка не отменяет уже успешно сделанную работу, но её
++`task_id` не объявляется продолжабельным.
++
++Продолжение резервирует запись атомарно, ждёт обычный permit роли и запускает
++новый PID. Холодный child открывает именно сохранённый journal с writer lease,
++сверяет его состояние и настройки, подтверждает физический root своего
++текущего runtime и только затем получает **новый** `Send`. Заменить профиль,
++workspace или модель через follow-up, автоматически повторить неоднозначный
++`Send` или стартовать чистую сессию вместо изменившейся истории нельзя.
++Прежний logical task ID и durable session сохраняются, но physical thread
++нового runtime не обязан совпадать с прежним. Отмена до выдачи permit
++возвращает запись в ограниченный реестр; ошибка после потребления записи
++делает её недоступной. Родитель держит максимум 64 таких записей на runtime,
++удаляя старейшую незарезервированную, и не повышает лимиты параллелизма.
++После остановки родителя остаётся только обычная история, а не authority для
++повторного запуска.
++
++Это opt-in для согласованных leaf-ролей, чьё состояние восстанавливается
++штатной сессией. Доверенные локальные executable и реализации компонентов
++должны оставаться теми же; это не защита от модификации частей процесса
++локальным администратором и не snapshot внешних систем. Проверка свежего
++head требует поддержки строгого snapshot/writer contract у storage. Живые
++process-local ресурсы стороннего компонента без такого контракта не
++переносятся. При положительном idle cap этот режим не включается.
++
++
+ ## Граница A2A
+ 
+ Работы по переходу на A2A отложены владельцем; production AgentControl
