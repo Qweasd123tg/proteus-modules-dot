@@ -1,0 +1,116 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 5cac324d1c8b814b92c5b90727c97e5aa1ce79a7..1a1a83ccff09ac0913f1c5957524699a308ceced 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -161,11 +161,7 @@ impl JsonlSnapshot {
+         let fingerprint = if let Some(hint) = hint {
+             hint.fingerprint.clone()
+         } else {
+-            hash.finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect()
++            crate::io::digest_hex(hash.finish())
+         };
+         if let Some(file) = &mut file {
+             file.seek(SeekFrom::Start(0))?;
+@@ -247,12 +243,7 @@ impl RecordSnapshot for JsonlSnapshot {
+                 hash.update(&block[..read]);
+                 offset += read as u64;
+             }
+-            let actual: String = hash
+-                .finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect();
++            let actual = crate::io::digest_hex(hash.finish());
+             ensure!(
+                 actual == self.fingerprint,
+                 "journal complete prefix changed during snapshot read"
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index 00166533db3d5c6f1d235f5721061c82132eefc4..051c4fc0196155f41fc176b3f3640576d388579f 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -85,11 +85,7 @@ fn snapshot_source(
+     let fingerprint = if let Some(hint) = hint {
+         hint.fingerprint.clone()
+     } else {
+-        hash.finish()
+-            .as_ref()
+-            .iter()
+-            .map(|b| format!("{b:02x}"))
+-            .collect()
++        crate::io::digest_hex(hash.finish())
+     };
+     Ok(Box::new(SqliteSnapshot {
+         conn,
+@@ -208,14 +204,7 @@ impl RecordSnapshot for SqliteSnapshot {
+             )
+             .optional()?;
+         let Some((sequence, bytes)) = row else {
+-            let actual: String = self
+-                .current_hash
+-                .clone()
+-                .finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect();
++            let actual = crate::io::digest_hex(self.current_hash.clone().finish());
+             ensure!(actual == self.fingerprint, "SQLite snapshot prefix changed");
+             return Ok(None);
+         };
+@@ -271,13 +260,7 @@ impl RecordSnapshot for SqliteSnapshot {
+                 "SQLite journal prefix has a sequence gap"
+             );
+         }
+-        Ok(Some(
+-            hash.finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect(),
+-        ))
++        Ok(Some(crate::io::digest_hex(hash.finish())))
+     }
+ }
+ 
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 6de1b91a75ae090cb7d23d0e915eba2481501ec0..6498b92cca9e9e9a841f7b525bf3bdfbb3debbba 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -14,7 +14,14 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+ }
+ 
+ pub(crate) fn digest_hex(digest: ring::digest::Digest) -> String {
+-    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
++    const HEX: &[u8; 16] = b"0123456789abcdef";
++    let bytes = digest.as_ref();
++    let mut encoded = String::with_capacity(bytes.len() * 2);
++    for &byte in bytes {
++        encoded.push(char::from(HEX[(byte >> 4) as usize]));
++        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
++    }
++    encoded
+ }
+ 
+ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+@@ -114,3 +121,16 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+     }
+     Ok(())
+ }
++
++#[cfg(test)]
++#[test]
++fn sha256_hex_matches_persisted_lowercase_format() {
++    assert_eq!(
++        sha256_hex(b""),
++        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++    );
++    assert_eq!(
++        sha256_hex(b"abc"),
++        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++    );
++}
