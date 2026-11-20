@@ -1,0 +1,65 @@
+From 5456afff45be73e9972ccef373d83692c91bb087 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 20 Nov 2026 18:08:36 +0800
+Subject: [PATCH] Keep rebuilt history pages in a window-sized row buffer
+
+---
+ .../proteus-core/src/app_server/read_model.rs |  6 +++++-
+ .../src/app_server/read_model/tests.rs        | 20 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 3a3b58b..696dfee 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -53,11 +53,15 @@ pub(super) fn transcript_page(
+         "history position is outside the requested revision"
+     );
+     let start = end.saturating_sub(50);
++    // Collecting the owned iterator directly can reuse the full archive allocation.
++    // Move only the requested rows into a separately sized response buffer.
++    let mut window = Vec::with_capacity(end - start);
++    window.extend(messages.into_iter().skip(start).take(end - start));
+     Ok(proteus_contracts::app_protocol::AppTranscriptPage {
+         revision,
+         start,
+         total,
+-        messages: messages.into_iter().skip(start).take(end - start).collect(),
++        messages: window,
+         // Rebuilding cannot prove a relationship to a lost display projection.
+         base: None,
+     })
+diff --git a/crates/proteus-core/src/app_server/read_model/tests.rs b/crates/proteus-core/src/app_server/read_model/tests.rs
+index 70f3009..6d4e5ea 100644
+--- a/crates/proteus-core/src/app_server/read_model/tests.rs
++++ b/crates/proteus-core/src/app_server/read_model/tests.rs
+@@ -71,6 +71,26 @@ async fn history_recovery_covers_empty_short_and_exact_page_boundaries() {
+     }
+ }
+ 
++#[tokio::test]
++async fn cold_page_does_not_keep_the_archives_row_allocation() {
++    let (_root, _workspace, store, old, faults) = fixture(121).await;
++    // Exercise the verified in-memory fallback, not a read of a 50-row cache leaf.
++    faults.set("unwritable");
++    for before in [None, Some(71usize), Some(0)] {
++        let page = transcript_page(&store, before, Some(&old.revision)).unwrap();
++        let end = before.unwrap_or(121);
++        let start = end.saturating_sub(50);
++        assert_eq!(page.revision, old.revision);
++        assert!(page.base.is_none());
++        assert_eq!((page.start, page.total), (start, 121));
++        assert_eq!(page.messages.len(), end - start);
++        assert_eq!(page.messages.capacity(), end - start, "retained spare rows");
++        for (row, expected) in page.messages.iter().zip(start..end) {
++            assert_eq!(row.text, format!("row {expected}"));
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn history_recovery_never_relabels_new_source_as_a_lost_revision() {
+     let (_root, _workspace, store, old, faults) = fixture(121).await;
+-- 
+2.52.0
+

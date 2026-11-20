@@ -1,0 +1,84 @@
+   Compiling proteus-contracts v0.1.0-alpha.2 (<bench-root>/r22/stream/core/crates/proteus-contracts)
+   Compiling proteus-process-host v0.1.0-alpha.2 (<bench-root>/r22/stream/core/crates/proteus-process-host)
+   Compiling proteus-core v0.1.0-alpha.3 (<bench-root>/r22/stream/core/crates/proteus-core)
+   Compiling proteus-module-protocol v0.1.0-alpha.2 (<bench-root>/r22/stream/core/crates/proteus-module-protocol)
+   Compiling proteus-session-semantics v0.1.0-alpha.1 (<bench-root>/r22/stream/core/crates/proteus-session-semantics)
+warning: unused import: `transcript::journal_transcript_messages`
+  --> crates/proteus-core/src/app_server.rs:68:16
+   |
+68 | pub(crate) use transcript::journal_transcript_messages;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `body` is never read
+   --> crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs:130:20
+    |
+130 |     let mut body = backend.0.lock().unwrap().cache.remove(&pack_key).unwrap();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:40:19
+   |
+11 | impl Polling {
+   | ------------ associated function in this implementation
+...
+40 |     pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:84:19
+   |
+58 | impl Poll {
+   | --------- associated function in this implementation
+...
+84 |     pub(super) fn controlled(
+   |                   ^^^^^^^^^^
+
+warning: method `session_dir` is never used
+  --> crates/proteus-core/src/app_server/events/session.rs:70:19
+   |
+59 | impl SessionView {
+   | ---------------- method in this implementation
+...
+70 |     pub(super) fn session_dir(&self) -> Option<std::path::PathBuf> {
+   |                   ^^^^^^^^^^^
+
+warning: method `usage` is never used
+   --> crates/proteus-core/src/core/session_store/remote/snapshot.rs:376:19
+    |
+211 | impl RemoteValidatedRead {
+    | ------------------------ method in this implementation
+...
+376 |     pub(crate) fn usage(&self) -> proteus_contracts::domain::SessionUsageSnapshot {
+    |                   ^^^^^
+
+warning: field `usage` is never read
+  --> crates/proteus-core/src/core/session_store/remote/view.rs:44:9
+   |
+41 | pub(crate) struct SessionReadView {
+   |                   --------------- field in this struct
+...
+44 |     pub usage: SessionUsageSnapshot,
+   |         ^^^^^
+   |
+   = note: `SessionReadView` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `proteus-core` (lib test) generated 7 warnings (run `cargo fix --lib -p proteus-core --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 3m 51s
+     Running unittests src/lib.rs (<bench-root>/r18-paging-test-target/release/deps/proteus_core-09ab77eba519e2d9)
+
+running 5 tests
+test app_server::read_model::tests::cold::cold_latest_page_uses_the_display_source_and_checks_it_again_before_returning ... ok
+test app_server::read_model::tests::cold_page_does_not_keep_the_archives_row_allocation ... ok
+test app_server::read_model::tests::history_recovery_covers_empty_short_and_exact_page_boundaries ... ok
+test app_server::read_model::tests::history_recovery_does_not_hide_corrupt_canonical_source ... ok
+test app_server::read_model::tests::history_recovery_never_relabels_new_source_as_a_lost_revision ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 733 filtered out; finished in 0.99s
+

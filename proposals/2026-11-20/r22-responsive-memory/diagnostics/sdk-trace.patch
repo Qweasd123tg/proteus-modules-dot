@@ -1,0 +1,418 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a9dbb281..d54dc403 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1518,6 +1518,7 @@ name = "proteus-module-sdk"
+ version = "0.1.0-alpha.2"
+ dependencies = [
+  "anyhow",
++ "libc",
+  "proteus-contracts",
+  "proteus-module-protocol",
+  "proteus-process-host",
+diff --git a/crates/proteus-module-sdk/Cargo.toml b/crates/proteus-module-sdk/Cargo.toml
+index 702d6e83..83953353 100644
+--- a/crates/proteus-module-sdk/Cargo.toml
++++ b/crates/proteus-module-sdk/Cargo.toml
+@@ -12,6 +12,9 @@ proteus-module-protocol = { path = "../proteus-module-protocol" }
+ serde = "1"
+ serde_json = "1"
+ 
++[target.'cfg(target_os = "linux")'.dependencies]
++libc = "0.2"
++
+ [dev-dependencies]
+ proteus-process-host = { path = "../proteus-process-host" }
+ 
+diff --git a/crates/proteus-module-sdk/src/lib.rs b/crates/proteus-module-sdk/src/lib.rs
+index 388f26b2..ab399788 100644
+--- a/crates/proteus-module-sdk/src/lib.rs
++++ b/crates/proteus-module-sdk/src/lib.rs
+@@ -8,6 +8,7 @@
+ //! The worker remains an executable with its configured OS permissions. Host
+ //! callbacks retain the active invocation's authority; SDK use grants no rights.
+ 
++mod response_trace;
+ mod runtime;
+ mod transport;
+ 
+diff --git a/crates/proteus-module-sdk/src/response_trace.rs b/crates/proteus-module-sdk/src/response_trace.rs
+new file mode 100644
+index 00000000..98efd4bd
+--- /dev/null
++++ b/crates/proteus-module-sdk/src/response_trace.rs
+@@ -0,0 +1,192 @@
++//! Opt-in diagnostic observer for terminal session-storage responses.
++//! One invocation thread owns each sample. Never log request/response values.
++use std::{
++    cell::RefCell,
++    fs::{File, OpenOptions},
++    io::{self, Write},
++    sync::Mutex,
++};
++
++use anyhow::{Context, Result};
++use serde::Serialize;
++
++pub(crate) struct TraceFile(Mutex<File>);
++
++impl TraceFile {
++    pub fn open() -> Result<Option<Self>> {
++        let Some(path) = std::env::var_os("PROTEUS_SDK_TRACE_PATH") else {
++            return Ok(None);
++        };
++        let mut options = OpenOptions::new();
++        options.create(true).append(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            options.mode(0o600);
++        }
++        let file = options.open(path).context("open SDK diagnostic trace")?;
++        Ok(Some(Self(Mutex::new(file))))
++    }
++
++    pub fn finish(&self, id: &str, operation: &'static str, ok: bool) -> Result<()> {
++        let Some(stages) = ACTIVE.with(|a| a.take()) else {
++            return Ok(());
++        };
++        #[derive(Serialize)]
++        struct Row<'a> {
++            clock: &'static str,
++            pid: u32,
++            id: &'a str,
++            operation: &'static str,
++            terminal_ok: bool,
++            #[serde(flatten)]
++            timing: Stages,
++        }
++        let mut row = serde_json::to_vec(&Row {
++            clock: CLOCK_NAME,
++            pid: std::process::id(),
++            id,
++            operation,
++            terminal_ok: ok,
++            timing: stages,
++        })?;
++        row.push(b'\n');
++        self.0
++            .lock()
++            .unwrap_or_else(|p| p.into_inner())
++            .write_all(&row)?;
++        Ok(())
++    }
++}
++
++#[cfg(target_os = "linux")]
++const CLOCK_NAME: &str = "CLOCK_MONOTONIC";
++#[cfg(target_os = "linux")]
++pub fn now() -> u64 {
++    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
++    // CLOCK_MONOTONIC matches the peer's Python time.monotonic_ns() on Linux.
++    // SAFETY: the pointer is writable and read only when the call succeeds.
++    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) };
++    assert_eq!(result, 0, "diagnostic clock unavailable");
++    let ts = unsafe { ts.assume_init() };
++    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
++}
++#[cfg(not(target_os = "linux"))]
++const CLOCK_NAME: &str = "process_local_monotonic";
++#[cfg(not(target_os = "linux"))]
++pub fn now() -> u64 {
++    use std::{sync::OnceLock, time::Instant};
++    static ORIGIN: OnceLock<Instant> = OnceLock::new();
++    ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
++}
++
++// Null = this stage was never reached, including errors and closed transports.
++#[derive(Default, Serialize)]
++pub(crate) struct Stages {
++    admitted_ns: u64,
++    dispatch_start_ns: u64,
++    pub storage_start_ns: Option<u64>,
++    pub value_start_ns: Option<u64>,
++    pub value_end_ns: Option<u64>,
++    pub dispatch_end_ns: Option<u64>,
++    pub count_start_ns: Option<u64>,
++    pub count_end_ns: Option<u64>,
++    pub stdout_lock_ns: Option<u64>,
++    pub encode_end_ns: Option<u64>,
++    pub flush_end_ns: Option<u64>,
++    pub frame_bytes: Option<usize>,
++    pub sink_write_calls: usize,
++    pub sink_write_ns: u64,
++    pub sink_write_ns_at_encode_end: u64,
++    pub sink_flush_ns: u64,
++}
++
++thread_local! {
++    static ACTIVE: RefCell<Option<Stages>> = const { RefCell::new(None) };
++}
++
++pub fn begin(admitted_ns: u64) {
++    ACTIVE.with(|a| {
++        a.replace(Some(Stages {
++            admitted_ns,
++            dispatch_start_ns: now(),
++            ..Default::default()
++        }))
++    });
++}
++
++pub fn mark(f: impl FnOnce(&mut Stages, u64)) {
++    ACTIVE.with(|a| {
++        if let Some(stages) = a.borrow_mut().as_mut() {
++            f(stages, now());
++        }
++    });
++}
++
++// Wrap only the original sink *below* the same BufWriter, when diagnostics are enabled.
++// Counting serde's many small writes individually would distort the lock under test.
++pub(crate) struct Metered<W>(pub W);
++
++impl<W: Write> Write for Metered<W> {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        let start = ACTIVE.with(|a| a.borrow().is_some().then(now));
++        let r = self.0.write(bytes);
++        if let Some(start) = start {
++            mark(|s, end| {
++                s.sink_write_ns += end - start;
++                s.sink_write_calls += 1;
++            });
++        }
++        r
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        let start = ACTIVE.with(|a| a.borrow().is_some().then(now));
++        let r = self.0.flush();
++        if let Some(start) = start {
++            mark(|s, end| s.sink_flush_ns += end - start);
++        }
++        r
++    }
++}
++
++// Accept fixed labels only. Unknown or malformed operation names are never logged verbatim.
++pub fn operation(raw: Option<&str>) -> &'static str {
++    const NAMES: &[&str] = &[
++        "create",
++        "open",
++        "describe",
++        "list",
++        "list_candidates",
++        "acquire_writer",
++        "release_writer",
++        "hibernate_writer",
++        "commit",
++        "commit_status",
++        "open_snapshot",
++        "open_display_snapshot",
++        "release_snapshot",
++        "compare_snapshots",
++        "read_records",
++        "read_display_records",
++        "read_conversation",
++        "read_usage",
++        "resume",
++        "read_execution_state",
++        "read_committed_turn",
++        "read_model_context_before_turn",
++        "read_writer_model_context_before_turn",
++        "read_metadata",
++        "read_cache",
++        "write_cache",
++        "compare_exchange_metadata",
++        "put_blob",
++        "read_blob",
++        "read_blob_by_hash",
++        "delete",
++    ];
++    NAMES
++        .iter()
++        .copied()
++        .find(|known| Some(*known) == raw)
++        .unwrap_or("other")
++}
+diff --git a/crates/proteus-module-sdk/src/runtime.rs b/crates/proteus-module-sdk/src/runtime.rs
+index 9e38f572..d9767505 100644
+--- a/crates/proteus-module-sdk/src/runtime.rs
++++ b/crates/proteus-module-sdk/src/runtime.rs
+@@ -26,6 +26,7 @@ use serde_json::Value;
+ use crate::{
+     Export,
+     hosts::HostBridge,
++    response_trace::{self, TraceFile},
+     transport::{FrameReader, ModuleTransport, rpc_error, rpc_success},
+ };
+ 
+@@ -44,6 +45,7 @@ struct ActiveInvocation {
+ 
+ struct ModuleRuntime {
+     component: ModuleExports,
++    trace: Option<TraceFile>,
+     transport: Arc<ModuleTransport>,
+     generation: u64,
+     active: Mutex<HashMap<String, ActiveInvocation>>,
+@@ -119,10 +121,12 @@ pub fn serve_with_transport(
+         exports: exports.values().map(|export| export.manifest()).collect(),
+         metadata: Default::default(),
+     };
++    let trace = TraceFile::open()?;
+     let transport = Arc::new(ModuleTransport::new(
+         initialize_wire_id.generation,
+         writer,
+         transport.max_frame_bytes,
++        trace.is_some(),
+     ));
+     transport.write(&rpc_success(
+         &initialize_id,
+@@ -135,6 +139,7 @@ pub fn serve_with_transport(
+             exports,
+         },
+         transport,
++        trace,
+         generation: initialize_wire_id.generation,
+         active: Mutex::new(HashMap::new()),
+     });
+@@ -212,6 +217,15 @@ impl ModuleRuntime {
+             );
+         }
+ 
++        let trace = (self.trace.is_some()
++            && call.export.slot == "session_storage"
++            && method == proteus_contracts::contracts::PROCESS_SESSION_STORAGE_EXECUTE_METHOD)
++            .then(|| {
++                (
++                    response_trace::now(),
++                    response_trace::operation(call.params.get("operation").and_then(Value::as_str)),
++                )
++            });
+         let runtime = Arc::clone(self);
+         let invocation_id = request_id;
+         let thread_id = invocation_id.replace(':', "-");
+@@ -219,7 +233,13 @@ impl ModuleRuntime {
+         match thread::Builder::new()
+             .name(format!("component-invocation-{thread_id}"))
+             .spawn(move || {
+-                runtime.execute_invocation(invocation_id_for_thread, method, call, cancellation);
++                runtime.execute_invocation(
++                    invocation_id_for_thread,
++                    method,
++                    call,
++                    cancellation,
++                    trace,
++                );
+             }) {
+             Ok(handle) => drop(handle),
+             Err(error) => {
+@@ -243,13 +263,18 @@ impl ModuleRuntime {
+         method: String,
+         call: ProcessComponentInvocation,
+         cancellation: Arc<AtomicBool>,
++        trace: Option<(u64, &'static str)>,
+     ) {
+         let bridge = HostBridge::new(
+             Arc::clone(&self.transport),
+             invocation_id.clone(),
+             Arc::clone(&cancellation),
+         );
++        if let Some((admitted, _)) = trace {
++            response_trace::begin(admitted);
++        }
+         let result = self.component.dispatch(call, &method, &bridge);
++        response_trace::mark(|s, t| s.dispatch_end_ns = Some(t));
+         let response = if cancellation.load(Ordering::SeqCst) {
+             rpc_error(
+                 &invocation_id,
+@@ -268,6 +293,12 @@ impl ModuleRuntime {
+             eprintln!("proteus-module-sdk: failed to write invocation response: {error:#}");
+             std::process::exit(1);
+         }
++        if let (Some(sink), Some((_, operation))) = (&self.trace, trace)
++            && let Err(error) =
++                sink.finish(&invocation_id, operation, response.get("result").is_some())
++        {
++            eprintln!("proteus-module-sdk: failed to record response timing: {error}");
++        }
+         if let Err(error) = self.finish_invocation(&invocation_id) {
+             eprintln!("proteus-module-sdk: failed to settle invocation: {error:#}");
+             std::process::exit(1);
+diff --git a/crates/proteus-module-sdk/src/session_storage.rs b/crates/proteus-module-sdk/src/session_storage.rs
+index a9ad263f..2664b6b8 100644
+--- a/crates/proteus-module-sdk/src/session_storage.rs
++++ b/crates/proteus-module-sdk/src/session_storage.rs
+@@ -78,6 +78,11 @@ impl<T: SessionStorageModule> Export for SessionStorageExport<T> {
+             bail!("session storage display projection was not negotiated");
+         }
+         request.validate()?;
+-        Ok(serde_json::to_value(self.storage.execute(request)?)?)
++        crate::response_trace::mark(|s, t| s.storage_start_ns = Some(t));
++        let response = self.storage.execute(request)?;
++        crate::response_trace::mark(|s, t| s.value_start_ns = Some(t));
++        let value = serde_json::to_value(response)?;
++        crate::response_trace::mark(|s, t| s.value_end_ns = Some(t));
++        Ok(value)
+     }
+ }
+diff --git a/crates/proteus-module-sdk/src/transport.rs b/crates/proteus-module-sdk/src/transport.rs
+index 7105922b..f5c2c8f2 100644
+--- a/crates/proteus-module-sdk/src/transport.rs
++++ b/crates/proteus-module-sdk/src/transport.rs
+@@ -71,11 +71,17 @@ impl ModuleTransport {
+         generation: u64,
+         writer: impl Write + Send + 'static,
+         max_frame_bytes: usize,
++        trace_sink: bool,
+     ) -> Self {
++        let writer: Box<dyn Write + Send> = if trace_sink {
++            Box::new(crate::response_trace::Metered(writer))
++        } else {
++            Box::new(writer)
++        };
+         Self {
+             generation,
+             closed: AtomicBool::new(false),
+-            writer: Mutex::new(BufWriter::new(Box::new(writer))),
++            writer: Mutex::new(BufWriter::new(writer)),
+             callbacks: Mutex::new(HashMap::new()),
+             next_callback_sequence: AtomicU64::new(1),
+             max_frame_bytes,
+@@ -85,17 +91,28 @@ impl ModuleTransport {
+     pub fn write(&self, value: &Value) -> Result<()> {
+         // Reject an oversized result before writing any part of its frame.
+         // Counting streams the canonical JSON without retaining another payload.
++        crate::response_trace::mark(|s, t| s.count_start_ns = Some(t));
+         let mut counter = FrameByteCounter {
+             remaining: self.max_frame_bytes.saturating_sub(1),
+         };
+         serde_json::to_writer(&mut counter, value)?;
++        crate::response_trace::mark(|s, t| {
++            s.count_end_ns = Some(t);
++            s.frame_bytes = Some(self.max_frame_bytes - counter.remaining); // includes newline
++        });
+         let mut writer = self
+             .writer
+             .lock()
+             .map_err(|_| anyhow!("worker writer lock poisoned"))?;
++        crate::response_trace::mark(|s, t| s.stdout_lock_ns = Some(t));
+         serde_json::to_writer(&mut *writer, value)?;
+         writer.write_all(b"\n")?;
++        crate::response_trace::mark(|s, t| {
++            s.encode_end_ns = Some(t);
++            s.sink_write_ns_at_encode_end = s.sink_write_ns;
++        });
+         writer.flush()?;
++        crate::response_trace::mark(|s, t| s.flush_end_ns = Some(t));
+         Ok(())
+     }
+ 
+@@ -236,7 +253,7 @@ mod tests {
+     #[test]
+     fn oversized_output_is_rejected_before_any_frame_bytes_are_written() {
+         let bytes = Arc::new(Mutex::new(Vec::new()));
+-        let transport = ModuleTransport::new(1, Capture(bytes.clone()), 64);
++        let transport = ModuleTransport::new(1, Capture(bytes.clone()), 64, false);
+         assert!(transport.write(&json!({"large":"x".repeat(64)})).is_err());
+         assert!(bytes.lock().unwrap().is_empty());
+         transport.write(&json!({"ok":true})).unwrap();
