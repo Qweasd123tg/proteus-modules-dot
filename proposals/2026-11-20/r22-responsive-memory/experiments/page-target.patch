@@ -1,0 +1,86 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 050f1ef..80ec0d2 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -8,6 +8,9 @@ use std::{
+ 
+ pub(crate) const MAX_STAGING_BYTES: u64 = 512 * 1024 * 1024;
+ 
++// Narrow the normal response batch without splitting a single canonical record.
++const DISPLAY_PAGE_TARGET_BYTES: usize = 1024 * 1024;
++
+ pub(crate) struct DisplayWriter {
+     writer: BufWriter<File>,
+     budget: u64,
+@@ -107,7 +110,10 @@ impl DisplayRecords {
+             if record.session_seq <= after {
+                 continue;
+             }
+-            if !records.is_empty() && bytes + record_bytes > SESSION_STORAGE_PAGE_BYTE_BUDGET {
++            if !records.is_empty()
++                && bytes + record_bytes
++                    > SESSION_STORAGE_PAGE_BYTE_BUDGET.min(DISPLAY_PAGE_TARGET_BYTES)
++            {
+                 self.pending = Some((record, record_bytes));
+                 break;
+             }
+diff --git a/storage/session-storage/src/tests/display.rs b/storage/session-storage/src/tests/display.rs
+index 882ce78..15f9670 100644
+--- a/storage/session-storage/src/tests/display.rs
++++ b/storage/session-storage/src/tests/display.rs
+@@ -173,4 +173,55 @@ fn display_pages_reject_rewritten_fixed_prefix() {
+     );
+ }
+ 
++#[test]
++fn projected_pages_bound_regular_batches_and_deliver_oversized_records_intact() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        let messages = [
++            text(&"a".repeat(360 * 1024)),
++            text(&"b".repeat(360 * 1024)),
++            text(&"c".repeat(360 * 1024)),
++            text(&"d".repeat(1120 * 1024)),
++            text("tail"),
++        ];
++        for msg in &messages {
++            f.append(vec![msg.clone()]);
++        }
++        let projection = open(&f);
++        let read = |request: SessionStorageRequest| {
++            let response = f.service.execute(request.clone()).unwrap();
++            request.validate_response(&response).unwrap();
++            let SessionStorageResponse::Records { page } = response else {
++                panic!()
++            };
++            page
++        };
++        let canonical = read(SessionStorageRequest::ReadRecords {
++            snapshot: f.snapshot(),
++            after_seq: 0,
++            limit: 64,
++        });
++        // Full canonical paging retains its existing 4 MiB policy.
++        assert_eq!(canonical.records.len(), 5);
++        let display = |after_seq| {
++            read(SessionStorageRequest::ReadDisplayRecords {
++                snapshot: projection.snapshot.clone(),
++                after_seq,
++                limit: 64,
++            })
++        };
++        let mut after = 0;
++        let mut returned = Vec::new();
++        for (count, next) in [(2, Some(2)), (1, Some(3)), (1, Some(4)), (1, None)] {
++            let page = display(after);
++            assert_eq!(page.records.len(), count);
++            assert_eq!(page.next_after_seq, next);
++            returned.extend(page.records);
++            after = next.unwrap_or(0);
++        }
++        assert_eq!(returned, canonical.records);
++        assert_eq!(display(0).records, canonical.records[..2]); // Independent rewind.
++    }
++}
++
+ mod concurrency;
