@@ -1,0 +1,9 @@
+# Acceptance gates for parked process tasks
+
+Pinned substrate: Core 048378da7cbe890d8bf8a0152e55eb28ecb5013d; Modules store cf999371f6e564376565738bebc3416aad12f908; no changes to production selections, storage schema or wire until separately approved by upstream. Synthetic, trusted local child processes only. Live parent retains bounded bookkeeping. Successful settled turn only, not mid-turn/approval/process crash recovery.
+
+1. With parking off, cap=0 does not advertise the completed result as resumable. Default configuration and hot resume stay unchanged. Opt-in parent controls the role configuration; untrusted followup text cannot provide its own executable, storage locator, parent or credentials.
+2. A settles successfully and persists a unique first-turn effect. Its old PID is reaped before returning a valid parked binding. Observe no A process before starting B. B settles with its own locator.
+3. Public facade addresses the same A, same logical task and canonical session, not a clone. New PID is observed; parent and workspace equal retained authority; recover expected history. Earlier journal prefix remains byte-identical. Exactly one extra successful turn, distinct turn ID, no re-execution of prior synthetic effect, B unchanged.
+4. Invalid parent/role/workspace/binding/config fails closed before a new task effect. Two concurrent restores cannot both use one receipt; aborted or ambiguous writes cannot silently retry. Scope and provenance stated.
+5. A memory claim requires PSS sampled over a tree, a passed correctness check, no hidden live PID, and separate measurements before/after settlement and while actually reopening. Cap=0 stock and candidate are **not feature-equivalent** (stock discards resume). Compare parked candidate with resident candidate for same count and proof with the same binaries/fixture. Existing 64 bound remains; do not present 100 as measured.
