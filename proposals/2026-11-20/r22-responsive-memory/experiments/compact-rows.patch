@@ -1,0 +1,200 @@
+diff --git a/crates/proteus-contracts/src/app_protocol/transcript.rs b/crates/proteus-contracts/src/app_protocol/transcript.rs
+index aeb5fe2..0468a66 100644
+--- a/crates/proteus-contracts/src/app_protocol/transcript.rs
++++ b/crates/proteus-contracts/src/app_protocol/transcript.rs
+@@ -41,8 +41,9 @@ pub struct AppTranscriptMessage {
+     pub role: String,
+     pub text: String,
+     pub images: Vec<crate::domain::ImageRef>,
+-    pub tool: Option<AppTranscriptTool>,
+-    pub subagent: Option<AppTranscriptSubagent>,
++    // Text rows dominate archives: reserve one pointer, not an entire unused rich card.
++    pub tool: Option<Box<AppTranscriptTool>>,
++    pub subagent: Option<Box<AppTranscriptSubagent>>,
+     /// Текст ещё стримится: сообщение — живой прогресс незавершённого хода
+     /// (см. turn_progress), клиент продолжает дописывать в него дельты.
+     pub streaming: bool,
+diff --git a/crates/proteus-contracts/tests/sparse_transcript.rs b/crates/proteus-contracts/tests/sparse_transcript.rs
+new file mode 100644
+index 0000000..325e7c9
+--- /dev/null
++++ b/crates/proteus-contracts/tests/sparse_transcript.rs
+@@ -0,0 +1,33 @@
++//! Diagnostic proof: public Rust field types change; serialized HTTP/SSE and cache rows must not.
++use proteus_contracts::app_protocol::{
++    AppTranscriptMessage, AppTranscriptSubagent, AppTranscriptTool,
++};
++
++#[test]
++#[cfg(target_pointer_width = "64")]
++fn plain_rows_no_longer_reserve_inline_space_for_absent_rich_cards() {
++    use std::mem::size_of;
++    assert_eq!(
++        size_of::<Option<Box<AppTranscriptTool>>>(),
++        size_of::<usize>()
++    );
++    assert_eq!(
++        size_of::<Option<Box<AppTranscriptSubagent>>>(),
++        size_of::<usize>()
++    );
++    assert!(
++        size_of::<AppTranscriptMessage>() <= 144,
++        "row no longer sparse"
++    );
++}
++
++#[test]
++fn golden_plain_tool_and_subagent_rows_roundtrip_without_wire_changes() {
++    const PLAIN: &str = r#"{"message_id":"00000000-0000-0000-0000-000000000001","timestamp_ms":7,"phase":null,"role":"assistant","text":"текст","images":[],"tool":null,"subagent":null,"streaming":false}"#;
++    const TOOL: &str = r#"{"message_id":null,"timestamp_ms":9,"phase":null,"role":"system","text":"","images":[],"tool":{"call_id":"c","name":"edit","args":{"a":3},"effective_args":null,"status":"done","result":"ok","metadata":{}},"subagent":null,"streaming":false}"#;
++    const SUBAGENT: &str = r#"{"message_id":null,"timestamp_ms":11,"phase":null,"role":"system","text":"","images":[],"tool":null,"subagent":{"child_thread_id":"t","session":{"session_id":"00000000-0000-0000-0000-000000000002","session_dir":"/test"},"role":"worker","description":null,"status":"running","iterations":1,"tools":[{"call_id":"s","name":"read","args":{},"effective_args":{},"status":"running","result":null,"metadata":null}]},"streaming":true}"#;
++    for golden in [PLAIN, TOOL, SUBAGENT] {
++        let row: AppTranscriptMessage = serde_json::from_str(golden).unwrap();
++        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+index 74e88e4..a3f1182 100644
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -102,7 +102,7 @@ fn append_transcript_tool_call(transcript: &mut TranscriptRows, call: &ToolCall)
+         phase: None,
+         role: "system".to_owned(),
+         text: String::new(),
+-        tool: Some(AppTranscriptTool {
++        tool: Some(Box::new(AppTranscriptTool {
+             terminal: None,
+             effective_args: None,
+             call_id: call.id.clone(),
+@@ -111,7 +111,7 @@ fn append_transcript_tool_call(transcript: &mut TranscriptRows, call: &ToolCall)
+             status: "running".to_owned(),
+             result: None,
+             metadata: Value::Null,
+-        }),
++        })),
+         subagent: None,
+         streaming: false,
+     });
+@@ -187,7 +187,7 @@ fn append_hosted_tool_activity(transcript: &mut TranscriptRows, activity: &Hoste
+         phase: None,
+         role: "system".to_owned(),
+         text: String::new(),
+-        tool: Some(AppTranscriptTool {
++        tool: Some(Box::new(AppTranscriptTool {
+             terminal: None,
+             effective_args: None,
+             call_id: activity.id().to_owned(),
+@@ -200,7 +200,7 @@ fn append_hosted_tool_activity(transcript: &mut TranscriptRows, activity: &Hoste
+                 "activity": activity,
+                 "citations": [],
+             }),
+-        }),
++        })),
+         subagent: None,
+         streaming: false,
+     });
+@@ -280,7 +280,7 @@ fn append_transcript_tool_result(transcript: &mut TranscriptRows, result: &ToolR
+         phase: None,
+         role: "system".to_owned(),
+         text: String::new(),
+-        tool: Some(AppTranscriptTool {
++        tool: Some(Box::new(AppTranscriptTool {
+             terminal: result
+                 .metadata
+                 .get("tool_terminal")
+@@ -292,7 +292,7 @@ fn append_transcript_tool_result(transcript: &mut TranscriptRows, result: &ToolR
+             status,
+             result: Some(result_text),
+             metadata: result.metadata.clone(),
+-        }),
++        })),
+         subagent: None,
+         streaming: false,
+     });
+diff --git a/crates/proteus-core/src/app_server/transcript/rows.rs b/crates/proteus-core/src/app_server/transcript/rows.rs
+index ca4b510..b4caf16 100644
+--- a/crates/proteus-core/src/app_server/transcript/rows.rs
++++ b/crates/proteus-core/src/app_server/transcript/rows.rs
+@@ -92,6 +92,6 @@ impl TranscriptRows {
+ 
+     pub(super) fn tool_mut(&mut self, call_id: &str) -> Option<&mut AppTranscriptTool> {
+         let index = *self.latest_tools.get(call_id)?;
+-        self.rows[index].tool.as_mut()
++        self.rows[index].tool.as_deref_mut()
+     }
+ }
+diff --git a/crates/proteus-core/src/app_server/turn_progress.rs b/crates/proteus-core/src/app_server/turn_progress.rs
+index 6c40235..590b158 100644
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -190,7 +190,7 @@ impl TurnProgress {
+                     role: "system".to_owned(),
+                     text: String::new(),
+                     tool: None,
+-                    subagent: Some(AppTranscriptSubagent {
++                    subagent: Some(Box::new(AppTranscriptSubagent {
+                         child_thread_id: child_thread_id.to_string(),
+                         session: None,
+                         role: role.clone(),
+@@ -198,7 +198,7 @@ impl TurnProgress {
+                         status: "running".to_owned(),
+                         iterations: None,
+                         tools: Vec::new(),
+-                    }),
++                    })),
+                     streaming: false,
+                 };
+                 if self.background_agent_parent_is_running(description.as_deref()) {
+@@ -365,7 +365,7 @@ impl TurnProgress {
+             phase: None,
+             role: "system".to_owned(),
+             text: String::new(),
+-            tool: Some(AppTranscriptTool {
++            tool: Some(Box::new(AppTranscriptTool {
+                 terminal: None,
+                 effective_args: None,
+                 call_id: call.id.clone(),
+@@ -374,7 +374,7 @@ impl TurnProgress {
+                 status: "running".to_owned(),
+                 result: None,
+                 metadata: serde_json::Value::Null,
+-            }),
++            })),
+             subagent: None,
+             streaming: false,
+         });
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index ac491a8..a20cdd1 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -431,7 +431,7 @@ pub(super) fn update_tools(
+     rows: &[AppTranscriptMessage],
+ ) -> Option<()> {
+     for row in rows {
+-        if let Some(tool) = &row.tool
++        if let Some(tool) = row.tool.as_deref()
+             && accepted(&tool.status)
+         {
+             tools.insert(
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 6a3b59e..ba223f1 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -210,7 +210,7 @@ fn cache_pages_have_a_byte_budget_and_tool_index_repairs_without_journal_scan()
+     for row in &mut model.transcript {
+         row.text = "x".repeat(2 * 1024 * 1024);
+     }
+-    model.transcript.last_mut().unwrap().tool = Some(AppTranscriptTool {
++    model.transcript.last_mut().unwrap().tool = Some(Box::new(AppTranscriptTool {
+         terminal: None,
+         call_id: "one-tool".into(),
+         name: "edit".into(),
+@@ -219,7 +219,7 @@ fn cache_pages_have_a_byte_budget_and_tool_index_repairs_without_journal_scan()
+         status: "completed".into(),
+         result: Some("large result".repeat(100)),
+         metadata: serde_json::Value::Null,
+-    });
++    }));
+     let source = RemoteCacheSource::read(&store).unwrap();
+     store.save_read_model(&source, &model);
+     let header = cache::header(&store).unwrap();

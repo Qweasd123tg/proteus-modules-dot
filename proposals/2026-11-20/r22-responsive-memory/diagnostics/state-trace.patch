@@ -1,0 +1,484 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index e8e9970..d5e9bd6 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -26,6 +26,7 @@ mod display;
+ mod locator;
+ mod objects;
+ mod sessions;
++mod state_trace;
+ mod views;
+ 
+ const MAX_SNAPSHOTS: usize = 32;
+@@ -118,14 +119,14 @@ impl StorageService {
+                 key,
+                 source,
+             } => cache::read_cache(session, key, source),
+-            request => self.lock_state()?.execute(request),
++            request => self
++                .lock_state(state_trace::Meta::request(&request))?
++                .execute(request),
+         }
+     }
+ 
+-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>> {
+-        self.state
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))
++    fn lock_state(&self, meta: state_trace::Meta) -> Result<state_trace::Guard<'_>> {
++        state_trace::Guard::lock(&self.state, meta)
+     }
+ 
+     fn lock_catalog(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+@@ -219,9 +220,11 @@ impl State {
+             }
+             Resume { lease } => {
+                 let id = lease.session.session_id;
+-                Ok(SessionStorageResponse::Resumed {
+-                    state: self.writer_fold(&lease)?.resume(id),
+-                })
++                let fold = self.writer_fold(&lease)?;
++                let t = state_trace::now();
++                let state = fold.resume(id);
++                state_trace::resume(state_trace::now() - t);
++                Ok(SessionStorageResponse::Resumed { state })
+             }
+             ReadExecutionState { lease } => {
+                 let fold = self.writer_fold(&lease)?;
+@@ -334,14 +337,19 @@ impl State {
+         let kind = self.kind;
+         let writer = self.writer(lease)?;
+         if writer.fold.is_none() {
++            state_trace::fold("recover");
++            let t = state_trace::now();
+             writer.backend.recover(&dir, lease.session.session_id)?;
++            state_trace::writer_recover(state_trace::now() - t);
+             let stamps = catalog::source_stamp(&dir, kind)?;
+             let blobs = catalog::durable::blob_stamps(&dir);
+             let mut source = writer.backend.snapshot(&dir, lease.session.session_id)?;
++            let t = state_trace::now();
+             let mut fold = Fold::default();
+             while let Some(record) = source.next()? {
+                 fold.apply(lease.session.session_id, &record)?;
+             }
++            state_trace::writer_replay(state_trace::now() - t, fold.session_seq);
+             writer.head = blobs
+                 .filter(|blobs| {
+                     catalog::source_stamp(&dir, kind).ok().as_ref() == Some(&stamps)
+@@ -354,6 +362,8 @@ impl State {
+                     hash: source.read_hash(),
+                 });
+             writer.fold = Some(fold);
++        } else {
++            state_trace::fold("reuse");
+         }
+         Ok(writer.fold.as_mut().expect("writer fold initialized"))
+     }
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 293ad26..83b13ef 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -250,8 +250,9 @@ impl StorageService {
+         path: &Path,
+         audit: bool,
+     ) -> Result<StorageSessionSummary> {
+-        let mut state = self.lock_state()?;
++        let mut state = self.lock_state(state_trace::Meta::new("catalog_probe", None))?;
+         let descriptor = state.open(path)?;
++        state.sid(descriptor.session.session_id);
+         // prime_catalog also accepts a journal path. Work only in the resolved directory.
+         let dir = descriptor
+             .local_path
+@@ -283,7 +284,10 @@ impl StorageService {
+         projection: Result<Projection>,
+         audit: bool,
+     ) -> Result<StorageSessionSummary> {
+-        let mut state = self.lock_state()?;
++        let mut state = self.lock_state(state_trace::Meta::new(
++            "catalog_publish",
++            Some(read.descriptor.session.session_id),
++        ))?;
+         let descriptor = state.open(dir)?;
+         ensure!(
+             descriptor.session == read.descriptor.session,
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 4ae8aab..9a5c1da 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -7,6 +7,8 @@ impl State {
+         &mut self,
+         session: SessionLocator,
+     ) -> Result<SessionStorageResponse> {
++        let t = state_trace::now();
++        let mut diag = state_trace::Display::default();
+         let dir = self.checked_path(&session)?;
+         let descriptor = self.describe(&session)?;
+         let stamps = catalog::source_stamp(&dir, self.kind)?;
+@@ -27,19 +29,37 @@ impl State {
+             .map(|display| display.bytes)
+             .sum();
+         let mut display = DisplayWriter::new(MAX_STAGING_BYTES.saturating_sub(staged));
+-        while let Some(record) = source.next()? {
++        let scan = state_trace::now();
++        diag.setup = scan - t;
++        loop {
++            let t = state_trace::now();
++            let next = source.next()?;
++            let a = state_trace::now();
++            diag.next += a - t;
++            let Some(record) = next else {
++                break;
++            };
++            diag.count += 1;
+             state.apply(session.session_id, &record)?;
++            diag.apply += state_trace::now() - a;
+             if cut == Some(record.session_seq) {
+                 source.remember_page_boundary(record.session_seq);
+                 previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+             }
+             if record.entry.kind().is_display_record()
+                 && let Some(writer) = &mut display
+-                && writer.push(&record).is_err()
+             {
+-                display = None;
++                let t = state_trace::now();
++                let failed = writer.push(&record).is_err();
++                diag.push += state_trace::now() - t;
++                diag.pushes += 1;
++                if failed {
++                    display = None;
++                }
+             }
+         }
++        let verify = state_trace::now();
++        diag.scan = verify - scan;
+         if source.source_version()? != version {
+             source.verify_fixed_prefix()?;
+         }
+@@ -70,16 +90,28 @@ impl State {
+             };
+             self.save_catalog_head(&dir, summary, &prefix, blobs);
+         }
+-        let Some(display) = display.and_then(DisplayWriter::finish) else {
++        let t = state_trace::now();
++        diag.catalog = t - verify;
++        let display = display.and_then(DisplayWriter::finish);
++        let f = state_trace::now();
++        diag.finish = f - t;
++        let Some(display) = display else {
+             return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
+         };
++        diag.bytes = Some(display.bytes);
+         let state = state.into_resume(session.session_id);
+-        if !state_fits(&state) {
++        let t = state_trace::now();
++        diag.resume = t - f;
++        let fits = state_fits(&state);
++        let pub_start = state_trace::now();
++        diag.fits = pub_start - t;
++        if !fits {
+             return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
+         }
+         let mut snapshot = SnapshotState::new(identity.clone(), source, true, previous_boundary)?;
+         snapshot.display = Some(display);
+         self.remember_snapshot(snapshot);
++        diag.publish = state_trace::now() - pub_start;
+         Ok(SessionStorageResponse::DisplaySnapshot {
+             projection: Some(StorageDisplaySnapshot {
+                 snapshot: identity,
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 5b1fdc2..381a84b 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -231,12 +231,14 @@ impl State {
+     }
+     pub(super) fn acquire(&mut self, session: SessionLocator) -> Result<SessionStorageResponse> {
+         if let Some(writer) = self.writers.get_mut(&session) {
++            state_trace::acquire("resident_writer");
+             let mut lease = writer.lease.clone();
+             lease.token = Uuid::new_v4();
+             writer.tokens.insert(lease.token);
+             let revision = self.writer_fold(&lease)?.revision();
+             return Ok(SessionStorageResponse::Writer { lease, revision });
+         }
++        state_trace::acquire("new_writer");
+         let descriptor = self.describe(&session)?;
+         let path = self.checked_path(&session)?;
+         crate::io::create_dir_all_durable(path.parent().context("session has no parent")?)?;
+diff --git a/storage/session-storage/src/service/state_trace.rs b/storage/session-storage/src/service/state_trace.rs
+new file mode 100644
+index 0000000..074570c
+--- /dev/null
++++ b/storage/session-storage/src/service/state_trace.rs
+@@ -0,0 +1,271 @@
++//! Diagnostic-only Linux x86_64 bench probe. Never serialize request/response payloads.
++use super::*;
++use std::{
++    cell::RefCell,
++    fs::{File, OpenOptions},
++    io::Write,
++    ops::{Deref, DerefMut},
++    sync::{
++        MutexGuard, OnceLock,
++        atomic::{AtomicU64, Ordering},
++    },
++};
++
++#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
++compile_error!("This diagnostic CLOCK_MONOTONIC ABI is for Linux x86_64 only");
++
++pub(super) fn now() -> u64 {
++    #[repr(C)]
++    struct Timespec {
++        sec: i64,
++        nsec: i64,
++    }
++    unsafe extern "C" {
++        fn clock_gettime(clockid: i32, ts: *mut Timespec) -> i32;
++    }
++    let mut ts = Timespec { sec: 0, nsec: 0 };
++    // Linux x86_64 libc timespec layout; CLOCK_MONOTONIC = 1, same clock as Python.
++    assert_eq!(unsafe { clock_gettime(1, &mut ts) }, 0);
++    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
++}
++
++static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
++static SEQUENCE: AtomicU64 = AtomicU64::new(1);
++fn log() -> Option<&'static Mutex<File>> {
++    LOG.get_or_init(|| {
++        std::env::var_os("PROTEUS_R22_STATE_TRACE").map(|p| {
++            Mutex::new(
++                OpenOptions::new()
++                    .append(true)
++                    .create(true)
++                    .open(p)
++                    .expect("unable to open diagnostic trace"),
++            )
++        })
++    })
++    .as_ref()
++}
++
++#[derive(Default, Serialize)]
++struct Stages {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    writer_fold: Option<&'static str>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    writer_acquire: Option<&'static str>,
++    writer_recover_ns: u64,
++    writer_replay_ns: u64,
++    writer_records: u64,
++    resume_clone_ns: u64,
++    display_setup_ns: u64,
++    display_next_ns: u64,
++    display_apply_ns: u64,
++    display_push_ns: u64,
++    display_scan_ns: u64,
++    display_records: u64,
++    display_pushes: u64,
++    display_verify_catalog_ns: u64,
++    display_finish_ns: u64,
++    display_into_resume_ns: u64,
++    display_state_fits_ns: u64,
++    display_publish_ns: u64,
++    display_bytes: Option<u64>,
++}
++thread_local! { static STAGES: RefCell<Stages> = RefCell::new(Stages::default()); }
++
++pub(super) fn acquire(mode: &'static str) {
++    STAGES.with_borrow_mut(|s| s.writer_acquire = Some(mode));
++}
++pub(super) fn fold(mode: &'static str) {
++    STAGES.with_borrow_mut(|s| s.writer_fold = Some(mode));
++}
++pub(super) fn writer_recover(ns: u64) {
++    STAGES.with_borrow_mut(|s| s.writer_recover_ns += ns);
++}
++pub(super) fn writer_replay(ns: u64, records: u64) {
++    STAGES.with_borrow_mut(|s| {
++        s.writer_replay_ns += ns;
++        s.writer_records += records;
++    });
++}
++pub(super) fn resume(ns: u64) {
++    STAGES.with_borrow_mut(|s| s.resume_clone_ns += ns);
++}
++
++#[derive(Default)]
++pub(super) struct Display {
++    pub setup: u64,
++    pub next: u64,
++    pub apply: u64,
++    pub push: u64,
++    pub scan: u64,
++    pub count: u64,
++    pub pushes: u64,
++    pub catalog: u64,
++    pub finish: u64,
++    pub resume: u64,
++    pub fits: u64,
++    pub publish: u64,
++    pub bytes: Option<u64>,
++}
++impl Drop for Display {
++    fn drop(&mut self) {
++        STAGES.with_borrow_mut(|s| {
++            s.display_setup_ns = self.setup;
++            s.display_next_ns = self.next;
++            s.display_apply_ns = self.apply;
++            s.display_push_ns = self.push;
++            s.display_scan_ns = self.scan;
++            s.display_records = self.count;
++            s.display_pushes = self.pushes;
++            s.display_verify_catalog_ns = self.catalog;
++            s.display_finish_ns = self.finish;
++            s.display_into_resume_ns = self.resume;
++            s.display_state_fits_ns = self.fits;
++            s.display_publish_ns = self.publish;
++            s.display_bytes = self.bytes;
++        });
++    }
++}
++
++#[derive(Serialize)]
++pub(super) struct Meta {
++    op: &'static str,
++    session_id: Option<SessionId>,
++    kind: Option<JournalKind>,
++}
++impl Meta {
++    pub(super) fn new(op: &'static str, sid: Option<SessionId>) -> Self {
++        Self {
++            op,
++            session_id: sid,
++            kind: None,
++        }
++    }
++    pub(super) fn request(r: &SessionStorageRequest) -> Self {
++        use SessionStorageRequest::*;
++        let (op, id) = match r {
++            Create { session_id, .. } => ("create", *session_id),
++            Describe { session } => ("describe", session.session_id),
++            AcquireWriter { session } => ("acquire_writer", session.session_id),
++            HibernateWriter { lease } => ("hibernate_writer", lease.session.session_id),
++            ReleaseWriter { lease } => ("release_writer", lease.session.session_id),
++            Resume { lease } => ("resume", lease.session.session_id),
++            Commit { commit } => {
++                return Self {
++                    op: "commit",
++                    session_id: Some(commit.lease.session.session_id),
++                    kind: Some(commit.entry.kind()),
++                };
++            }
++            CommitStatus { session, .. } => ("commit_status", session.session_id),
++            OpenSnapshot { session } => ("open_snapshot", session.session_id),
++            OpenDisplaySnapshot { session } => ("open_display_snapshot", session.session_id),
++            ReleaseSnapshot { snapshot } => ("release_snapshot", snapshot.session.session_id),
++            CompareSnapshots { snapshot, .. } => ("compare_snapshots", snapshot.session.session_id),
++            ReadRecords { snapshot, .. } => ("read_records", snapshot.session.session_id),
++            ReadDisplayRecords { snapshot, .. } => {
++                ("read_display_records", snapshot.session.session_id)
++            }
++            ReadConversation { snapshot, .. } => ("read_conversation", snapshot.session.session_id),
++            ReadUsage { snapshot } => ("read_usage", snapshot.session.session_id),
++            ReadExecutionState { lease } => ("read_execution_state", lease.session.session_id),
++            ReadCommittedTurn { lease, .. } => ("read_committed_turn", lease.session.session_id),
++            ReadModelContextBeforeTurn { snapshot, .. } => (
++                "read_model_context_before_turn",
++                snapshot.session.session_id,
++            ),
++            ReadWriterModelContextBeforeTurn { lease, .. } => (
++                "read_writer_model_context_before_turn",
++                lease.session.session_id,
++            ),
++            WriteCache { session, .. } => ("write_cache", session.session_id),
++            ReadMetadata { session, .. } => ("read_metadata", session.session_id),
++            CompareExchangeMetadata { lease, .. } => {
++                ("compare_exchange_metadata", lease.session.session_id)
++            }
++            PutBlob { lease, .. } => ("put_blob", lease.session.session_id),
++            ReadBlob { session, .. } => ("read_blob", session.session_id),
++            ReadBlobByHash { session, .. } => ("read_blob_by_hash", session.session_id),
++            Delete { lease, .. } => ("delete", lease.session.session_id),
++            Open { .. } | List { .. } | ListCandidates { .. } | ReadCache { .. } => {
++                unreachable!("not a State request")
++            }
++        };
++        Self::new(op, Some(id))
++    }
++}
++
++pub(super) struct Guard<'a> {
++    inner: Option<MutexGuard<'a, State>>,
++    meta: Meta,
++    wait_ns: u64,
++    acquired_ns: u64,
++    seq: u64,
++    sink: Option<&'static Mutex<File>>,
++}
++impl Deref for Guard<'_> {
++    type Target = State;
++    fn deref(&self) -> &State {
++        self.inner.as_deref().unwrap()
++    }
++}
++impl DerefMut for Guard<'_> {
++    fn deref_mut(&mut self) -> &mut State {
++        self.inner.as_deref_mut().unwrap()
++    }
++}
++impl<'a> Guard<'a> {
++    pub(super) fn lock(m: &'a Mutex<State>, meta: Meta) -> Result<Self> {
++        let sink = log();
++        let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
++        STAGES.with_borrow_mut(|s| *s = Stages::default());
++        let wait_ns = now();
++        let inner = m
++            .lock()
++            .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))?;
++        let acquired_ns = now();
++        Ok(Self {
++            inner: Some(inner),
++            meta,
++            wait_ns,
++            acquired_ns,
++            seq,
++            sink,
++        })
++    }
++    pub(super) fn sid(&mut self, sid: SessionId) {
++        self.meta.session_id = Some(sid);
++    }
++}
++impl Drop for Guard<'_> {
++    fn drop(&mut self) {
++        let release_ns = now();
++        drop(self.inner.take());
++        let released_ns = now();
++        let Some(sink) = self.sink else {
++            return;
++        };
++        let stages = STAGES.with(|s| s.take());
++        let thread = std::thread::current();
++        let id = thread
++            .name()
++            .and_then(|n| n.strip_prefix("component-invocation-h-"))
++            .and_then(|s| s.split_once('-'))
++            .filter(|(g, q)| {
++                [g, q].into_iter().all(|p| {
++                    !p.is_empty() && p.len() <= 20 && p.bytes().all(|b| b.is_ascii_digit())
++                })
++            })
++            .map(|(g, q)| format!("h:{g}:{q}"));
++        let row = serde_json::json!({"event":"state","pid":std::process::id(),"id":id,"seq":self.seq,
++            "op":self.meta.op,"session_id":self.meta.session_id,"kind":self.meta.kind,
++            "wait_start_ns":self.wait_ns,"acquired_ns":self.acquired_ns,"release_ns":release_ns,
++            "released_ns":released_ns,"wait_ns":self.acquired_ns-self.wait_ns,"hold_ns":release_ns-self.acquired_ns,"stages":stages});
++        let mut bytes = serde_json::to_vec(&row).expect("safe diagnostic fields");
++        bytes.push(b'\n');
++        sink.lock()
++            .expect("trace sink poisoned")
++            .write_all(&bytes)
++            .expect("trace write failed");
++    }
++}
