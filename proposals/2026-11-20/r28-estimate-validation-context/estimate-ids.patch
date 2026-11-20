@@ -1,0 +1,104 @@
+diff --git a/crates/proteus-contracts/src/model_standard/input_estimates.rs b/crates/proteus-contracts/src/model_standard/input_estimates.rs
+index 2e8bb5ae03eef5b82435c212029c74b544c11422..bbdbadb75d286a96011e3b7d9c6cdf59cd837380 100644
+--- a/crates/proteus-contracts/src/model_standard/input_estimates.rs
++++ b/crates/proteus-contracts/src/model_standard/input_estimates.rs
+@@ -19,12 +19,33 @@ pub struct ModelInputEstimateRequest {
+ 
+ impl ModelInputEstimateRequest {
+     pub fn validate(&self) -> Result<(), String> {
++        self.validation_context().map(drop)
++    }
++
++    /// Snapshot only opaque part identities before moving the request to a provider.
++    pub fn validation_context(&self) -> Result<ModelInputEstimateValidation, String> {
+         let mut ids = HashSet::new();
+         for part in &self.parts {
+             if !ids.insert(part.part_id) || !matches!(part.payload, ContentPart::Opaque { .. }) {
+                 return Err("input estimate requires unique canonical opaque parts".into());
+             }
+         }
++        Ok(ModelInputEstimateValidation { ids })
++    }
++}
++
++/// One validated request, one optional partial response. Never retains opaque payloads.
++pub struct ModelInputEstimateValidation {
++    ids: HashSet<PartId>,
++}
++
++impl ModelInputEstimateValidation {
++    pub fn validate_response(mut self, estimate: &ModelInputEstimate) -> Result<(), String> {
++        for part in &estimate.parts {
++            if !self.ids.remove(&part.part_id) {
++                return Err("input estimate contains an unknown or duplicate part id".into());
++            }
++        }
+         Ok(())
+     }
+ }
+@@ -44,15 +65,7 @@ pub struct ModelPartTokenEstimate {
+ 
+ impl ModelInputEstimate {
+     pub fn validate(&self, request: &ModelInputEstimateRequest) -> Result<(), String> {
+-        request.validate()?;
+-        let allowed: HashSet<_> = request.parts.iter().map(|part| part.part_id).collect();
+-        let mut seen = HashSet::new();
+-        for part in &self.parts {
+-            if !allowed.contains(&part.part_id) || !seen.insert(part.part_id) {
+-                return Err("input estimate contains an unknown or duplicate part id".into());
+-            }
+-        }
+-        Ok(())
++        request.validation_context()?.validate_response(self)
+     }
+ 
+     pub fn tokens_for(&self, part: &CanonicalPart) -> Option<u32> {
+diff --git a/crates/proteus-core/src/core/model_service.rs b/crates/proteus-core/src/core/model_service.rs
+index e4cc2755ba0534b09ccff3928cd36ec788d273ed..49e86b445af45197763e5eb183473d15b4ecf639 100644
+--- a/crates/proteus-core/src/core/model_service.rs
++++ b/crates/proteus-core/src/core/model_service.rs
+@@ -72,10 +72,12 @@ impl Model for ModelService {
+         &self,
+         request: crate::contracts::ModelInputEstimateRequest,
+     ) -> Result<Option<crate::contracts::ModelInputEstimate>> {
+-        request.validate().map_err(anyhow::Error::msg)?;
+-        let result = self.adapter.estimate_input(request.clone()).await?;
++        let validation = request.validation_context().map_err(anyhow::Error::msg)?;
++        let result = self.adapter.estimate_input(request).await?;
+         if let Some(estimate) = &result {
+-            estimate.validate(&request).map_err(anyhow::Error::msg)?;
++            validation
++                .validate_response(estimate)
++                .map_err(anyhow::Error::msg)?;
+         }
+         Ok(result)
+     }
+diff --git a/crates/proteus-core/src/process_adapters/model.rs b/crates/proteus-core/src/process_adapters/model.rs
+index 6d2d4fae7cd551ecdf176404301674c9d164d5d9..3adbc45c536e850f6dee0589951f9f77949dcad4 100644
+--- a/crates/proteus-core/src/process_adapters/model.rs
++++ b/crates/proteus-core/src/process_adapters/model.rs
+@@ -251,13 +251,13 @@ impl Model for ProcessModel {
+         &self,
+         request: crate::contracts::ModelInputEstimateRequest,
+     ) -> Result<Option<crate::contracts::ModelInputEstimate>> {
+-        request.validate().map_err(anyhow::Error::msg)?;
++        let validation = request.validation_context().map_err(anyhow::Error::msg)?;
+         let method = crate::contracts::PROCESS_MODEL_ESTIMATE_METHOD;
+         let start = self
+             .client
+             .start(
+                 method,
+-                serde_json::to_value(&request)?,
++                serde_json::to_value(request)?,
+                 Arc::new(proteus_module_protocol::v3::NoAsyncHostRequests),
+             )
+             .await;
+@@ -274,7 +274,7 @@ impl Model for ProcessModel {
+         let result: Option<crate::contracts::ModelInputEstimate> =
+             self.client.decode(method, terminal)?;
+         if let Some(estimate) = &result {
+-            if let Err(error) = estimate.validate(&request) {
++            if let Err(error) = validation.validate_response(estimate) {
+                 self.client.reset();
+                 bail!("invalid model input estimate: {error}");
+             }
