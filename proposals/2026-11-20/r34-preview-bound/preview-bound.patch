@@ -1,0 +1,89 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 6db60e6..0f304bd 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -297,30 +297,35 @@ impl SnapshotState {
+ 
+ pub(crate) fn preview(messages: &[CanonicalMessage]) -> Option<String> {
+     use proteus_contracts::model_standard::{ContentPart, MessageRole};
++    fn excerpt(text: &str) -> Option<String> {
++        let text = text.trim();
++        if text.is_empty() {
++            return None;
++        }
++        const LIMIT: usize = 160;
++        if text.len() > LIMIT
++            && let Some((end, _)) = text.char_indices().nth(LIMIT)
++        {
++            let mut short = String::with_capacity(end + 3);
++            short.push_str(&text[..end]);
++            short.push_str("...");
++            return Some(short);
++        }
++        Some(text.to_owned())
++    }
++
+     let text = |message: &CanonicalMessage| {
+         message.parts.iter().find_map(|part| match &part.payload {
+             ContentPart::Text { text }
+             | ContentPart::ReasoningSummary { text }
+-            | ContentPart::Reasoning { text, .. } => {
+-                let text = text.trim();
+-                (!text.is_empty()).then(|| text.to_owned())
+-            }
+-            ContentPart::ToolResult { result } => {
+-                let text = result.text_or_status();
+-                let text = text.trim();
+-                (!text.is_empty()).then(|| text.to_owned())
+-            }
++            | ContentPart::Reasoning { text, .. } => excerpt(text),
++            ContentPart::ToolResult { result } => excerpt(&result.text_or_status()),
+             _ => None,
+         })
+     };
+-    let selected = messages
++    messages
+         .iter()
+         .filter(|m| m.role == MessageRole::User)
+         .find_map(text)
+-        .or_else(|| messages.iter().find_map(text))?;
+-    Some(if selected.chars().count() <= 160 {
+-        selected
+-    } else {
+-        format!("{}...", selected.chars().take(160).collect::<String>())
+-    })
++        .or_else(|| messages.iter().find_map(text))
+ }
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+index 61bbbbe..9ef737b 100644
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -1,5 +1,28 @@
+ use super::*;
+ 
++#[test]
++fn catalog_preview_trims_before_cutting_at_a_unicode_scalar_boundary() {
++    let prefix = "🦀".repeat(160);
++    let selected = |s: String| {
++        crate::snapshot::preview(&[
++            CanonicalMessage::text(MessageRole::Assistant, "fallback"),
++            CanonicalMessage::new(
++                MessageRole::User,
++                vec![
++                    ContentPart::Text { text: "  ".into() },
++                    ContentPart::ReasoningSummary { text: s },
++                ],
++            ),
++        ])
++    };
++    assert_eq!(selected(format!("　{prefix}　")), Some(prefix.clone()));
++    assert_eq!(
++        selected(format!(" {prefix}я ")),
++        Some(format!("{prefix}..."))
++    );
++    assert_eq!(selected("　".into()).as_deref(), Some("fallback"));
++}
++
+ #[test]
+ fn metadata_cas_receipts_survive_reopen_and_reject_conflicts() {
+     for kind in backends() {
