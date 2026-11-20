@@ -1,0 +1,87 @@
+{
+  "control": "loopback mocked HTTP /history/page, not Core or GUI",
+  "passed": true,
+  "source": "7ccb6c8634c40f450d83bb6e9eff891dc776ee6b",
+  "results": {
+    "tail": {
+      "ok": true,
+      "api_ms": 3.2553970000000003,
+      "page": {
+        "revision": "r20",
+        "start": 0,
+        "total": 0,
+        "messages": [],
+        "base": null
+      },
+      "id": "tail"
+    },
+    "older": {
+      "ok": true,
+      "api_ms": 3.4089229999999997,
+      "page": {
+        "revision": "r20",
+        "start": 0,
+        "total": 0,
+        "messages": [],
+        "base": null
+      },
+      "id": "older"
+    },
+    "slow_drip_body": {
+      "ok": false,
+      "api_ms": 30005.821824000002,
+      "error": "timeout: global",
+      "id": "slow_drip_body"
+    },
+    "stalled_headers": {
+      "ok": false,
+      "api_ms": 31918.314244,
+      "error": "timeout: global",
+      "id": "stalled_headers"
+    }
+  },
+  "requests": [
+    {
+      "route": "/history/page",
+      "query": {
+        "session_dir": [
+          "/delay"
+        ]
+      },
+      "bearer_ok": true
+    },
+    {
+      "route": "/history/page",
+      "query": {
+        "session_dir": [
+          "/slow-drip"
+        ]
+      },
+      "bearer_ok": true
+    },
+    {
+      "route": "/history/page",
+      "query": {
+        "session_dir": [
+          "/stored/session + #1"
+        ]
+      },
+      "bearer_ok": true
+    },
+    {
+      "route": "/history/page",
+      "query": {
+        "session_dir": [
+          "/stored/session + #1"
+        ],
+        "before": [
+          "50"
+        ],
+        "revision": [
+          "r20/prev?"
+        ]
+      },
+      "bearer_ok": true
+    }
+  ]
+}
