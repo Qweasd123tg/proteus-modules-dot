@@ -1,0 +1,75 @@
+diff --git a/crates/proteus-core/src/core/model_service.rs b/crates/proteus-core/src/core/model_service.rs
+index e4cc2755ba0534b09ccff3928cd36ec788d273ed..3f70d4e58613de598a0c90999b908a948d075407 100644
+--- a/crates/proteus-core/src/core/model_service.rs
++++ b/crates/proteus-core/src/core/model_service.rs
+@@ -209,6 +209,31 @@ mod tests {
+         )
+     }
+ 
++    // Temporary allocation probe: see paired evidence, not part of the production patch.
++    #[test]
++    fn r28_direct_service_allocation() {
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .build()
++            .unwrap();
++        for size in [1024, 1 << 20, 8 << 20] {
++            let adapter = Arc::new(ScriptedAdapter::new(vec![ModelStreamEvent::Response {
++                response: final_response(),
++            }]));
++            let service = ModelService::new(adapter);
++            let request = CanonicalModelRequest::new(
++                ModelRef::new("scripted", "x"),
++                vec![CanonicalMessage::text(MessageRole::User, "x".repeat(size))],
++            );
++            let (result, allocated) =
++                crate::test_alloc::measure(|| rt.block_on(service.complete(request)));
++            assert_eq!(result.unwrap().finish_reason, FinishReason::Stop);
++            eprintln!(
++                "R28ALLOC path=service fixture={} bytes={} calls={}",
++                size, allocated.bytes, allocated.calls
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn response_tool_surface_must_match_the_shaped_request() {
+         let call = ToolCall::new(new_call_id(), "apply_patch", serde_json::json!(""))
+diff --git a/crates/proteus-core/src/core/prompt_replay/tests.rs b/crates/proteus-core/src/core/prompt_replay/tests.rs
+index b11f1d6867e224eef4bc9e454be1547a1739d8bc..f401664bcb3dcf51e33e758f193c6d48d5fb44b1 100644
+--- a/crates/proteus-core/src/core/prompt_replay/tests.rs
++++ b/crates/proteus-core/src/core/prompt_replay/tests.rs
+@@ -468,3 +468,22 @@ async fn provider_hosted_tools_require_explicit_opt_in_and_request_stays_exact()
+     assert_eq!(report.citations.recorded, 1);
+     assert_eq!(report.citations.replay, 1);
+ }
++
++#[test]
++fn r28_raw_replay_allocation() {
++    let rt = tokio::runtime::Builder::new_current_thread()
++        .build()
++        .unwrap();
++    for size in [1024, 1 << 20, 8 << 20] {
++        let adapter = Arc::new(RecordingModel::new(text_response("complete")));
++        let input = request(&"x".repeat(size));
++        let (result, allocated) =
++            crate::test_alloc::measure(|| rt.block_on(invoke_model(adapter.clone(), input)));
++        assert_eq!(result.unwrap().finish_reason, FinishReason::Stop);
++        assert_eq!(adapter.requests.lock().unwrap().len(), 1);
++        eprintln!(
++            "R28ALLOC path=replay fixture={} bytes={} calls={}",
++            size, allocated.bytes, allocated.calls
++        );
++    }
++}
+diff --git a/crates/proteus-core/src/lib.rs b/crates/proteus-core/src/lib.rs
+index 6ffa36f194d379fd2039b01fd2692bd1e1885e13..0b4f54db3dd8decd26ff3d5040d3c3ac97bae966 100644
+--- a/crates/proteus-core/src/lib.rs
++++ b/crates/proteus-core/src/lib.rs
+@@ -16,3 +16,7 @@ extern crate self as proteus_core;
+ #[cfg(test)]
+ #[path = "../tests/support/model.rs"]
+ pub(crate) mod test_model;
++
++#[cfg(test)]
++#[path = "../../proteus-contracts/src/test_alloc.rs"]
++mod test_alloc;
