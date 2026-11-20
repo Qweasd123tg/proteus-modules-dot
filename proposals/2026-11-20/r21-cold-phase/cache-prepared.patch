@@ -1,0 +1,268 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index e8e9970..d058ca7 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -43,6 +43,9 @@ pub struct StorageService {
+     state: Mutex<State>,
+     // Bound cold catalog work independently of foreground writers.
+     catalog_scan: Mutex<()>,
++    // One optional encoded cache body per service. Acquire before State; a
++    // durable operation never waits for this preparation permit.
++    cache_prepare: Mutex<()>,
+ }
+ struct State {
+     kind: BackendKind,
+@@ -75,6 +78,7 @@ impl StorageService {
+         Self {
+             kind,
+             catalog_scan: Mutex::new(()),
++            cache_prepare: Mutex::new(()),
+             state: Mutex::new(State {
+                 kind,
+                 writers: HashMap::new(),
+@@ -118,6 +122,12 @@ impl StorageService {
+                 key,
+                 source,
+             } => cache::read_cache(session, key, source),
++            WriteCache {
++                session,
++                key,
++                source,
++                value,
++            } => self.write_cache(session, key, source, value),
+             request => self.lock_state()?.execute(request),
+         }
+     }
+@@ -257,15 +267,13 @@ impl State {
+                     .context("model context requested outside the latest admitted turn")?;
+                 Ok(SessionStorageResponse::ModelContext { observations })
+             }
+-            Open { .. } | ReadCache { .. } | ListCandidates { .. } | List { .. } => {
++            Open { .. }
++            | ReadCache { .. }
++            | WriteCache { .. }
++            | ListCandidates { .. }
++            | List { .. } => {
+                 unreachable!("handled by StorageService")
+             }
+-            WriteCache {
+-                session,
+-                key,
+-                source,
+-                value,
+-            } => self.write_cache(session, key, source, value),
+             ReadMetadata { session, key } => {
+                 let dir = self.checked_path(&session)?;
+                 Ok(SessionStorageResponse::Metadata {
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 136b46e..b2b6c21 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -1,9 +1,13 @@
+ //! Disposable read caches are not canonical storage and never acquire a writer.
+ use super::*;
+ use serde::{Deserialize, Serialize};
+-use std::{fs::OpenOptions, io::Write};
++use std::{
++    fs::OpenOptions,
++    io::{self, Write},
++};
+ 
+ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
++const MAX_ENVELOPE_BYTES: usize = MAX_CACHE_BYTES + 1024 * 1024;
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Cache {
+@@ -25,7 +29,7 @@ pub(super) fn read_cache(
+     source: Option<StorageSnapshot>,
+ ) -> Result<SessionStorageResponse> {
+     let dir = checked_path(&session)?;
+-    let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_CACHE_BYTES + 1024 * 1024) {
++    let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_ENVELOPE_BYTES) {
+         Ok(bytes) => bytes,
+         Err(_) => return Ok(SessionStorageResponse::Metadata { document: None }),
+     };
+@@ -52,13 +56,62 @@ pub(super) fn read_cache(
+     })
+ }
+ 
+-impl State {
++impl StorageService {
+     pub(super) fn write_cache(
+-        &mut self,
++        &self,
+         session: SessionLocator,
+         key: String,
+         source: StorageSnapshot,
+         value: serde_json::Value,
++    ) -> Result<SessionStorageResponse> {
++        let _permit = self
++            .cache_prepare
++            .lock()
++            .map_err(|_| anyhow::anyhow!("storage cache preparation lock poisoned"))?;
++        let cache = Cache { source, value };
++        // Defer any encoding error until the same authoritative check as
++        // before: a stale or missing target remains a disposable cache miss.
++        let prepared = prepare_cache_body(&cache);
++        let Cache { source, value } = cache;
++        drop(value);
++        self.lock_state()?
++            .write_prepared_cache(session, key, source, prepared)
++    }
++}
++
++fn prepare_cache_body(cache: &Cache) -> Result<(Vec<u8>, String)> {
++    struct Envelope(Vec<u8>);
++    impl Write for Envelope {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            if bytes.len() > MAX_ENVELOPE_BYTES.saturating_sub(self.0.len()) {
++                return Err(io::Error::other("cache value exceeds maximum"));
++            }
++            let end = self.0.len() + bytes.len();
++            if end > self.0.capacity() {
++                let capacity = (self.0.capacity() * 2).max(end).min(MAX_ENVELOPE_BYTES);
++                self.0.reserve_exact(capacity - self.0.len());
++            }
++            self.0.extend_from_slice(bytes);
++            Ok(bytes.len())
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    let mut bytes = Envelope(Vec::with_capacity(1024));
++    serde_json::to_writer(&mut bytes, cache)?;
++    Ok((bytes.0, storage_value_etag(&cache.value)?))
++}
++
++impl State {
++    fn write_prepared_cache(
++        &mut self,
++        session: SessionLocator,
++        key: String,
++        source: StorageSnapshot,
++        prepared: Result<(Vec<u8>, String)>,
+     ) -> Result<SessionStorageResponse> {
+         ensure!(
+             source.session == session,
+@@ -72,12 +125,7 @@ impl State {
+         if !same_prefix(&current, &source) {
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+-        let cache = Cache { source, value };
+-        let bytes = serde_json::to_vec(&cache)?;
+-        ensure!(
+-            bytes.len() <= MAX_CACHE_BYTES + 1024 * 1024,
+-            "cache value exceeds maximum"
+-        );
++        let (bytes, etag) = prepared?;
+         // No create_dir_all: a cache write may never resurrect a deleted session.
+         let temp = dir.join(format!(".storage-cache-{}.tmp", Uuid::new_v4()));
+         let result = (|| {
+@@ -99,9 +147,7 @@ impl State {
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+         evict(&dir, &path(&dir, &key))?;
+-        Ok(SessionStorageResponse::CacheWritten {
+-            etag: Some(storage_value_etag(&cache.value)?),
+-        })
++        Ok(SessionStorageResponse::CacheWritten { etag: Some(etag) })
+     }
+ }
+ 
+diff --git a/storage/session-storage/src/tests/cache.rs b/storage/session-storage/src/tests/cache.rs
+new file mode 100644
+index 0000000..0950ddd
+--- /dev/null
++++ b/storage/session-storage/src/tests/cache.rs
+@@ -0,0 +1,76 @@
++use super::*;
++use serde_json::json;
++
++fn write(f: &Fixture, source: StorageSnapshot, value: serde_json::Value) -> Option<String> {
++    let request = SessionStorageRequest::WriteCache {
++        session: f.descriptor.session.clone(),
++        key: "test-preview".to_owned(),
++        source,
++        value,
++    };
++    let response = f.service.execute(request.clone()).unwrap();
++    request.validate_response(&response).unwrap();
++    let SessionStorageResponse::CacheWritten { etag } = response else {
++        panic!("unexpected cache write response");
++    };
++    etag
++}
++
++fn read(f: &Fixture, source: StorageSnapshot) -> Option<StorageMetadataDocument> {
++    let request = SessionStorageRequest::ReadCache {
++        session: f.descriptor.session.clone(),
++        key: "test-preview".to_owned(),
++        source: Some(source),
++    };
++    let response = f.service.execute(request.clone()).unwrap();
++    request.validate_response(&response).unwrap();
++    let SessionStorageResponse::Metadata { document } = response else {
++        panic!("unexpected cache read response");
++    };
++    document
++}
++
++#[test]
++fn prepared_cache_returns_the_exact_etag_and_round_trips_both_backends() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("before")]);
++        let source = f.snapshot();
++        let value = json!({"rows": [[["пример 😀", null], 11.1]], "visible": true});
++        let expected = storage_value_etag(&value).unwrap();
++        assert_eq!(
++            write(&f, source.clone(), value.clone()),
++            Some(expected.clone())
++        );
++        let document = read(&f, source).unwrap();
++        assert_eq!(document.etag, expected);
++        assert_eq!(document.value, value);
++    }
++}
++
++#[test]
++fn prepared_stale_cache_cannot_replace_current_or_leave_a_named_tmp() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("before")]);
++        let old = f.snapshot();
++        f.append(vec![text("after")]);
++        let current = f.snapshot();
++        assert_ne!(old.revision, current.revision);
++        assert_ne!(old.content_sha256, current.content_sha256);
++        let current_value = json!({"rows": ["current"]});
++        assert!(write(&f, current.clone(), current_value.clone()).is_some());
++        assert!(write(&f, old.clone(), json!({"rows": ["stale"]})).is_none());
++        assert!(read(&f, old).is_none());
++        assert_eq!(read(&f, current).unwrap().value, current_value);
++        assert!(
++            std::fs::read_dir(f.descriptor.local_path.as_ref().unwrap())
++                .unwrap()
++                .all(|entry| !entry
++                    .unwrap()
++                    .file_name()
++                    .to_string_lossy()
++                    .ends_with(".tmp"))
++        );
++    }
++}
+diff --git a/storage/session-storage/src/tests/mod.rs b/storage/session-storage/src/tests/mod.rs
+index c8426bc..21a6642 100644
+--- a/storage/session-storage/src/tests/mod.rs
++++ b/storage/session-storage/src/tests/mod.rs
+@@ -120,6 +120,7 @@ pub(crate) fn text(value: &str) -> CanonicalMessage {
+     CanonicalMessage::text(MessageRole::User, value)
+ }
+ 
++mod cache;
+ mod journal;
+ mod metadata;
+ mod ownership;
