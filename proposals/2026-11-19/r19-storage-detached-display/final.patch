@@ -1,0 +1,1523 @@
+diff --git a/storage/session-storage/README.md b/storage/session-storage/README.md
+index 92a9087..c270aed 100644
+--- a/storage/session-storage/README.md
++++ b/storage/session-storage/README.md
+@@ -59,7 +59,16 @@ budget для таких записей; данные не обрезаются.
+ для отображения во временный файл. `ReadDisplayRecords` читает этот файл,
+ сохраняя исходные sequence numbers с пропусками диагностических записей.
+ Открытый snapshot владеет файлом до release или вытеснения. Временный файл
+-ограничен 512 MiB, возвращаемое состояние — 32 MiB. Невозможность подготовить
++использует общий бюджет 512 MiB на экземпляр сервиса (готовые проекции плюс
++одна строящаяся); возвращаемое состояние ограничено 32 MiB. Холодная сборка
++делит допуск с обходом каталога, но не удерживает mutex состояния при открытии
++источника, хешировании, семантическом проходе и записи проекции. JSONL фиксирует
++дескриптор и физическую границу; SQLite использует одну read transaction от
++первой проверки identity до чтения страниц. Перед публикацией повторно
++проверяются locator, жизненный цикл и метки источника. Если та же сессия
++изменилась во время сборки, запрос может вернуть ошибку конфликта: старый
++результат не публикуется как новая голова, автоматического повтора здесь нет.
++Это изменение не выносит обычный холодный `OpenSnapshot` из mutex. Невозможность подготовить
+ такое представление возвращает пустой результат для обычного восстановления;
+ повреждение канонического журнала возвращает ошибку. Запросы исполнения и replay
+ используют полную проверку выбранного хранилища.
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 5cac324..de76753 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -1,7 +1,10 @@
+ use super::*;
+ use crate::{
+     codec,
+-    io::{MAX_PAYLOAD_BYTES, complete_jsonl_offset, restore_offset, sync_directory},
++    io::{
++        MAX_PAYLOAD_BYTES, complete_jsonl_offset, complete_jsonl_offset_at, restore_offset,
++        sync_directory,
++    },
+ };
+ use anyhow::{Context, bail, ensure};
+ use ring::digest::{Context as HashContext, SHA256};
+@@ -26,12 +29,8 @@ impl Jsonl {
+ }
+ 
+ impl JournalBackend for Jsonl {
+-    fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>> {
+-        ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
+-            "session contains a SQLite journal; select its storage implementation or explicitly migrate it"
+-        );
+-        Ok(Box::new(JsonlSnapshot::open(dir, id, None)?))
++    fn freeze(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn FrozenSource>> {
++        Ok(Box::new(FrozenJsonl::capture(dir, id)?))
+     }
+     fn snapshot_warm(
+         &mut self,
+@@ -39,11 +38,7 @@ impl JournalBackend for Jsonl {
+         id: SessionId,
+         hint: &PrefixHint,
+     ) -> Result<Box<dyn RecordSnapshot>> {
+-        ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
+-            "session contains a SQLite journal"
+-        );
+-        Ok(Box::new(JsonlSnapshot::open(dir, id, Some(hint))?))
++        FrozenJsonl::capture(dir, id)?.reader(Some(hint))
+     }
+     fn recover(&mut self, dir: &Path, _id: SessionId) -> Result<()> {
+         ensure!(
+@@ -96,50 +91,82 @@ impl JournalBackend for Jsonl {
+     }
+ }
+ 
+-struct PageBoundary {
+-    after: u64,
+-    offset: u64,
+-    hash: HashContext,
+-}
+-
+-struct JsonlSnapshot {
+-    file: Option<BufReader<std::io::Take<File>>>,
++/// Pin the file object and its physical upper bound. Capturing does no scanning,
++/// hashing, or recovery and never creates the path for a reserved session.
++struct FrozenJsonl {
++    journal: Option<(File, SourceVersion)>,
+     dir: PathBuf,
+     id: SessionId,
+-    length: u64,
+-    fingerprint: String,
+-    current_hash: HashContext,
+-    consumed: u64,
+-    has_external_payloads: bool,
+-    // A resident writer can attest semantics before this reader has scanned blobs.
+-    fully_read: bool,
+-    page_boundary: Option<PageBoundary>,
+ }
+-impl JsonlSnapshot {
+-    fn open(dir: &Path, id: SessionId, hint: Option<&PrefixHint>) -> Result<Self> {
+-        let path = dir.join(codec::JOURNAL_FILE);
+-        let mut file = match File::open(&path) {
+-            Ok(file) => Some(file),
++
++fn version_of(metadata: &std::fs::Metadata) -> Result<SourceVersion> {
++    #[cfg(unix)]
++    let changed = {
++        use std::os::unix::fs::MetadataExt;
++        (metadata.ctime(), metadata.ctime_nsec())
++    };
++    #[cfg(not(unix))]
++    let changed = (0, 0);
++    Ok(SourceVersion {
++        bytes: metadata.len(),
++        modified: metadata.modified()?,
++        changed,
++    })
++}
++
++impl FrozenSource for FrozenJsonl {
++    fn open(self: Box<Self>) -> Result<Box<dyn RecordSnapshot>> {
++        self.reader(None)
++    }
++}
++
++impl FrozenJsonl {
++    fn capture(dir: &Path, id: SessionId) -> Result<Self> {
++        ensure!(
++            !dir.join("journal.sqlite").try_exists()?,
++            "session contains a SQLite journal; select its storage implementation or explicitly migrate it"
++        );
++        let journal = match File::open(dir.join(codec::JOURNAL_FILE)) {
++            Ok(file) => {
++                let metadata = file.metadata()?;
++                ensure!(metadata.is_file(), "journal is not a regular file");
++                Some((file, version_of(&metadata)?))
++            }
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+             Err(e) => return Err(e.into()),
+         };
+-        let length = if let Some(file) = &mut file {
+-            ensure!(file.metadata()?.is_file(), "journal is not a regular file");
+-            if let Some(hint) = hint {
+-                ensure!(
+-                    file.metadata()?.len() >= hint.extent,
+-                    "journal shortened below cached prefix"
+-                );
+-                hint.extent
+-            } else {
+-                complete_jsonl_offset(file)?
+-            }
++        Ok(Self {
++            journal,
++            dir: dir.to_owned(),
++            id,
++        })
++    }
++
++    fn reader(self, hint: Option<&PrefixHint>) -> Result<Box<dyn RecordSnapshot>> {
++        let Self {
++            mut journal,
++            dir,
++            id,
++        } = self;
++        let ceiling = journal.as_ref().map_or(0, |(_, version)| version.bytes);
++        let length = if let Some(hint) = hint {
++            ensure!(
++                ceiling >= hint.extent,
++                "journal shortened below cached prefix"
++            );
++            hint.extent
++        } else if let Some((file, frozen)) = &mut journal {
++            ensure!(
++                &version_of(&file.metadata()?)? == frozen,
++                "journal changed before snapshot prefix was authenticated"
++            );
++            complete_jsonl_offset_at(file, ceiling)?
+         } else {
+             0
+         };
+         let mut hash = HashContext::new(&SHA256);
+         if hint.is_none()
+-            && let Some(file) = &mut file
++            && let Some((file, frozen)) = &mut journal
+         {
+             file.seek(SeekFrom::Start(0))?;
+             let mut source = file.take(length);
+@@ -156,23 +183,24 @@ impl JsonlSnapshot {
+                 source.limit() == 0,
+                 "journal shortened during snapshot capture"
+             );
+-            file.seek(SeekFrom::Start(0))?;
++            // An fd pins the inode, not its bytes. Until a digest exists, even
++            // apparent growth could include an earlier in-place rewrite.
++            ensure!(
++                &version_of(&file.metadata()?)? == frozen,
++                "journal changed before snapshot prefix was authenticated"
++            );
+         }
+         let fingerprint = if let Some(hint) = hint {
+             hint.fingerprint.clone()
+         } else {
+-            hash.finish()
+-                .as_ref()
+-                .iter()
+-                .map(|b| format!("{b:02x}"))
+-                .collect()
++            crate::io::digest_hex(hash.finish())
+         };
+-        if let Some(file) = &mut file {
++        if let Some((file, _)) = &mut journal {
+             file.seek(SeekFrom::Start(0))?;
+         }
+-        Ok(Self {
+-            file: file.map(|f| BufReader::with_capacity(64 * 1024, f.take(length))),
+-            dir: dir.to_owned(),
++        Ok(Box::new(JsonlSnapshot {
++            file: journal.map(|(file, _)| BufReader::with_capacity(64 * 1024, file.take(length))),
++            dir,
+             id,
+             length,
+             fingerprint,
+@@ -181,8 +209,30 @@ impl JsonlSnapshot {
+             has_external_payloads: false,
+             fully_read: false,
+             page_boundary: None,
+-        })
++        }))
+     }
++}
++
++struct PageBoundary {
++    after: u64,
++    offset: u64,
++    hash: HashContext,
++}
++
++struct JsonlSnapshot {
++    file: Option<BufReader<std::io::Take<File>>>,
++    dir: PathBuf,
++    id: SessionId,
++    length: u64,
++    fingerprint: String,
++    current_hash: HashContext,
++    consumed: u64,
++    has_external_payloads: bool,
++    // A resident writer can attest semantics before this reader has scanned blobs.
++    fully_read: bool,
++    page_boundary: Option<PageBoundary>,
++}
++impl JsonlSnapshot {
+     fn position(&mut self, offset: u64, hash: HashContext) -> Result<()> {
+         if let Some(reader) = &mut self.file {
+             reader.get_mut().get_mut().seek(SeekFrom::Start(offset))?;
+@@ -199,19 +249,7 @@ impl RecordSnapshot for JsonlSnapshot {
+         let Some(reader) = &self.file else {
+             return Ok(None);
+         };
+-        let metadata = reader.get_ref().get_ref().metadata()?;
+-        #[cfg(unix)]
+-        let changed = {
+-            use std::os::unix::fs::MetadataExt;
+-            (metadata.ctime(), metadata.ctime_nsec())
+-        };
+-        #[cfg(not(unix))]
+-        let changed = (0, 0);
+-        Ok(Some(SourceVersion {
+-            bytes: metadata.len(),
+-            modified: metadata.modified()?,
+-            changed,
+-        }))
++        Ok(Some(version_of(&reader.get_ref().get_ref().metadata()?)?))
+     }
+     fn verify_fixed_prefix(&self) -> Result<()> {
+         let Some(reader) = &self.file else {
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 25635a3..d084c3f 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -60,8 +60,17 @@ pub(crate) trait RecordSnapshot: Send {
+     fn prefix_fingerprint(&mut self, sequence: u64) -> Result<Option<String>>;
+ }
+ 
++/// A physical boundary pinned without reading canonical payloads. Opening it
++/// performs any expensive fingerprint scan without holding the service mutex.
++pub(crate) trait FrozenSource: Send {
++    fn open(self: Box<Self>) -> Result<Box<dyn RecordSnapshot>>;
++}
++
+ pub(crate) trait JournalBackend: Send {
+-    fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>>;
++    fn freeze(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn FrozenSource>>;
++    fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>> {
++        self.freeze(dir, id)?.open()
++    }
+     fn snapshot_warm(
+         &mut self,
+         dir: &Path,
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index 0016653..c59d61a 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -48,62 +48,74 @@ fn fingerprint_payload<'r>(row: &'r rusqlite::Row<'_>) -> rusqlite::Result<&'r [
+         .map_err(|_| rusqlite::Error::InvalidColumnType(0, "payload".into(), value.data_type()))
+ }
+ 
+-fn snapshot_source(
+-    dir: &Path,
++/// An actual SQLite read transaction, not a filename or a deferred BEGIN
++/// without its first read. The same connection owns the WAL read mark from
++/// capture through hashing, replay and any registered snapshot pages.
++struct FrozenSqlite {
++    conn: Option<Connection>,
+     id: SessionId,
+-    hint: Option<&PrefixHint>,
+-) -> Result<Box<dyn RecordSnapshot>> {
+-    let conn = open_read(dir)?;
+-    let mut hash = HashContext::new(&SHA256);
+-    let end = if let Some(conn) = &conn {
+-        validate_identity(conn, id)?;
+-        let end = u64::try_from(conn.query_row(
+-            "SELECT coalesce(max(sequence),0) FROM journal",
+-            [],
+-            |r| r.get::<_, i64>(0),
+-        )?)?;
+-        if let Some(hint) = hint {
++    end: u64,
++}
++
++impl FrozenSqlite {
++    fn capture(dir: &Path, id: SessionId) -> Result<Self> {
++        let conn = open_read(dir)?;
++        let end = if let Some(conn) = &conn {
++            // The identity read pins the committed view. MAX on the integer
++            // primary key sets its upper bound without scanning payloads.
++            validate_identity(conn, id)?;
++            u64::try_from(conn.query_row(
++                "SELECT coalesce(max(sequence),0) FROM journal",
++                [],
++                |r| r.get::<_, i64>(0),
++            )?)?
++        } else {
++            0
++        };
++        Ok(Self { conn, id, end })
++    }
++
++    fn into_snapshot(self, hint: Option<&PrefixHint>) -> Result<Box<dyn RecordSnapshot>> {
++        let Self { conn, id, end } = self;
++        let (end, fingerprint) = if let Some(hint) = hint {
+             ensure!(
+                 end >= hint.extent,
+                 "SQLite journal shortened below cached prefix"
+             );
+-            hint.extent
++            (hint.extent, hint.fingerprint.clone())
+         } else {
+-            let mut stmt =
+-                conn.prepare("SELECT payload FROM journal WHERE sequence<=?1 ORDER BY sequence")?;
+-            let mut rows = stmt.query([i64::try_from(end)?])?;
+-            while let Some(row) = rows.next()? {
+-                let bytes = fingerprint_payload(row)?;
+-                crate::diagnostics::fingerprint(bytes.len());
+-                hash.update(bytes);
++            let mut hash = HashContext::new(&SHA256);
++            if let Some(conn) = &conn {
++                let mut stmt = conn
++                    .prepare("SELECT payload FROM journal WHERE sequence<=?1 ORDER BY sequence")?;
++                let mut rows = stmt.query([i64::try_from(end)?])?;
++                while let Some(row) = rows.next()? {
++                    let bytes = fingerprint_payload(row)?;
++                    crate::diagnostics::fingerprint(bytes.len());
++                    hash.update(bytes);
++                }
+             }
+-            end
+-        }
+-    } else {
+-        0
+-    };
+-    let fingerprint = if let Some(hint) = hint {
+-        hint.fingerprint.clone()
+-    } else {
+-        hash.finish()
+-            .as_ref()
+-            .iter()
+-            .map(|b| format!("{b:02x}"))
+-            .collect()
+-    };
+-    Ok(Box::new(SqliteSnapshot {
+-        conn,
+-        end,
+-        after: 0,
+-        id,
+-        fingerprint,
+-        current_hash: HashContext::new(&SHA256),
+-    }))
++            (end, crate::io::digest_hex(hash.finish()))
++        };
++        Ok(Box::new(SqliteSnapshot {
++            conn,
++            end,
++            after: 0,
++            id,
++            fingerprint,
++            current_hash: HashContext::new(&SHA256),
++        }))
++    }
+ }
+ 
++impl FrozenSource for FrozenSqlite {
++    fn open(self: Box<Self>) -> Result<Box<dyn RecordSnapshot>> {
++        self.into_snapshot(None)
++    }
++}
+ impl JournalBackend for Sqlite {
+-    fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>> {
+-        snapshot_source(dir, id, None)
++    fn freeze(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn FrozenSource>> {
++        Ok(Box::new(FrozenSqlite::capture(dir, id)?))
+     }
+     fn snapshot_warm(
+         &mut self,
+@@ -111,7 +123,7 @@ impl JournalBackend for Sqlite {
+         id: SessionId,
+         hint: &PrefixHint,
+     ) -> Result<Box<dyn RecordSnapshot>> {
+-        snapshot_source(dir, id, Some(hint))
++        FrozenSqlite::capture(dir, id)?.into_snapshot(Some(hint))
+     }
+     fn recover(&mut self, dir: &Path, id: SessionId) -> Result<()> {
+         ensure!(
+@@ -299,3 +311,57 @@ fn fingerprint_payload_matches_owned_blob_reads_and_errors() {
+         );
+     }
+ }
++
++#[cfg(test)]
++#[test]
++fn freeze_pins_the_read_view_before_hash_and_releases_the_wal_on_drop() {
++    use crate::{
++        service::BackendKind,
++        tests::{Fixture, text},
++    };
++
++    let mut f = Fixture::new(BackendKind::Sqlite);
++    let commit = f.append(vec![text("frozen prefix")]);
++    let dir = f.descriptor.local_path.as_ref().unwrap().clone();
++    let db = Connection::open(dir.join(FILE)).unwrap();
++    db.busy_timeout(std::time::Duration::ZERO).unwrap();
++    let bytes: Vec<u8> = db
++        .query_row("SELECT payload FROM journal WHERE sequence=1", [], |r| {
++            r.get(0)
++        })
++        .unwrap();
++    let checkpoint = || {
++        db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
++            r.get::<_, i64>(0)
++        })
++        .unwrap()
++    };
++
++    crate::diagnostics::reset();
++    let frozen = Sqlite::default()
++        .freeze(&dir, commit.lease.session.session_id)
++        .unwrap();
++    assert_eq!(crate::diagnostics::get().fingerprint_bytes, 0);
++    assert_eq!(crate::diagnostics::get().decoded, 0);
++    // A normal durable commit succeeds while the frozen view is idle. Changing
++    // the old row as well distinguishes a read transaction from just MAX(seq).
++    f.append(vec![text("later append")]);
++    db.execute("UPDATE journal SET payload=x'00' WHERE sequence=1", [])
++        .unwrap();
++    assert_eq!(checkpoint(), 1);
++
++    let mut source = frozen.open().unwrap();
++    assert_eq!(source.extent(), 1);
++    assert_eq!(source.fingerprint(), crate::io::sha256_hex(&bytes));
++    for _ in 0..2 {
++        source.reset().unwrap();
++        assert_eq!(
++            source.next().unwrap().unwrap().record_id,
++            commit.operation_id
++        );
++        assert!(source.next().unwrap().is_none());
++    }
++    assert_eq!(checkpoint(), 1, "replay must retain the original read mark");
++    drop(source);
++    assert_eq!(checkpoint(), 0, "the last reader must not leak a WAL pin");
++}
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 6de1b91..dfb0b25 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -45,8 +45,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+ 
+ /// Read-only discovery never repairs an interrupted final JSONL line.
+ pub(crate) fn complete_jsonl_offset(file: &mut File) -> Result<u64> {
+-    let len = file.metadata()?.len();
+-    let mut end = len;
++    let ceiling = file.metadata()?.len();
++    complete_jsonl_offset_at(file, ceiling)
++}
++
++/// Never reinterpret bytes appended after the caller pinned its physical range.
++pub(crate) fn complete_jsonl_offset_at(file: &mut File, ceiling: u64) -> Result<u64> {
++    let mut end = ceiling;
+     let mut block = [0_u8; 8192];
+     while end != 0 {
+         let start = end.saturating_sub(block.len() as u64);
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index e8e9970..9e5457e 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -41,8 +41,12 @@ pub enum BackendKind {
+ pub struct StorageService {
+     kind: BackendKind,
+     state: Mutex<State>,
+-    // Bound cold catalog work independently of foreground writers.
+-    catalog_scan: Mutex<()>,
++    // Only one detached replay can retain a Fold, new SQLite transaction or
++    // display staging reservation. Always acquire before (never under) State.
++    cold_scan: Mutex<()>,
++    display_staging_budget: u64,
++    #[cfg(test)]
++    pub(crate) after_display_freeze: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+ }
+ struct State {
+     kind: BackendKind,
+@@ -74,7 +78,10 @@ impl StorageService {
+     pub fn new(kind: BackendKind) -> Self {
+         Self {
+             kind,
+-            catalog_scan: Mutex::new(()),
++            cold_scan: Mutex::new(()),
++            display_staging_budget: crate::display::MAX_STAGING_BYTES,
++            #[cfg(test)]
++            after_display_freeze: Mutex::new(None),
+             state: Mutex::new(State {
+                 kind,
+                 writers: HashMap::new(),
+@@ -113,6 +120,7 @@ impl StorageService {
+                 workspace_path,
+                 audit,
+             } => self.list(&config_root, workspace_path.as_deref(), audit),
++            OpenDisplaySnapshot { session } => self.open_display_snapshot(session),
+             ReadCache {
+                 session,
+                 key,
+@@ -128,15 +136,15 @@ impl StorageService {
+             .map_err(|_| anyhow::anyhow!("storage service lock poisoned"))
+     }
+ 
+-    fn lock_catalog(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+-        self.catalog_scan
++    fn lock_cold_scan(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
++        self.cold_scan
+             .lock()
+-            .map_err(|_| anyhow::anyhow!("catalog scan lock poisoned"))
++            .map_err(|_| anyhow::anyhow!("cold scan lock poisoned"))
+     }
+ 
+     /// Validate one session and persist its disposable catalog index.
+     pub fn prime_catalog(&self, path: &Path) -> Result<()> {
+-        let _scan = self.lock_catalog()?;
++        let _scan = self.lock_cold_scan()?;
+         self.catalog_summary(path, false)?;
+         Ok(())
+     }
+@@ -181,7 +189,6 @@ impl State {
+                 let snapshot = self.snapshot(session)?;
+                 Ok(SessionStorageResponse::Snapshot { snapshot })
+             }
+-            OpenDisplaySnapshot { session } => self.open_display_snapshot(session),
+             ReleaseSnapshot { snapshot } => {
+                 self.get_snapshot(&snapshot)?;
+                 self.snapshots.remove(&snapshot.snapshot_id);
+@@ -257,7 +264,11 @@ impl State {
+                     .context("model context requested outside the latest admitted turn")?;
+                 Ok(SessionStorageResponse::ModelContext { observations })
+             }
+-            Open { .. } | ReadCache { .. } | ListCandidates { .. } | List { .. } => {
++            Open { .. }
++            | ReadCache { .. }
++            | ListCandidates { .. }
++            | List { .. }
++            | OpenDisplaySnapshot { .. } => {
+                 unreachable!("handled by StorageService")
+             }
+             WriteCache {
+diff --git a/storage/session-storage/src/service/control.rs b/storage/session-storage/src/service/control.rs
+index c799b47..c275f30 100644
+--- a/storage/session-storage/src/service/control.rs
++++ b/storage/session-storage/src/service/control.rs
+@@ -40,15 +40,20 @@ fn path(dir: &Path) -> Result<PathBuf> {
+         .join(format!(".{name}.storage-control.json")))
+ }
+ pub(super) fn load(dir: &Path) -> Result<Control> {
++    Ok(load_existing(dir)?.unwrap_or_default())
++}
++/// Missing is a stable lifecycle witness for a read-only reservation; a
++/// freshly generated default generation is not.
++pub(super) fn load_existing(dir: &Path) -> Result<Option<Control>> {
+     let path = path(dir)?;
+     match crate::io::bounded_read(&path, 1024 * 1024) {
+-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
++        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+         Err(error)
+             if error
+                 .downcast_ref::<std::io::Error>()
+                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+         {
+-            Ok(Control::default())
++            Ok(None)
+         }
+         Err(error) => Err(error),
+     }
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 4ae8aab..573126a 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -1,90 +1,180 @@
+ //! Capture display state in the same strict pass that validates its source.
+ use super::*;
+-use crate::display::{DisplayWriter, MAX_STAGING_BYTES, state_fits};
++use crate::{
++    backend::{FrozenSource, PrefixHint},
++    display::{DisplayWriter, state_fits},
++    snapshot::Verification,
++};
++
++#[derive(PartialEq, Eq)]
++struct Lifecycle {
++    materialized: bool,
++    control: Option<(Uuid, Option<Uuid>, bool)>,
++}
++
++impl Lifecycle {
++    fn capture(dir: &Path) -> Result<Self> {
++        let control = control::load_existing(dir)?;
++        ensure!(
++            !control
++                .as_ref()
++                .is_some_and(|c| c.deletes.values().any(|r| !r.complete)),
++            "session has an unfinished deletion"
++        );
++        Ok(Self {
++            materialized: dir.try_exists()?,
++            control: control.map(|c| (c.generation, c.incarnation, c.deleted)),
++        })
++    }
++}
++
++impl StorageService {
++    #[cfg(test)]
++    pub(crate) fn limit_display_staging_for_test(&mut self, bytes: u64) {
++        self.display_staging_budget = bytes;
++    }
+ 
+-impl State {
+     pub(super) fn open_display_snapshot(
+-        &mut self,
++        &self,
+         session: SessionLocator,
+     ) -> Result<SessionStorageResponse> {
+-        let dir = self.checked_path(&session)?;
+-        let descriptor = self.describe(&session)?;
+-        let stamps = catalog::source_stamp(&dir, self.kind)?;
++        // This guard reserves the entire remaining staging allowance, until the
++        // stage is dropped or transferred under State. While held, registered
++        // display bytes can only decrease (release/eviction/delete).
++        let _scan = self.lock_cold_scan()?;
++        let (dir, lifecycle, stamps, cut, budget) = {
++            let state = self.lock_state()?;
++            let descriptor = state.describe(&session)?;
++            let dir = descriptor.local_path.context("session has no local path")?;
++            let lifecycle = Lifecycle::capture(&dir)?;
++            let stamps = catalog::source_stamp(&dir, self.kind)?;
++            let cut = state.prefixes.get(&session).map(|c| c.revision.session_seq);
++            let staged: u64 = state
++                .snapshots
++                .values()
++                .filter_map(|s| s.display.as_ref())
++                .map(|d| d.bytes)
++                .sum();
++            let budget = self.display_staging_budget.saturating_sub(staged);
++            (dir, lifecycle, stamps, cut, budget)
++        };
++
++        // Even a read-only SQLite open can wait on another process's DB lock.
++        // The pre-capture path stamps and lifecycle are checked at publication.
++        let frozen = self.kind.backend().freeze(&dir, session.session_id)?;
++        #[cfg(test)]
++        if let Some(after_freeze) = self.after_display_freeze.lock().unwrap().take() {
++            after_freeze();
++        }
+         let blobs = catalog::durable::blob_stamps(&dir);
+-        let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+-        let version = source.source_version()?;
+-        let cut = self
+-            .prefixes
+-            .get(&session)
+-            .map(|cache| cache.revision.session_seq);
+-        let mut state = Fold::default();
+-        let mut previous_boundary =
+-            (cut == Some(0)).then(|| (state.revision(), source.consumed_fingerprint()));
+-        let staged: u64 = self
+-            .snapshots
+-            .values()
+-            .filter_map(|snapshot| snapshot.display.as_ref())
+-            .map(|display| display.bytes)
+-            .sum();
+-        let mut display = DisplayWriter::new(MAX_STAGING_BYTES.saturating_sub(staged));
+-        while let Some(record) = source.next()? {
+-            state.apply(session.session_id, &record)?;
+-            if cut == Some(record.session_seq) {
+-                source.remember_page_boundary(record.session_seq);
+-                previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+-            }
+-            if record.entry.kind().is_display_record()
+-                && let Some(writer) = &mut display
+-                && writer.push(&record).is_err()
+-            {
+-                display = None;
++        let built = build(session.clone(), frozen, cut, budget)?;
++
++        // Strict conflict on a changed source, including an intervening append.
++        // A pinned transaction/fd can prove the old view but not today's HEAD.
++        let mut state = self.lock_state()?;
++        let descriptor = state.describe(&session)?;
++        ensure!(
++            descriptor.session == session
++                && descriptor.local_path.as_ref() == Some(&dir)
++                && Lifecycle::capture(&dir)? == lifecycle,
++            "session lifecycle changed during display capture"
++        );
++        ensure!(
++            catalog::source_stamp(&dir, self.kind)? == stamps,
++            "journal changed during display capture"
++        );
++        if let Some(blobs) = blobs {
++            ensure!(
++                catalog::durable::blob_stamps(&dir).as_ref() == Some(&blobs),
++                "journal blobs changed during display capture"
++            );
++            if lifecycle.materialized {
++                let prefix = views::PrefixCache {
++                    stamps,
++                    revision: built.revision,
++                    hint: built.hint,
++                    blob_digest: Some(catalog::durable::blob_stamp_digest(&blobs)),
++                };
++                let summary = StorageSessionSummary {
++                    descriptor,
++                    message_count: built.message_count,
++                    preview: built.preview,
++                };
++                state.save_catalog_head(&dir, summary, &prefix, blobs);
+             }
+         }
+-        if source.source_version()? != version {
+-            source.verify_fixed_prefix()?;
++        let projection = built.projection.map(|(handle, state_for_resume)| {
++            let snapshot = handle.identity.clone();
++            state.remember_snapshot(handle);
++            StorageDisplaySnapshot {
++                snapshot,
++                state: state_for_resume,
++            }
++        });
++        Ok(SessionStorageResponse::DisplaySnapshot { projection })
++    }
++}
++
++struct Built {
++    revision: StorageRevision,
++    hint: PrefixHint,
++    message_count: usize,
++    preview: Option<String>,
++    projection: Option<(SnapshotState, StorageResumeState)>,
++}
++
++fn build(
++    session: SessionLocator,
++    frozen: Box<dyn FrozenSource>,
++    cut: Option<u64>,
++    budget: u64,
++) -> Result<Built> {
++    let mut source = frozen.open()?;
++    let version = source.source_version()?;
++    let mut state = Fold::default();
++    let mut previous_boundary =
++        (cut == Some(0)).then(|| (state.revision(), source.consumed_fingerprint()));
++    let mut display = DisplayWriter::new(budget);
++    while let Some(record) = source.next()? {
++        state.apply(session.session_id, &record)?;
++        if cut == Some(record.session_seq) {
++            source.remember_page_boundary(record.session_seq);
++            previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+         }
+-        let identity = StorageSnapshot {
+-            session: session.clone(),
+-            snapshot_id: Uuid::new_v4().to_string(),
+-            revision: state.revision(),
+-            content_sha256: source.fingerprint().to_owned(),
+-        };
+-        if let Some(blobs) = blobs
+-            && catalog::durable::blob_stamps(&dir).as_ref() == Some(&blobs)
+-            && catalog::source_stamp(&dir, self.kind)? == stamps
++        if record.entry.kind().is_display_record()
++            && let Some(writer) = &mut display
++            && writer.push(&record).is_err()
+         {
+-            let prefix = views::PrefixCache {
+-                stamps,
+-                revision: identity.revision,
+-                hint: crate::backend::PrefixHint {
+-                    extent: source.extent(),
+-                    fingerprint: identity.content_sha256.clone(),
+-                },
+-                blob_digest: Some(catalog::durable::blob_stamp_digest(&blobs)),
+-            };
+-            let messages = state.validation.history();
+-            let summary = StorageSessionSummary {
+-                descriptor,
+-                message_count: messages.len(),
+-                preview: crate::snapshot::preview(messages),
+-            };
+-            self.save_catalog_head(&dir, summary, &prefix, blobs);
++            // Losing the optional projection must not skip strict validation.
++            display = None;
+         }
+-        let Some(display) = display.and_then(DisplayWriter::finish) else {
+-            return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
+-        };
++    }
++    let verified = Verification::after_replay(&*source, version)?;
++    let revision = state.revision();
++    let messages = state.validation.history();
++    let mut result = Built {
++        revision,
++        hint: PrefixHint {
++            extent: source.extent(),
++            fingerprint: source.fingerprint().to_owned(),
++        },
++        message_count: messages.len(),
++        preview: crate::snapshot::preview(messages),
++        projection: None,
++    };
++    if let Some(display) = display.and_then(DisplayWriter::finish) {
+         let state = state.into_resume(session.session_id);
+-        if !state_fits(&state) {
+-            return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
++        if state_fits(&state) {
++            let identity = StorageSnapshot {
++                session,
++                snapshot_id: Uuid::new_v4().to_string(),
++                revision,
++                content_sha256: result.hint.fingerprint.clone(),
++            };
++            let mut handle = SnapshotState::new(identity, source, verified, previous_boundary);
++            handle.display = Some(display);
++            result.projection = Some((handle, state));
+         }
+-        let mut snapshot = SnapshotState::new(identity.clone(), source, true, previous_boundary)?;
+-        snapshot.display = Some(display);
+-        self.remember_snapshot(snapshot);
+-        Ok(SessionStorageResponse::DisplaySnapshot {
+-            projection: Some(StorageDisplaySnapshot {
+-                snapshot: identity,
+-                state,
+-            }),
+-        })
+     }
++    Ok(result)
+ }
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 5b1fdc2..3059bb7 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -142,7 +142,7 @@ impl StorageService {
+         workspace: Option<&Path>,
+         audit: bool,
+     ) -> Result<SessionStorageResponse> {
+-        let _scan = self.lock_catalog()?;
++        let _scan = self.lock_cold_scan()?;
+         let mut result = Vec::new();
+         for path in candidate_paths(root, workspace, audit)? {
+             match self.catalog_summary(&path, audit) {
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index df9b8cf..419e7e9 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::backend::PrefixHint;
++use crate::{backend::PrefixHint, snapshot::Verification};
+ 
+ #[derive(Clone)]
+ pub(super) struct PrefixCache {
+@@ -42,7 +42,7 @@ impl State {
+             .filter(|cache| cache.valid_at(&dir, &stamps))
+             .cloned();
+         let descriptor = self.describe(&session)?;
+-        let mut verified = false;
++        let mut resident_head = false;
+         if cached.is_none()
+             && let Some(writer) = self.writers.get(&session)
+             && let (Some(fold), Some(head)) = (&writer.fold, &writer.head)
+@@ -67,22 +67,29 @@ impl State {
+             };
+             self.save_catalog_head(&dir, summary, &prefix, blobs);
+             cached = Some(prefix);
+-            verified = true;
++            resident_head = true;
+         }
+         if cached.is_none() {
+             cached = self.load_catalog_head(&dir, &descriptor, &stamps);
+         }
+         let mut previous_boundary = None;
+-        let (mut source, revision) = if let Some(cached) = cached {
++        let (mut source, revision, verification) = if let Some(cached) = cached {
+             let source =
+                 self.kind
+                     .backend()
+                     .snapshot_warm(&dir, session.session_id, &cached.hint)?;
++            // Witness the open source before the final comparison with the
++            // resident writer head, not after reset or handle registration.
++            let verification = if resident_head {
++                Verification::Verified(source.source_version()?)
++            } else {
++                Verification::Provisional
++            };
+             ensure!(
+                 catalog::source_stamp(&dir, self.kind)? == cached.stamps,
+                 "journal changed during snapshot capture"
+             );
+-            (source, cached.revision)
++            (source, cached.revision, verification)
+         } else {
+             let blobs = catalog::durable::blob_stamps(&dir);
+             let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+@@ -102,9 +109,7 @@ impl State {
+                     previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+                 }
+             }
+-            if source.source_version()? != version {
+-                source.verify_fixed_prefix()?;
+-            }
++            let verification = Verification::after_replay(&*source, version)?;
+             let blobs =
+                 blobs.filter(|blobs| catalog::durable::blob_stamps(&dir).as_ref() == Some(blobs));
+             let prefix = PrefixCache {
+@@ -128,8 +133,7 @@ impl State {
+                 };
+                 self.save_catalog_head(&dir, summary, &prefix, blobs);
+             }
+-            verified = true;
+-            (source, revision)
++            (source, revision, verification)
+         };
+         let identity = StorageSnapshot {
+             session,
+@@ -138,7 +142,12 @@ impl State {
+             content_sha256: source.fingerprint().to_owned(),
+         };
+         source.reset()?;
+-        SnapshotState::new(identity, source, verified, previous_boundary)
++        Ok(SnapshotState::new(
++            identity,
++            source,
++            verification,
++            previous_boundary,
++        ))
+     }
+     pub(super) fn snapshot(&mut self, session: SessionLocator) -> Result<StorageSnapshot> {
+         let prepared = self.prepare_snapshot(session)?;
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 6db60e6..dcb6177 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -1,4 +1,7 @@
+-use crate::{backend::RecordSnapshot, types::*};
++use crate::{
++    backend::{RecordSnapshot, SourceVersion},
++    types::*,
++};
+ use anyhow::{Result, ensure};
+ use proteus_contracts::{domain::SessionId, model_standard::CanonicalMessage};
+ use proteus_session_semantics::{JournalValidationState, ModelContextProjection, UsageProjection};
+@@ -60,14 +63,33 @@ impl Fold {
+     }
+ }
+ 
++/// Proof is bound to the version observed while reading the fixed prefix, not
++/// a newer version sampled when the handle is constructed or registered.
++#[derive(Clone, PartialEq, Eq)]
++pub(crate) enum Verification {
++    Provisional,
++    Verified(Option<SourceVersion>),
++}
++impl Verification {
++    pub fn after_replay(source: &dyn RecordSnapshot, start: Option<SourceVersion>) -> Result<Self> {
++        let end = source.source_version()?;
++        if end != start {
++            source.verify_fixed_prefix()?;
++            ensure!(
++                source.source_version()? == end,
++                "journal changed during fixed prefix verification"
++            );
++        }
++        Ok(Self::Verified(end))
++    }
++}
+ pub(crate) struct SnapshotState {
+     pub identity: StorageSnapshot,
+     pub source: Box<dyn RecordSnapshot>,
+     // At most one historical boundary, derived inside the same validation
+     // pass as identity. No caller-supplied descriptor or Fold is retained.
+     previous_boundary: Option<(StorageRevision, String)>,
+-    verified: bool,
+-    verified_version: Option<crate::backend::SourceVersion>,
++    verification: Verification,
+     page_after: Option<u64>,
+     pending: Option<JournalRecord>,
+     pub(crate) display: Option<crate::display::DisplayRecords>,
+@@ -76,25 +98,23 @@ impl SnapshotState {
+     pub fn new(
+         identity: StorageSnapshot,
+         source: Box<dyn RecordSnapshot>,
+-        verified: bool,
++        verification: Verification,
+         previous_boundary: Option<(StorageRevision, String)>,
+-    ) -> Result<Self> {
+-        let verified_version = source.source_version()?;
+-        Ok(Self {
++    ) -> Self {
++        Self {
+             identity,
+             source,
+-            verified,
++            verification,
+             previous_boundary,
+-            verified_version,
+             page_after: None,
+             pending: None,
+             display: None,
+-        })
++        }
+     }
+     /// Reusing a resident semantic projection is safe only for a fully verified
+     /// exact prefix. A cheap warm descriptor alone is never sufficient.
+     pub fn is_verified_unchanged(&self) -> Result<bool> {
+-        Ok(self.verified && self.source.source_version()? == self.verified_version)
++        Ok(self.verification == Verification::Verified(self.source.source_version()?))
+     }
+     fn reset_page_cursor(&mut self) {
+         self.page_after = None;
+@@ -107,7 +127,7 @@ impl SnapshotState {
+         {
+             return Ok(false);
+         }
+-        if self.verified {
++        if matches!(self.verification, Verification::Verified(_)) {
+             let known = if prefix.revision.session_seq == self.identity.revision.session_seq {
+                 Some((&self.identity.revision, &self.identity.content_sha256))
+             } else {
+@@ -143,7 +163,7 @@ impl SnapshotState {
+     }
+     pub fn fold(&mut self) -> Result<Fold> {
+         self.reset_page_cursor();
+-        self.verified = false;
++        self.verification = Verification::Provisional;
+         let version = self.source.source_version()?;
+         self.source.reset()?;
+         let mut state = Fold::default();
+@@ -154,11 +174,7 @@ impl SnapshotState {
+             state.revision() == self.identity.revision,
+             "snapshot revision changed"
+         );
+-        if self.source.source_version()? != version {
+-            self.source.verify_fixed_prefix()?;
+-        }
+-        self.verified = true;
+-        self.verified_version = self.source.source_version()?;
++        self.verification = Verification::after_replay(&*self.source, version)?;
+         Ok(state)
+     }
+     pub fn page(&mut self, after: u64, limit: u32) -> Result<StorageRecordPage> {
+@@ -168,13 +184,13 @@ impl SnapshotState {
+         );
+         // A warm snapshot is only a cheap provisional descriptor. Validate its
+         // complete fixed prefix once before exposing any canonical records.
+-        if !self.verified || self.source.source_version()? != self.verified_version {
++        if !self.is_verified_unchanged()? {
+             self.fold()?;
+         }
+         // Failed pages leave no reusable cursor. Cover repositioning as well
+         // as streaming with the same source-version check.
+         let continuing = self.page_after.take() == Some(after);
+-        let page_version = self.source.source_version()?;
++
+         if !continuing {
+             self.pending = None;
+             self.source.reset_for_page(after)?;
+@@ -204,10 +220,7 @@ impl SnapshotState {
+             bytes += record_bytes;
+             records.push(record);
+         }
+-        if self.source.source_version()? != page_version {
+-            self.source.verify_fixed_prefix()?;
+-            self.verified_version = self.source.source_version()?;
+-        }
++        self.reconfirm_prefix()?;
+         let last = records.last().map_or(after, |record| record.session_seq);
+         self.page_after = Some(last);
+         let next_after_seq = (last < self.identity.revision.session_seq).then_some(last);
+@@ -218,22 +231,27 @@ impl SnapshotState {
+         })
+     }
+     pub fn display_page(&mut self, after: u64, limit: u32) -> Result<StorageRecordPage> {
+-        let version = self.source.source_version()?;
+-        if version != self.verified_version {
+-            self.source.verify_fixed_prefix()?;
+-            self.verified_version = self.source.source_version()?;
+-        }
+-        let page = self
+-            .display
+-            .as_mut()
+-            .ok_or_else(|| anyhow::anyhow!("snapshot has no display projection"))?
+-            .page(&self.identity, after, limit)?;
+-        if self.source.source_version()? != self.verified_version {
+-            self.source.verify_fixed_prefix()?;
+-            self.verified_version = self.source.source_version()?;
+-        }
++        ensure!(self.display.is_some(), "snapshot has no display projection");
++        self.reconfirm_prefix()?;
++        let page =
++            self.display
++                .as_mut()
++                .expect("checked above")
++                .page(&self.identity, after, limit)?;
++        self.reconfirm_prefix()?;
+         Ok(page)
+     }
++    fn reconfirm_prefix(&mut self) -> Result<()> {
++        match &self.verification {
++            Verification::Verified(previous) => {
++                self.verification = Verification::after_replay(&*self.source, previous.clone())?;
++            }
++            Verification::Provisional => {
++                self.fold()?;
++            }
++        }
++        Ok(())
++    }
+     pub fn conversation_at(&mut self, point: StorageHistoryPoint) -> Result<StorageConversation> {
+         if point == StorageHistoryPoint::Current {
+             let state = self.fold()?;
+diff --git a/storage/session-storage/src/tests/display.rs b/storage/session-storage/src/tests/display.rs
+index 46fc3bd..882ce78 100644
+--- a/storage/session-storage/src/tests/display.rs
++++ b/storage/session-storage/src/tests/display.rs
+@@ -5,8 +5,12 @@ use proteus_contracts::contracts::{
+ };
+ 
+ fn append_hook(f: &mut Fixture) {
++    append_hook_with(f, &"diagnostic history ".repeat(60_000));
++}
++
++fn append_hook_with(f: &mut Fixture, body: &str) {
+     let execution = proteus_contracts::domain::new_execution_id();
+-    let messages = vec![text(&"diagnostic history ".repeat(60_000))];
++    let messages = vec![text(body)];
+     let event = HookEvent::BeforeContext {
+         input: ContextPreparationInput::new(messages.clone(), None),
+         output: ContextPreparationOutput::unchanged(messages),
+@@ -134,6 +138,7 @@ fn display_capture_rejects_corrupt_replay_only_payload() {
+     let mut f = Fixture::new(BackendKind::Jsonl);
+     f.append(vec![text("visible")]);
+     append_hook(&mut f);
++    f.service.limit_display_staging_for_test(0);
+     let dir = f.descriptor.local_path.as_ref().unwrap();
+     let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+     let hook: serde_json::Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+@@ -167,3 +172,5 @@ fn display_pages_reject_rewritten_fixed_prefix() {
+             .is_err()
+     );
+ }
++
++mod concurrency;
+diff --git a/storage/session-storage/src/tests/display/concurrency.rs b/storage/session-storage/src/tests/display/concurrency.rs
+new file mode 100644
+index 0000000..8bc9c24
+--- /dev/null
++++ b/storage/session-storage/src/tests/display/concurrency.rs
+@@ -0,0 +1,263 @@
++use super::*;
++use SessionStorageRequest as Req;
++use SessionStorageResponse as Res;
++use std::{sync::mpsc, thread, time::Duration};
++
++const WAIT: Duration = Duration::from_secs(3);
++
++/// Pause the real request dispatcher once the fd/WAL transaction is pinned,
++/// before hashing or decoding. A failed assertion also releases the builder.
++fn pause(service: &StorageService) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
++    let (started, frozen) = mpsc::channel();
++    let (release, wait) = mpsc::channel();
++    *service.after_display_freeze.lock().unwrap() = Some(Box::new(move || {
++        started.send(()).unwrap();
++        let _ = wait.recv_timeout(WAIT * 2);
++    }));
++    (frozen, release)
++}
++
++fn display_request(session: &SessionLocator) -> Req {
++    Req::OpenDisplaySnapshot {
++        session: session.clone(),
++    }
++}
++
++fn increased(mut commit: StorageCommit) -> StorageCommit {
++    commit.operation_id = new_record_id();
++    commit.expected.session_seq += 1;
++    commit.expected.history_revision += 1;
++    let JournalEntry::HistoryMutated(change) = &mut commit.entry else {
++        panic!()
++    };
++    change.previous_revision += 1;
++    change.new_revision += 1;
++    change.messages = vec![text("active writer progressed")];
++    commit
++}
++
++#[test]
++fn other_session_commits_durably_before_cold_display_is_unblocked() {
++    for kind in backends() {
++        let mut a = Fixture::new(kind);
++        let commit = increased(a.append(vec![text("warm writer A")]));
++        let mut b = Fixture::new(kind);
++        b.append(vec![text("cold B")]);
++        append_hook_with(&mut b, "hidden diagnostic");
++        b.append(vec![text("visible tail")]);
++        let req = display_request(&b.descriptor.session);
++        let service = &a.service;
++        let pending = thread::scope(|scope| {
++            let (frozen, release) = pause(service);
++            let reader = scope.spawn(move || service.execute(req));
++            frozen.recv_timeout(WAIT).expect("freeze was not reached");
++            let (sent, ack) = mpsc::channel();
++            scope.spawn(move || {
++                let _ = sent.send(service.execute(Req::Commit { commit }));
++            });
++            let ack = ack.recv_timeout(WAIT);
++            drop(release);
++            assert!(
++                matches!(ack.expect("commit waited for a different session's cold display").unwrap(),
++                Res::Committed { ack } if ack.revision.session_seq == 2)
++            );
++            reader.join().unwrap().unwrap()
++        });
++        let Res::DisplaySnapshot {
++            projection: Some(got),
++        } = pending
++        else {
++            panic!()
++        };
++        let serial = open(&b);
++        assert_eq!(got.state, serial.state);
++        assert_eq!(got.snapshot.session, serial.snapshot.session);
++        assert_eq!(got.snapshot.content_sha256, serial.snapshot.content_sha256);
++        assert_eq!(got.snapshot.revision, serial.snapshot.revision);
++        assert_eq!(got.snapshot.revision.session_seq, 3);
++        assert_eq!(got.snapshot.revision.history_revision, 2);
++        assert_ne!(got.snapshot.snapshot_id, serial.snapshot.snapshot_id);
++        for (after, seq) in [(0, 1), (1, 3)] {
++            let req = Req::ReadDisplayRecords {
++                snapshot: got.snapshot.clone(),
++                after_seq: after,
++                limit: 1,
++            };
++            let Res::Records { page: actual } = service.execute(req).unwrap() else {
++                panic!()
++            };
++            let expected = page(&b, &serial.snapshot, after);
++            assert_eq!(actual.records, expected.records);
++            assert_eq!(actual.records[0].session_seq, seq);
++            assert_eq!(actual.next_after_seq, expected.next_after_seq);
++        }
++    }
++}
++
++#[test]
++fn concurrent_append_or_recreation_cannot_publish_stale_handle_or_head() {
++    for kind in backends() {
++        for retire in [false, true] {
++            let mut f = Fixture::new(kind);
++            let commit = increased(f.append(vec![text("old head")]));
++            let lease = f.lease.clone();
++            let old = f.descriptor.clone();
++            let root = f.root.path();
++            let index = old
++                .local_path
++                .as_ref()
++                .unwrap()
++                .join(".storage-catalog-v1.json");
++            let service = &f.service;
++            let (err, current) = thread::scope(|scope| {
++                let (frozen, release) = pause(service);
++                let request = display_request(&old.session);
++                let reader = scope.spawn(move || service.execute(request));
++                frozen.recv_timeout(WAIT).expect("freeze was not reached");
++                let current = if retire {
++                    service
++                        .execute(Req::Delete {
++                            lease,
++                            operation_id: new_record_id(),
++                        })
++                        .unwrap();
++                    let Res::Session { descriptor } = service
++                        .execute(Req::Create {
++                            config_root: root.into(),
++                            workspace_path: old.workspace_path.clone(),
++                            session_id: old.session.session_id,
++                            parent_session_id: None,
++                        })
++                        .unwrap()
++                    else {
++                        panic!()
++                    };
++                    assert_ne!(old.session, descriptor.session);
++                    service
++                        .execute(Req::AcquireWriter {
++                            session: descriptor.session.clone(),
++                        })
++                        .unwrap();
++                    descriptor.session
++                } else {
++                    service.execute(Req::Commit { commit }).unwrap();
++                    old.session.clone()
++                };
++                let before = std::fs::read(&index).ok();
++                drop(release);
++                let err = reader.join().unwrap().unwrap_err();
++                assert_eq!(std::fs::read(&index).ok(), before);
++                (err, current)
++            });
++            assert!(!err.to_string().is_empty());
++            let Res::DisplaySnapshot {
++                projection: Some(latest),
++            } = service.execute(display_request(&current)).unwrap()
++            else {
++                panic!()
++            };
++            assert_eq!(
++                latest.snapshot.revision.session_seq,
++                if retire { 0 } else { 2 }
++            );
++        }
++    }
++}
++
++#[test]
++fn concurrent_display_stages_share_one_budget_and_release_or_eviction_reclaims_it() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("one display record")]);
++        let identity = f.snapshot();
++        let Res::Records { page } = f
++            .service
++            .execute(Req::ReadRecords {
++                snapshot: identity,
++                after_seq: 0,
++                limit: 1,
++            })
++            .unwrap()
++        else {
++            panic!()
++        };
++        let one_stage = serde_json::to_vec(&page.records[0]).unwrap().len() as u64 + 1;
++        f.service.limit_display_staging_for_test(one_stage);
++        let req = display_request(&f.descriptor.session);
++        let service = &f.service;
++        let single = thread::scope(|scope| {
++            let (frozen, release) = pause(service);
++            let r = req.clone();
++            let first = scope.spawn(move || service.execute(r));
++            frozen.recv_timeout(WAIT).unwrap();
++            let r = req.clone();
++            let second = scope.spawn(move || service.execute(r));
++            drop(release);
++            let Res::DisplaySnapshot {
++                projection: Some(first),
++            } = first.join().unwrap().unwrap()
++            else {
++                panic!()
++            };
++            assert!(matches!(
++                second.join().unwrap().unwrap(),
++                Res::DisplaySnapshot { projection: None }
++            ));
++            first.snapshot
++        });
++        service
++            .execute(Req::ReleaseSnapshot { snapshot: single })
++            .unwrap();
++        let next = open(&f).snapshot;
++        for _ in 0..32 {
++            f.snapshot();
++        }
++        assert!(
++            service
++                .execute(Req::ReleaseSnapshot { snapshot: next })
++                .is_err()
++        );
++        assert_eq!(open(&f).snapshot.revision, f.revision);
++    }
++}
++
++#[test]
++fn read_only_reservation_stays_empty_and_materialization_conflicts() {
++    for kind in backends() {
++        let f = Fixture::new(kind);
++        let service = &f.service;
++        let Res::Session { descriptor } = service
++            .execute(Req::Create {
++                config_root: f.root.path().to_owned(),
++                workspace_path: f.descriptor.workspace_path.clone(),
++                session_id: new_session_id(),
++                parent_session_id: None,
++            })
++            .unwrap()
++        else {
++            panic!()
++        };
++        let dir = descriptor.local_path.unwrap();
++        let req = display_request(&descriptor.session);
++        let Res::DisplaySnapshot {
++            projection: Some(empty),
++        } = service.execute(req.clone()).unwrap()
++        else {
++            panic!()
++        };
++        assert_eq!(empty.snapshot.revision.session_seq, 0);
++        assert!(!dir.exists());
++        thread::scope(|scope| {
++            let (frozen, release) = pause(service);
++            let reader = scope.spawn(move || service.execute(req));
++            frozen.recv_timeout(WAIT).unwrap();
++            service
++                .execute(Req::AcquireWriter {
++                    session: descriptor.session,
++                })
++                .unwrap();
++            drop(release);
++            assert!(reader.join().unwrap().is_err());
++        });
++    }
++}
+diff --git a/storage/session-storage/src/tests/journal.rs b/storage/session-storage/src/tests/journal.rs
+index b457326..997d101 100644
+--- a/storage/session-storage/src/tests/journal.rs
++++ b/storage/session-storage/src/tests/journal.rs
+@@ -409,3 +409,63 @@ fn rejected_prospective_validation_reloads_canonical_state_before_next_commit()
+         assert_eq!(history.messages.len(), 2);
+     }
+ }
++
++#[test]
++fn jsonl_freeze_defers_hashing_and_refuses_a_changed_unauthenticated_prefix() {
++    use crate::backend::{JournalBackend, Jsonl};
++
++    let mut f = Fixture::new(BackendKind::Jsonl);
++    f.append(vec![text("pinned")]);
++    let dir = f.descriptor.local_path.clone().unwrap();
++    let id = f.descriptor.session.session_id;
++    let mut backend = Jsonl::new();
++    crate::diagnostics::reset();
++    let frozen = backend.freeze(&dir, id).unwrap();
++    assert_eq!(crate::diagnostics::get().fingerprint_bytes, 0);
++    assert_eq!(crate::diagnostics::get().decoded, 0);
++    let mut reader = frozen.open().unwrap();
++    assert_eq!(crate::diagnostics::get().fingerprint_bytes, reader.extent());
++    assert_eq!(reader.next().unwrap().unwrap().session_seq, 1);
++    assert!(reader.next().unwrap().is_none());
++
++    let frozen = backend.freeze(&dir, id).unwrap();
++    f.append(vec![text("new suffix")]);
++    assert!(
++        frozen.open().is_err(),
++        "no prior digest to prove the old prefix"
++    );
++    reader.verify_fixed_prefix().unwrap(); // Published reader still pins N.
++
++    let frozen = backend.freeze(&dir, id).unwrap();
++    let path = f.descriptor.record_location.as_ref().unwrap();
++    let bytes = std::fs::read_to_string(path).unwrap();
++    std::fs::write(path, bytes.replace("pinned", "edited")).unwrap();
++    // Make this deterministic even on filesystems with coarse mtime resolution.
++    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
++    std::fs::File::options()
++        .write(true)
++        .open(path)
++        .unwrap()
++        .set_modified(modified + std::time::Duration::from_secs(2))
++        .unwrap();
++    assert!(
++        frozen.open().is_err(),
++        "a valid new history is not the frozen one"
++    );
++    assert!(reader.verify_fixed_prefix().is_err());
++}
++
++#[test]
++fn jsonl_complete_line_search_obeys_its_original_physical_ceiling() {
++    use std::io::{Seek, Write};
++    let mut journal = tempfile::tempfile().unwrap();
++    journal.write_all(b"line\n").unwrap();
++    journal.write_all(&[b'x'; 20_000]).unwrap();
++    let ceiling = journal.stream_position().unwrap();
++    journal.write_all(b"newly-completed\n").unwrap();
++    assert_eq!(
++        crate::io::complete_jsonl_offset_at(&mut journal, ceiling).unwrap(),
++        5
++    );
++    assert!(crate::io::complete_jsonl_offset(&mut journal).unwrap() > ceiling);
++}

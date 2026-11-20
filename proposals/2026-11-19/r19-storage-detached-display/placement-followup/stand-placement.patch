@@ -1,0 +1,36 @@
+--- a/archives.py
++++ b/archives.py
+@@ -81,9 +81,12 @@
+     if a.expected_corpus:require(a.expected_corpus==initial,'corpus identity differs')
+     save(out/'identity.json',report)
+     config=cfg/'config.toml'
+-    config.write_text(profile(a.reference,0).replace('[modules]\n','[modules]\nsession_storage="jsonl"\n')+'\n[components.store]\ncommand='+json.dumps(str(a.worker))+'\n[components.store.exports.session_storage.jsonl]\n[components.store.transport]\nmax_frame_bytes=134217728\n')
++    stderr_capture = out/'worker.stderr'
++    wrapper = ['/bin/sh', '-c', 'exec "$1" 2> "$2"', 'placement', str(a.worker), str(stderr_capture.resolve())]
++    config.write_text(profile(a.reference,0).replace('[modules]\n','[modules]\nsession_storage="jsonl"\n')+'\n[components.store]\ncommand='+json.dumps(wrapper[0])+'\nargs='+json.dumps(wrapper[1:])+'\n[components.store.exports.session_storage.jsonl]\n[components.store.transport]\nmax_frame_bytes=134217728\n')
++    report['fold_requested']=a.fold_placement
+     report['worker_arena_limit']=a.worker_arena_limit
+-    env = {}
++    env = {'PROTEUS_DIAG_FOLD_PLACEMENT': a.fold_placement}
+     if a.worker_arena_limit: env['MALLOC_ARENA_MAX'] = str(a.worker_arena_limit)
+     if a.allocator_sampler:
+         env['LD_PRELOAD'] = str(a.allocator_sampler.resolve(strict=True))
+@@ -192,6 +195,9 @@
+             if a.extended_idle:
+                 stage='retained_2_to_10';time.sleep(8)
+                 stage='retained_near_10';time.sleep(2)
++                if a.minute_idle:
++                    stage='retained_12_to_60';time.sleep(48)
++                    stage='retained_near_60';time.sleep(2)
+             report['cold_journals_observed']=opened.observed();opened.close()
+             # Keep cold failures failed; only attempt warm tests on previously successful cold heads.
+             ok=[(c['index'],c['revision']) for c in cold if c['ok']]
+@@ -256,6 +262,8 @@
+     ap.add_argument('--expected-corpus')
+     ap.add_argument('--worker-arena-limit',type=int,choices=(1,2,4))
+     ap.add_argument('--extended-idle',action='store_true')
++    ap.add_argument('--minute-idle',action='store_true')
++    ap.add_argument('--fold-placement',choices=('direct','same'),required=True)
+     ap.add_argument('--allocator-sampler',type=Path)
+     ap.add_argument('--observe',type=float,default=240,help='client timeout only; backend policy unchanged')
+     a=ap.parse_args()

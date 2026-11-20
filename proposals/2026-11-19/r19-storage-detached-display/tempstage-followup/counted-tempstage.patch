@@ -1,0 +1,67 @@
+--- a/archives.py
++++ b/archives.py
+@@ -81,7 +81,29 @@
+     if a.expected_corpus:require(a.expected_corpus==initial,'corpus identity differs')
+     save(out/'identity.json',report)
+     config=cfg/'config.toml'
+-    config.write_text(profile(a.reference,0).replace('[modules]\n','[modules]\nsession_storage="jsonl"\n')+'\n[components.store]\ncommand='+json.dumps(str(a.worker))+'\n[components.store.exports.session_storage.jsonl]\n[components.store.transport]\nmax_frame_bytes=134217728\n')
++    helper=Path(__file__).with_name('count_wire.py')
++    wrapper=[str(Path(sys.executable).resolve()),str(helper),str(a.worker),str(out.resolve()/'worker-ops.txt')]
++    config.write_text(profile(a.reference,0).replace('[modules]\n','[modules]\nsession_storage="jsonl"\n')+'\n[components.store]\ncommand='+json.dumps(wrapper[0])+'\nargs='+json.dumps(wrapper[1:])+'\n[components.store.exports.session_storage.jsonl]\n[components.store.transport]\nmax_frame_bytes=134217728\n')
++    core_tmp=root/'core-tmp'
++    store_tmp=root/'store-tmp'
++    if a.core_stage=='on': core_tmp.mkdir()
++    store_tmp.mkdir()
++    with config.open('a') as f:
++        f.write('\n[components.store.env]\nTMPDIR = '+json.dumps(str(store_tmp))+'\n')
++    report.update(core_stage=a.core_stage, candidate_mount=a.mount_label)
++    def stages(pid, directory):
++        sizes=[]
++        try: entries=list(Path(f'/proc/{pid}/fd').iterdir())
++        except OSError: return sizes
++        prefix=str(directory)+'/'
++        for f in entries:
++            try:
++                target=os.readlink(f)
++                if target.startswith(prefix) and target.endswith(' (deleted)'):
++                    st=f.stat()
++                    if st.st_nlink==0: sizes.append(st.st_size)
++            except OSError: pass
++        return sizes
+     text_probe='r19 foreground proof'
+     phases={}; stage='starting';samples=[]; stop=threading.Event()
+     opened=JournalOpens(dirs)
+@@ -89,7 +111,7 @@
+     proc=None; monitor=None
+     try:
+         with (out/'server.log').open('w') as slog,(out/'trace.jsonl').open('w',buffering=1) as trace:
+-            proc=subprocess.Popen([a.core,'--config',config,'--cwd',cwd,'--resume-session',active,'server','http','--host','127.0.0.1','--port','0','--ready-stdout'],cwd=cwd,stdout=subprocess.PIPE,stderr=slog,start_new_session=True)
++            proc=subprocess.Popen([a.core,'--config',config,'--cwd',cwd,'--resume-session',active,'server','http','--host','127.0.0.1','--port','0','--ready-stdout'],cwd=cwd,stdout=subprocess.PIPE,stderr=slog,start_new_session=True,env={**os.environ,'TMPDIR':str(core_tmp)})
+             tree=Tree(proc.pid,root_group='backend')
+             def scan():
+                 try:
+@@ -98,7 +120,14 @@
+                         if st!=stage:continue
+                         procs=[dict(pid=i['pid'],start_ticks=i['start_ticks'],role=('core' if i['pid']==proc.pid else 'worker' if i['exe']==str(a.worker) else 'reference' if i['exe']==str(a.reference) else 'other'),pss=i['Pss']) for i in s['processes']]
+                         v={k:s[k] for k in ('monotonic_ns','pss_kib','rss_kib','private_kib','swap_pss_kib','process_count','memory_incomplete_pids','scan_duration_seconds')}
+-                        v.update(stage=st,processes=procs);samples.append(v);trace.write(json.dumps(v,separators=(',',':'))+'\n');stop.wait(.04)
++                        v.update(stage=st,processes=procs)
++                        v['core_stage_bytes']=stages(proc.pid,core_tmp)
++                        v['worker_stage_bytes']=[size for d in procs if d['role']=='worker' for size in stages(d['pid'],store_tmp)]
++                        try: trace.write(json.dumps(v,separators=(',',':'))+'\n')
++                        except ValueError:
++                            if trace.closed: return
++                            raise
++                        samples.append(v);stop.wait(.04)
+                 except Exception as e:tree_errors.append(err(e))
+             monitor=threading.Thread(target=scan,daemon=True);monitor.start()
+             with selectors.DefaultSelector() as sel:
+@@ -233,6 +262,8 @@
+     for k in ('source','core','worker','reference','golden','out'):ap.add_argument('--'+k,type=Path,required=True)
+     for k in ('core-commit','core-sha256','worker-sha256'):ap.add_argument('--'+k,required=True)
+     ap.add_argument('--expected-corpus')
++    ap.add_argument('--core-stage',choices=('on','off'),required=True)
++    ap.add_argument('--mount-label',required=True)
+     ap.add_argument('--observe',type=float,default=240,help='client timeout only; backend policy unchanged')
+     a=ap.parse_args()
+     for n in ('source','golden','core','worker','reference'):setattr(a,n,getattr(a,n).resolve(strict=True))
