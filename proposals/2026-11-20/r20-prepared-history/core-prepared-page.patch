@@ -1,0 +1,253 @@
+From 2547f15f2a7b511c20b9b34ecf2d4872557608b7 Mon Sep 17 00:00:00 2001
+From: Dooter <dooter@localhost>
+Date: Fri, 20 Nov 2026 16:04:20 +0800
+Subject: [PATCH] Serve prepared latest transcript pages with a final source
+ witness
+
+---
+ .../core/session_store/remote/view/cache.rs   |  45 +++++---
+ .../core/session_store/remote/view/tests.rs   |   1 +
+ .../remote/view/tests/latest_page.rs          | 104 ++++++++++++++++++
+ .../remote/view/tests/support.rs              |   7 ++
+ docs/guides/runtime-and-events.md             |   6 +-
+ 5 files changed, 148 insertions(+), 15 deletions(-)
+ create mode 100644 crates/proteus-core/src/core/session_store/remote/view/tests/latest_page.rs
+
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index ac491a8..5c48316 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -316,28 +316,45 @@ pub(super) fn transcript_page(
+     expected: Option<&str>,
+     stale_display: bool,
+ ) -> Option<AppTranscriptPage> {
+-    let header = match expected {
+-        Some(revision) => header_at_revision(store, revision)?,
+-        None => header(store)?,
+-    };
+-    if expected.is_none()
+-        && !stale_display
+-        && RemoteCacheSource::read(store).as_ref() != Some(&header.source)
+-    {
++    if let Some(revision) = expected {
++        // A retained, explicitly named revision can be older than the journal.
++        return page_from_header(store, header_at_revision(store, revision)?, before);
++    }
++    let head = header(store)?;
++    if stale_display {
++        return page_from_header(store, head, before);
++    }
++    // All page content is addressed by hash. Check the complete source identity
++    // AFTER the read: an earlier probe adds no proof to a successful final check.
++    let source = head.source.clone();
++    let page = page_from_header(store, head, before);
++    let current = RemoteCacheSource::read(store)?;
++    if source == current {
++        return page;
++    }
++    drop(page);
++    // A publisher stores the named index before HEAD. If the last write failed,
++    // a complete index for the current source may survive behind an older HEAD.
++    // This remains a latest-page request; recheck after reading that index too.
++    let saved = header_at_revision(store, &current.revision()?)?;
++    if saved.source != current {
+         return None;
+     }
++    let page = page_from_header(store, saved, before)?;
++    (RemoteCacheSource::read(store)? == current).then_some(page)
++}
++
++fn page_from_header(
++    store: &RemoteSessionStore,
++    header: Header,
++    before: Option<usize>,
++) -> Option<AppTranscriptPage> {
+     let end = before.unwrap_or(header.transcript.rows);
+     if end > header.transcript.rows {
+         return None;
+     }
+     let start = end.saturating_sub(PAGE_ROWS);
+     let messages = read_section(store, &header.transcript, start, end)?;
+-    if expected.is_none()
+-        && !stale_display
+-        && RemoteCacheSource::read(store).as_ref() != Some(&header.source)
+-    {
+-        return None;
+-    }
+     Some(AppTranscriptPage {
+         revision: header.source.revision()?,
+         start,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 6a3b59e..9cd4fd2 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -263,6 +263,7 @@ fn cache_fingerprints_ignore_independent_worker_object_order() {
+     assert!(store.fresh_read_model().is_some());
+ }
+ 
++mod latest_page;
+ mod packs;
+ 
+ #[test]
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/latest_page.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/latest_page.rs
+new file mode 100644
+index 0000000..f9df909
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/latest_page.rs
+@@ -0,0 +1,104 @@
++//! Latest reads use only the page and a final current-source witness on a hit.
++use super::*;
++
++#[test]
++fn latest_reads_one_source_and_pinned_reads_none() {
++    let (backend, store) = Backend::store();
++    backend.append(121);
++    store.project_read_model(full).unwrap();
++    let mut state = backend.0.lock().unwrap();
++    let (opens, records) = (state.handles, state.record_reads);
++    state.cache_reads.clear();
++    state.writes.clear();
++    drop(state);
++
++    let page = store.saved_transcript_page(Some(57), None).unwrap();
++    assert_eq!((page.start, page.total), (7, 121));
++    assert_eq!(page.messages.first().unwrap().text, "message-0-7");
++    assert_eq!(page.messages.last().unwrap().text, "message-0-56");
++    let pinned = store
++        .saved_transcript_page(Some(57), Some(&page.revision))
++        .unwrap();
++    assert_eq!(
++        serde_json::to_value(page).unwrap(),
++        serde_json::to_value(pinned).unwrap()
++    );
++    let state = backend.0.lock().unwrap();
++    assert_eq!(state.handles - opens, 1);
++    assert_eq!(state.record_reads, records);
++    assert!(state.writes.is_empty());
++}
++
++#[test]
++fn stale_head_uses_the_named_current_index_without_replay_and_rechecks_after_read() {
++    let (backend, store) = Backend::store();
++    backend.append(51);
++    store.project_read_model(full).unwrap();
++    let first = store.saved_transcript_page(None, None).unwrap();
++    backend.append(1);
++    backend.0.lock().unwrap().fail_head = true;
++    store.project_read_model(full).unwrap();
++    let source = RemoteCacheSource::read(&store).unwrap();
++    let revision = source.revision().unwrap();
++    let current_header = cache::header_at_revision(&store, &revision).unwrap();
++    let leaf = format!(
++        "display-data-{}",
++        current_header.transcript.pages.last().unwrap().hash
++    );
++    let first_header = cache::header(&store).unwrap();
++    assert_ne!(
++        current_header.transcript.pages.last().unwrap().hash,
++        first_header.transcript.pages.last().unwrap().hash
++    );
++    assert_eq!(first_header.source.revision().unwrap(), first.revision);
++
++    let mut state = backend.0.lock().unwrap();
++    state.writes.clear();
++    let records = state.record_reads;
++    drop(state);
++    let page = store.saved_transcript_page(None, None).unwrap();
++    let pinned = store.saved_transcript_page(None, Some(&revision)).unwrap();
++    assert_eq!(page.revision, revision);
++    assert_eq!((page.start, page.total), (2, 52));
++    assert_eq!(page.messages.last().unwrap().text, "message-1-0");
++    assert_eq!(
++        serde_json::to_value(page).unwrap(),
++        serde_json::to_value(pinned).unwrap()
++    );
++    // A second append lands as the named index's body is read. It was current
++    // at lookup but is no longer an answer to the implicit latest request.
++    backend.0.lock().unwrap().append_on_cache_read = Some(leaf);
++    assert!(store.saved_transcript_page(None, None).is_none());
++    assert_eq!(
++        store
++            .saved_transcript_page(None, Some(&first.revision))
++            .unwrap()
++            .total,
++        51
++    );
++    let state = backend.0.lock().unwrap();
++    assert!(state.append_on_cache_read.is_none());
++    assert_eq!(state.record_reads, records);
++    assert!(state.writes.is_empty());
++}
++
++#[test]
++fn a_source_change_during_the_head_page_read_is_not_returned_as_latest() {
++    let (backend, store) = Backend::store();
++    backend.append(51);
++    store.project_read_model(full).unwrap();
++    let head = cache::header(&store).unwrap();
++    backend.0.lock().unwrap().append_on_cache_read = Some(format!(
++        "display-data-{}",
++        head.transcript.pages.last().unwrap().hash
++    ));
++    assert!(store.saved_transcript_page(None, None).is_none());
++    assert!(backend.0.lock().unwrap().append_on_cache_read.is_none());
++    assert_eq!(
++        store
++            .saved_transcript_page(None, Some(&head.source.revision().unwrap()))
++            .unwrap()
++            .total,
++        51
++    );
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+index fb317b6..ba8e4dd 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/support.rs
+@@ -31,6 +31,7 @@ pub(super) struct State {
+     pub(super) cache_reads: Vec<String>,
+     pub(super) record_reads: usize,
+     pub(super) fail_head: bool,
++    pub(super) append_on_cache_read: Option<String>,
+     pub(super) handles: u64,
+ }
+ 
+@@ -60,6 +61,7 @@ impl Backend {
+             record_reads: 0,
+             handles: 0,
+             fail_head: false,
++            append_on_cache_read: None,
+         })));
+         let store =
+             RemoteSessionStore::open(backend.clone(), PathBuf::from("/session-cache-fixture"))
+@@ -176,6 +178,11 @@ impl SessionStorage for Backend {
+                 } else {
+                     None
+                 };
++                if state.append_on_cache_read.as_ref() == Some(&key) {
++                    state.append_on_cache_read = None;
++                    drop(state);
++                    self.append(1);
++                }
+                 Ok(Response::Metadata {
+                     document: value.map(|value| StorageMetadataDocument {
+                         etag: "test".into(),
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index ca51839..3245d4a 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1545,7 +1545,11 @@ messages, base}` с последними 50 строками. Для преды
+ ревизии: сервер отвергает несовпадение вместо смешивания страниц. Известная
+ клиенту завершённая ревизия остаётся пригодной для просмотра во время нового
+ turn, пока её индекс не заменён. Полный `/history` сохраняет прежнюю семантику.
+-При утрате или повреждении индекса полный `/history` и страничное чтение
++Страница без `revision` проверяет источник после чтения хешированных строк.
++Если указатель HEAD отстал, но именной индекс текущего источника уже записан,
++сервер читает страницу из этого индекса и снова проверяет источник. Утрата
++самого HEAD не добавляет предварительного открытия снимка к холодному чтению.
++При отсутствии пригодного индекса полный `/history` и страничное чтение
+ делают одну попытку строгой проекции. Явно запрошенную ревизию разрешено
+ восстановить только при совпадении fingerprint канонического источника до и
+ после чтения; новые строки не выдаются под старой ревизией. При невозможности
+-- 
+2.52.0
+

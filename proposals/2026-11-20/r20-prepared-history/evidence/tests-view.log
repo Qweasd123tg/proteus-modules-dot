@@ -1,0 +1,95 @@
+   Compiling proteus-contracts v0.1.0-alpha.2 (r20-impl/crates/proteus-contracts)
+   Compiling proteus-process-host v0.1.0-alpha.2 (r20-impl/crates/proteus-process-host)
+   Compiling proteus-core v0.1.0-alpha.3 (r20-impl/crates/proteus-core)
+   Compiling proteus-module-protocol v0.1.0-alpha.2 (r20-impl/crates/proteus-module-protocol)
+   Compiling proteus-session-semantics v0.1.0-alpha.1 (r20-impl/crates/proteus-session-semantics)
+warning: unused import: `transcript::journal_transcript_messages`
+  --> crates/proteus-core/src/app_server.rs:68:16
+   |
+68 | pub(crate) use transcript::journal_transcript_messages;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `body` is never read
+   --> crates/proteus-core/src/core/session_store/remote/view/tests/packs.rs:130:20
+    |
+130 |     let mut body = backend.0.lock().unwrap().cache.remove(&pack_key).unwrap();
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:40:19
+   |
+11 | impl Polling {
+   | ------------ associated function in this implementation
+...
+40 |     pub(super) fn controlled() -> (Self, tokio::sync::mpsc::UnboundedSender<Poll>) {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `controlled` is never used
+  --> crates/proteus-core/src/app_server/profile_watch/polling.rs:84:19
+   |
+58 | impl Poll {
+   | --------- associated function in this implementation
+...
+84 |     pub(super) fn controlled(
+   |                   ^^^^^^^^^^
+
+warning: method `session_dir` is never used
+  --> crates/proteus-core/src/app_server/events/session.rs:70:19
+   |
+59 | impl SessionView {
+   | ---------------- method in this implementation
+...
+70 |     pub(super) fn session_dir(&self) -> Option<std::path::PathBuf> {
+   |                   ^^^^^^^^^^^
+
+warning: method `usage` is never used
+   --> crates/proteus-core/src/core/session_store/remote/snapshot.rs:376:19
+    |
+211 | impl RemoteValidatedRead {
+    | ------------------------ method in this implementation
+...
+376 |     pub(crate) fn usage(&self) -> proteus_contracts::domain::SessionUsageSnapshot {
+    |                   ^^^^^
+
+warning: field `usage` is never read
+  --> crates/proteus-core/src/core/session_store/remote/view.rs:44:9
+   |
+41 | pub(crate) struct SessionReadView {
+   |                   --------------- field in this struct
+...
+44 |     pub usage: SessionUsageSnapshot,
+   |         ^^^^^
+   |
+   = note: `SessionReadView` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `proteus-core` (lib test) generated 7 warnings (run `cargo fix --lib -p proteus-core --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 3m 12s
+     Running unittests src/lib.rs (r18-paging-test-target/release/deps/proteus_core-09ab77eba519e2d9)
+
+running 16 tests
+test core::session_store::remote::view::tests::acknowledged_turn_updates_saved_pages_without_reading_the_journal ... ok
+test core::session_store::remote::view::tests::cache_fingerprints_ignore_independent_worker_object_order ... ok
+test core::session_store::remote::view::tests::cache_pages_have_a_byte_budget_and_tool_index_repairs_without_journal_scan ... ok
+test core::session_store::remote::view::tests::cold_display_reuses_the_validated_records_without_another_storage_traversal ... ok
+test core::session_store::remote::view::tests::full_reprojection_compares_changed_archived_leaf_and_preserves_pinned_history ... ok
+test core::session_store::remote::view::tests::latest_page::a_source_change_during_the_head_page_read_is_not_returned_as_latest ... ok
+test core::session_store::remote::view::tests::latest_page::latest_reads_one_source_and_pinned_reads_none ... ok
+test core::session_store::remote::view::tests::latest_page::stale_head_uses_the_named_current_index_without_replay_and_rechecks_after_read ... ok
+test core::session_store::remote::view::tests::missing_requested_page_rebuilds_and_failed_publication_keeps_verified_result ... ok
+test core::session_store::remote::view::tests::packs::framed_pack_reads_recheck_backing_and_bound_logical_leaf_bytes ... ok
+test core::session_store::remote::view::tests::packs::historical_packs_obey_actual_json_byte_cap_and_large_leaf_remains_readable ... ok
+test core::session_store::remote::view::tests::packs::invalid_archive_objects_and_spans_are_cache_misses_not_mixed_rows ... ok
+test core::session_store::remote::view::tests::packs::physical_packs_preserve_logical_leaves_and_skip_the_latest_window ... ok
+test core::session_store::remote::view::tests::prepared_view_never_mixes_an_older_summary_with_a_newer_transcript ... ok
+test core::session_store::remote::view::tests::remote_display_append_reuses_prefix_pages_and_matches_full_projection ... ok
+test core::session_store::remote::view::tests::stale_remote_view_is_display_only_and_old_revision_remains_coherent ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 724 filtered out; finished in 1.07s
+
