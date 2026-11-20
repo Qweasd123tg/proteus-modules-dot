@@ -1,0 +1,139 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 1c2c9e3..c95ab5d 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -34,7 +34,7 @@ pub(super) fn transcript_from_scan(
+     live_turn_id: Option<TurnId>,
+ ) -> Result<Vec<AppTranscriptMessage>> {
+     let mut start = 0;
+-    let mut history_only = true;
++    let mut causal_history = true;
+     let mut visibility = TranscriptVisibility::default();
+     let mut committed_parts = std::collections::HashSet::new();
+     let mut final_results = std::collections::HashSet::new();
+@@ -56,7 +56,12 @@ pub(super) fn transcript_from_scan(
+         {
+             visibility.root_threads.insert(turn, thread);
+         }
+-        history_only &= matches!(record.entry, JournalEntry::HistoryMutated(_));
++        causal_history &= matches!(
++            record.entry,
++            JournalEntry::HistoryMutated(_)
++                | JournalEntry::TurnOpened(_)
++                | JournalEntry::TurnSettled(_)
++        );
+         match &record.entry {
+             JournalEntry::HistoryMutated(mutation) => {
+                 for message in &mutation.messages {
+@@ -64,7 +69,7 @@ pub(super) fn transcript_from_scan(
+                         committed_parts.insert(part.part_id);
+                         // A hosted card can take its date from a later tool call.
+                         if matches!(part.payload, ContentPart::HostedToolActivity { .. }) {
+-                            history_only = false;
++                            causal_history = false;
+                         }
+                     }
+                 }
+@@ -80,12 +85,11 @@ pub(super) fn transcript_from_scan(
+         Ok(())
+     })?;
+ 
+-    // History-only streams have no forward visibility dependencies. With no
+-    // replay frontier every message and part is in scope, so collecting dates
+-    // immediately before rendering each record yields the same first occurrence
+-    // as collecting the full date index first. In particular the minimum is by
+-    // sequence, not wall clock. Resets retain the scoped, bounded index below.
+-    if history_only && start == 0 {
++    // Turn opens supply root bindings (already collected); settlements use
++    // their own date. Without a reset or hosted card, history dates are causal:
++    // collecting them before rendering each record gives the same first journal
++    // occurrence as a separate pass, even if the wall clock steps backwards.
++    if causal_history && start == 0 {
+         drop(committed_parts);
+         let mut replay = TranscriptReplay {
+             state: TranscriptProjectionState::default(),
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+index 9af92e9..e1a53df 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/tests/replay_frontier.rs
+@@ -109,6 +109,80 @@ fn image(id: &str) -> ImageRef {
+     }
+ }
+ 
++#[test]
++fn turn_lifecycles_replay_in_two_passes_until_a_visible_hard_reset() {
++    let mut fixture = Fixture::new();
++    let first = fixture.turn;
++    fixture.open();
++    let old = CanonicalMessage::text(MessageRole::User, "before");
++    fixture.history(HistoryMutationKind::Append, vec![old.clone()], false, true);
++    fixture.records.last_mut().unwrap().timestamp_ms = 42;
++    fixture.push(
++        JournalEntry::TurnSettled(TurnSettled {
++            status: TurnSettlementStatus::Error,
++            output: None,
++            error: Some("first failed".into()),
++        }),
++        false,
++        true,
++    );
++    fixture.turn = new_turn_id();
++    fixture.thread = new_thread_id();
++    fixture.execution = new_execution_id();
++    fixture.open();
++    let mut next = CanonicalMessage::text(MessageRole::Assistant, "follow-up");
++    next.parts.push(old.parts[0].clone());
++    fixture.history(HistoryMutationKind::Replace, vec![next.clone()], true, true);
++    fixture.records.last_mut().unwrap().timestamp_ms = 15;
++    let reset = fixture.records.len();
++    fixture.history(HistoryMutationKind::Replace, vec![next], false, true);
++    fixture.push(
++        JournalEntry::TurnSettled(TurnSettled {
++            status: TurnSettlementStatus::Canceled,
++            output: None,
++            error: None,
++        }),
++        false,
++        true,
++    );
++
++    for end in 0..=fixture.records.len() {
++        let projection = JournalProjection::build(fixture.session, fixture.records[..end].to_vec())
++            .expect("valid prefix");
++        for live in [None, Some(first), Some(fixture.turn)] {
++            let mut passes = 0;
++            let rows = source::transcript_from_scan(
++                |visit| {
++                    passes += 1;
++                    projection.records.iter().cloned().try_for_each(visit)
++                },
++                live,
++            )
++            .unwrap();
++            assert_eq!(
++                serde_json::to_value(&rows).unwrap(),
++                serde_json::to_value(replay_transcript(&projection, live, 0)).unwrap(),
++                "prefix {end}, live {live:?}"
++            );
++            assert_eq!(
++                passes,
++                if end > reset && live != Some(fixture.turn) {
++                    4
++                } else {
++                    2
++                }
++            );
++            if end == reset && live.is_none() {
++                assert_eq!(rows.len(), 3);
++                assert_eq!(rows[1].text, "AppServer error: first failed");
++                assert_eq!(rows[1].timestamp_ms, Some(3));
++                assert_eq!(rows[2].text, "follow-up");
++                assert_eq!(rows[2].timestamp_ms, Some(42));
++            }
++        }
++    }
++}
++
+ #[test]
+ fn reset_frontier_skips_discarded_rows_but_not_first_part_dates() {
+     let mut fixture = Fixture::new();
