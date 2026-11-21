@@ -1,0 +1,175 @@
+diff --git a/src/tool_display/mod.rs b/src/tool_display/mod.rs
+index 96650d4..c6ff33a 100644
+--- a/src/tool_display/mod.rs
++++ b/src/tool_display/mod.rs
+@@ -76,16 +76,15 @@ pub fn headline(name: &str, args: &Value) -> Headline {
+             };
+         }
+     }
+-    if name == UPDATE_PLAN {
+-        let steps = plan_steps(args);
+-        if !steps.is_empty() {
+-            return Headline {
+-                label,
+-                subject: Some(plan_summary(&steps)),
+-                stats: None,
+-                subject_key: None,
+-            };
+-        }
++    if name == UPDATE_PLAN
++        && let Some(subject) = plan_summary(args)
++    {
++        return Headline {
++            label,
++            subject: Some(subject),
++            stats: None,
++            subject_key: None,
++        };
+     }
+     let key = match known {
+         Some("") => None,
+@@ -180,12 +179,11 @@ pub struct PlanStep {
+     pub status: StepStatus,
+ }
+ 
+-pub fn plan_steps(args: &Value) -> Vec<PlanStep> {
+-    let Some(steps) = args.get("plan").and_then(Value::as_array) else {
+-        return Vec::new();
+-    };
+-    steps
+-        .iter()
++fn plan_entries(args: &Value) -> impl Iterator<Item = (&str, StepStatus)> {
++    args.get("plan")
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
+         .filter_map(|entry| {
+             let step = entry.get("step").and_then(Value::as_str)?;
+             let status = match entry.get("status").and_then(Value::as_str)? {
+@@ -193,28 +191,48 @@ pub fn plan_steps(args: &Value) -> Vec<PlanStep> {
+                 "in_progress" => StepStatus::InProgress,
+                 _ => StepStatus::Pending,
+             };
+-            Some(PlanStep {
+-                step: step.to_owned(),
+-                status,
+-            })
++            Some((step, status))
++        })
++}
++
++pub fn plan_steps(args: &Value) -> Vec<PlanStep> {
++    plan_entries(args)
++        .map(|(step, status)| PlanStep {
++            step: step.to_owned(),
++            status,
+         })
+         .collect()
+ }
+ 
+-fn plan_summary(steps: &[PlanStep]) -> String {
+-    let completed = steps
+-        .iter()
+-        .filter(|step| step.status == StepStatus::Completed)
+-        .count();
+-    let current = steps
+-        .iter()
+-        .find(|step| step.status == StepStatus::InProgress)
+-        .map(|step| format!(" · {}", step.step))
+-        .unwrap_or_default();
+-    limit(
+-        format!("{completed}/{}{current}", steps.len()),
+-        SUBJECT_LIMIT,
+-    )
++fn plan_summary(args: &Value) -> Option<String> {
++    let mut count = 0usize;
++    let mut completed = 0usize;
++    let mut current = None;
++    for (step, status) in plan_entries(args) {
++        count += 1;
++        match status {
++            StepStatus::Completed => completed += 1,
++            StepStatus::InProgress if current.is_none() => current = Some(step),
++            _ => {}
++        }
++    }
++    if count == 0 {
++        return None;
++    }
++
++    let mut summary = format!("{completed}/{count}");
++    if let Some(step) = current {
++        summary.push_str(" · ");
++        // The caption is limited in Unicode scalars; never copy the
++        // unshown suffix of a large step into an intermediate string.
++        let remaining = SUBJECT_LIMIT.saturating_sub(summary.chars().count());
++        let end = step
++            .char_indices()
++            .nth(remaining)
++            .map_or(step.len(), |(i, _)| i);
++        summary.push_str(&step[..end]);
++    }
++    Some(summary)
+ }
+ 
+ fn patch_subject(files: &[PatchFile]) -> String {
+diff --git a/src/tool_display/tests.rs b/src/tool_display/tests.rs
+index e34509e..6314fa3 100644
+--- a/src/tool_display/tests.rs
++++ b/src/tool_display/tests.rs
+@@ -206,6 +206,55 @@ fn plans_summarize_progress() {
+     assert_eq!(plan_steps(&args)[2].status, StepStatus::Pending);
+ }
+ 
++#[test]
++fn plan_preview_counts_only_visible_steps_and_clips_the_first_active_step() {
++    let long = "🦀я".repeat(300);
++    let args = json!({"plan": [
++        null,
++        {"step": null, "status": "completed"},
++        {"step": 42},
++        {"step": "no status"},
++        {"step": "null status", "status": null},
++        {"step": "numeric status", "status": 3},
++        {"step": "done", "status": "completed"},
++        {"step": long, "status": "in_progress"},
++        {"step": "later", "status": "in_progress"},
++        {"step": "unknown", "status": "wrong"}
++    ]});
++    let preview = headline(UPDATE_PLAN, &args).subject.unwrap();
++    let original = format!("1/4 · {long}");
++    assert_eq!(preview, original.chars().take(300).collect::<String>());
++    let expanded = plan_steps(&args);
++    assert_eq!(expanded.len(), 4);
++    assert_eq!(expanded[1].step, long);
++    assert_eq!(expanded[3].status, StepStatus::Pending);
++    for args in [json!({}), json!(null), json!({"plan": [null, {"step": 0}]})] {
++        assert_eq!(headline(UPDATE_PLAN, &args).subject, None);
++        assert!(plan_steps(&args).is_empty());
++    }
++
++    let args = json!({"plan": [
++        {"step": "", "status": "in_progress"},
++        {"step": "not first", "status": "in_progress"},
++    ]});
++    assert_eq!(
++        headline(UPDATE_PLAN, &args).subject.as_deref(),
++        Some("0/2 · ")
++    );
++
++    for n in [0, 293, 294, 295, 296, 300] {
++        let step = format!(" \n{} ", "я".repeat(n));
++        let args = json!({"plan": [{"step": step, "status": "in_progress"}]});
++        assert_eq!(
++            headline(UPDATE_PLAN, &args).subject.unwrap(),
++            format!("0/1 · {step}")
++                .chars()
++                .take(300)
++                .collect::<String>()
++        );
++    }
++}
++
+ #[test]
+ fn expanded_known_path_list_is_bounded_and_keeps_filename_boundaries() {
+     let args = json!({"paths": ["src/lib.rs", "part\n2.rs", "α".repeat(161)]});
