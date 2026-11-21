@@ -1,0 +1,88 @@
+diff --git a/packages/files/src/tree.rs b/packages/files/src/tree.rs
+index 3acdfe83752d658fec66db5d96ab12ba80492fee..a264d802d64ff68cad19d5ce61bcc3698fd351c9 100644
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -267,14 +267,14 @@ impl Project {
+     /// Collapses a row with the folders folded into it.
+     pub fn collapse(&mut self, path: &str) {
+         let head = self.heads.get(path).map_or(path, String::as_str);
+-        let chain: Vec<String> = self
+-            .expanded
+-            .iter()
+-            .filter(|open| paths::within(path, open) && paths::within(open, head))
+-            .cloned()
+-            .collect();
+-        for open in chain {
+-            self.expanded.remove(&open);
++        let mut open = path;
++        // Only the path and its ancestors can be part of this folded row.
++        while paths::within(open, head) {
++            self.expanded.remove(open);
++            if open == head {
++                break;
++            }
++            open = paths::parent(open);
+         }
+     }
+ 
+diff --git a/packages/files/src/tree_tests.rs b/packages/files/src/tree_tests.rs
+index bab077729da5d32dc138471d2c604637317a8709..83c9c974cb39db316a9d8987a1433a5419032072 100644
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -112,6 +112,56 @@ fn folded_expand_all_agrees_with_ordinary_expand_and_collapse_intent() {
+     assert!(!all.is_expanded("a/b"));
+ }
+ 
++#[test]
++fn collapse_removes_only_the_path_prefixes_inside_its_folded_head() {
++    let keys = [
++        "",
++        "a",
++        "a/",
++        "a/b",
++        "a//b",
++        "a//b/",
++        "a/b/child",
++        "a/side",
++        "ab",
++        "аб",
++        "аб/в",
++        "аб/в/г",
++        "unrelated",
++    ];
++    for (path, head) in [
++        ("", None),
++        ("a/b", None),
++        ("a/b", Some("a")),
++        ("a/b", Some("a/")),
++        ("a/b", Some("")),
++        ("a//b/", Some("a/")),
++        ("аб/в", Some("аб")),
++        ("a/b", Some("unrelated")),
++    ] {
++        let mut project = Project {
++            expanded: keys.into_iter().map(str::to_owned).collect(),
++            ..Project::default()
++        };
++        if let Some(head) = head {
++            project.heads.insert(path.into(), head.into());
++        }
++        let head = head.unwrap_or(path);
++        let expected = keys
++            .into_iter()
++            .filter(|open| !(paths::within(path, open) && paths::within(open, head)))
++            .map(str::to_owned)
++            .collect();
++        project.collapse(path);
++        assert_eq!(project.expanded, expected, "path={path:?}, head={head:?}");
++        project.collapse(path);
++        assert_eq!(
++            project.expanded, expected,
++            "repeating collapse changed a sibling"
++        );
++    }
++}
++
+ #[test]
+ fn expand_all_without_a_known_folded_head_does_not_reveal_other_ancestors() {
+     let folders = workspace(&[
