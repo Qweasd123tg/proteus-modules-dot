@@ -1,0 +1,313 @@
+diff --git a/src/ui/settings/tags.rs b/src/ui/settings/tags.rs
+index a05e3ee..7c31ae8 100644
+--- a/src/ui/settings/tags.rs
++++ b/src/ui/settings/tags.rs
+@@ -6,14 +6,14 @@ use std::{collections::HashMap, rc::Rc};
+ 
+ use gpui_kit::component::*;
+ use gpui_kit::*;
+-use proteus_contracts::app_protocol::config_builder::ConfigBuilderSnapshot;
+-use proteus_contracts::domain::{ConfigField, ConfigSuggestions, ConfigValueSchema};
++use proteus_contracts::domain::{ConfigField, ConfigValueSchema};
+ use serde_json::Value;
+ 
+ use super::{SettingsView, editors::TextInput, fields::FieldSpec};
+ use crate::settings::FieldPath;
+ 
+ pub(super) mod editor;
++mod suggest;
+ 
+ #[cfg(test)]
+ mod tests;
+@@ -34,71 +34,6 @@ pub(super) fn is_tag_field(field: &ConfigField) -> bool {
+     }
+ }
+ 
+-#[derive(Clone, Debug, PartialEq)]
+-struct Suggestion {
+-    value: String,
+-    title: String,
+-}
+-
+-fn suggestions(field: &ConfigField, snapshot: Option<&ConfigBuilderSnapshot>) -> Vec<Suggestion> {
+-    let mut values = Vec::new();
+-    let mut push = |value: &str, title: &str| {
+-        if !values.iter().any(|item: &Suggestion| item.value == value) {
+-            values.push(Suggestion {
+-                value: value.into(),
+-                title: title.into(),
+-            });
+-        }
+-    };
+-    if let ConfigValueSchema::Array { items } = &field.value
+-        && let ConfigValueSchema::Enum { options } = items.as_ref()
+-    {
+-        for option in options {
+-            if let Some(value) = option.value.as_str() {
+-                push(value, &option.title);
+-            }
+-        }
+-    }
+-    // Defaults are module-owned known values too (e.g. builtin context
+-    // sources that are handled inside the context module, not exports).
+-    if let Some(values) = field.default.as_ref().and_then(Value::as_array) {
+-        for value in values.iter().filter_map(Value::as_str) {
+-            push(value, value);
+-        }
+-    }
+-    if let Some(snapshot) = snapshot {
+-        match &field.suggestions {
+-            Some(ConfigSuggestions::Tools {}) => {
+-                for tool in &snapshot.tools {
+-                    push(&tool.name, &tool.name);
+-                }
+-            }
+-            Some(ConfigSuggestions::Exports { slot }) => {
+-                for module in snapshot
+-                    .slots
+-                    .iter()
+-                    .flat_map(|slot| &slot.modules)
+-                    .chain(snapshot.model_modules.iter())
+-                    .chain(snapshot.hook_modules.iter())
+-                    .filter(|module| &module.slot == slot)
+-                {
+-                    push(&module.id, &module.id);
+-                }
+-                for export in snapshot
+-                    .plugins
+-                    .iter()
+-                    .flat_map(|plugin| &plugin.exports)
+-                    .filter(|export| &export.slot == slot)
+-                {
+-                    push(&export.id, &export.id);
+-                }
+-            }
+-            None => {}
+-        }
+-    }
+-    values
+-}
+-
+ fn array(value: Option<&Value>) -> Option<&[Value]> {
+     match value {
+         None => Some(&[]),
+diff --git a/src/ui/settings/tags/editor.rs b/src/ui/settings/tags/editor.rs
+index d25bdc2..0c1de3d 100644
+--- a/src/ui/settings/tags/editor.rs
++++ b/src/ui/settings/tags/editor.rs
+@@ -12,7 +12,7 @@ use proteus_contracts::app_protocol::config_builder::ConfigBuilderSnapshot;
+ use proteus_contracts::domain::ConfigField;
+ use serde_json::Value;
+ 
+-use super::{Edit, added_value, item_ids, suggestions, tag_label};
++use super::{Edit, added_value, item_ids, suggest, tag_label};
+ use crate::ui::context::RightClickMenu as _;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::settings::widgets::hashed_id;
+@@ -111,30 +111,17 @@ pub(in crate::ui::settings) fn render(
+                         }),
+                 ),
+         );
+-        let query = query.to_lowercase();
+-        let choices = suggestions(&spec.field, snapshot);
+-        let filtered = choices
+-            .iter()
+-            .filter(|item| {
+-                !spec
+-                    .values
+-                    .iter()
+-                    .any(|value| value.as_str() == Some(&item.value))
+-                    && (query.is_empty()
+-                        || item.value.to_lowercase().contains(&query)
+-                        || item.title.to_lowercase().contains(&query))
+-            })
+-            .collect::<Vec<_>>();
++        let filtered = suggest::visible(&spec.field, snapshot, &spec.values, &query);
+         if !filtered.is_empty() {
+             body = body.child(
+                 h_flex()
+                     .flex_wrap()
+                     .gap_1()
+-                    .children(filtered.iter().take(8).map(|item| {
++                    .children(filtered.into_iter().map(|item| {
+                         let add = spec.clone();
+-                        let value = item.value.clone();
+-                        kit::button(hashed_id("tag-suggestion", &(&spec.key, &item.value)))
+-                            .faded_label(item.title.clone())
++                        let value = item.value;
++                        kit::button(hashed_id("tag-suggestion", &(&spec.key, &value)))
++                            .faded_label(item.title)
+                             .quiet(cx)
+                             .xsmall()
+                             .on_click(move |_, window, cx| {
+diff --git a/src/ui/settings/tags/suggest.rs b/src/ui/settings/tags/suggest.rs
+new file mode 100644
+index 0000000..ec7412f
+--- /dev/null
++++ b/src/ui/settings/tags/suggest.rs
+@@ -0,0 +1,143 @@
++//! First visible tag suggestions, in schema/registry order, without building
++//! owned rows for the hidden part of the catalog.
++
++use std::collections::HashSet;
++
++use proteus_contracts::app_protocol::config_builder::ConfigBuilderSnapshot;
++use proteus_contracts::domain::{ConfigField, ConfigSuggestions, ConfigValueSchema};
++use serde_json::Value;
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) struct Suggestion {
++    pub value: String,
++    pub title: String,
++}
++
++pub(super) fn visible(
++    field: &ConfigField,
++    snapshot: Option<&ConfigBuilderSnapshot>,
++    selected: &[Value],
++    query: &str,
++) -> Vec<Suggestion> {
++    let query = query.to_lowercase();
++    let mut seen = HashSet::new();
++    candidates(field, snapshot)
++        // Keep the first title for a value even if its title does not match.
++        .filter(|&(value, _)| seen.insert(value))
++        .filter(|&(value, title)| {
++            !selected.iter().any(|item| item.as_str() == Some(value))
++                && (query.is_empty()
++                    || value.to_lowercase().contains(&query)
++                    || (title != value && title.to_lowercase().contains(&query)))
++        })
++        .take(8)
++        .map(|(value, title)| Suggestion {
++            value: value.into(),
++            title: title.into(),
++        })
++        .collect()
++}
++
++fn candidates<'a>(
++    field: &'a ConfigField,
++    snapshot: Option<&'a ConfigBuilderSnapshot>,
++) -> impl Iterator<Item = (&'a str, &'a str)> {
++    let options = match &field.value {
++        ConfigValueSchema::Array { items } => match items.as_ref() {
++            ConfigValueSchema::Enum { options } => options.as_slice(),
++            _ => &[],
++        },
++        _ => &[],
++    };
++    let options = options
++        .iter()
++        .filter_map(|option| Some((option.value.as_str()?, option.title.as_str())));
++    // Defaults include module-owned values not exposed as exports.
++    let defaults = field
++        .default
++        .as_ref()
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter_map(Value::as_str)
++        .map(|value| (value, value));
++    let tools = snapshot
++        .filter(|_| matches!(field.suggestions, Some(ConfigSuggestions::Tools {})))
++        .into_iter()
++        .flat_map(|snapshot| &snapshot.tools)
++        .map(|tool| (tool.name.as_str(), tool.name.as_str()));
++    let exports = match (&field.suggestions, snapshot) {
++        (Some(ConfigSuggestions::Exports { slot }), Some(snapshot)) => Some((slot, snapshot)),
++        _ => None,
++    };
++    let exports = exports.into_iter().flat_map(|(slot, snapshot)| {
++        let modules = snapshot
++            .slots
++            .iter()
++            .flat_map(|slot| &slot.modules)
++            .chain(snapshot.model_modules.iter())
++            .chain(snapshot.hook_modules.iter())
++            .filter(move |module| &module.slot == slot)
++            .map(|module| (module.id.as_str(), module.id.as_str()));
++        let plugins = snapshot
++            .plugins
++            .iter()
++            .flat_map(|plugin| &plugin.exports)
++            .filter(move |export| &export.slot == slot)
++            .map(|export| (export.id.as_str(), export.id.as_str()));
++        modules.chain(plugins)
++    });
++    options.chain(defaults).chain(tools).chain(exports)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn first_title_wins_before_filtering_and_only_eight_rows_are_returned() {
++        let mut field = ConfigField::new(
++            "tags",
++            "Tags",
++            "",
++            ConfigValueSchema::Array {
++                items: Box::new(ConfigValueSchema::choices(&[
++                    ("duplicate", "Initial"),
++                    ("duplicate", "matches only the later title"),
++                ])),
++            },
++        );
++        field.default = Some(serde_json::json!([
++            "duplicate",
++            "one",
++            "two",
++            "three",
++            "four",
++            "five",
++            "six",
++            "seven",
++            "eight",
++            "nine"
++        ]));
++        let selected = [Value::String("one".into()), Value::from(42)];
++        assert!(visible(&field, None, &selected, "later").is_empty());
++        let rows = visible(&field, None, &selected, "");
++        assert_eq!(rows.len(), 8);
++        assert_eq!(rows[0].title, "Initial");
++        assert_eq!(
++            rows.iter()
++                .map(|row| row.value.as_str())
++                .collect::<Vec<_>>(),
++            [
++                "duplicate",
++                "two",
++                "three",
++                "four",
++                "five",
++                "six",
++                "seven",
++                "eight"
++            ]
++        );
++    }
++}
+diff --git a/src/ui/settings/tags/tests.rs b/src/ui/settings/tags/tests.rs
+index f0d120f..cf52eb1 100644
+--- a/src/ui/settings/tags/tests.rs
++++ b/src/ui/settings/tags/tests.rs
+@@ -1,7 +1,7 @@
+ use super::*;
+ use crate::ui::settings::SettingsContext;
+ use proteus_contracts::app_protocol::config_builder::{
+-    ConfigBuilderPlugin, ConfigBuilderPluginExport, ConfigBuilderTool,
++    ConfigBuilderPlugin, ConfigBuilderPluginExport, ConfigBuilderSnapshot, ConfigBuilderTool,
+ };
+ use serde_json::json;
+ 
+@@ -233,7 +233,7 @@ fn suggestions_are_schema_owned_and_never_rewrite_unknown_saved_values() {
+         ..Default::default()
+     };
+     let values = |field: &ConfigField| {
+-        suggestions(field, Some(&snapshot))
++        suggest::visible(field, Some(&snapshot), &[], "")
+             .into_iter()
+             .map(|item| item.value)
+             .collect::<Vec<_>>()
