@@ -1,0 +1,130 @@
+diff --git a/src/conversations.rs b/src/conversations.rs
+index 07e4fec..9bc93dd 100644
+--- a/src/conversations.rs
++++ b/src/conversations.rs
+@@ -1,7 +1,7 @@
+ //! Summary-only conversations shared by driver-specific transports and UI.
+ //! A Codex thread is never represented as a fabricated Core directory or UUID.
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::path::PathBuf;
+ 
+ use proteus_contracts::app_protocol::{AppSessionActivity, AppSessionSummary};
+@@ -69,6 +69,37 @@ pub fn upsert_summary(summaries: &mut Vec<ConversationSummary>, summary: Convers
+     }
+ }
+ 
++/// Merge a nonempty Codex list page, retaining the same row positions as successive
++/// single upserts. Index only the incoming opaque IDs, not the entire catalog.
++pub fn merge_codex_page(
++    summaries: &mut Vec<ConversationSummary>,
++    page: &[crate::agents::codex::Summary],
++    deleting: &HashSet<ChatKey>,
++) {
++    let mut pending: HashMap<_, _> = page.iter().map(|row| (row.id.as_str(), row)).collect();
++    for row in summaries.iter_mut() {
++        if let ChatKey::Codex(id) = &row.key
++            && let Some(update) = pending.remove(id.as_str())
++        {
++            if !deleting.contains(&row.key) {
++                *row = from_codex(update);
++            }
++            if pending.is_empty() {
++                return;
++            }
++        }
++    }
++    // A repeated new ID appends at its first occurrence, with its last value.
++    for item in page {
++        if let Some(update) = pending.remove(item.id.as_str()) {
++            let row = from_codex(update);
++            if !deleting.contains(&row.key) {
++                summaries.push(row);
++            }
++        }
++    }
++}
++
+ /// Resolve parent UUIDs while the driver's complete summary catalog is present.
+ /// Missing parents remain accessible roots; no transcript is needed.
+ pub fn from_proteus(sessions: Vec<AppSessionSummary>) -> Vec<ConversationSummary> {
+@@ -193,6 +224,48 @@ mod tests {
+         assert_eq!(rows.last().unwrap().key, ChatKey::Codex("new".into()));
+     }
+ 
++    #[test]
++    fn codex_page_matches_single_upserts_across_drivers_repeats_and_deletions() {
++        let item = |id: &str, title: &str| crate::agents::codex::Summary {
++            id: id.into(),
++            title: title.into(),
++            ..Default::default()
++        };
++        let mut core = from_codex(&item("shared", "not a Codex row"));
++        core.key = ChatKey::Proteus("shared".into());
++        let mut rows = vec![
++            core,
++            from_codex(&item("old", "before")),
++            from_codex(&item("deleting", "leave untouched")),
++            from_codex(&item("old", "second existing occurrence")),
++        ];
++        rows.extend((0..64).map(|i| from_codex(&item(&format!("other:{i}"), "unchanged"))));
++        let mut expected = rows.clone();
++        let deleting = ["deleting", "deleted-new"]
++            .map(|id| ChatKey::Codex(id.into()))
++            .into_iter()
++            .collect::<HashSet<_>>();
++        let page = [
++            item("new", "first"),
++            item("old", "updated"),
++            item("shared", "distinct driver"),
++            item("deleting", "stale"),
++            item("old", "latest"),
++            item("new", "latest"),
++            item("deleted-new", "stale"),
++            item("another", "arrived later"),
++            item("new", "final value"),
++        ];
++        for item in &page {
++            let row = from_codex(item);
++            if !deleting.contains(&row.key) {
++                upsert_summary(&mut expected, row);
++            }
++        }
++        merge_codex_page(&mut rows, &page, &deleting);
++        assert_eq!(rows, expected);
++    }
++
+     #[test]
+     fn parent_uuid_is_resolved_to_the_real_driver_key_and_missing_parent_stays_accessible() {
+         let summary = |id: u128, parent: Option<u128>| {
+diff --git a/src/ui/chats/codex.rs b/src/ui/chats/codex.rs
+index 8855384..46e6fe1 100644
+--- a/src/ui/chats/codex.rs
++++ b/src/ui/chats/codex.rs
+@@ -70,12 +70,20 @@ impl Workspace {
+                             .entry(project)
+                             .or_default()
+                             .accept(cursor.as_deref(), page.next_cursor);
+-                        for row in page.data {
+-                            let row = crate::conversations::from_codex(&row);
+-                            if this.deleting_sessions.contains(&row.key) {
+-                                continue;
++                        // A short final page or a tiny catalog costs less to scan directly.
++                        if page.data.len() <= 8 || this.sessions.len() <= 32 {
++                            for row in page.data {
++                                let row = crate::conversations::from_codex(&row);
++                                if !this.deleting_sessions.contains(&row.key) {
++                                    crate::conversations::upsert_summary(&mut this.sessions, row);
++                                }
+                             }
+-                            crate::conversations::upsert_summary(&mut this.sessions, row);
++                        } else {
++                            crate::conversations::merge_codex_page(
++                                &mut this.sessions,
++                                &page.data,
++                                &this.deleting_sessions,
++                            );
+                         }
+                         this.sessions_arrived
+                             .get_or_insert_with(std::time::Instant::now);
