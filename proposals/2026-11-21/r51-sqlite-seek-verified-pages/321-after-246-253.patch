@@ -1,0 +1,394 @@
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index b544b87..6ed9bf0 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -48,26 +48,35 @@ fn payload_bytes<'r>(row: &'r rusqlite::Row<'_>, column: usize) -> rusqlite::Res
+     })
+ }
+ 
+-fn snapshot_source(
+-    dir: &Path,
+-    id: SessionId,
+-    hint: Option<&PrefixHint>,
+-) -> Result<Box<dyn RecordSnapshot>> {
++fn open_source(dir: &Path, id: SessionId) -> Result<(Option<Connection>, u64)> {
+     let conn = open_read(dir)?;
+-    let mut hash = HashContext::new(&SHA256);
+     let end = if let Some(conn) = &conn {
+         validate_identity(conn, id)?;
+-        let end = u64::try_from(conn.query_row(
++        u64::try_from(conn.query_row(
+             "SELECT coalesce(max(sequence),0) FROM journal",
+             [],
+             |r| r.get::<_, i64>(0),
+-        )?)?;
++        )?)?
++    } else {
++        0
++    };
++    Ok((conn, end))
++}
++
++fn snapshot_source(
++    conn: Option<Connection>,
++    id: SessionId,
++    mut end: u64,
++    hint: Option<&PrefixHint>,
++) -> Result<SqliteSnapshot> {
++    let mut hash = HashContext::new(&SHA256);
++    if let Some(conn) = &conn {
+         if let Some(hint) = hint {
+             ensure!(
+                 end >= hint.extent,
+                 "SQLite journal shortened below cached prefix"
+             );
+-            hint.extent
++            end = hint.extent;
+         } else {
+             let mut stmt =
+                 conn.prepare("SELECT payload FROM journal WHERE sequence<=?1 ORDER BY sequence")?;
+@@ -77,29 +86,105 @@ fn snapshot_source(
+                 crate::diagnostics::fingerprint(bytes.len());
+                 hash.update(bytes);
+             }
+-            end
+         }
+-    } else {
+-        0
+-    };
++    }
+     let fingerprint = if let Some(hint) = hint {
+         hint.fingerprint.clone()
+     } else {
+         crate::io::digest_hex(hash.finish())
+     };
+-    Ok(Box::new(SqliteSnapshot {
++    Ok(SqliteSnapshot {
+         conn,
+         end,
+         after: 0,
+         id,
+         fingerprint,
+         current_hash: HashContext::new(&SHA256),
+-    }))
++    })
++}
++
++impl Sqlite {
++    /// Cold catalog only. Hand back proof after every ordered row has passed
++    /// the visitor and EOF is reached, without exposing an unverified snapshot.
++    pub(crate) fn replay_catalog<T: Default>(
++        dir: &Path,
++        id: SessionId,
++        apply: impl Fn(&mut T, &JournalRecord) -> Result<()>,
++    ) -> Result<(T, PrefixHint)> {
++        let (conn, end) = open_source(dir, id)?;
++        if let Some(replayed) = replay_catalog_rows(conn.as_ref(), id, end, &apply)? {
++            return Ok(replayed);
++        }
++
++        // Unexpected ordering falls back on the same pinned transaction.
++        // Start a new fold: no partial result can escape the cursor path.
++        let mut source = snapshot_source(conn, id, end, None)?;
++        let mut folded = T::default();
++        while let Some(record) = source.next()? {
++            apply(&mut folded, &record)?;
++        }
++        Ok((
++            folded,
++            PrefixHint {
++                extent: source.end,
++                fingerprint: source.fingerprint,
++            },
++        ))
++    }
++}
++
++fn replay_catalog_rows<T: Default>(
++    conn: Option<&Connection>,
++    id: SessionId,
++    end: u64,
++    apply: impl Fn(&mut T, &JournalRecord) -> Result<()>,
++) -> Result<Option<(T, PrefixHint)>> {
++    let mut folded = T::default();
++    let mut hash = HashContext::new(&SHA256);
++    if let Some(conn) = conn {
++        let ordinary_table: bool = conn.query_row(
++            "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
++                           WHERE type='table' AND name='journal' AND rootpage>0)",
++            [],
++            |row| row.get(0),
++        )?;
++        if !ordinary_table {
++            return Ok(None);
++        }
++        let mut stmt = conn
++            .prepare("SELECT sequence,payload FROM journal WHERE sequence<=?1 ORDER BY sequence")?;
++        let mut rows = stmt.query([i64::try_from(end)?])?;
++        let mut seen = 0;
++        while let Some(row) = rows.next()? {
++            seen += 1;
++            // The legacy seek cursor visits positive, distinct sequences.
++            // Do not assume an arbitrary existing table enforces the writer DDL.
++            let sequence = match row.get::<_, i64>(0) {
++                Ok(sequence) if u64::try_from(sequence) == Ok(seen) => seen,
++                Ok(_) | Err(rusqlite::Error::InvalidColumnType(..)) => return Ok(None),
++                Err(error) => return Err(error.into()),
++            };
++            let bytes = payload_bytes(row, 1)?;
++            hash.update(bytes);
++            apply(&mut folded, &decode_record(id, sequence, bytes)?)?;
++        }
++        if seen != end {
++            return Ok(None);
++        }
++    }
++    Ok(Some((
++        folded,
++        PrefixHint {
++            extent: end,
++            fingerprint: crate::io::digest_hex(hash.finish()),
++        },
++    )))
+ }
+ 
+ impl JournalBackend for Sqlite {
+     fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>> {
+-        snapshot_source(dir, id, None)
++        let (conn, end) = open_source(dir, id)?;
++        Ok(Box::new(snapshot_source(conn, id, end, None)?))
+     }
+     fn snapshot_warm(
+         &mut self,
+@@ -107,7 +192,8 @@ impl JournalBackend for Sqlite {
+         id: SessionId,
+         hint: &PrefixHint,
+     ) -> Result<Box<dyn RecordSnapshot>> {
+-        snapshot_source(dir, id, Some(hint))
++        let (conn, end) = open_source(dir, id)?;
++        Ok(Box::new(snapshot_source(conn, id, end, Some(hint))?))
+     }
+     fn recover(&mut self, dir: &Path, id: SessionId) -> Result<()> {
+         ensure!(
+@@ -202,26 +288,15 @@ impl RecordSnapshot for SqliteSnapshot {
+             i64::try_from(self.end)?
+         ])?;
+         let Some(row) = rows.next()? else {
+-            let actual = crate::io::digest_hex(self.current_hash.clone().finish());
++            let actual: String = crate::io::digest_hex(self.current_hash.clone().finish());
+             ensure!(actual == self.fingerprint, "SQLite snapshot prefix changed");
+             return Ok(None);
+         };
+         let sequence: i64 = row.get(0)?;
+         let bytes = payload_bytes(row, 1)?;
+-        crate::diagnostics::decoded();
+         self.current_hash.update(bytes);
+         let sequence = u64::try_from(sequence)?;
+-        ensure!(
+-            bytes.len() <= crate::io::MAX_PAYLOAD_BYTES * 2,
+-            "SQLite record exceeds maximum"
+-        );
+-        let record = record::decode(bytes)?;
+-        ensure!(
+-            record.session_seq == sequence
+-                && record.session_id == self.id
+-                && record.schema_version == JOURNAL_SCHEMA_VERSION,
+-            "SQLite journal record identity mismatch"
+-        );
++        let record = decode_record(self.id, sequence, bytes)?;
+         self.after = sequence;
+         Ok(Some(record))
+     }
+@@ -260,10 +335,28 @@ impl RecordSnapshot for SqliteSnapshot {
+                 "SQLite journal prefix has a sequence gap"
+             );
+         }
+-        Ok(Some(crate::io::digest_hex(hash.finish())))
++        Ok(Some(
++            crate::io::digest_hex(hash.finish()),
++        ))
+     }
+ }
+ 
++fn decode_record(id: SessionId, sequence: u64, bytes: &[u8]) -> Result<JournalRecord> {
++    crate::diagnostics::decoded();
++    ensure!(
++        bytes.len() <= crate::io::MAX_PAYLOAD_BYTES * 2,
++        "SQLite record exceeds maximum"
++    );
++    let record = record::decode(bytes)?;
++    ensure!(
++        record.session_seq == sequence
++            && record.session_id == id
++            && record.schema_version == JOURNAL_SCHEMA_VERSION,
++        "SQLite journal record identity mismatch"
++    );
++    Ok(record)
++}
++
+ #[cfg(test)]
+ #[test]
+ fn payload_bytes_matches_owned_blob_reads_and_errors_for_both_projections() {
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 293ad26..52f03b7 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -3,6 +3,8 @@ use super::*;
+ use std::{fs::Metadata, time::UNIX_EPOCH};
+ pub(super) mod durable;
+ #[cfg(test)]
++mod replay_tests;
++#[cfg(test)]
+ mod tests;
+ 
+ #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -201,18 +203,29 @@ type Projection = (StorageSessionSummary, super::views::PrefixCache);
+ impl CatalogRead {
+     fn replay(&self, kind: BackendKind, dir: &Path) -> Result<Projection> {
+         let session = self.descriptor.session.session_id;
+-        let mut source = kind.backend().snapshot(dir, session)?;
+-        let mut fold = Fold::default();
+-        while let Some(record) = source.next()? {
+-            fold.apply(session, &record)?;
+-        }
++        let (fold, hint) = match kind {
++            BackendKind::Sqlite => {
++                Sqlite::replay_catalog(dir, session, |fold: &mut Fold, record| {
++                    fold.apply(session, record)
++                })?
++            }
++            BackendKind::Jsonl => {
++                let mut source = kind.backend().snapshot(dir, session)?;
++                let mut fold = Fold::default();
++                while let Some(record) = source.next()? {
++                    fold.apply(session, &record)?;
++                }
++                let hint = crate::backend::PrefixHint {
++                    extent: source.extent(),
++                    fingerprint: source.fingerprint().to_owned(),
++                };
++                (fold, hint)
++            }
++        };
+         let prefix = super::views::PrefixCache {
+             stamps: self.stamps.clone(),
+             revision: fold.revision(),
+-            hint: crate::backend::PrefixHint {
+-                extent: source.extent(),
+-                fingerprint: source.fingerprint().to_owned(),
+-            },
++            hint,
+             blob_digest: self.blobs.as_ref().map(durable::blob_stamp_digest),
+         };
+         Ok((
+diff --git a/storage/session-storage/src/service/catalog/replay_tests.rs b/storage/session-storage/src/service/catalog/replay_tests.rs
+new file mode 100644
+index 0000000..1a88242
+--- /dev/null
++++ b/storage/session-storage/src/service/catalog/replay_tests.rs
+@@ -0,0 +1,105 @@
++use super::*;
++use crate::tests::{Fixture, text};
++use std::cell::RefCell;
++
++fn raw_proof(path: &Path) -> (String, u64) {
++    let conn =
++        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
++            .unwrap();
++    let mut stmt = conn
++        .prepare("SELECT payload FROM journal ORDER BY sequence")
++        .unwrap();
++    let mut rows = stmt.query([]).unwrap();
++    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
++    let mut total = 0;
++    while let Some(row) = rows.next().unwrap() {
++        let value = row.get_ref(0).unwrap();
++        let bytes = value.as_blob().unwrap();
++        hash.update(bytes);
++        total += bytes.len() as u64;
++    }
++    (crate::io::digest_hex(hash.finish()), total)
++}
++
++#[test]
++fn sqlite_cold_catalog_replay_hashes_the_strict_rows_once() {
++    for count in [0, 1, 24] {
++        let mut f = Fixture::new(BackendKind::Sqlite);
++        let text_payload = "x".repeat(32 * 1024);
++        for i in 0..count {
++            f.append(vec![text(&format!("строка {i}: {text_payload}"))]);
++        }
++        let dir = f.descriptor.local_path.clone().unwrap();
++        let (hash, payload_bytes) = raw_proof(f.descriptor.record_location.as_ref().unwrap());
++        // The stock catalog uses this identical complete snapshot + Fold
++        // sequence, including the eager scan and the cursor's EOF check.
++        let id = f.descriptor.session.session_id;
++        crate::diagnostics::reset();
++        let mut stock_source = Sqlite::default().snapshot(&dir, id).unwrap();
++        let mut stock_fold = Fold::default();
++        while let Some(record) = stock_source.next().unwrap() {
++            stock_fold.apply(id, &record).unwrap();
++        }
++        let stock_work = crate::diagnostics::get();
++        assert_eq!(stock_source.fingerprint(), hash);
++        assert_eq!(stock_work.fingerprint_bytes, payload_bytes);
++        assert_eq!(stock_work.decoded, count as u64);
++        drop(stock_source);
++
++        let storage = StorageService::new(BackendKind::Sqlite);
++        crate::diagnostics::reset();
++        let summary = storage.catalog_summary(&dir, false).unwrap();
++        let work = crate::diagnostics::get();
++        assert_eq!(summary.message_count, count);
++        assert_eq!(work.decoded, count as u64);
++        assert_eq!(
++            work.fingerprint_bytes, 0,
++            "no supplementary fingerprint scan"
++        );
++
++        let prefix = &storage.lock_state().unwrap().prefixes[&summary.descriptor.session];
++        assert_eq!(prefix.hint.extent, count as u64);
++        assert_eq!(prefix.revision, stock_fold.revision());
++        assert_eq!(prefix.hint.fingerprint, hash);
++        let index: serde_json::Value =
++            serde_json::from_slice(&std::fs::read(dir.join(".storage-catalog-v1.json")).unwrap())
++                .unwrap();
++        assert_eq!(index["data"]["extent"], count);
++        assert_eq!(index["data"]["fingerprint"], hash);
++        eprintln!(
++            "sqlite rows={} replay_payload_bytes={payload_bytes} eager_before={} eager_after={}",
++            work.decoded, stock_work.fingerprint_bytes, work.fingerprint_bytes
++        );
++    }
++}
++
++#[test]
++fn sqlite_catalog_transaction_keeps_its_exact_rows_across_a_live_commit() {
++    let mut f = Fixture::new(BackendKind::Sqlite);
++    for i in 0..3 {
++        f.append(vec![text(&format!("old {i}"))]);
++    }
++    let dir = f.descriptor.local_path.clone().unwrap();
++    let id = f.descriptor.session.session_id;
++    let journal = f.descriptor.record_location.clone().unwrap();
++    let (before, _) = raw_proof(&journal);
++    let f = RefCell::new(f);
++    let (fold, prefix) = Sqlite::replay_catalog(&dir, id, |fold: &mut Fold, record| {
++        if record.session_seq == 1 {
++            f.borrow_mut()
++                .append(vec![text("new during the live read transaction")]);
++        }
++        fold.apply(id, record)
++    })
++    .unwrap();
++    assert_eq!(fold.revision().session_seq, 3);
++    assert_eq!(prefix.extent, 3);
++    assert_eq!(prefix.fingerprint, before);
++    let (after, _) = raw_proof(&journal);
++    assert_ne!(before, after);
++    let (fold, prefix) =
++        Sqlite::replay_catalog(&dir, id, |fold: &mut Fold, record| fold.apply(id, record)).unwrap();
++    assert_eq!(fold.revision().session_seq, 4);
++    assert_eq!(prefix.extent, 4);
++    assert_eq!(prefix.fingerprint, after);
++}
