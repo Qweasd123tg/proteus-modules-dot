@@ -1,0 +1,57 @@
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 293ad26..031df2a 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -163,9 +163,11 @@ impl State {
+                 .get(&descriptor.session)
+                 .is_some_and(|prefix| prefix.valid_at(dir, stamps))
+         {
+-            let mut summary = cached.summary.clone();
+-            summary.descriptor = descriptor.clone();
+-            return Some(summary);
++            return Some(StorageSessionSummary {
++                descriptor: descriptor.clone(),
++                message_count: cached.summary.message_count,
++                preview: cached.summary.preview.clone(),
++            });
+         }
+         let (summary, prefix) = durable::load(dir, descriptor, stamps)?;
+         self.remember_prefix(descriptor.session.clone(), prefix);
+diff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs
+index 7e6103d..5161d2a 100644
+--- a/storage/session-storage/src/service/catalog/tests.rs
++++ b/storage/session-storage/src/service/catalog/tests.rs
+@@ -2,6 +2,33 @@
+ use super::*;
+ use crate::tests::{Fixture, backends, text};
+ 
++#[test]
++fn resident_catalog_uses_observed_descriptor_with_the_cached_projection() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("one verified resident message")]);
++        let dir = f.descriptor.local_path.as_ref().unwrap();
++        let expected = f.service.catalog_summary(dir, false).unwrap();
++        let index = dir.join(".storage-catalog-v1.json");
++        // There must be no disk hit to mask an accidentally missed resident.
++        std::fs::remove_file(&index).unwrap();
++        {
++            let mut state = f.service.lock_state().unwrap();
++            let cached = state.catalog.get_mut(&expected.descriptor.session).unwrap();
++            // Model older descriptor data in the disposable, verified cache.
++            // The source journal, locator and source stamps are untouched.
++            cached.summary.descriptor.created_at_ms ^= 1;
++            cached.summary.descriptor.updated_at_ms ^= 1;
++            assert_ne!(cached.summary.descriptor, expected.descriptor);
++        }
++        crate::diagnostics::reset();
++        let hit = f.service.catalog_summary(dir, false).unwrap();
++        assert_eq!(hit, expected);
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++        assert!(!index.exists(), "resident hit does not rewrite the index");
++    }
++}
++
+ fn pending(f: &Fixture) -> (PathBuf, CatalogRead, Projection) {
+     let dir = f.descriptor.local_path.clone().unwrap();
+     let descriptor = sessions::open(f.service.kind, &dir).unwrap();
