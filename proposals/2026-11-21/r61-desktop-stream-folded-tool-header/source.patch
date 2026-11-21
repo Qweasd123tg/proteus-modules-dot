@@ -1,0 +1,212 @@
+diff --git a/src/ui/chat/thread.rs b/src/ui/chat/thread.rs
+index 6b17483..470941d 100644
+--- a/src/ui/chat/thread.rs
++++ b/src/ui/chat/thread.rs
+@@ -239,12 +239,11 @@ impl Chat {
+             }
+             (Role::System, Some(tool), _) => match &chain {
+                 Some(chain) if ix == chain.start => {
+-                    let tools: Vec<_> = entries[chain.clone()]
++                    let tools = entries[chain.clone()]
+                         .iter()
+-                        .filter_map(|entry| entry.tool.as_ref())
+-                        .collect();
++                        .filter_map(|entry| entry.tool.as_ref());
+                     let header =
+-                        render_chain_header(key, &tools, chain_open, self.session.connected, cx);
++                        render_chain_header(key, tools, chain_open, self.session.connected, cx);
+                     let calls = if chain_moving {
+                         let run = self.render_run(chain.clone(), frame_at, cx);
+                         motion::reveal_at(
+diff --git a/src/ui/chat/tool_chain.rs b/src/ui/chat/tool_chain.rs
+index 2ea0fcb..8ffbbc5 100644
+--- a/src/ui/chat/tool_chain.rs
++++ b/src/ui/chat/tool_chain.rs
+@@ -8,12 +8,14 @@ use gpui_kit::*;
+ use proteus_contracts::app_protocol::AppTranscriptTool;
+ 
+ use super::Chat;
+-use super::tool_row::{is_running, status_icon};
++use super::tool_row::status_icon;
+ use crate::transcript::{affected_rows, tool_chain};
+ use crate::ui::fade::faded;
+ use crate::ui::kit::Pressable as _;
+ use crate::ui::motion::{self, chevron};
+ 
++mod summary;
++
+ impl Chat {
+     pub(super) fn chain_open(&self, head: u64) -> bool {
+         self.open_chains.contains(&head)
+@@ -96,23 +98,20 @@ fn trace_geometry(
+     );
+ }
+ 
+-pub(super) fn render_chain_header(
++pub(super) fn render_chain_header<'a>(
+     head: u64,
+-    tools: &[&AppTranscriptTool],
++    tools: impl IntoIterator<Item = &'a AppTranscriptTool>,
+     open: bool,
+     connected: bool,
+     cx: &mut Context<Chat>,
+ ) -> AnyElement {
+     let theme = cx.theme();
+     let muted = theme.chat_secondary_foreground;
+-    let mut labels: Vec<(&str, usize)> = Vec::new();
+-    for tool in tools {
+-        if let Some((_, count)) = labels.iter_mut().find(|(name, _)| *name == tool.name) {
+-            *count += 1;
+-        } else {
+-            labels.push((&tool.name, 1));
+-        }
+-    }
++    let summary::Summary {
++        count,
++        status,
++        labels,
++    } = summary::summarize(tools);
+     let weak = cx.entity().downgrade();
+     h_flex()
+         .id(ElementId::NamedInteger("tool-chain".into(), head))
+@@ -120,12 +119,8 @@ pub(super) fn render_chain_header(
+         .text_sm()
+         .min_w_0()
+         .chat_disclosure(cx)
+-        .child(status_icon(chain_status(tools), connected, cx))
+-        .child(
+-            div()
+-                .flex_none()
+-                .child(format!("Инструменты · {}", tools.len())),
+-        )
++        .child(status_icon(status, connected, cx))
++        .child(div().flex_none().child(format!("Инструменты · {}", count)))
+         .child(
+             h_flex()
+                 .min_w_0()
+@@ -158,24 +153,3 @@ pub(super) fn render_chain_header(
+         .on_click(cx.listener(move |this, _, _, cx| this.toggle_chain(head, cx)))
+         .into_any_element()
+ }
+-
+-/// Running wins over waiting, waiting over failure, failure over an
+-/// interrupted call, and that over success.
+-fn chain_status(tools: &[&AppTranscriptTool]) -> &'static str {
+-    let has = |wanted: &[&str]| {
+-        tools
+-            .iter()
+-            .any(|tool| wanted.contains(&tool.status.as_str()))
+-    };
+-    if tools.iter().any(|tool| is_running(&tool.status)) {
+-        "running"
+-    } else if has(&["waiting_approval"]) {
+-        "waiting_approval"
+-    } else if has(&["failed", "denied"]) {
+-        "failed"
+-    } else if tools.iter().any(|tool| tool.status != "done") {
+-        "interrupted"
+-    } else {
+-        "done"
+-    }
+-}
+diff --git a/src/ui/chat/tool_chain/summary.rs b/src/ui/chat/tool_chain/summary.rs
+new file mode 100644
+index 0000000..2f2e61d
+--- /dev/null
++++ b/src/ui/chat/tool_chain/summary.rs
+@@ -0,0 +1,95 @@
++//! One pass over the calls represented by a folded header.
++use proteus_contracts::app_protocol::AppTranscriptTool;
++
++use super::super::tool_row::is_running;
++
++pub(super) struct Summary<'a> {
++    pub count: usize,
++    pub status: &'static str,
++    pub labels: Vec<(&'a str, usize)>,
++}
++
++pub(super) fn summarize<'a>(tools: impl IntoIterator<Item = &'a AppTranscriptTool>) -> Summary<'a> {
++    let mut count = 0;
++    let mut status = Status::Done;
++    let mut labels: Vec<(&str, usize)> = Vec::new();
++    for tool in tools {
++        count += 1;
++        status = status.max(Status::for_call(&tool.status));
++        if let Some((_, count)) = labels.iter_mut().find(|(name, _)| *name == tool.name) {
++            *count += 1;
++        } else {
++            labels.push((&tool.name, 1));
++        }
++    }
++    Summary {
++        count,
++        status: status.as_str(),
++        labels,
++    }
++}
++
++/// Increasing priority, independent of the order of the calls in the chain.
++#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++enum Status {
++    Done,
++    Interrupted,
++    Failed,
++    WaitingApproval,
++    Running,
++}
++
++impl Status {
++    fn for_call(status: &str) -> Self {
++        match status {
++            status if is_running(status) => Self::Running,
++            "waiting_approval" => Self::WaitingApproval,
++            "failed" | "denied" => Self::Failed,
++            "done" => Self::Done,
++            _ => Self::Interrupted,
++        }
++    }
++
++    fn as_str(self) -> &'static str {
++        match self {
++            Self::Done => "done",
++            Self::Interrupted => "interrupted",
++            Self::Failed => "failed",
++            Self::WaitingApproval => "waiting_approval",
++            Self::Running => "running",
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn repeated_labels_keep_first_order_while_approval_uses_highest_priority() {
++        let tool = |name: &str, status: &str| AppTranscriptTool {
++            call_id: name.into(),
++            name: name.into(),
++            args: serde_json::Value::Null,
++            effective_args: None,
++            status: status.into(),
++            result: None,
++            metadata: serde_json::Value::Null,
++            terminal: None,
++        };
++        let calls = [
++            tool("search", "denied"),
++            tool("read_file", "unknown"),
++            tool("search", "waiting_approval"),
++            tool("read_file", "approved"),
++        ];
++        let waiting = summarize(&calls[..3]);
++        assert_eq!(waiting.count, 3);
++        assert_eq!(waiting.status, "waiting_approval");
++        assert_eq!(waiting.labels, [("search", 2), ("read_file", 1)]);
++        let running = summarize(&calls);
++        assert_eq!(running.count, 4);
++        assert_eq!(running.status, "running");
++        assert_eq!(running.labels, [("search", 2), ("read_file", 2)]);
++    }
++}
