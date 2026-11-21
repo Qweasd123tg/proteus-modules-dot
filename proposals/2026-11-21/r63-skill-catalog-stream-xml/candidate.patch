@@ -1,0 +1,91 @@
+diff --git a/tool/skill-pack/src/lib.rs b/tool/skill-pack/src/lib.rs
+index 77a8aa1a165947ee6ab2161ab550bd040daeca78..0e6724b80d6d31bbc0caea7c06d1125ea32806c1 100644
+--- a/tool/skill-pack/src/lib.rs
++++ b/tool/skill-pack/src/lib.rs
+@@ -206,11 +206,16 @@ fn available_skills_chunk(skills: &[SkillDocument]) -> ContextChunk {
+     for skill in skills {
+         content.push_str("<skill>\n");
+         content.push_str("<name>");
+-        content.push_str(&escape_xml(&skill.id));
++        push_xml_escaped(&mut content, &skill.id);
+         content.push_str("</name>\n<description>");
+-        content.push_str(&escape_xml(&normalize_whitespace(&skill.description)));
++        for (index, word) in skill.description.split_whitespace().enumerate() {
++            if index != 0 {
++                content.push(' ');
++            }
++            push_xml_escaped(&mut content, word);
++        }
+         content.push_str("</description>\n<location>");
+-        content.push_str(&escape_xml(&skill.path.display().to_string()));
++        push_xml_escaped(&mut content, &skill.path.display().to_string());
+         content.push_str("</location>\n</skill>\n");
+     }
+     content.push_str("</available_skills>");
+@@ -223,17 +228,22 @@ fn available_skills_chunk(skills: &[SkillDocument]) -> ContextChunk {
+         }))
+ }
+ 
+-fn normalize_whitespace(value: &str) -> String {
+-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+-}
+-
+-fn escape_xml(value: &str) -> String {
+-    value
+-        .replace('&', "&amp;")
+-        .replace('<', "&lt;")
+-        .replace('>', "&gt;")
+-        .replace('"', "&quot;")
+-        .replace('\'', "&apos;")
++fn push_xml_escaped(output: &mut String, value: &str) {
++    let mut start = 0;
++    for (index, character) in value.char_indices() {
++        let replacement = match character {
++            '&' => "&amp;",
++            '<' => "&lt;",
++            '>' => "&gt;",
++            '"' => "&quot;",
++            '\'' => "&apos;",
++            _ => continue,
++        };
++        output.push_str(&value[start..index]);
++        output.push_str(replacement);
++        start = index + character.len_utf8();
++    }
++    output.push_str(&value[start..]);
+ }
+ 
+ pub fn register_modules(registry: &mut dyn ModuleRegistry) -> Result<(), ProcessModuleError> {
+@@ -251,6 +261,32 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn skill_listing_preserves_whitespace_and_all_xml_entities() {
++        let skill = SkillDocument {
++            id: "review".into(),
++            enabled: true,
++            name: "review".to_owned(),
++            description: "\tCheck  <diff>\n&  \"тесты\"\u{2003}'🦀' &amp;\r\n".to_owned(),
++            body: "Body".to_owned(),
++            path: "fixture/.proteus/skills/review & notes/SKILL.md".into(),
++            source: discovery::SkillSource::Project,
++        };
++
++        let chunk = available_skills_chunk(&[skill]);
++
++        assert_eq!(
++            chunk.content,
++            concat!(
++                "<available_skills>\n<skill>\n<name>review</name>\n",
++                "<description>Check &lt;diff&gt; &amp; &quot;тесты&quot; &apos;🦀&apos; &amp;amp;</description>\n",
++                "<location>fixture/.proteus/skills/review &amp; notes/SKILL.md</location>\n",
++                "</skill>\n</available_skills>",
++            )
++        );
++        assert_eq!(chunk.metadata["skill_count"], 1);
++    }
++
+     #[test]
+     fn available_skills_context_escapes_frontmatter_text() {
+         let skill = SkillDocument {
