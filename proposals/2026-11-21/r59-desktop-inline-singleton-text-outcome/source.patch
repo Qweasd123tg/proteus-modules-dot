@@ -1,0 +1,198 @@
+diff --git a/src/transcript/text_run.rs b/src/transcript/text_run.rs
+index e1579a3..1061f22 100644
+--- a/src/transcript/text_run.rs
++++ b/src/transcript/text_run.rs
+@@ -55,12 +55,27 @@ impl TextRun {
+ /// Original per-event effects remain observable even when layout work is reduced.
+ pub(crate) struct TextRunOutcome {
+     pub(crate) feedback_changed: bool,
+-    changes: Vec<Change>,
++    changes: Changes,
++}
++
++enum Changes {
++    One(Change),
++    Batch(Vec<Change>),
++}
++
++impl Changes {
++    fn as_slice(&self) -> &[Change] {
++        match self {
++            Self::One(change) => std::slice::from_ref(change),
++            Self::Batch(changes) => changes,
++        }
++    }
+ }
+ 
+ impl TextRunOutcome {
+     pub fn event_changes(&self) -> impl Iterator<Item = Change> + '_ {
+         self.changes
++            .as_slice()
+             .iter()
+             .copied()
+             .filter(|change| *change != Change::None)
+@@ -68,7 +83,7 @@ impl TextRunOutcome {
+ 
+     pub fn layout_changes(&self) -> impl Iterator<Item = Change> + '_ {
+         // Creation must survive even if a later empty delta truncates the row.
+-        let change = if self.changes.contains(&Change::Pushed) {
++        let change = if self.changes.as_slice().contains(&Change::Pushed) {
+             Some(Change::Pushed)
+         } else {
+             self.event_changes().last()
+@@ -115,7 +130,7 @@ impl Transcript {
+     pub(crate) fn apply_text_run(&mut self, run: &TextRun) -> TextRunOutcome {
+         let Some(first) = run.events.first().and_then(|event| delta(event)) else {
+             return TextRunOutcome {
+-                changes: Vec::new(),
++                changes: Changes::Batch(Vec::new()),
+                 feedback_changed: false,
+             };
+         };
+@@ -124,13 +139,13 @@ impl Transcript {
+             let change = self.apply_runtime(first.envelope.thread_id, &first.envelope.event);
+             self.stamp(change, first.envelope.timestamp_ms);
+             return TextRunOutcome {
+-                changes: vec![change],
++                changes: Changes::One(change),
+                 feedback_changed: false,
+             };
+         }
+         if !self.is_turn_thread(first.envelope.thread_id) {
+             return TextRunOutcome {
+-                changes: vec![Change::None; run.events.len()],
++                changes: Changes::Batch(vec![Change::None; run.events.len()]),
+                 feedback_changed: false,
+             };
+         }
+@@ -167,7 +182,7 @@ impl Transcript {
+         }
+         if !exists {
+             return TextRunOutcome {
+-                changes,
++                changes: Changes::Batch(changes),
+                 feedback_changed: false,
+             };
+         }
+@@ -197,7 +212,7 @@ impl Transcript {
+             });
+         }
+         TextRunOutcome {
+-            changes,
++            changes: Changes::Batch(changes),
+             feedback_changed: false,
+         }
+     }
+diff --git a/src/transcript/text_run/tests.rs b/src/transcript/text_run/tests.rs
+index bba0db9..6c31bcd 100644
+--- a/src/transcript/text_run/tests.rs
++++ b/src/transcript/text_run/tests.rs
+@@ -132,7 +132,7 @@ fn compare_partition(base: Option<&str>, events: &[Box<AppServerEvent>], mask: u
+         }
+         let expected_changes = apply_oracle(&mut expected, &events[start..end]);
+         let outcome = actual.apply_text_run(&run(&events[start..end]));
+-        assert_eq!(outcome.changes, expected_changes);
++        assert_eq!(outcome.changes.as_slice(), expected_changes);
+         assert_eq!(
+             outcome.event_changes().collect::<Vec<_>>(),
+             expected_changes
+@@ -152,6 +152,36 @@ fn compare_partition(base: Option<&str>, events: &[Box<AppServerEvent>], mask: u
+     }
+ }
+ 
++#[test]
++fn a_run_reduced_to_one_event_keeps_its_effect_and_timestamp() {
++    let mut transcript = fixture(None);
++    let mut text_run = run(&[event(0, "old", 11), event(usize::MAX, "é", 12)]);
++    let mut include = [false, true].into_iter();
++    text_run.retain(|_| include.next().unwrap());
++
++    let outcome = transcript.apply_text_run(&text_run);
++    assert_eq!(
++        outcome.event_changes().collect::<Vec<_>>(),
++        [Change::Pushed]
++    );
++    assert_eq!(
++        outcome.layout_changes().collect::<Vec<_>>(),
++        [Change::Pushed]
++    );
++    assert!(outcome.shown());
++    let entry = transcript.entries.last().unwrap();
++    assert_eq!(&*entry.text, "é");
++    assert_eq!(entry.time, Some(12));
++
++    text_run.retain(|_| false);
++    let mut outcome = transcript.apply_text_run(&text_run);
++    assert_eq!(outcome.event_changes().next(), None);
++    assert_eq!(outcome.layout_changes().next(), None);
++    assert!(!outcome.shown());
++    outcome.feedback_changed = true;
++    assert!(outcome.shown());
++}
++
+ #[test]
+ fn all_small_utf8_offset_sequences_match_real_reducer_at_every_partition() {
+     let offsets = [0, 1, 2, 3, 5, usize::MAX];
+@@ -213,7 +243,7 @@ fn first_nonempty_stamp_key_and_final_empty_row_survive_coalescing() {
+     let mut expected = fixture(None);
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_eq!(changes, [Change::None, Change::Pushed, Change::Updated(1)]);
+     assert_transcript(&actual, &expected);
+     assert_eq!(actual.entries.len(), 2);
+@@ -248,7 +278,7 @@ fn empty_noop_reopens_existing_row_without_stamping_or_stopping_other_rows() {
+     let events = [event(2, "", 11), event(2, "", 12)];
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_transcript(&actual, &expected);
+     assert_eq!(actual.entries[1].time, None);
+     assert!(actual.entries[0].streaming);
+@@ -296,7 +326,7 @@ fn reverse_identity_lookup_preserves_nonassistant_metadata() {
+     let events = [event(6, "replacement", 11), event(0, "", 12)];
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_eq!(changes, [Change::Updated(1), Change::Updated(1)]);
+     assert_transcript(&actual, &expected);
+     assert_eq!(actual.entries[2].role, Role::User);
+@@ -318,7 +348,7 @@ fn foreign_root_run_is_ignored_without_consuming_identity_or_work() {
+     }
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_transcript(&actual, &expected);
+     assert!(!outcome.shown());
+     assert_eq!(actual.take_text_work(), TextWork::default());
+@@ -335,7 +365,7 @@ fn work_budget_for_adjacent_appends() {
+     let mut expected = fixture(Some(&base));
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_transcript(&actual, &expected);
+     let old = expected.take_text_work();
+     assert_eq!(old.delta_lookups, 64);
+@@ -364,7 +394,7 @@ fn all_empty_absent_run_preserves_rows_keys_and_zero_delta_row_replacements() {
+     ];
+     let changes = apply_oracle(&mut expected, &events);
+     let outcome = actual.apply_text_run(&run(&events));
+-    assert_eq!(outcome.changes, changes);
++    assert_eq!(outcome.changes.as_slice(), changes);
+     assert_transcript(&actual, &expected);
+     assert_eq!(actual.entries.len(), 1);
+     assert!(actual.entries[0].streaming);
+@@ -392,7 +422,7 @@ fn singleton_runs_preserve_real_reducer_state_and_logical_work() {
+                     let events = [item];
+                     let changes = apply_oracle(&mut expected, &events);
+                     let outcome = actual.apply_text_run(&run(&events));
+-                    assert_eq!(outcome.changes, changes);
++                    assert_eq!(outcome.changes.as_slice(), changes);
+                     assert_transcript(&actual, &expected);
+                     assert_eq!(actual.take_text_work(), expected.take_text_work());
+                     assert_eq!(
