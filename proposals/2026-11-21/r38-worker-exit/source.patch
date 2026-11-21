@@ -1,0 +1,124 @@
+diff --git a/crates/proteus-module-protocol/src/v3/failure.rs b/crates/proteus-module-protocol/src/v3/failure.rs
+index c74c2c51b5b8d76247574f41db754d71fee81bd7..702b6803d7083a3ce5866ae448f54c953ee8c0c1 100644
+--- a/crates/proteus-module-protocol/src/v3/failure.rs
++++ b/crates/proteus-module-protocol/src/v3/failure.rs
+@@ -247,24 +247,25 @@ impl LoopState {
+     }
+ 
+     pub(super) fn reader_failed(&mut self, error: ReceiveFrameError) {
+-        let process_exited = self.worker.as_ref().is_some_and(|worker| {
++        let observed = self.worker.as_ref().map(|worker| {
+             worker
+                 .transport
+                 .lifecycle()
+                 .wait_for_exit(Duration::from_millis(50))
+-                .map_or(true, |exit| exit.is_some())
+         });
+-        let failure = if process_exited {
+-            ComponentFailure::ProcessExit
+-        } else {
+-            let message = error.to_string();
+-            if message.contains("exceeded") || message.contains("too large") {
+-                ComponentFailure::Resource
+-            } else {
+-                ComponentFailure::Protocol
++        let message = error.to_string();
++        let (failure, reason) = match observed {
++            Some(Ok(Some(_))) => (ComponentFailure::ProcessExit, message),
++            Some(Err(error)) => (
++                ComponentFailure::Resource,
++                format!("failed to observe component exit: {error}; reader: {message}"),
++            ),
++            _ if message.contains("exceeded") || message.contains("too large") => {
++                (ComponentFailure::Resource, message)
+             }
++            _ => (ComponentFailure::Protocol, message),
+         };
+-        self.reset_generation_with_reason(failure, Some(error.to_string()));
++        self.reset_generation_with_reason(failure, Some(reason));
+     }
+ 
+     pub(super) fn reset_generation(&mut self, failure: ComponentFailure) {
+diff --git a/crates/proteus-module-protocol/tests/broker_v3.rs b/crates/proteus-module-protocol/tests/broker_v3.rs
+index 62eb590e99bfaad7b91f8a9aad7bb76afc314917..331f79ee145cc8cb200ea34e516b4ebe5b93dce6 100644
+--- a/crates/proteus-module-protocol/tests/broker_v3.rs
++++ b/crates/proteus-module-protocol/tests/broker_v3.rs
+@@ -1076,6 +1076,61 @@ async fn crash_and_resource_fault_fan_out() -> Result<()> {
+     Ok(())
+ }
+ 
++// Linux auto-reaps a child when SIGCHLD is explicitly ignored: even though the
++// pipes close normally, waitid has no exit status to give the generation owner.
++// Change the disposition only in an isolated copy of this test process.
++#[cfg(target_os = "linux")]
++#[tokio::test]
++async fn unobservable_child_exit_is_not_reported_as_a_confirmed_exit() -> Result<()> {
++    const CHILD: &str = "PROTEUS_TEST_AUTOREAP_CHILD";
++    if std::env::var_os(CHILD).is_none() {
++        let status = std::process::Command::new("python3")
++            .args([
++                "-c",
++                concat!(
++                    "import os, signal, sys\n",
++                    "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n",
++                    "os.execv(sys.argv[1], sys.argv[1:])",
++                ),
++            ])
++            .arg(std::env::current_exe()?)
++            .args([
++                "--exact",
++                stringify!(unobservable_child_exit_is_not_reported_as_a_confirmed_exit),
++                "--nocapture",
++            ])
++            .env(CHILD, "1")
++            .status()?;
++        ensure!(status.success(), "auto-reap subprocess failed: {status}");
++        return Ok(());
++    }
++
++    let broker = broker(ComponentBrokerOptions::default())?;
++    let mut invocation = broker
++        .start_invocation(
++            &export("workflow", "fixture.workflow"),
++            PROCESS_WORKFLOW_METHOD,
++            json!({"op":"exit_process"}),
++            INVOCATION_TIMEOUT,
++        )
++        .await?;
++    let terminal = invocation.result().await?;
++    ensure!(
++        terminal == InvocationTerminal::ComponentLost(ComponentFailure::Resource),
++        "unobservable child status: {terminal:?}"
++    );
++    let snapshot = broker.snapshot()?;
++    ensure!(
++        snapshot.last_failure == Some(ComponentFailure::Resource)
++            && snapshot
++                .last_failure_reason
++                .as_deref()
++                .is_some_and(|reason| reason.contains("failed to observe component exit")),
++        "missing host observation failure: {snapshot:?}"
++    );
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn bootstrap_closes_after_runtime_traffic() -> Result<()> {
+     let broker = broker(ComponentBrokerOptions::default())?;
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index aeacd58160283faabc19c1af6fdb5e0b6354cbae..6f286118d8fb2f017e4835da5304d122cded2b7d 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -803,6 +803,12 @@ process.
+ сохраняют `anyhow::Result`, но Core может различить module failure, cancel,
+ timeout и конкретный класс component loss без парсинга display text.
+ 
++Если при остановке reader монитор не смог узнать статус дочернего процесса,
++broker сообщает `ComponentLost(Resource)` и записывает ошибку наблюдения в
++`last_failure_reason`. Для `ProcessExit` нужен полученный статус выхода этого
++поколения. Сам по себе этот статус не подтверждает корректность входных
++данных и не служит разрешением на повтор запроса.
++
+ До постановки invocation в writer host повторно проверяет наблюдаемые
+ отмену, потерю async terminal receiver и deadline; эта проверка действует
+ также при продвижении queued roots. После блокирующего handshake потеря
