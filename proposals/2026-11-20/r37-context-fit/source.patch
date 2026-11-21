@@ -1,0 +1,56 @@
+From ead1762e0ae9927203fc3f4b0ade97e3e8ce1a2b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 21 Nov 2026 07:06:22 +0800
+Subject: [PATCH] Keep context chunks in place when the entire byte budget fits
+
+---
+ context/context-pack/src/budget.rs | 11 +++++++++++
+ context/context-pack/src/tests.rs  | 10 ++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/context/context-pack/src/budget.rs b/context/context-pack/src/budget.rs
+index 0420680..190d453 100644
+--- a/context/context-pack/src/budget.rs
++++ b/context/context-pack/src/budget.rs
+@@ -8,6 +8,17 @@ pub(super) fn apply_byte_budget(
+     chunks: Vec<ContextChunk>,
+     max_context_bytes: usize,
+ ) -> anyhow::Result<Vec<ContextChunk>> {
++    // Ranking only affects admission when a whole chunk must be dropped.
++    if chunks
++        .iter()
++        .try_fold(max_context_bytes, |remaining, chunk| {
++            remaining.checked_sub(chunk.content.len())
++        })
++        .is_some()
++    {
++        return Ok(chunks);
++    }
++
+     let mut selected = Vec::new();
+     let mut ranked = Vec::new();
+     let mut used = 0usize;
+diff --git a/context/context-pack/src/tests.rs b/context/context-pack/src/tests.rs
+index 7102983..eea7fc0 100644
+--- a/context/context-pack/src/tests.rs
++++ b/context/context-pack/src/tests.rs
+@@ -81,6 +81,16 @@ fn zero_search_limit_skips_host_search_in_simple_and_repo_aware() {
+     assert!(repo.is_empty());
+ }
+ 
++#[test]
++fn exact_byte_budget_keeps_every_chunk_in_provider_order() {
++    let chunks = vec![
++        ContextChunk::new("low", "я").with_score(0.1),
++        ContextChunk::new("rules", "a").with_metadata(json!({"provider": "project_instructions"})),
++        ContextChunk::new("high", "").with_score(1.0),
++    ];
++    assert_eq!(apply_byte_budget(chunks.clone(), 3).unwrap(), chunks);
++}
++
+ #[test]
+ fn byte_budget_prefers_higher_score_and_restores_original_order() {
+     let chunks = vec![
+-- 
+2.52.0
+
