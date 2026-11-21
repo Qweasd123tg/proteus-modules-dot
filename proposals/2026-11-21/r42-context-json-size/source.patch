@@ -1,0 +1,219 @@
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index 9da6e69..c83a384 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -9,6 +9,7 @@ use std::{
+     sync::Arc,
+ };
+ mod context_summary;
++mod json_size;
+ mod path_identity;
+ pub(crate) mod remote;
+ mod workspace_dir;
+diff --git a/crates/proteus-core/src/core/session_store/context_summary.rs b/crates/proteus-core/src/core/session_store/context_summary.rs
+index aa93de1..5eed456 100644
+--- a/crates/proteus-core/src/core/session_store/context_summary.rs
++++ b/crates/proteus-core/src/core/session_store/context_summary.rs
+@@ -2,12 +2,16 @@
+ use crate::model_standard::{CanonicalMessage, ContentPart, MessageRole};
+ use proteus_contracts::app_protocol::AppContextHistorySummary;
+ 
++fn json_bytes(value: &impl serde::Serialize) -> usize {
++    super::json_size::encoded_len(value, usize::MAX).unwrap_or_default()
++}
++
+ pub(crate) fn summarize_context_history(messages: &[CanonicalMessage]) -> AppContextHistorySummary {
+     let mut summary = AppContextHistorySummary::default();
+     summary.messages = messages.len();
+     let mut bytes = 0usize;
+     for message in messages {
+-        bytes += message.metadata.to_string().len() + 4;
++        bytes += json_bytes(&message.metadata) + 4;
+         match message.role {
+             MessageRole::User => summary.user_messages += 1,
+             MessageRole::Assistant => summary.assistant_messages += 1,
+@@ -30,42 +34,30 @@ pub(crate) fn summarize_context_history(messages: &[CanonicalMessage]) -> AppCon
+                             .map(|path| path.display().to_string().len())
+                             .unwrap_or_default()
+                         + chunk.content.len()
+-                        + chunk.metadata.to_string().len();
++                        + json_bytes(&chunk.metadata);
+                 }
+                 ContentPart::FileRef { path, content } => {
+                     bytes += path.display().to_string().len()
+                         + content.as_deref().unwrap_or_default().len();
+                 }
+                 ContentPart::ToolCall { call } => {
+-                    bytes += call.name.len() + call.args.to_string().len();
++                    bytes += call.name.len() + json_bytes(&call.args);
+                 }
+                 ContentPart::ToolResult { result } => {
+                     summary.tool_results += 1;
+                     bytes += result.output.len()
+                         + result.error.as_deref().unwrap_or_default().len()
+-                        + result.metadata.to_string().len()
+-                        + result
+-                            .content
+-                            .iter()
+-                            .map(|content| {
+-                                serde_json::to_string(content)
+-                                    .map(|text| text.len())
+-                                    .unwrap_or(0)
+-                            })
+-                            .sum::<usize>();
++                        + json_bytes(&result.metadata)
++                        + result.content.iter().map(json_bytes).sum::<usize>();
+                 }
+                 ContentPart::Patch { patch } => {
+                     bytes += patch.content.len();
+                 }
+                 ContentPart::HostedToolActivity { activity } => {
+-                    bytes += serde_json::to_string(activity)
+-                        .map(|value| value.len())
+-                        .unwrap_or_default();
++                    bytes += json_bytes(activity);
+                 }
+                 ContentPart::Citation { citation } => {
+-                    bytes += serde_json::to_string(citation)
+-                        .map(|value| value.len())
+-                        .unwrap_or_default();
++                    bytes += json_bytes(citation);
+                 }
+                 _ => {}
+             }
+diff --git a/crates/proteus-core/src/core/session_store/json_size.rs b/crates/proteus-core/src/core/session_store/json_size.rs
+new file mode 100644
+index 0000000..18daca1
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/json_size.rs
+@@ -0,0 +1,42 @@
++//! Compact JSON byte length without retaining an encoded copy. A rejected value
++//! never yields a partial count. Cache callers supply their existing hard limit.
++use std::io::Write;
++
++use serde::Serialize;
++
++pub(super) fn encoded_len(value: &impl Serialize, limit: usize) -> Option<usize> {
++    struct Counter {
++        used: usize,
++        limit: usize,
++    }
++    impl Write for Counter {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            if bytes.len() > self.limit.saturating_sub(self.used) {
++                return Err(std::io::Error::other("encoded JSON exceeds byte budget"));
++            }
++            self.used += bytes.len();
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    let mut counter = Counter { used: 0, limit };
++    serde_json::to_writer(&mut counter, value).ok()?;
++    Some(counter.used)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn cache_limit_is_inclusive_and_counts_escaped_utf8_bytes() {
++        for value in [json!(null), json!({"ключ": ["\n\t\0\\\"", "🦀", -1.5]})] {
++            let bytes = serde_json::to_vec(&value).unwrap().len();
++            assert_eq!(encoded_len(&value, bytes), Some(bytes));
++            assert_eq!(encoded_len(&value, bytes - 1), None);
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 5c48316..ae0a953 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -1,5 +1,5 @@
+ //! Immutable content pages with a source-bound header published last.
+-use std::{collections::BTreeMap, io::Write};
++use std::collections::BTreeMap;
+ 
+ use anyhow::{Result, bail, ensure};
+ use proteus_contracts::{
+@@ -162,25 +162,10 @@ pub(super) fn write_prefix(
+ fn bounded_value(value: &impl Serialize) -> Option<Value> {
+     // Reject oversized groups before building an owned Value copy. The common
+     // path serializes at most one display page; larger caches remain misses.
+-    struct Limit(usize);
+-    impl Write for Limit {
+-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            if bytes.len()
+-                > proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES
+-                    .saturating_sub(self.0)
+-            {
+-                return Err(std::io::Error::other(
+-                    "display cache page exceeds byte budget",
+-                ));
+-            }
+-            self.0 += bytes.len();
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> std::io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    serde_json::to_writer(&mut Limit(0), value).ok()?;
++    crate::core::session_store::json_size::encoded_len(
++        value,
++        proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES,
++    )?;
+     serde_json::to_value(value).ok()
+ }
+ 
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index f030473..cfc48f1 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -1,10 +1,9 @@
+ //! Content-addressed pages have both row and byte budgets.
+-use std::io::Write;
+-
+ use proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES;
+ use serde::{Deserialize, Serialize, de::DeserializeOwned};
+ 
+ use super::{PAGE_ROWS, RemoteCacheSource, RemoteSessionStore, read_content};
++use crate::core::session_store::json_size::encoded_len;
+ 
+ mod packs;
+ use packs::{PackRef, PendingPack};
+@@ -29,30 +28,6 @@ pub(in crate::core::session_store::remote::view) struct Section {
+     packs: Vec<PackRef>,
+ }
+ 
+-fn encoded_len<T: Serialize>(value: &T, limit: usize) -> Option<usize> {
+-    struct Counter {
+-        used: usize,
+-        limit: usize,
+-    }
+-    impl Write for Counter {
+-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            if bytes.len() > self.limit.saturating_sub(self.used) {
+-                return Err(std::io::Error::other(
+-                    "display cache row exceeds byte budget",
+-                ));
+-            }
+-            self.used += bytes.len();
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> std::io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    let mut counter = Counter { used: 0, limit };
+-    serde_json::to_writer(&mut counter, value).ok()?;
+-    Some(counter.used)
+-}
+-
+ fn write_pages<'a, T: Serialize + 'a>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
