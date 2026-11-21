@@ -1,0 +1,87 @@
+diff --git a/src/sessions.rs b/src/sessions.rs
+index af442cb..15f2880 100644
+--- a/src/sessions.rs
++++ b/src/sessions.rs
+@@ -222,9 +222,14 @@ impl SessionMarks {
+                 }
+             }
+         }
+-        listing
+-            .projects
+-            .sort_by_key(|project| std::cmp::Reverse(project.updated_at_ms()));
++        let newest_first = |project: &Project<'_>| std::cmp::Reverse(project.updated_at_ms());
++        if listing.projects.len() <= 2 {
++            // At most one comparison, so a key cache would only add an allocation.
++            listing.projects.sort_by_key(newest_first);
++        } else {
++            // Computing a key walks the whole visible project tree.
++            listing.projects.sort_by_cached_key(newest_first);
++        }
+         listing
+     }
+ }
+@@ -252,16 +257,6 @@ impl Row<'_> {
+         }
+         false
+     }
+-
+-    fn updated_at_ms(&self) -> u64 {
+-        let mut latest = 0;
+-        let mut pending = vec![self];
+-        while let Some(row) = pending.pop() {
+-            latest = latest.max(row.summary.updated_at_ms.unwrap_or(0));
+-            pending.extend(&row.children);
+-        }
+-        latest
+-    }
+ }
+ 
+ /// Full preview before the row clips it, or the title shown for an empty session.
+@@ -319,7 +314,18 @@ pub struct Project<'a> {
+ impl Project<'_> {
+     /// When a session of the project last changed.
+     fn updated_at_ms(&self) -> u64 {
+-        self.rows.iter().map(Row::updated_at_ms).max().unwrap_or(0)
++        let mut latest = 0;
++        // Only descendants need a stack. Reuse it across roots in this project.
++        let mut pending = Vec::new();
++        for root in &self.rows {
++            latest = latest.max(root.summary.updated_at_ms.unwrap_or(0));
++            pending.extend(&root.children);
++            while let Some(row) = pending.pop() {
++                latest = latest.max(row.summary.updated_at_ms.unwrap_or(0));
++                pending.extend(&row.children);
++            }
++        }
++        latest
+     }
+ }
+ 
+@@ -454,6 +460,27 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn project_recency_uses_visible_descendants_and_keeps_equal_keys_stable() {
++        let first = changed("/s/first", "/z", Some(5), Some("root"));
++        let second = changed("/s/second", "/m", Some(10), Some("root"));
++        let third = changed("/s/third", "/a", Some(10), Some("root"));
++        let mut child = changed("/s/child", "/elsewhere", Some(20), Some("child"));
++        child.parent = Some(first.key.clone());
++        let sessions = [first, second, third, child];
++        let marks = SessionMarks::default();
++        let projects = |search| {
++            marks
++                .arrange(&sessions, &view(false, search))
++                .projects
++                .into_iter()
++                .map(|project| project.path)
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(projects(""), ["/z", "/m", "/a"].map(Path::new));
++        assert_eq!(projects("root"), ["/m", "/a", "/z"].map(Path::new));
++    }
++
+     #[test]
+     fn search_matches_titles_and_reaches_the_archive() {
+         let sessions = [
