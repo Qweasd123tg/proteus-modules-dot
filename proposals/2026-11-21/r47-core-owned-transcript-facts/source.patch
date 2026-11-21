@@ -1,0 +1,103 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 6fc32df..8090643 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -62,7 +62,7 @@ pub(super) fn transcript_from_scan(
+                 | JournalEntry::TurnOpened(_)
+                 | JournalEntry::TurnSettled(_)
+         );
+-        match &record.entry {
++        match record.entry {
+             // A hosted card can take its date from a later tool call.
+             JournalEntry::HistoryMutated(mutation) if causal_history && start == 0 => {
+                 causal_history = !mutation
+@@ -78,10 +78,10 @@ pub(super) fn transcript_from_scan(
+                 last_response_with_parts = Some(record.session_seq);
+             }
+             JournalEntry::SubagentSessionBoundRecorded(binding) => {
+-                subagent_bindings.insert(binding.source_call_id.clone(), binding.clone());
++                subagent_bindings.insert(binding.source_call_id.clone(), binding);
+             }
+             JournalEntry::ToolResultRecorded(tool) => {
+-                final_results.insert(tool.result.call_id.clone());
++                final_results.insert(tool.result.call_id);
+             }
+             _ => {}
+         }
+@@ -116,20 +116,21 @@ pub(super) fn transcript_from_scan(
+     let mut committed_parts = std::collections::HashSet::new();
+     let mut timestamps = TranscriptTimestamps::default();
+     scan(&mut |record| {
+-        if let JournalEntry::ToolCallRecorded(tool) = &record.entry
+-            && let ToolCallRecordPhase::Requested { owner } = &tool.phase
+-            && visibility.is_root_record(record.thread_id, record.turn_id)
+-        {
+-            visibility
+-                .display_tool_calls
+-                .entry(record.turn_id.expect("root record has a turn"))
+-                .or_default()
+-                .insert(tool.call.id.clone());
+-            if matches!(owner, OperationOwner::Workflow) {
+-                visibility.workflow_root_calls.insert(tool.call.id.clone());
++        match record.entry {
++            JournalEntry::ToolCallRecorded(tool) => {
++                if let ToolCallRecordPhase::Requested { owner } = tool.phase
++                    && visibility.is_root_record(record.thread_id, record.turn_id)
++                {
++                    if matches!(owner, OperationOwner::Workflow) {
++                        visibility.workflow_root_calls.insert(tool.call.id.clone());
++                    }
++                    visibility
++                        .display_tool_calls
++                        .entry(record.turn_id.expect("root record has a turn"))
++                        .or_default()
++                        .insert(tool.call.id);
++                }
+             }
+-        }
+-        match &record.entry {
+             JournalEntry::HistoryMutated(mutation) => {
+                 for message in &mutation.messages {
+                     if need_commits {
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/tests.rs b/crates/proteus-core/src/app_server/transcript/journal/tests.rs
+index af09c13..beb4605 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/tests.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/tests.rs
+@@ -187,6 +187,22 @@ fn failed_turn_recovers_model_text_tool_card_and_terminal_error_from_journal() {
+             ),
+         ),
+     );
++    let child = crate::domain::SubagentSessionBinding {
++        source_call_id: "call-1".into(),
++        child_thread_id: new_thread_id(),
++        session_id: new_session_id(),
++        session_dir: "/fixture/child".into(),
++    };
++    // A durable link may arrive after the source turn has settled. Its info
++    // still attaches to the original completed tool row.
++    records.push(record(
++        session_id,
++        Some(execution_id),
++        thread_id,
++        turn_id,
++        0, // Sequence set below.
++        JournalEntry::SubagentSessionBoundRecorded(child.clone()),
++    ));
+     for (index, item) in records.iter_mut().enumerate() {
+         item.session_seq = index as u64 + 1;
+         item.timestamp_ms = item.session_seq as i64;
+@@ -253,6 +269,14 @@ fn failed_turn_recovers_model_text_tool_card_and_terminal_error_from_journal() {
+     assert_eq!(tool.call_id, "call-1");
+     assert_eq!(tool.status, "done");
+     assert_eq!(tool.result.as_deref(), Some("listing"));
++    assert_eq!(
++        tool.metadata["child_thread_id"],
++        json!(child.child_thread_id)
++    );
++    assert_eq!(
++        tool.metadata["subagent_session"],
++        json!({"session_id": child.session_id, "session_dir": child.session_dir})
++    );
+     let terminal = transcript.last().expect("terminal failure message");
+     assert_eq!(terminal.role, "system");
+     assert_eq!(
