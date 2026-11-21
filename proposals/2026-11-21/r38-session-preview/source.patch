@@ -1,0 +1,144 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 5c48316..7f35ed2 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -7,7 +7,7 @@ use proteus_contracts::{
+     contracts::{
+         SessionStorageRequest as Request, SessionStorageResponse as Response, StorageSnapshot,
+     },
+-    model_standard::{CanonicalMessage, ContentPart, MessageRole},
++    model_standard::CanonicalMessage,
+ };
+ use serde::{Serialize, de::DeserializeOwned};
+ use serde_json::Value;
+@@ -21,6 +21,7 @@ const HEAD: &str = "display-view-v1-head";
+ const PREFIX: &str = "display-view-v1-prefix";
+ 
+ mod pages;
++mod preview;
+ use pages::valid_section;
+ pub(super) use pages::{
+     Section, append_section, extend_known_section, read_section, visit_section, write_section,
+@@ -561,37 +562,13 @@ pub(super) fn summary(
+         descriptor.session == store.descriptor.session,
+         "storage summary belongs to another session"
+     );
+-    let preview = messages
+-        .iter()
+-        .filter(|message| message.role == MessageRole::User)
+-        .chain(messages.iter())
+-        .find_map(|message| {
+-            message.parts.iter().find_map(|part| {
+-                let text = match &part.payload {
+-                    ContentPart::Text { text }
+-                    | ContentPart::Reasoning { text, .. }
+-                    | ContentPart::ReasoningSummary { text } => text.trim().to_owned(),
+-                    ContentPart::ToolResult { result } => result.text_or_status().trim().to_owned(),
+-                    _ => return None,
+-                };
+-                if text.is_empty() {
+-                    None
+-                } else {
+-                    Some(if text.chars().count() > 160 {
+-                        format!("{}...", text.chars().take(160).collect::<String>())
+-                    } else {
+-                        text
+-                    })
+-                }
+-            })
+-        });
+     let mut summary = AppSessionSummary::new(
+         store.session_dir().to_owned(),
+         store.session_id(),
+         descriptor.workspace_path,
+         messages.len(),
+         u64::try_from(descriptor.updated_at_ms).ok(),
+-        preview,
++        preview::session_preview(messages),
+     );
+     summary.parent_session_id = store.parent_session_id();
+     Ok(summary)
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
+new file mode 100644
+index 0000000..17dd44d
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
+@@ -0,0 +1,78 @@
++use proteus_contracts::model_standard::{CanonicalMessage, ContentPart, MessageRole};
++
++pub(super) fn session_preview(messages: &[CanonicalMessage]) -> Option<String> {
++    messages
++        .iter()
++        .filter(|message| message.role == MessageRole::User)
++        .chain(messages.iter())
++        .find_map(|message| {
++            message.parts.iter().find_map(|part| match &part.payload {
++                ContentPart::Text { text }
++                | ContentPart::Reasoning { text, .. }
++                | ContentPart::ReasoningSummary { text } => preview_text(text),
++                ContentPart::ToolResult { result } => preview_text(&result.text_or_status()),
++                _ => None,
++            })
++        })
++}
++
++fn preview_text(text: &str) -> Option<String> {
++    let text = text.trim();
++    if text.is_empty() {
++        return None;
++    }
++    // The public preview limit counts Unicode scalar values, not bytes.
++    const LIMIT: usize = 160;
++    let Some((end, _)) = text.char_indices().nth(LIMIT) else {
++        return Some(text.to_owned());
++    };
++    let mut preview = String::with_capacity(end + 3);
++    preview.push_str(&text[..end]);
++    preview.push_str("...");
++    Some(preview)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn preview_trims_before_testing_the_unicode_limit() {
++        let exact = "a界🙂е\u{301}".repeat(32);
++        assert_eq!(
++            preview_text(&format!("\u{2003}{exact}\n")),
++            Some(exact.clone())
++        );
++        assert_eq!(
++            preview_text(&format!(" {exact}Ж ")),
++            Some(format!("{exact}..."))
++        );
++        let ends_in_space = format!("{} ", "Ж".repeat(159));
++        assert_eq!(
++            preview_text(&format!("{ends_in_space}字")),
++            Some(format!("{ends_in_space}..."))
++        );
++        assert_eq!(preview_text("\t\u{a0}\n"), None);
++    }
++
++    #[test]
++    fn preview_prefers_nonblank_user_parts_then_falls_back_in_history_order() {
++        let assistant = CanonicalMessage::new(
++            MessageRole::Assistant,
++            vec![ContentPart::ReasoningSummary {
++                text: " fallback ".into(),
++            }],
++        );
++        let blank = CanonicalMessage::text(MessageRole::User, " \n ");
++        let visible = CanonicalMessage::text(MessageRole::User, " preferred ");
++        assert_eq!(
++            session_preview(&[assistant.clone(), blank.clone()]).as_deref(),
++            Some("fallback")
++        );
++        assert_eq!(
++            session_preview(&[assistant, blank, visible]).as_deref(),
++            Some("preferred")
++        );
++        assert_eq!(session_preview(&[]), None);
++    }
++}
