@@ -1,0 +1,101 @@
+diff --git a/scripts/settings-migration.py b/scripts/settings-migration.py
+index bcd85db..8c3f645 100755
+--- a/scripts/settings-migration.py
++++ b/scripts/settings-migration.py
+@@ -176,7 +176,21 @@ def read_archive(path):
+     return manifest, files
+ 
+ 
+-def relocate(data, suffix, mappings):
++def preserve_window_state(preferences, destination):
++    """Archive preferences are portable; the destination owns its window state."""
++    try:
++        current = json.loads(read_settings(destination)) if destination.exists() else {}
++    except (json.JSONDecodeError, UnicodeDecodeError) as error:
++        raise ValueError(f'Cannot preserve window state from {destination}: invalid JSON') from error
++    if not isinstance(preferences, dict) or not isinstance(current, dict):
++        raise ValueError(f'Expected a JSON object for Desktop preferences: {destination}')
++    for key in WINDOW_STATE:
++        preferences.pop(key, None)
++    # Keep the original local values (including paths), in stable file order.
++    preferences.update((key, value) for key, value in current.items() if key in WINDOW_STATE)
++
++
++def relocate(data, suffix, mappings, *, preferences_at=None):
+     def path_value(value):
+         for source, destination in mappings:
+             if value == source or value.startswith(source + '/'):
+@@ -195,7 +209,10 @@ def relocate(data, suffix, mappings):
+     value = structured(data, suffix)
+     reject_credentials(value, 'archive')
+     if suffix == '.json':
+-        return (json.dumps(visit(value), ensure_ascii=False, indent=2) + '\n').encode()
++        value = visit(value)
++        if preferences_at is not None:
++            preserve_window_state(value, preferences_at)
++        return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
+ 
+     def literal(match):
+         token = match.group()
+@@ -286,7 +303,10 @@ def restore_archive(args):
+         parts = PurePosixPath(name).parts
+         destination = locations[parts[1]].joinpath(*parts[2:])
+         regular_path(destination)
+-        data_by_path[destination] = relocate(data, destination.suffix, mappings)
++        preferences_at = destination if name == 'files/desktop/preferences.json' else None
++        data_by_path[destination] = relocate(
++            data, destination.suffix, mappings, preferences_at=preferences_at,
++        )
+     for path in data_by_path:
+         if is_named_profile(path, locations['agent']):
+             data_by_path[path] = with_session_storage(path, data_by_path, home)
+diff --git a/scripts/test_settings_migration.py b/scripts/test_settings_migration.py
+index 956a8b5..e86cbe7 100644
+--- a/scripts/test_settings_migration.py
++++ b/scripts/test_settings_migration.py
+@@ -75,6 +75,45 @@ class SettingsMigrationTests(unittest.TestCase):
+         self.assertEqual(result.returncode, 0, result.stderr)
+         self.assertIn('Restored 0', result.stdout)
+ 
++    def test_restore_keeps_destination_window_state_and_replaces_portable_preferences(self):
++        result = self.run_script('export')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        destination = self.target / '.config/dev.proteus.native/preferences.json'
++        destination.parent.mkdir(parents=True)
++        # A local path can share the exporter's prefix; it must not be relocated.
++        workspace = str(self.source / 'shared workspace')
++        state = {
++            'tabs': {'active': 'codex:local', 'roots': {'codex:local': {}}},
++            'tabs_workspace': {'workspace': workspace, 'profile': None},
++            'sessions': {'codex:local': {'title': 'Мой чат', 'pinned': True}},
++            'recent': [workspace],
++        }
++        original = json.dumps({'visual_configs': {}, **state}).encode()
++        destination.write_bytes(original)
++        preview = self.run_script('restore', self.archive, self.target, '--dry-run')
++        self.assertEqual(preview.returncode, 0, preview.stderr)
++        self.assertEqual(destination.read_bytes(), original)
++        result = self.run_script('restore', home=self.target)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        restored = json.loads(destination.read_bytes())
++        self.assertEqual({key: restored.get(key) for key in state}, state)
++        profile = str(self.target / '.config/Proteus-harness/configs/config.toml')
++        self.assertIn(profile, restored['visual_configs']['bindings'])
++        repeat = self.run_script('restore', home=self.target)
++        self.assertEqual(repeat.returncode, 0, repeat.stderr)
++        self.assertIn('Restored 0', repeat.stdout)
++
++    def test_invalid_local_preferences_abort_before_any_restore(self):
++        self.assertEqual(self.run_script('export').returncode, 0)
++        destination = self.target / '.config/dev.proteus.native/preferences.json'
++        destination.parent.mkdir(parents=True)
++        destination.write_bytes(b'null')
++        result = self.run_script('restore', home=self.target)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn('preferences', result.stderr)
++        self.assertEqual(destination.read_bytes(), b'null')
++        self.assertFalse((self.target / '.config/Proteus-harness').exists())
++
+     def test_upgrade_storage_preserves_an_existing_included_storage_selection(self):
+         shared = self.agent / 'configs/fragments/storage.toml'
+         shared.parent.mkdir()
