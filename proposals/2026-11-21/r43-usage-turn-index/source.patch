@@ -1,0 +1,115 @@
+diff --git a/packages/usage/src/entry.rs b/packages/usage/src/entry.rs
+index 4566f08107a6a7c253f8f04c30d010dfdff68c6e..4ab52a6472b01acafa7f28aef5447f7076e6c835 100644
+--- a/packages/usage/src/entry.rs
++++ b/packages/usage/src/entry.rs
+@@ -14,15 +14,14 @@ const FIELDS: [&str; 5] = [
+     "reasoning_output_tokens",
+ ];
+ 
+-pub fn entry(request: &Value, number: usize, turns: &[String], open: bool) -> Value {
++pub fn entry(request: &Value, number: usize, turn_number: Option<usize>, open: bool) -> Value {
+     let usage = request.at("usage");
+     let reported = usage.as_object().is_some_and(|usage| !usage.is_empty());
+     let status = request.str("status");
+     let (status, tone) = report::status(status).unwrap_or((status, "muted"));
+-    let turn = request.str("turn_id");
+-    let place = match turns.iter().position(|known| known == turn) {
+-        Some(index) if !turn.is_empty() => format!("Ход {}", index + 1),
+-        _ => "Вне хода".to_owned(),
++    let place = match turn_number {
++        Some(number) => format!("Ход {number}"),
++        None => "Вне хода".to_owned(),
+     };
+     let marker = if open { "▾ " } else { "▸ " };
+     let mut head = vec![
+diff --git a/packages/usage/src/report.rs b/packages/usage/src/report.rs
+index df7df9a02e5abaf71fd84ac479c1d47a0659300a..df4622e7bb8fe87fa6aeaecae938d901067fd485 100644
+--- a/packages/usage/src/report.rs
++++ b/packages/usage/src/report.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::cmp::Reverse;
+ 
+-use indexmap::IndexMap;
++use indexmap::{IndexMap, IndexSet};
+ use proteus_extension::{Result, Value, ValueExt, bail};
+ 
+ pub use proteus_extension::exact;
+@@ -136,12 +136,13 @@ pub fn used(request: &Value) -> Option<i64> {
+         .then(|| usage.i64("input_tokens").unwrap_or(0) + usage.i64("output_tokens").unwrap_or(0))
+ }
+ 
+-pub fn turn_ids(snapshot: &Value) -> Vec<String> {
+-    let mut turns: Vec<String> = Vec::new();
++/// The position of each non-empty id is its first-seen turn number minus one.
++pub fn turn_ids(snapshot: &Value) -> IndexSet<&str> {
++    let mut turns = IndexSet::new();
+     for request in snapshot.list("requests") {
+-        let turn = request.str("turn_id");
+-        if !turn.is_empty() && !turns.iter().any(|known| known == turn) {
+-            turns.push(turn.to_owned());
++        let id = request.str("turn_id");
++        if !id.is_empty() {
++            turns.insert(id);
+         }
+     }
+     turns
+diff --git a/packages/usage/src/tests.rs b/packages/usage/src/tests.rs
+index efe8f4a7f74584bd7fa040f2dfa3ee8b505ef081..d7dbcb7db809ba1e4ff19cfe457aa634204189c5 100644
+--- a/packages/usage/src/tests.rs
++++ b/packages/usage/src/tests.rs
+@@ -310,3 +310,16 @@ fn totals_distinguish_missing_optional_counts_from_present_zero() {
+         (Some(0), None, Some(0))
+     );
+ }
++
++#[test]
++fn turn_ids_keep_first_seen_order_and_ignore_outside_turns() {
++    let snapshot = json!({"requests": [
++        {"turn_id":"β"}, {"turn_id":""}, {"turn_id":"α"}, {"turn_id":"β"},
++        {"turn_id":null}, {}, {"turn_id":7}
++    ]});
++    let turns = report::turn_ids(&snapshot);
++    assert_eq!(turns.iter().copied().collect::<Vec<_>>(), ["β", "α"]);
++    assert_eq!(turns.get_index_of("β"), Some(0));
++    assert_eq!(turns.get_index_of("α"), Some(1));
++    assert_eq!(turns.get_index_of(""), None);
++}
+diff --git a/packages/usage/src/view.rs b/packages/usage/src/view.rs
+index dc67c066d3276fbdc99507dcf6357d33939ff730..dfb14f2d63b7d61b4841c83502c4faa76bac39ef 100644
+--- a/packages/usage/src/view.rs
++++ b/packages/usage/src/view.rs
+@@ -2,6 +2,7 @@
+ 
+ use std::collections::HashMap;
+ 
++use indexmap::IndexSet;
+ use proteus_extension::ui::{Node, button, card, note, row, select, table};
+ use proteus_extension::{Result, Value, ValueExt, bail, json};
+ 
+@@ -98,7 +99,7 @@ pub fn render(state: &mut Usage, snapshot: &Value) -> Result<Vec<Value>> {
+         body.push(entry(
+             request,
+             numbers[id],
+-            &turns,
++            turns.get_index_of(request.str("turn_id")).map(|i| i + 1),
+             state.expanded.contains(id),
+         ));
+     }
+@@ -129,14 +130,14 @@ pub fn render(state: &mut Usage, snapshot: &Value) -> Result<Vec<Value>> {
+     Ok(body)
+ }
+ 
+-fn controls(state: &mut Usage, turns: &[String], models: &[String]) -> Value {
++fn controls(state: &mut Usage, turns: &IndexSet<&str>, models: &[String]) -> Value {
+     let mut periods = choices(&[("all", "Весь чат"), ("latest", "Последний ход")]);
+     periods.extend(
+         turns
+             .iter()
+             .enumerate()
+             .rev()
+-            .map(|(index, turn)| (Value::from(turn.as_str()), format!("Ход {}", index + 1))),
++            .map(|(index, turn)| (Value::from(*turn), format!("Ход {}", index + 1))),
+     );
+     let find = |period: &str| {
+         periods
