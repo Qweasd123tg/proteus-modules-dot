@@ -1,0 +1,156 @@
+diff --git a/src/ui/chat/scroller/scrollbar/height_store/disk.rs b/src/ui/chat/scroller/scrollbar/height_store/disk.rs
+index 0522049..55b9ed2 100644
+--- a/src/ui/chat/scroller/scrollbar/height_store/disk.rs
++++ b/src/ui/chat/scroller/scrollbar/height_store/disk.rs
+@@ -1,7 +1,7 @@
+ use super::*;
+ use std::{
+     fs::{self, File},
+-    io::{self, BufReader, BufWriter, Read, Write},
++    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+ };
+ 
+ fn name(identity: &Hash) -> String {
+@@ -161,30 +161,55 @@ pub(super) fn load(root: &Path, requested: Key, permit: Permit) -> io::Result<Op
+     if keep == 0 {
+         return Ok(None);
+     }
+-    let mut spans = Vec::with_capacity(count);
++    // Each retained span contains at least one row. Validate the whole file
++    // below, but don't reserve storage for spans beyond the proven prefix.
++    let mut spans = Vec::with_capacity(count.min(keep));
+     let mut total = 0usize;
+     let mut hash = Sha256::new();
+-    for _ in 0..count {
+-        let row_bytes = bytes::<8>(&mut file)?;
+-        let pixel_bytes = bytes::<8>(&mut file)?;
+-        let tag = bytes::<1>(&mut file)?;
+-        hash.update(row_bytes);
+-        hash.update(pixel_bytes);
+-        hash.update(tag);
+-        let span_rows = usize::try_from(u64::from_le_bytes(row_bytes)).map_err(|_| invalid())?;
+-        let pixels = f64::from_le_bytes(pixel_bytes);
+-        if span_rows == 0 || !pixels.is_finite() || pixels < 0. || tag[0] > 2 {
+-            return Err(invalid());
++    // Decode wire records straight from the reader's buffer. Only a record
++    // straddling two buffer fills needs to be copied into a temporary array.
++    let mut left = count;
++    while left != 0 {
++        let available = match file.fill_buf() {
++            // Preserve read_exact's retry behavior at buffer boundaries.
++            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
++            result => result?,
++        };
++        let bytes_in_buffer = left.min(available.len() / SPAN_BYTES) * SPAN_BYTES;
++        let overlapping;
++        let batch = if bytes_in_buffer == 0 {
++            overlapping = bytes::<SPAN_BYTES>(&mut file)?;
++            overlapping.as_slice()
++        } else {
++            &available[..bytes_in_buffer]
++        };
++        hash.update(batch);
++        for record in batch.as_chunks::<SPAN_BYTES>().0 {
++            let (row_bytes, rest) = record.split_first_chunk::<8>().unwrap();
++            let (pixel_bytes, rest) = rest.split_first_chunk::<8>().unwrap();
++            let span_rows =
++                usize::try_from(u64::from_le_bytes(*row_bytes)).map_err(|_| invalid())?;
++            let pixels = f64::from_le_bytes(*pixel_bytes);
++            let tag = rest[0];
++            if span_rows == 0 || !pixels.is_finite() || pixels < 0. || tag > 2 {
++                return Err(invalid());
++            }
++            if total < keep {
++                let take = span_rows.min(keep - total);
++                spans.push(ColdSpan {
++                    rows: take,
++                    pixels: pixels * take as f64 / span_rows as f64,
++                    kind: tag,
++                });
++            }
++            total = total.checked_add(span_rows).ok_or_else(invalid)?;
+         }
+-        if total < keep {
+-            let take = span_rows.min(keep - total);
+-            spans.push(ColdSpan {
+-                rows: take,
+-                pixels: pixels * take as f64 / span_rows as f64,
+-                kind: tag[0],
+-            });
++        if bytes_in_buffer == 0 {
++            left -= 1;
++        } else {
++            file.consume(bytes_in_buffer);
++            left -= bytes_in_buffer / SPAN_BYTES;
+         }
+-        total = total.checked_add(span_rows).ok_or_else(invalid)?;
+     }
+     if total != rows || Hash::from(hash.finalize()) != expected {
+         return Err(invalid());
+diff --git a/src/ui/chat/scroller/scrollbar/height_store/tests.rs b/src/ui/chat/scroller/scrollbar/height_store/tests.rs
+index 52ddaed..13b4f03 100644
+--- a/src/ui/chat/scroller/scrollbar/height_store/tests.rs
++++ b/src/ui/chat/scroller/scrollbar/height_store/tests.rs
+@@ -175,6 +175,62 @@ fn corrupt_truncated_and_oversized_cache_cannot_restore_data() {
+     assert!(disk::load(&fixture.0, key, reserve(&pool).unwrap()).is_err());
+ }
+ 
++#[test]
++fn a_short_prefix_keeps_a_partial_span_but_still_checks_the_discarded_suffix() {
++    let fixture = Fixture::new();
++    let pool = pool();
++    let mut original = key("session");
++    original.prefix = 1000;
++    let mut spans = vec![ColdSpan {
++        rows: 3,
++        pixels: 255.,
++        kind: 2,
++    }];
++    spans.extend((3..original.prefix).map(|row| ColdSpan {
++        rows: 1,
++        pixels: row as f64 + 80.,
++        kind: 1,
++    }));
++    assert!(
++        disk::save(
++            &fixture.0,
++            &Snapshot::new(original.clone(), spans, reserve(&pool).unwrap()),
++            MAX_DISK_BYTES,
++            MAX_FILES,
++        )
++        .unwrap()
++    );
++    let mut requested = original.clone();
++    requested.revision = hash("revision-2");
++    requested.base = Some((original.revision, 2));
++    let loaded = disk::load(&fixture.0, requested.clone(), reserve(&pool).unwrap())
++        .unwrap()
++        .unwrap();
++    assert_eq!(loaded.key.prefix, 2);
++    assert_eq!(
++        loaded.spans,
++        [ColdSpan {
++            rows: 2,
++            pixels: 170.,
++            kind: 2
++        }]
++    );
++    // Update a valid tag in the discarded suffix. It can only be rejected by
++    // hashing all records, not by the retained prefix or a tag-range check.
++    let path = std::fs::read_dir(&fixture.0)
++        .unwrap()
++        .next()
++        .unwrap()
++        .unwrap()
++        .path();
++    let mut bytes = std::fs::read(&path).unwrap();
++    *bytes.last_mut().unwrap() = 2;
++    std::fs::write(path, bytes).unwrap();
++    assert!(disk::load(&fixture.0, requested, reserve(&pool).unwrap()).is_err());
++    drop(loaded);
++    assert_eq!(pool.load(Ordering::Relaxed), 0);
++}
++
+ #[test]
+ fn immediate_reopen_reads_the_pending_latest_snapshot_before_debounce() {
+     let fixture = Fixture::new();
