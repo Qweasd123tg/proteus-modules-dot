@@ -1,0 +1,110 @@
+diff --git a/packages/usage/src/report.rs b/packages/usage/src/report.rs
+index df7df9a02e5abaf71fd84ac479c1d47a0659300a..643b5afa0eb0fc0f22bfc2958d0e53337432701e 100644
+--- a/packages/usage/src/report.rs
++++ b/packages/usage/src/report.rs
+@@ -108,9 +108,33 @@ pub fn clock(ms: Option<f64>) -> String {
+     }
+ }
+ 
+-pub fn model_key(request: &Value) -> String {
++fn model_parts(request: &Value) -> (&str, &str) {
+     let model = request.at("model");
+-    format!("{}/{}", model.str("provider"), model.str("model"))
++    (model.str("provider"), model.str("model"))
++}
++
++pub fn model_key(request: &Value) -> String {
++    let (provider, name) = model_parts(request);
++    format!("{provider}/{name}")
++}
++
++/// Compare the display key exactly, including aliases that contain slashes.
++fn same_model_key(key: &str, (provider, name): (&str, &str)) -> bool {
++    key.strip_prefix(provider)
++        .and_then(|rest| rest.strip_prefix('/'))
++        == Some(name)
++}
++
++/// Model picker labels in first-seen order. Only new labels need allocation.
++pub fn model_options(requests: &[Value]) -> Vec<String> {
++    let mut labels: Vec<String> = Vec::new();
++    for request in requests {
++        let parts = model_parts(request);
++        if !labels.iter().any(|key| same_model_key(key, parts)) {
++            labels.push(model_key(request));
++        }
++    }
++    labels
+ }
+ 
+ pub fn duration(request: &Value) -> i64 {
+@@ -160,7 +184,7 @@ pub fn scoped<'a>(snapshot: &'a Value, period: &str, model: Option<&str>) -> Vec
+         .list("requests")
+         .iter()
+         .filter(|request| turn.is_none_or(|id| request.opt_str("turn_id") == Some(id)))
+-        .filter(|request| model.is_none_or(|model| model_key(request) == model))
++        .filter(|request| model.is_none_or(|model| same_model_key(model, model_parts(request))))
+         .collect()
+ }
+ 
+diff --git a/packages/usage/src/tests.rs b/packages/usage/src/tests.rs
+index efe8f4a7f74584bd7fa040f2dfa3ee8b505ef081..fc1c3837ec7842e129232fd0fab86b3859f24a55 100644
+--- a/packages/usage/src/tests.rs
++++ b/packages/usage/src/tests.rs
+@@ -213,6 +213,37 @@ fn requests_tab_renders_cards_summary_and_pages() {
+     assert!(!text.contains("Дальше"));
+ }
+ 
++#[test]
++fn model_picker_and_scope_use_the_same_exact_keys_for_slashes_and_missing_fields() {
++    let snapshot = json!({"requests":[
++        {"exchange_id":"first","model":{"provider":"a/b","model":"名"}},
++        {"exchange_id":"missing","model":null},
++        {"exchange_id":"alias","model":{"provider":"a","model":"b/名"}},
++        {"exchange_id":"suffix","model":{"provider":"a/b","model":"名/2"}},
++        {"exchange_id":"invalid-fields","model":{"provider":3,"model":[]}},
++        {"exchange_id":"empty-provider","model":{"provider":"","model":"名"}},
++        {"exchange_id":"empty-name","model":{"provider":"a","model":""}}
++    ]});
++    assert_eq!(
++        report::model_options(snapshot.list("requests")),
++        ["a/b/名", "/", "a/b/名/2", "/名", "a/"]
++    );
++    for (label, expected) in [
++        ("a/b/名", &["first", "alias"][..]),
++        ("/", &["missing", "invalid-fields"][..]),
++        ("a/b/名/2", &["suffix"][..]),
++        ("/名", &["empty-provider"][..]),
++        ("a/", &["empty-name"][..]),
++        ("a", &[][..]),
++        ("a/b/名/", &[][..]),
++    ] {
++        assert_eq!(
++            ids(&report::scoped(&snapshot, "all", Some(label))),
++            expected
++        );
++    }
++}
++
+ #[test]
+ fn requests_tab_empty_states_and_single_model() {
+     let empty = json!({"session_id": "s", "revision": 1, "latest_turn_id": null, "requests": []});
+diff --git a/packages/usage/src/view.rs b/packages/usage/src/view.rs
+index dc67c066d3276fbdc99507dcf6357d33939ff730..c0d2ba774cb2ba56c108562ec14324024aeedb31 100644
+--- a/packages/usage/src/view.rs
++++ b/packages/usage/src/view.rs
+@@ -41,13 +41,7 @@ fn named<'a>(pairs: &'a [(&str, &str)], value: &str) -> Result<&'a str> {
+ pub fn render(state: &mut Usage, snapshot: &Value) -> Result<Vec<Value>> {
+     let requests = snapshot.list("requests");
+     let turns = report::turn_ids(snapshot);
+-    let mut models: Vec<String> = Vec::new();
+-    for request in requests {
+-        let model = report::model_key(request);
+-        if !models.contains(&model) {
+-            models.push(model);
+-        }
+-    }
++    let models = report::model_options(requests);
+     if state
+         .model
+         .as_ref()
