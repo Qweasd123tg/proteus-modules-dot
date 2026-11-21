@@ -1,0 +1,56 @@
+diff --git a/src/sessions.rs b/src/sessions.rs
+index af442cb..8c1735f 100644
+--- a/src/sessions.rs
++++ b/src/sessions.rs
+@@ -243,12 +243,24 @@ pub struct Row<'a> {
+ 
+ impl Row<'_> {
+     pub fn contains(&self, dir: &ChatKey) -> bool {
+-        let mut pending = vec![self];
+-        while let Some(row) = pending.pop() {
++        let mut pending = Vec::new();
++        let mut row = self;
++        loop {
+             if &row.summary.key == dir {
+                 return true;
+             }
+-            pending.extend(&row.children);
++            // Continue along the next DFS edge directly. Only siblings that
++            // must wait need the stack; a leaf or a single-child chain is free.
++            if let Some((last, siblings)) = row.children.split_last() {
++                if !siblings.is_empty() {
++                    pending.extend(siblings);
++                }
++                row = last;
++            } else if let Some(next) = pending.pop() {
++                row = next;
++            } else {
++                break;
++            }
+         }
+         false
+     }
+@@ -510,6 +522,23 @@ mod tests {
+         assert_eq!(dirs(&root.children[0].children), [key("/s/3")]);
+     }
+ 
++    #[test]
++    fn contains_returns_to_siblings_after_a_deep_branch_miss() {
++        let sessions = [
++            linked(1, None, "root"),
++            linked(2, Some(1), "side"),
++            linked(3, Some(1), "chain"),
++            linked(4, Some(3), "child"),
++            linked(5, Some(4), "leaf"),
++        ];
++        let listing = SessionMarks::default().arrange(&sessions, &view(false, ""));
++        let root = &listing.projects[0].rows[0];
++        assert!(root.contains(&key("/s/5")));
++        assert!(root.contains(&key("/s/2")));
++        assert!(!root.contains(&key("/s/missing")));
++        assert!(!root.contains(&ChatKey::Codex("/s/5".into())));
++    }
++
+     #[test]
+     fn missing_parents_and_cycles_do_not_hide_sessions() {
+         let sessions = [
