@@ -1,0 +1,28 @@
+diff --git a/crates/proteus-core/src/app_server/turn_progress.rs b/crates/proteus-core/src/app_server/turn_progress.rs
+index 6c40235..1a99b96 100644
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -337,14 +337,20 @@ impl TurnProgress {
+ 
+     /// Снимок прогресса для /history с теми же item ids и состоянием завершения.
+     pub(super) fn snapshot(&self) -> Vec<AppTranscriptMessage> {
+-        let mut messages = self.messages.clone();
++        let mut messages = Vec::with_capacity(
++            self.messages.len()
++                + usize::from(self.submitted.is_some())
++                + self.failed_queued_inputs.len()
++                + self.background_subagents.len(),
++        );
++        messages.extend_from_slice(&self.messages);
+         if let Some(text) = &self.submitted {
+             let mut message = Self::user_message(text.clone(), self.submitted_at);
+             message.images = self.submitted_images.clone();
+             messages.push(message);
+         }
+-        messages.extend(self.failed_queued_inputs.clone());
+-        messages.extend(self.background_subagents.clone());
++        messages.extend_from_slice(&self.failed_queued_inputs);
++        messages.extend_from_slice(&self.background_subagents);
+         messages
+     }
+ 
