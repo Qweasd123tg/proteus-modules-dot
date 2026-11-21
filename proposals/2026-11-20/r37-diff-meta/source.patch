@@ -1,0 +1,104 @@
+diff --git a/crates/diff/src/lib.rs b/crates/diff/src/lib.rs
+index 390f47b..831f5a7 100644
+--- a/crates/diff/src/lib.rs
++++ b/crates/diff/src/lib.rs
+@@ -6,6 +6,7 @@ mod parse;
+ mod tests;
+ 
+ use serde::Deserialize;
++use std::collections::HashMap;
+ 
+ /// File information supplied alongside a patch, including files for which
+ /// the server cannot return text (binary, over the size limit, unavailable).
+@@ -106,12 +107,34 @@ impl File {
+     }
+ }
+ 
+-/// Parse the original patch once. Supplemental metadata also keeps files
+-/// without a textual diff visible as ordinary file cards.
+-pub fn parse(patch: &str, info: &[FileInfo]) -> Vec<File> {
+-    let mut files = parse::files(patch);
++fn merge_metadata(files: &mut Vec<File>, info: &[FileInfo]) {
++    // Short metadata lists are cheaper to scan than to index. For larger
++    // lists, borrow keys from the input instead of cloning parsed paths.
++    let mut by_path = (info.len() > 128).then(HashMap::new);
++    if let Some(index) = &mut by_path
++        && !files.is_empty()
++    {
++        for meta in info {
++            index.insert(meta.path.as_str(), None);
++        }
++        for (at, file) in files.iter().enumerate() {
++            if let Some(slot) = index.get_mut(file.path.as_str()) {
++                // Multiple blocks may share a path. Update the first one.
++                slot.get_or_insert(at);
++            }
++        }
++    }
+     for meta in info {
+-        if let Some(file) = files.iter_mut().find(|file| file.path == meta.path) {
++        let existing = if let Some(index) = &mut by_path {
++            let at = index
++                .entry(meta.path.as_str())
++                .or_default()
++                .get_or_insert(files.len());
++            files.get_mut(*at)
++        } else {
++            files.iter_mut().find(|file| file.path == meta.path)
++        };
++        if let Some(file) = existing {
+             if !meta.status.is_empty() {
+                 file.status.clone_from(&meta.status);
+             }
+@@ -132,6 +155,13 @@ pub fn parse(patch: &str, info: &[FileInfo]) -> Vec<File> {
+             files.push(file);
+         }
+     }
++}
++
++/// Parse the original patch once. Supplemental metadata also keeps files
++/// without a textual diff visible as ordinary file cards.
++pub fn parse(patch: &str, info: &[FileInfo]) -> Vec<File> {
++    let mut files = parse::files(patch);
++    merge_metadata(&mut files, info);
+     for file in &mut files {
+         file.finish();
+     }
+diff --git a/crates/diff/src/tests.rs b/crates/diff/src/tests.rs
+index 1856324..58ce89e 100644
+--- a/crates/diff/src/tests.rs
++++ b/crates/diff/src/tests.rs
+@@ -106,6 +106,33 @@ fn binary_oversized_and_empty_files_remain_visible() {
+     assert!(parse("", &[]).is_empty());
+ }
+ 
++#[test]
++fn repeated_metadata_keeps_first_card_and_note_but_last_nonempty_status() {
++    let patch = "diff --git a/a b/a\ndiff --git a/a b/a\n";
++    let meta = |path: &str, status: &str, message: Option<&str>| FileInfo {
++        path: path.into(),
++        status: status.into(),
++        message: message.map(str::to_owned),
++    };
++    for extra in [0, 256] {
++        let mut info = vec![meta("a", "added", Some("first")), meta("z", "", None)];
++        info.extend((0..extra).map(|i| meta(&format!("other-{i}"), "", None)));
++        info.extend([
++            meta("z", "conflict", Some("second")),
++            meta("a", "modified", Some("ignored")),
++            meta("a", "", None),
++        ]);
++        let files = parse(patch, &info);
++        assert_eq!(files.len(), 3 + extra);
++        assert_eq!(files[0].status, "modified");
++        assert_eq!(files[0].lines[0].text, "first");
++        assert!(files[1].status.is_empty());
++        assert_eq!(files[2].path, "z");
++        assert_eq!(files[2].status, "conflict");
++        assert_eq!(files[2].lines[0].text, "second");
++    }
++}
++
+ #[test]
+ fn metadata_merges_without_duplicating_files() {
+     let files = parse(
