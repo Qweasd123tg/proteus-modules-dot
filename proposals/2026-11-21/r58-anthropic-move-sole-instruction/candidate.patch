@@ -1,0 +1,74 @@
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+index a2a33f06f938ea5d9119f22ad3ff118fb2e447f2..366dc0fdd1b8cf53cdebe4987db193055099d719 100644
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -143,7 +143,7 @@ fn anthropic_system_value(system: String, cache_control: Option<&Value>) -> Valu
+ }
+ 
+ fn joined_instructions(request: &CanonicalModelRequest) -> Option<String> {
+-    let text = instruction_text(&request.instructions);
++    let mut text = instruction_text(&request.instructions);
+     let systems = request
+         .messages
+         .iter()
+@@ -155,12 +155,16 @@ fn joined_instructions(request: &CanonicalModelRequest) -> Option<String> {
+         })
+         .collect::<Vec<_>>()
+         .join("\n\n");
+-    let text = [text, systems]
+-        .into_iter()
+-        .filter(|text| !text.is_empty())
+-        .collect::<Vec<_>>()
+-        .join("\n\n");
+-    if text.is_empty() { None } else { Some(text) }
++    // A single group is already the final system prefix.
++    if text.is_empty() {
++        return (!systems.is_empty()).then_some(systems);
++    }
++    if !systems.is_empty() {
++        text.reserve_exact(2 + systems.len());
++        text.push_str("\n\n");
++        text.push_str(&systems);
++    }
++    Some(text)
+ }
+ 
+ fn to_anthropic_tool(tool: &ToolSpec, cache_control: Option<&Value>) -> Result<Value> {
+diff --git a/model/model-pack/src/adapters/anthropic/request_tests.rs b/model/model-pack/src/adapters/anthropic/request_tests.rs
+index 6534b1f0f473d79ad6fb8b2feabab7c440fee025..d95fdf0beee1d26e9c8c16e2ec8df1533803878e 100644
+--- a/model/model-pack/src/adapters/anthropic/request_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/request_tests.rs
+@@ -50,6 +50,33 @@ fn canonical_prefix_preserves_legacy_system_and_cache_semantics() {
+     }
+ }
+ 
++#[test]
++fn canonical_prefix_keeps_separators_for_empty_legacy_parts() {
++    for (legacy, expected) in [
++        (vec![""], "canonical"),
++        (vec!["", ""], "canonical\n\n\n\n"),
++        (
++            vec!["", " legacy 🦀 ", ""],
++            "canonical\n\n\n\n legacy 🦀 \n\n",
++        ),
++    ] {
++        let mut messages = legacy
++            .into_iter()
++            .map(|text| CanonicalMessage::text(MessageRole::System, text))
++            .collect::<Vec<_>>();
++        messages.push(CanonicalMessage::text(MessageRole::User, "question"));
++        let request = CanonicalModelRequest::new(ModelRef::new("anthropic", "fixture"), messages)
++            .with_instructions(vec![InstructionBlock::new(
++                InstructionKind::Developer,
++                "canonical",
++                100,
++            )]);
++        let body = to_anthropic_request(&request).unwrap();
++        assert_eq!(body["system"], expected);
++        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
++    }
++}
++
+ #[test]
+ fn shaped_output_limits_keep_required_anthropic_max_tokens() {
+     let adapter = AnthropicMessagesClient::from_provider_config(json!({})).unwrap();
