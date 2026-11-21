@@ -1,0 +1,93 @@
+diff --git a/packages/usage/src/report.rs b/packages/usage/src/report.rs
+index df7df9a..9b7e16d 100644
+--- a/packages/usage/src/report.rs
++++ b/packages/usage/src/report.rs
+@@ -165,7 +165,7 @@ pub fn scoped<'a>(snapshot: &'a Value, period: &str, model: Option<&str>) -> Vec
+ }
+ 
+ /// Every whitespace-separated word occurs in the ids or the model.
+-pub fn matches(request: &Value, query: &str) -> bool {
++fn matches(request: &Value, mut terms: std::str::SplitWhitespace<'_>) -> bool {
+     let model = request.at("model");
+     let haystack = [
+         request.str("exchange_id"),
+@@ -175,10 +175,7 @@ pub fn matches(request: &Value, query: &str) -> bool {
+     ]
+     .join(" ")
+     .to_lowercase();
+-    query
+-        .to_lowercase()
+-        .split_whitespace()
+-        .all(|term| haystack.contains(term))
++    terms.all(|term| haystack.contains(term))
+ }
+ 
+ pub fn filtered<'a>(
+@@ -187,13 +184,23 @@ pub fn filtered<'a>(
+     query: &str,
+     order: &str,
+ ) -> Result<Vec<&'a Value>> {
+-    let rows: Vec<&Value> = requests
++    let eligible = requests
+         .iter()
+         .copied()
+         .filter(|request| status != "problems" || request.str("status") != "completed")
+-        .filter(|request| status != "missing" || request.at("usage").is_null())
+-        .filter(|request| matches(request, query))
+-        .collect();
++        .filter(|request| status != "missing" || request.at("usage").is_null());
++    // The unfiltered page does not need to assemble any search text.
++    let rows: Vec<&Value> = if query.trim().is_empty() {
++        eligible.collect()
++    } else {
++        let mut lowered = None;
++        eligible
++            .filter(|request| {
++                let query = lowered.get_or_insert_with(|| query.to_lowercase());
++                matches(request, query.split_whitespace())
++            })
++            .collect()
++    };
+     let key: fn(&Value) -> Option<f64> = match order {
+         "oldest" => return Ok(rows),
+         "newest" => |request| request.f64("started_at_ms"),
+diff --git a/packages/usage/src/tests.rs b/packages/usage/src/tests.rs
+index efe8f4a..703ee7c 100644
+--- a/packages/usage/src/tests.rs
++++ b/packages/usage/src/tests.rs
+@@ -84,6 +84,35 @@ fn ids(rows: &[&Value]) -> Vec<String> {
+         .collect()
+ }
+ 
++#[test]
++fn search_keeps_blank_and_unicode_term_semantics() {
++    let rows = [
++        with(
++            request(1),
++            json!({
++                "exchange_id":"ΟΣ", "turn_id":"ХОД",
++                "model":{"provider":"OpenAI", "model":"İSTANBUL"}
++            }),
++        ),
++        with(
++            request(2),
++            json!({"turn_id":null,"model":null,"usage":null,"status":"error"}),
++        ),
++    ];
++    let refs: Vec<_> = rows.iter().collect();
++    let select = |status, query| ids(&filtered(&refs, status, query, "oldest").unwrap());
++    assert_eq!(select("all", ""), ["ΟΣ", "request-2"]);
++    assert_eq!(select("all", "\u{2003}\t\n"), ["ΟΣ", "request-2"]);
++    assert_eq!(select("problems", "\u{2003}"), ["request-2"]);
++    assert_eq!(select("missing", " "), ["request-2"]);
++    assert_eq!(select("all", "İstanbul\u{2003}ход OpenAI ΟΣ"), ["ΟΣ"]);
++    assert!(select("all", "ΟΣ unknown").is_empty());
++    // Lowercasing is Unicode-aware, not simple ASCII-only matching.
++    assert!(select("all", "istanbul").is_empty());
++    assert_eq!(select("all", "Ος"), ["ΟΣ"]);
++    assert!(select("all", "Οσ").is_empty());
++}
++
+ #[test]
+ fn latest_period_excludes_requests_outside_any_turn() {
+     let mut snapshot = json!({"requests": [
