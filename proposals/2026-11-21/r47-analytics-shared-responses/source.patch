@@ -1,0 +1,185 @@
+diff --git a/packages/analysis/src/main.rs b/packages/analysis/src/main.rs
+index 6c644f2..bd73aa2 100644
+--- a/packages/analysis/src/main.rs
++++ b/packages/analysis/src/main.rs
+@@ -220,7 +220,9 @@ impl Extension for Analysis {
+         }
+         let turn = self.turn.clone().filter(|turn| !turn.is_empty());
+         let query: Vec<(&str, &str)> = turn.iter().map(|turn| ("turn_id", turn.as_str())).collect();
+-        let data = self.analytics.fetch(host, "/analysis", &query, false)?;
++        let data = self
++            .analytics
++            .fetch_shared(host, "/analysis", &query, false)?;
+         let picker = self.analytics.session_picker(host)?;
+         let root = self.page(&data, picker);
+         host.show(view, root);
+diff --git a/packages/usage/src/main.rs b/packages/usage/src/main.rs
+index e527483..5480794 100644
+--- a/packages/usage/src/main.rs
++++ b/packages/usage/src/main.rs
+@@ -92,7 +92,7 @@ impl Extension for Usage {
+             return Ok(());
+         }
+         let picker = self.analytics.session_picker(host)?;
+-        let snapshot = self.analytics.fetch(host, "/usage", &[], false)?;
++        let snapshot = self.analytics.fetch_shared(host, "/usage", &[], false)?;
+         let root = self.page(picker, &snapshot)?;
+         host.show(view, root);
+         Ok(())
+diff --git a/sdk/src/analytics.rs b/sdk/src/analytics.rs
+index 6235025..a279831 100644
+--- a/sdk/src/analytics.rs
++++ b/sdk/src/analytics.rs
+@@ -1,5 +1,6 @@
+ use std::collections::VecDeque;
+ use std::io::{self, Write};
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ use anyhow::Result;
+@@ -16,7 +17,7 @@ type Key = (String, Option<String>, String);
+ struct Cached {
+     key: Key,
+     fetched: Instant,
+-    value: Value,
++    value: Arc<Value>,
+     bytes: usize,
+ }
+ 
+@@ -59,6 +60,19 @@ impl Analytics {
+         query: &[(&str, &str)],
+         active: bool,
+     ) -> Result<Value> {
++        self.fetch_shared(host, path, query, active)
++            .map(Arc::unwrap_or_clone)
++    }
++
++    /// Read-only handle to a cached answer. The handle remains valid across
++    /// later fetches or eviction; the cache still owns only its budgeted entries.
++    pub fn fetch_shared(
++        &mut self,
++        host: &Host,
++        path: &str,
++        query: &[(&str, &str)],
++        active: bool,
++    ) -> Result<Arc<Value>> {
+         let session = if active {
+             host.session.clone()
+         } else {
+@@ -72,19 +86,20 @@ impl Analytics {
+         Ok(self.remember(key, value))
+     }
+ 
+-    fn cached_value(&mut self, key: &Key) -> Option<Value> {
++    fn cached_value(&mut self, key: &Key) -> Option<Arc<Value>> {
+         let index = self.cached.iter().position(|entry| entry.key == *key)?;
+         let entry = self.cached.remove(index)?;
+         if self.ttl.is_some_and(|ttl| entry.fetched.elapsed() >= ttl) {
+             self.bytes -= entry.bytes;
+             return None;
+         }
+-        let value = entry.value.clone();
++        let value = Arc::clone(&entry.value);
+         self.cached.push_back(entry);
+         Some(value)
+     }
+ 
+-    fn remember(&mut self, key: Key, value: Value) -> Value {
++    fn remember(&mut self, key: Key, value: Value) -> Arc<Value> {
++        let value = Arc::new(value);
+         let Some(bytes) = encoded_size(&key, &value, self.byte_limit) else {
+             // Keep an oversized answer only in its active view, without an
+             // extra cache copy or eviction of useful small answers.
+@@ -101,10 +116,10 @@ impl Analytics {
+         self.cached.push_back(Cached {
+             key,
+             fetched: Instant::now(),
+-            value,
++            value: Arc::clone(&value),
+             bytes,
+         });
+-        self.cached.back().unwrap().value.clone()
++        value
+     }
+ 
+     /// Drops cached answers of one path, e.g. after `run_settled`.
+@@ -126,7 +141,7 @@ impl Analytics {
+ 
+     /// Select of saved sessions; sends action `session`.
+     pub fn session_picker(&mut self, host: &Host) -> Result<Value> {
+-        let sessions = self.fetch(host, "/sessions", &[], false)?;
++        let sessions = self.fetch_shared(host, "/sessions", &[], false)?;
+         let choices: Vec<(Value, String)> = sessions
+             .as_array()
+             .map(Vec::as_slice)
+diff --git a/sdk/src/analytics/tests.rs b/sdk/src/analytics/tests.rs
+index 76f493e..1dc9747 100644
+--- a/sdk/src/analytics/tests.rs
++++ b/sdk/src/analytics/tests.rs
+@@ -16,7 +16,10 @@ fn many_saved_turns_share_entry_and_exact_encoded_byte_budgets() {
+     analytics.byte_limit = 1500;
+     for turn in 0..500 {
+         let value = json!({"turn": turn, "text": "синтетика\\\"\n".repeat(12)});
+-        assert_eq!(analytics.remember(key(turn), value.clone()), value);
++        assert_eq!(
++            analytics.remember(key(turn), value.clone()).as_ref(),
++            &value
++        );
+         assert!(analytics.cached.len() <= 4);
+         assert!(analytics.bytes <= 1500);
+         assert_eq!(
+@@ -51,6 +54,7 @@ fn recent_hits_survive_eviction_and_oversized_answers_are_not_copied_into_cache(
+     let returned = analytics.remember(key(4), huge);
+     assert_eq!(returned["text"].as_str().unwrap().as_ptr(), pointer);
+     assert!(analytics.cached_value(&key(4)).is_none());
++    assert_eq!(Arc::strong_count(&returned), 1);
+     assert!(analytics.cached_value(&key(1)).is_some());
+     assert_eq!(analytics.cached.len(), 2);
+ }
+@@ -66,12 +70,45 @@ fn ttl_expiration_and_clear_release_retention_and_encoded_size_counts_utf8() {
+         + serde_json::to_vec(&value).unwrap().len();
+     assert_eq!(encoded_size(&target, &value, expected), Some(expected));
+     assert_eq!(encoded_size(&target, &value, expected - 1), None);
+-    analytics.remember(target.clone(), value);
++    let expired = Arc::downgrade(&analytics.remember(target.clone(), value));
+     analytics.cached.front_mut().unwrap().fetched = Instant::now() - Duration::from_secs(6);
+     assert!(analytics.cached_value(&target).is_none());
++    assert!(expired.upgrade().is_none());
+     assert_eq!(analytics.bytes, 0);
+     analytics.remember(key(2), json!({"text":"another"}));
+     analytics.clear();
+     assert!(analytics.cached.is_empty());
+     assert_eq!(analytics.bytes, 0);
+ }
++
++#[test]
++fn shared_reads_preserve_identity_and_outlive_only_their_cache_entry() {
++    fn send_sync<T: Send + Sync>() {}
++    send_sync::<Analytics>();
++    let mut analytics = Analytics::new(None);
++    analytics.entry_limit = 1;
++    let value = json!({"text": "large synthetic response".repeat(1000)});
++    let text = value["text"].as_str().unwrap().as_ptr();
++    let fresh = analytics.remember(key(1), value);
++    let hit = analytics.cached_value(&key(1)).unwrap();
++    assert!(Arc::ptr_eq(&fresh, &hit));
++    assert_eq!(hit["text"].as_str().unwrap().as_ptr(), text);
++
++    let weak = Arc::downgrade(&fresh);
++    let second = analytics.remember(key(2), json!({"text": "next"}));
++    assert_eq!(analytics.cached.len(), 1);
++    assert!(analytics.cached_value(&key(1)).is_none());
++    assert_eq!(hit["text"].as_str().unwrap().as_ptr(), text);
++    // Legacy owned callers can mutate their copy without mutating the cache.
++    let mut owned = Arc::unwrap_or_clone(Arc::clone(&second));
++    owned["text"] = json!("changed");
++    assert_eq!(analytics.cached_value(&key(2)).unwrap()["text"], "next");
++
++    drop(fresh);
++    drop(hit);
++    assert!(weak.upgrade().is_none());
++    let weak = Arc::downgrade(&second);
++    drop(second);
++    analytics.clear();
++    assert!(weak.upgrade().is_none());
++}
