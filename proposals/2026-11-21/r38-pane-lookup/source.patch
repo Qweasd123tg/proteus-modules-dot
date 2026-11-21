@@ -1,0 +1,65 @@
+diff --git a/crates/tabs/src/layout.rs b/crates/tabs/src/layout.rs
+index c637e53..c118637 100644
+--- a/crates/tabs/src/layout.rs
++++ b/crates/tabs/src/layout.rs
+@@ -112,13 +112,12 @@ impl TabLayout {
+     }
+ 
+     pub fn pane(&self, id: PaneId) -> Option<&Pane> {
+-        self.panes().into_iter().find(|pane| pane.id == id)
++        self.root.find_pane(&|pane| pane.id == id)
+     }
+ 
+     pub fn pane_of(&self, tab: &str) -> Option<PaneId> {
+-        self.panes()
+-            .into_iter()
+-            .find(|pane| pane.has(tab))
++        self.root
++            .find_pane(&|pane| pane.has(tab))
+             .map(|pane| pane.id)
+     }
+ 
+@@ -127,7 +126,7 @@ impl TabLayout {
+     }
+ 
+     pub fn is_pinned(&self, tab: &str) -> bool {
+-        self.panes().into_iter().any(|pane| pane.is_pinned(tab))
++        self.root.find_pane(&|pane| pane.is_pinned(tab)).is_some()
+     }
+ 
+     pub fn active(&self, pane: PaneId) -> Option<&str> {
+diff --git a/crates/tabs/src/pane.rs b/crates/tabs/src/pane.rs
+index 92ecb4b..bfbc38d 100644
+--- a/crates/tabs/src/pane.rs
++++ b/crates/tabs/src/pane.rs
+@@ -44,7 +44,7 @@ impl Pane {
+     }
+ 
+     pub fn is_pinned(&self, id: &str) -> bool {
+-        self.position(id).is_some_and(|ix| ix < self.pinned)
++        self.tabs.iter().take(self.pinned).any(|tab| tab == id)
+     }
+ 
+     pub fn show(&mut self, id: &str) {
+diff --git a/crates/tabs/src/tree.rs b/crates/tabs/src/tree.rs
+index 4a8bcb4..0fabaeb 100644
+--- a/crates/tabs/src/tree.rs
++++ b/crates/tabs/src/tree.rs
+@@ -92,6 +92,17 @@ impl Node {
+         }
+     }
+ 
++    /// The first matching pane in reading order, without collecting the rest.
++    pub(super) fn find_pane(&self, matches: &impl Fn(&Pane) -> bool) -> Option<&Pane> {
++        match self {
++            Node::Pane(pane) => matches(pane).then_some(pane),
++            Node::Split(split) => split
++                .children
++                .iter()
++                .find_map(|child| child.node.find_pane(matches)),
++        }
++    }
++
+     pub(super) fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+         match self {
+             Node::Pane(pane) => (pane.id == id).then_some(pane),
