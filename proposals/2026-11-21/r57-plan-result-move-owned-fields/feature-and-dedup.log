@@ -1,0 +1,16 @@
+M100 selected exact source patches checked: 100; no patch touches tool/plan-tool/src/lib.rs
+#183 (already reflected in upstream main at the pinned base) moved input args; R57 leaves validation unchanged and moves output strings.
+
+Isolated command: cargo tree --locked -e features -i serde_json -p plan-tool
+serde_json v1.0.151
+preserve_order absent.
+
+Workspace command: cargo tree --locked -e features -i serde_json --workspace
+serde_json v1.0.151
+├── serde_json feature "indexmap"
+│   └── serde_json feature "preserve_order"
+│       ├── agent-client-protocol v2.1.0 (*)
+│       └── agent-client-protocol-schema v1.7.0 (*)
+├── serde_json feature "preserve_order" (*)
+Both agent-client-protocol 2.1.0 and agent-client-protocol-schema 1.7.0 enable preserve_order; in this graph they reach the workspace through proteus-core 0c1b757, a dev-dependency of model-pack and proteus-reference-module.
+The differential probe explicitly compiles plan-tool both without preserve_order and with --features serde_json/preserve_order. It does not substitute for running the full workspace tests.
