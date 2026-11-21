@@ -1,0 +1,131 @@
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 6de1b91..38d8d66 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -81,12 +81,32 @@ pub(crate) fn restore_offset(path: &Path, committed: u64) -> Result<()> {
+ }
+ 
+ pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
++    open_bounded(path, maximum, None)
++}
++
++pub(crate) fn bounded_read_with_size_hint(
++    path: &Path,
++    maximum: usize,
++    max_hint: usize,
++) -> Result<Vec<u8>> {
++    open_bounded(path, maximum, Some(max_hint))
++}
++
++fn open_bounded(path: &Path, maximum: usize, max_hint: Option<usize>) -> Result<Vec<u8>> {
+     let file = File::open(path)?;
+-    ensure!(
+-        file.metadata()?.is_file(),
+-        "storage object must be a regular file"
+-    );
+-    let mut bytes = Vec::new();
++    let metadata = file.metadata()?;
++    ensure!(metadata.is_file(), "storage object must be a regular file");
++    // The existing length is an allocation hint from the same file, not an
++    // admission check. Large or uncertain reads keep the original growth path.
++    let capacity = match max_hint {
++        Some(hint) if metadata.len() <= hint.min(maximum) as u64 => metadata.len() as usize,
++        _ => 0,
++    };
++    read_bounded(file, maximum, capacity)
++}
++
++fn read_bounded(file: File, maximum: usize, capacity: usize) -> Result<Vec<u8>> {
++    let mut bytes = Vec::with_capacity(capacity);
+     file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+     if bytes.len() > maximum {
+         bail!("storage object exceeds {maximum} bytes");
+@@ -94,6 +114,62 @@ pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+     Ok(bytes)
+ }
+ 
++#[cfg(test)]
++#[test]
++fn bounded_read_small_hint_preserves_empty_limits_and_object_checks() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("record");
++    for data in [b"".as_slice(), b"small value", &[b'x'; 512]] {
++        std::fs::write(&path, data).unwrap();
++        assert_eq!(bounded_read(&path, data.len()).unwrap(), data);
++        assert_eq!(
++            bounded_read_with_size_hint(&path, data.len(), 64 * 1024).unwrap(),
++            data
++        );
++        if !data.is_empty() {
++            let maximum = data.len() - 1;
++            assert_eq!(
++                bounded_read_with_size_hint(&path, maximum, 64 * 1024)
++                    .unwrap_err()
++                    .to_string(),
++                bounded_read(&path, maximum).unwrap_err().to_string()
++            );
++        }
++    }
++    for other in [dir.path().join("absent"), dir.path().to_path_buf()] {
++        assert!(bounded_read(&other, 128).is_err());
++        assert!(bounded_read_with_size_hint(&other, 128, 64 * 1024).is_err());
++    }
++}
++
++#[cfg(test)]
++#[test]
++fn bounded_read_checks_actual_bytes_after_an_ordinary_size_change() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("record");
++    std::fs::write(&path, b"initial bytes").unwrap();
++    let source = File::open(&path).unwrap();
++    let size = source.metadata().unwrap().len() as usize;
++    OpenOptions::new()
++        .write(true)
++        .open(&path)
++        .unwrap()
++        .set_len(3)
++        .unwrap();
++    assert_eq!(read_bounded(source, 64, size).unwrap(), b"ini");
++
++    let source = File::open(&path).unwrap();
++    let size = source.metadata().unwrap().len() as usize;
++    OpenOptions::new()
++        .append(true)
++        .open(&path)
++        .unwrap()
++        .write_all(b" larger")
++        .unwrap();
++    assert_eq!(read_bounded(source, 64, size).unwrap(), b"ini larger");
++    assert!(read_bounded(File::open(&path).unwrap(), 4, size).is_err());
++}
++
+ /// Persist each newly created directory entry before its children are committed.
+ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+     let mut missing = Vec::new();
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 136b46e..6805617 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
+ use std::{fs::OpenOptions, io::Write};
+ 
+ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
++// Hint only ordinary small cache documents; other object readers keep no hint.
++const CACHE_READ_HINT_MAX_BYTES: usize = 64 * 1024;
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Cache {
+@@ -25,7 +27,11 @@ pub(super) fn read_cache(
+     source: Option<StorageSnapshot>,
+ ) -> Result<SessionStorageResponse> {
+     let dir = checked_path(&session)?;
+-    let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_CACHE_BYTES + 1024 * 1024) {
++    let bytes = match crate::io::bounded_read_with_size_hint(
++        &path(&dir, &key),
++        MAX_CACHE_BYTES + 1024 * 1024,
++        CACHE_READ_HINT_MAX_BYTES,
++    ) {
+         Ok(bytes) => bytes,
+         Err(_) => return Ok(SessionStorageResponse::Metadata { document: None }),
+     };
