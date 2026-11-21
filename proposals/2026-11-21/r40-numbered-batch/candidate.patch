@@ -1,0 +1,79 @@
+diff --git a/tool/file-tools/src/read_many.rs b/tool/file-tools/src/read_many.rs
+index a43f14f8d7ba1585a6a35948d2bc8cd1e734eef4..5d75b881c6a53ae14036b893622bb3d0768abfd1 100644
+--- a/tool/file-tools/src/read_many.rs
++++ b/tool/file-tools/src/read_many.rs
+@@ -1,6 +1,6 @@
+ //! `read_many_files` tool: пакетное чтение нескольких UTF-8 файлов.
+ 
+-use std::{io::Read, path::Path};
++use std::{fmt::Write, io::Read, path::Path};
+ 
+ use proteus_contracts::process_module::{ProcessModuleError, ToolModule, ToolModuleHostMut};
+ use serde_json::{Value, json};
+@@ -160,7 +160,7 @@ impl ToolModule for ReadManyFilesTool {
+                 Err(e) => return err_result(&call.id, &call.name, e),
+             };
+             let mut rendered = if line_numbers {
+-                add_line_numbers(&file_read.text)
++                add_line_numbers(&file_read.text, content_budget)
+             } else {
+                 file_read.text
+             };
+@@ -264,12 +264,19 @@ fn read_text_prefix(path: &Path, limit: usize, original_bytes: usize) -> Result<
+     })
+ }
+ 
+-fn add_line_numbers(text: &str) -> String {
+-    text.lines()
+-        .enumerate()
+-        .map(|(index, line)| format!("{}\t{}", index + 1, line))
+-        .collect::<Vec<_>>()
+-        .join("\n")
++fn add_line_numbers(text: &str, budget: usize) -> String {
++    let mut rendered = String::new();
++    for (index, line) in text.lines().enumerate() {
++        if index > 0 {
++            rendered.push('\n');
++        }
++        write!(rendered, "{}\t{line}", index + 1).expect("writing to a String cannot fail");
++        // Leave the first overflow visible to the caller's UTF-8 truncation policy.
++        if rendered.len() > budget {
++            break;
++        }
++    }
++    rendered
+ }
+ 
+ #[cfg(test)]
+diff --git a/tool/file-tools/src/tests.rs b/tool/file-tools/src/tests.rs
+index 2290752e8f2ee693ebb2982d60550cf72049445a..263e92adebfcbd4cd0495b4dcf32b2b35ef91fb4 100644
+--- a/tool/file-tools/src/tests.rs
++++ b/tool/file-tools/src/tests.rs
+@@ -343,6 +343,27 @@ fn read_many_files_reports_truncated_with_line_numbers_when_rendered_output_is_l
+     assert_eq!(result["metadata"]["total_returned_bytes"], output.len());
+ }
+ 
++#[test]
++fn read_many_numbered_budget_preserves_partial_prefixes_and_utf8() {
++    let dir = tempfile::tempdir().expect("workspace");
++    let text = "\n".repeat(9) + "😀\r\nend\n";
++    std::fs::write(dir.path().join("f"), text).unwrap();
++    let header = "== f ==\n";
++    let numbered = "1\t\n2\t\n3\t\n4\t\n5\t\n6\t\n7\t\n8\t\n9\t\n10\t😀\n11\tend";
++    // Cut the first overflowing line's number, tab, scalar or separator.
++    for budget in 27..=numbered.len() + 1 {
++        let result = invoke(
++            &ReadManyFilesTool,
++            dir.path(),
++            json!({"paths":["f"], "line_numbers":true, "max_bytes_total":header.len() + budget}),
++        );
++        let bytes = numbered.floor_char_boundary(budget.min(numbered.len()));
++        assert_eq!(result["output"], format!("{header}{}", &numbered[..bytes]));
++        assert_eq!(result["metadata"]["files"][0]["returned_bytes"], bytes);
++        assert_eq!(result["metadata"]["truncated"], budget < numbered.len());
++    }
++}
++
+ #[test]
+ fn find_files_returns_glob_matches() {
+     if std::process::Command::new("rg")
