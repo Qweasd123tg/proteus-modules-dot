@@ -1,0 +1,21 @@
+Five identical independent samples per tier/variant; same-thread System requested bytes, after upstream-shaped decoded JSON page admission with no UI nodes.
+Columns: tier rows arm rows_per_slot slots capacity_total elem_size live_blocks live_bytes first_owner_ptr_matches warm_ptr_matches cold_calls cold_requested_bytes max_single_admission_extra_requested_upper_bound warm_calls warm_requested_bytes.
+First-owner matching counts nonempty first hash, parents and refs buffers; 1-row parent is empty by design. Warm clone result is dropped before reporting retained live allocation.
+For M150, one typed vector allocation per nonempty page, unchanged zero-cost warm borrow. Capacity is measured; two-slot case owns two independent 100-record pages, not pagination spare capacity.
+base rows stock 0 1 0 72 0 0 0 0 0 0 0 0 0
+base rows stock 1 1 1 72 35 3235 0 0 35 3235 3235 35 3235
+base rows stock 100 1 100 72 1730 200268 0 0 1730 200268 200268 1730 200268
+base rows stock 100 2 200 72 3460 400536 0 0 3460 400536 200268 3460 400536
+base rows candidate 0 1 0 184 0 0 0 0 0 0 0 0 0
+base rows candidate 1 1 1 184 25 1761 2 0 1 184 184 25 1689
+base rows candidate 100 1 100 184 730 66980 3 0 1 18400 18400 730 45668
+base rows candidate 100 2 200 184 1460 133960 6 0 2 36800 18400 1460 91336
+composed rows stock 0 1 0 72 0 0 0 0 0 0 0 0 0
+composed rows stock 1 1 4 72 35 3523 2 1 0 0 0 0 0
+composed rows stock 100 1 128 72 1730 223596 3 1 0 0 0 0 0
+composed rows stock 100 2 256 72 3460 447192 6 2 0 0 0 0 0
+composed rows candidate 0 1 0 184 0 0 0 0 0 0 0 0 0
+composed rows candidate 1 1 1 184 25 1761 2 1 1 184 184 0 0
+composed rows candidate 100 1 100 184 730 66980 3 1 1 18400 18400 0 0
+composed rows candidate 100 2 200 184 1460 133960 6 2 2 36800 18400 0 0
+100-row live savings: upstream 133288 B; composed 156616 B, 1000 blocks. Two composed pages save 313232 B, 2000 blocks. No whole-process peak/RSS or timing measure.
