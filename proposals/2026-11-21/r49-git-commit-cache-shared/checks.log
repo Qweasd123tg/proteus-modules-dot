@@ -1,0 +1,23 @@
+Base: Proteus-harness/Proteus-desktop-extensions 892f627570369ed60d7205eb0d351c753ec4305f
+Platform: Debian 13 x86_64, TZ=UTC
+rustc 1.95.0 (59807616e 2026-04-14)
+cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+Python 3.12.14
+Standalone upstream patch SHA256: 46ed9afcf3d2cdc19799cbe2fbea521a807031efc70063597403e65b7f2e66e4
+Direct git apply --index --check, apply --whitespace=error, reverse --check, git diff --check: PASS
+cargo fmt --check -p extension-git on both: PASS
+stock debug test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.81s
+stock release test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+candidate debug test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s
+candidate release test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+Uninstrumented release/stdin process + actual upstream HTTP fixture: 12 stdout frames byte-for-byte identical; all 6 HTTP calls including queries identical.
+Instrumented release: 9 serialized widget roots byte-for-byte identical; counters identical for five processes per arm.
+At end of each cached scenario the commit and diff snapshots have exactly one strong reference; dropping session cache releases both (Weak validation on both arms).
+Merge compatibility: Qweasd123tg/proteus-modules-dot PR #283 @7d1e1878e9bef5d4955eaea9712655502a7caac4
+PR #283 source: proposals/2026-11-21/r42-history-owned-arrays/source.patch (SHA256 304154dd50500366fa9b6f076ad15dac6c3ddcdaa564aa12b4a07d67947b8794)
+Strict apply --index --whitespace=error on separate exact checkouts: R49 + #283 and #283 + R49 both yielded tree 3b24c528fb663354478d53043a528be99ca06175; git diff --cached --check passed on each.
+Combined tree cargo test --locked -p extension-git -p proteus-extension (debug; results in order: Git / SDK / SDK doctest):
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.43s
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Scope: affected Git package, plus explicit #283 composition; no full workspace, native UI, packaging, RSS or latency measurement.

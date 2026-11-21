@@ -1,0 +1,86 @@
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index 2388e8e..05df791 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -260,7 +260,10 @@ impl Git {
+         }
+         header.push(row(meta));
+         let patch = match picked {
+-            Some(path) => patch_view("commit-patch", &self.commit_diff(host, &full, &path)?, files.iter().find(|file| file.str("path") == path)),
++            Some(path) => {
++                let diff = self.commit_diff(host, &full, &path)?;
++                patch_view("commit-patch", &diff, files.iter().find(|file| file.str("path") == path))
++            }
+             None => diff("commit-patch", commit.str("patch")).with("files", files.iter().map(|file| {
+                 let message = if commit.bool("truncated") {
+                     Some("Выберите файл в дереве графа коммитов")
+diff --git a/packages/git/src/history.rs b/packages/git/src/history.rs
+index dfb3393..e628914 100644
+--- a/packages/git/src/history.rs
++++ b/packages/git/src/history.rs
+@@ -2,6 +2,7 @@
+ //! Commit history: pages of `/workspace/log` drawn as `lanes` in the graph
+ //! and as two-line `list` rows in the panel, and commits read once.
+ 
++use std::sync::Arc;
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use proteus_extension::ui::{Node, item, lane_row, lane_segment, lanes, list, list_row};
+@@ -237,24 +238,23 @@ impl Git {
+         parent
+     }
+ 
+-    pub fn commit_details(&mut self, host: &Host, hash: &str) -> Result<Value> {
++    pub fn commit_details(&mut self, host: &Host, hash: &str) -> Result<Arc<Value>> {
+         if let Some(commit) = self.history_cache.commit(hash) {
+-            return Ok(commit.as_ref().clone());
++            return Ok(commit);
+         }
+-        let commit = std::sync::Arc::new(host.api("/workspace/commit", &[("hash", hash)])?);
+-        self.history_cache.insert_commit(hash, commit.clone());
+-        Ok(commit.as_ref().clone())
++        let commit = Arc::new(host.api("/workspace/commit", &[("hash", hash)])?);
++        self.history_cache.insert_commit(hash, Arc::clone(&commit));
++        Ok(commit)
+     }
+ 
+-    pub fn commit_diff(&mut self, host: &Host, hash: &str, path: &str) -> Result<Value> {
++    pub fn commit_diff(&mut self, host: &Host, hash: &str, path: &str) -> Result<Arc<Value>> {
+         if let Some(diff) = self.history_cache.diff(hash, path) {
+-            return Ok(diff.as_ref().clone());
++            return Ok(diff);
+         }
+-        let diff = std::sync::Arc::new(
+-            host.api("/workspace/commit/diff", &[("hash", hash), ("path", path)])?,
+-        );
+-        self.history_cache.insert_diff(hash, path, diff.clone());
+-        Ok(diff.as_ref().clone())
++        let diff = Arc::new(host.api("/workspace/commit/diff", &[("hash", hash), ("path", path)])?);
++        self.history_cache
++            .insert_diff(hash, path, Arc::clone(&diff));
++        Ok(diff)
+     }
+ 
+     pub fn short_of(&self, hash: &str) -> String {
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 8922950..d596417 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -536,7 +536,7 @@ fn inspector_and_short_document_share_one_immutable_commit_request() {
+     let full = "abc1234000000000000000000000000000000000";
+     let inspector = fake.git.commit_details(&fake.host, full).unwrap();
+     let document = fake.git.commit_details(&fake.host, "abc1234").unwrap();
+-    assert_eq!(inspector, document);
++    assert!(Arc::ptr_eq(&inspector, &document));
+     let calls = fake.calls.lock().unwrap();
+     assert_eq!(
+         calls
+@@ -622,7 +622,7 @@ fn cached_file_diffs_share_full_and_short_commit_aliases_without_http() {
+         .git
+         .commit_diff(&fake.host, "abc1234", "synthetic.txt")
+         .unwrap();
+-    assert_eq!(first, second);
++    assert!(Arc::ptr_eq(&first, &second));
+     assert_eq!(
+         fake.calls
+             .lock()
