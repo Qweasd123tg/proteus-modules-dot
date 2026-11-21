@@ -1,0 +1,206 @@
+diff --git a/packages/files/src/tree.rs b/packages/files/src/tree.rs
+index cae2c2b..2c84658 100644
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -40,16 +40,44 @@ pub enum Kind {
+ 
+ #[derive(Debug)]
+ #[cfg_attr(test, derive(Clone))]
+-pub struct Entry {
+-    pub name: String,
+-    pub path: String,
+-    pub kind: Kind,
++struct Entry {
++    name: EntryName,
++    path: String,
++    kind: Kind,
++}
++
++#[derive(Debug)]
++#[cfg_attr(test, derive(Clone))]
++enum EntryName {
++    PathSuffix(usize),
++    Override(Box<str>),
++}
++
++impl Entry {
++    fn new(name: &str, path: String, kind: Kind) -> Self {
++        // Reuse bytes only when the exact display name is already in the
++        // immutable normalized path. An alias keeps its original label.
++        let name = match path.strip_suffix(name) {
++            Some(prefix) if prefix.is_empty() || prefix.ends_with(['/', '\\']) => {
++                EntryName::PathSuffix(prefix.len())
++            }
++            _ => EntryName::Override(name.into()),
++        };
++        Self { name, path, kind }
++    }
++
++    fn name(&self) -> &str {
++        match &self.name {
++            EntryName::PathSuffix(start) => &self.path[*start..],
++            EntryName::Override(name) => name,
++        }
++    }
+ }
+ 
+ #[derive(Debug, Default)]
+ #[cfg_attr(test, derive(Clone))]
+ pub struct Listing {
+-    pub entries: Vec<Entry>,
++    entries: Vec<Entry>,
+     pub truncated: bool,
+ }
+ 
+@@ -59,15 +87,18 @@ impl Listing {
+             .list("entries")
+             .iter()
+             .filter(|entry| !EXCLUDED.contains(&entry.str("name")))
+-            .map(|entry| Entry {
+-                name: entry.str("name").to_owned(),
+-                path: entry.str("path").trim_start_matches("./").to_owned(),
+-                kind: match entry.str("kind") {
++            .map(|entry| {
++                let kind = match entry.str("kind") {
+                     "directory" => Kind::Directory,
+                     "file" => Kind::File,
+                     "symlink" => Kind::Symlink,
+                     _ => Kind::Other,
+-                },
++                };
++                Entry::new(
++                    entry.str("name"),
++                    entry.str("path").trim_start_matches("./").to_owned(),
++                    kind,
++                )
+             })
+             .collect();
+         Self {
+@@ -199,7 +230,7 @@ impl Project {
+             if entry.kind != Kind::Directory {
+                 lines.push(Line {
+                     path: entry.path.clone(),
+-                    label: entry.name.clone(),
++                    label: entry.name().to_owned(),
+                     depth,
+                     kind: entry.kind,
+                     expanded: None,
+@@ -225,7 +256,7 @@ impl Project {
+     /// The deepest folder of the chain starting at `entry` and its `a/b/c` label.
+     fn fold(&mut self, entry: &Entry, load: &mut Loader, budget: &mut usize) -> (String, String) {
+         let mut path = entry.path.clone();
+-        let mut label = entry.name.clone();
++        let mut label = entry.name().to_owned();
+         for _ in 0..CHAIN {
+             if !self.listings.contains_key(&path) {
+                 if !self.expanded.contains(&path) && *budget == 0 {
+@@ -240,7 +271,7 @@ impl Project {
+                 break;
+             };
+             label.push('/');
+-            label.push_str(&child.name);
++            label.push_str(child.name());
+             path.clone_from(&child.path);
+         }
+         if path != entry.path {
+diff --git a/packages/files/src/tree_tests.rs b/packages/files/src/tree_tests.rs
+index bd0eea2..5f8474d 100644
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -221,11 +221,7 @@ fn folded_ancestors_do_not_spend_or_extend_expand_all_listing_budget() {
+         Ok(Listing {
+             entries: if folder == path {
+                 (0..EXPAND_ALL)
+-                    .map(|i| Entry {
+-                        name: format!("d{i}"),
+-                        path: format!("{path}/d{i}"),
+-                        kind: Kind::Directory,
+-                    })
++                    .map(|i| Entry::new(&format!("d{i}"), format!("{path}/d{i}"), Kind::Directory))
+                     .collect()
+             } else {
+                 Vec::new()
+@@ -249,11 +245,11 @@ fn folded_ancestors_do_not_spend_or_extend_expand_all_descendant_depth() {
+     project.expand_all(path, &mut |folder| {
+         reads.push(folder.to_owned());
+         Ok(Listing {
+-            entries: vec![Entry {
+-                name: "child".into(),
+-                path: format!("{folder}/child"),
+-                kind: Kind::Directory,
+-            }],
++            entries: vec![Entry::new(
++                "child",
++                format!("{folder}/child"),
++                Kind::Directory,
++            )],
+             truncated: false,
+         })
+     });
+@@ -499,10 +495,9 @@ fn recovered_listing_does_not_reverse_explicit_collapse() {
+ fn failed_collapsed_lookahead_still_obeys_per_render_budget() {
+     let root = Listing {
+         entries: (0..LOOKAHEAD + 8)
+-            .map(|index| Entry {
+-                name: format!("folder-{index}"),
+-                path: format!("folder-{index}"),
+-                kind: Kind::Directory,
++            .map(|index| {
++                let path = format!("folder-{index}");
++                Entry::new(&path, path.clone(), Kind::Directory)
+             })
+             .collect(),
+         truncated: false,
+@@ -591,3 +586,52 @@ fn lookahead_and_recursion_keep_rows_ordered_and_do_not_pin_refreshed_listings()
+     assert_eq!(rows[3].label, "visible.rs");
+     assert_eq!(fresh[3].label, "new.rs");
+ }
++
++#[test]
++fn listing_names_share_an_exact_path_suffix_and_keep_original_labels() {
++    let source = json!({
++        "entries": [
++            {"name":"папка", "path":"././prefix/папка", "kind":"directory"},
++            {"name":"日本語.rs", "path":"a\\日本語.rs", "kind":"file"},
++            {"name":"literal\\name", "path":"a/literal\\name", "kind":"file"},
++            {"name":"other", "path":"a/path", "kind":"symlink"},
++            {"name":"tail", "path":"not-a-tail", "kind":"unknown"},
++            {"name":"", "path":"a/", "kind":null},
++            {"name":42, "path":false},
++            {"name":"without-path"},
++            {"name":".git", "path":"kept-by-path"},
++            {"name":"visible", "path":"./.git", "kind":"file"}
++        ],
++        "truncated": true
++    });
++    let listed = Listing::parse(&source);
++    assert!(listed.truncated);
++    assert_eq!(
++        listed
++            .entries
++            .iter()
++            .map(|entry| {
++                let shares = match &entry.name {
++                    EntryName::PathSuffix(start) => {
++                        assert_eq!(entry.name().as_ptr(), entry.path[*start..].as_ptr());
++                        true
++                    }
++                    EntryName::Override(_) => false,
++                };
++                (entry.name(), entry.path.as_str(), entry.kind, shares)
++            })
++            .collect::<Vec<_>>(),
++        [
++            ("папка", "prefix/папка", Kind::Directory, true),
++            ("日本語.rs", "a\\日本語.rs", Kind::File, true),
++            ("literal\\name", "a/literal\\name", Kind::File, true),
++            ("other", "a/path", Kind::Symlink, false),
++            ("tail", "not-a-tail", Kind::Other, false),
++            ("", "a/", Kind::Other, true),
++            ("", "", Kind::Other, true),
++            ("without-path", "", Kind::Other, false),
++            ("visible", ".git", Kind::File, false),
++        ]
++    );
++    assert!(Listing::parse(&json!({"entries":false})).entries.is_empty());
++}
