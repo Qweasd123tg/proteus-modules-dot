@@ -1,0 +1,76 @@
+diff --git a/crates/proteus-core/src/app_server/http/tests/workspace_git_history.rs b/crates/proteus-core/src/app_server/http/tests/workspace_git_history.rs
+index 26f4ae6..510acfd 100644
+--- a/crates/proteus-core/src/app_server/http/tests/workspace_git_history.rs
++++ b/crates/proteus-core/src/app_server/http/tests/workspace_git_history.rs
+@@ -108,6 +108,31 @@ fn workspace_git_log_pages_graph_parents_and_refs() {
+     assert_eq!(last["entries"].as_array().unwrap().len(), 2);
+ }
+ 
++#[test]
++fn workspace_git_log_all_refs_without_a_current_commit() {
++    let repo = tempfile::tempdir().unwrap();
++    let root = repo.path();
++    init(root);
++    let empty = json!({"head": null, "entries": [], "has_more": false});
++    assert_eq!(log(root, 1, 0, true), empty);
++
++    git(root, &["commit", "--allow-empty", "-qm", "base"]);
++    git(root, &["tag", "v1"]);
++    git(root, &["commit", "--allow-empty", "-qm", "latest"]);
++    git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
++    git(root, &["switch", "--orphan", "docs"]);
++    git(root, &["branch", "-D", "main"]);
++
++    assert_eq!(log(root, 1, 0, false), empty);
++    let first = log(root, 1, 0, true);
++    assert_eq!(first["head"], Value::Null);
++    assert_eq!(first["entries"][0]["summary"], "latest");
++    assert_eq!(first["has_more"], true);
++    let last = log(root, 1, 1, true);
++    assert_eq!(last["entries"][0]["summary"], "base");
++    assert_eq!(last["has_more"], false);
++}
++
+ #[test]
+ fn workspace_git_commit_details_and_file_diff() {
+     let repo = tempfile::tempdir().unwrap();
+diff --git a/crates/proteus-core/src/app_server/http/workspace/git/log.rs b/crates/proteus-core/src/app_server/http/workspace/git/log.rs
+index c8f5c68..f71b298 100644
+--- a/crates/proteus-core/src/app_server/http/workspace/git/log.rs
++++ b/crates/proteus-core/src/app_server/http/workspace/git/log.rs
+@@ -64,7 +64,7 @@ pub(crate) fn log(root: &Path, query: LogQuery) -> Result<Log> {
+         return Ok(result);
+     }
+     result.head = head_hash(root)?;
+-    if result.head.is_none() {
++    if result.head.is_none() && !query.all {
+         return Ok(result);
+     }
+     let count = format!("--max-count={}", query.limit + 1);
+@@ -81,7 +81,10 @@ pub(crate) fn log(root: &Path, query: LogQuery) -> Result<Log> {
+     if query.all {
+         args.extend(["--date-order", "--branches", "--remotes", "--tags"]);
+     }
+-    args.extend(["HEAD", "--"]);
++    if result.head.is_some() {
++        args.push("HEAD");
++    }
++    args.push("--");
+     let output = run(root, &args)?.checked_or_truncated("log")?;
+     // Stopped at the output cap: whatever was not read is still to come.
+     result.has_more = output.truncated;
+diff --git a/docs/guides/runtime-and-events.md b/docs/guides/runtime-and-events.md
+index edaa678..5c7cf2a 100644
+--- a/docs/guides/runtime-and-events.md
++++ b/docs/guides/runtime-and-events.md
+@@ -1016,7 +1016,9 @@ store; stdio остаётся привязанным к одной session пр
+     префиксов `refs/heads/`, `refs/remotes/`, `refs/tags/`). По умолчанию
+     обходится история HEAD; `all=true` добавляет все локальные и удалённые
+     ветки и теги в порядке `--date-order` (родители после потомков) для
+-    графа коммитов. `has_more` сообщает, что за страницей есть ещё коммиты;
++    графа коммитов. Если у текущей ветки ещё нет коммита, `head` остаётся
++    `null`, но `all=true` показывает историю остальных веток и тегов.
++    `has_more` сообщает, что за страницей есть ещё коммиты;
+     следующая страница — `skip + entries.length`. Без коммитов и вне
+     репозитория `entries` пуст.
+   - `GET /workspace/commit?session_dir=<path>&hash=<hex>` — `{hash, short,
