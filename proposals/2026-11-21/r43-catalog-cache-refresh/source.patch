@@ -1,0 +1,136 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index e8e9970..6a5af00 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -29,6 +29,7 @@ mod sessions;
+ mod views;
+ 
+ const MAX_SNAPSHOTS: usize = 32;
++const MAX_CATALOG_ENTRIES: usize = 1024;
+ 
+ #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 293ad26..e60ba1d 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -175,18 +175,33 @@ impl State {
+ 
+     fn remember_summary(&mut self, stamps: SourceStamp, summary: StorageSessionSummary) {
+         let session = summary.descriptor.session.clone();
+-        self.catalog_order.retain(|old| old != &session);
+-        while self.catalog.len() >= 1024 {
+-            if let Some(old) = self.catalog_order.pop_front() {
+-                self.catalog.remove(&old);
+-            } else {
+-                break;
+-            }
++        remember_catalog_entry(
++            &mut self.catalog,
++            &mut self.catalog_order,
++            session,
++            CachedSummary { stamps, summary },
++        );
++    }
++}
++
++// Each resident has exactly one queue entry. Only a refresh can already
++// be in the queue, and only a new admission may evict a resident.
++pub(super) fn remember_catalog_entry<V>(
++    entries: &mut HashMap<SessionLocator, V>,
++    order: &mut VecDeque<SessionLocator>,
++    session: SessionLocator,
++    value: V,
++) {
++    if entries.insert(session.clone(), value).is_some() {
++        if order.back() == Some(&session) {
++            return;
+         }
+-        self.catalog_order.push_back(session.clone());
+-        self.catalog
+-            .insert(session, CachedSummary { stamps, summary });
++        order.retain(|old| old != &session);
++    } else if order.len() == MAX_CATALOG_ENTRIES {
++        let oldest = order.pop_front().expect("full catalog queue");
++        entries.remove(&oldest);
+     }
++    order.push_back(session);
+ }
+ 
+ // The readonly replay owns no service handles and publishes no state or files.
+diff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs
+index 7e6103d..be7b5ba 100644
+--- a/storage/session-storage/src/service/catalog/tests.rs
++++ b/storage/session-storage/src/service/catalog/tests.rs
+@@ -79,3 +79,49 @@ fn retired_replay_cannot_publish_into_a_recreated_session() {
+         );
+     }
+ }
++
++#[test]
++fn refreshing_a_full_catalog_preserves_other_residents_and_renews_eviction_order() {
++    let (_, _, (summary, prefix)) = pending(&Fixture::new(BackendKind::Jsonl));
++    let service = StorageService::new(BackendKind::Jsonl);
++    let mut state = service.lock_state().unwrap();
++    let key = |i: usize| SessionLocator {
++        key: format!("resident-{i}"),
++        ..summary.descriptor.session.clone()
++    };
++    let remember = |state: &mut State, i, seq| {
++        let mut summary = summary.clone();
++        summary.descriptor.session = key(i);
++        summary.message_count = seq;
++        let mut prefix = prefix.clone();
++        prefix.revision.session_seq = seq as u64;
++        state.remember_prefix(key(i), prefix);
++        state.remember_summary(Vec::new(), summary);
++    };
++    for i in 0..MAX_CATALOG_ENTRIES {
++        remember(&mut state, i, 0);
++    }
++    remember(&mut state, 0, 1);
++    remember(&mut state, 0, 2);
++    assert_eq!(
++        (state.catalog.len(), state.prefixes.len()),
++        (MAX_CATALOG_ENTRIES, MAX_CATALOG_ENTRIES),
++        "a refresh must not evict any other resident"
++    );
++    assert_eq!(state.catalog[&key(0)].summary.message_count, 2);
++    assert_eq!(state.prefixes[&key(0)].revision.session_seq, 2);
++
++    remember(&mut state, MAX_CATALOG_ENTRIES, 3);
++    let expected: VecDeque<_> = (2..MAX_CATALOG_ENTRIES)
++        .chain([0, MAX_CATALOG_ENTRIES])
++        .map(key)
++        .collect();
++    assert_eq!(state.catalog_order, expected);
++    assert_eq!(state.prefix_order, expected);
++    assert!(!state.catalog.contains_key(&key(1)));
++    assert!(!state.prefixes.contains_key(&key(1)));
++    assert_eq!(
++        (state.catalog.len(), state.prefixes.len()),
++        (MAX_CATALOG_ENTRIES, MAX_CATALOG_ENTRIES)
++    );
++}
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index df9b8cf..cd578af 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -22,16 +22,7 @@ impl PrefixCache {
+ }
+ impl State {
+     pub(super) fn remember_prefix(&mut self, session: SessionLocator, cache: PrefixCache) {
+-        self.prefix_order.retain(|s| s != &session);
+-        while self.prefixes.len() >= 1024 {
+-            if let Some(old) = self.prefix_order.pop_front() {
+-                self.prefixes.remove(&old);
+-            } else {
+-                break;
+-            }
+-        }
+-        self.prefix_order.push_back(session.clone());
+-        self.prefixes.insert(session, cache);
++        catalog::remember_catalog_entry(&mut self.prefixes, &mut self.prefix_order, session, cache);
+     }
+     pub(super) fn prepare_snapshot(&mut self, session: SessionLocator) -> Result<SnapshotState> {
+         let dir = self.checked_path(&session)?;
