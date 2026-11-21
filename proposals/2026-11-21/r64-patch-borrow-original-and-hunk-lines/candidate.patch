@@ -1,0 +1,85 @@
+diff --git a/tool/direct-patch/src/transaction.rs b/tool/direct-patch/src/transaction.rs
+index 1e112b0de6085094a8581b2d602aee7f3a0446f0..159ebbaa6993e97dc10fda0dbc063cc32fa3611b 100644
+--- a/tool/direct-patch/src/transaction.rs
++++ b/tool/direct-patch/src/transaction.rs
+@@ -255,6 +255,7 @@ fn apply_hunks(original: &str, hunks: &[Hunk], no_newline_at_eof: bool) -> Resul
+     } else {
+         "\n"
+     };
++    // Keep views of the original and hunk lines until rendering the final text.
+     let (mut lines, mut trailing_newline) = split_lines(original, line_ending);
+     let mut cursor = 0;
+     for hunk in hunks {
+@@ -263,11 +264,11 @@ fn apply_hunks(original: &str, hunks: &[Hunk], no_newline_at_eof: bool) -> Resul
+         for line in &hunk.lines {
+             match line {
+                 HunkLine::Context(text) => {
+-                    old_lines.push(text.clone());
+-                    new_lines.push(text.clone());
++                    old_lines.push(text.as_str());
++                    new_lines.push(text.as_str());
+                 }
+-                HunkLine::Remove(text) => old_lines.push(text.clone()),
+-                HunkLine::Add(text) => new_lines.push(text.clone()),
++                HunkLine::Remove(text) => old_lines.push(text.as_str()),
++                HunkLine::Add(text) => new_lines.push(text.as_str()),
+             }
+         }
+         if old_lines.is_empty() {
+@@ -286,19 +287,17 @@ fn apply_hunks(original: &str, hunks: &[Hunk], no_newline_at_eof: bool) -> Resul
+     Ok(render_text(&lines, trailing_newline, line_ending))
+ }
+ 
+-fn split_lines(text: &str, line_ending: &str) -> (Vec<String>, bool) {
++fn split_lines<'a>(text: &'a str, line_ending: &str) -> (Vec<&'a str>, bool) {
+     let trailing_newline = text.ends_with(line_ending);
+     let lines = if text.is_empty() {
+         Vec::new()
+     } else {
+-        text.split_terminator(line_ending)
+-            .map(str::to_owned)
+-            .collect()
++        text.split_terminator(line_ending).collect()
+     };
+     (lines, trailing_newline)
+ }
+ 
+-fn find_subsequence(lines: &[String], needle: &[String], start: usize) -> Option<usize> {
++fn find_subsequence(lines: &[&str], needle: &[&str], start: usize) -> Option<usize> {
+     if needle.is_empty() {
+         return Some(start.min(lines.len()));
+     }
+@@ -309,7 +308,11 @@ fn find_subsequence(lines: &[String], needle: &[String], start: usize) -> Option
+     (start..=last_start).find(|&index| lines[index..index + needle.len()] == needle[..])
+ }
+ 
+-fn render_text(lines: &[String], trailing_newline: bool, line_ending: &str) -> String {
++fn render_text(
++    lines: &[impl std::borrow::Borrow<str>],
++    trailing_newline: bool,
++    line_ending: &str,
++) -> String {
+     if lines.is_empty() {
+         return String::new();
+     }
+diff --git a/tool/direct-patch/src/transaction/eol_tests.rs b/tool/direct-patch/src/transaction/eol_tests.rs
+index ced44a5c6c2bd05291385b46e80376a21b3abac3..4e3be76e45f2088228f960c4649d88aa532fd934 100644
+--- a/tool/direct-patch/src/transaction/eol_tests.rs
++++ b/tool/direct-patch/src/transaction/eol_tests.rs
+@@ -113,3 +113,16 @@ fn add_file_content_still_uses_lf_even_when_patch_text_is_crlf() {
+     };
+     assert_eq!(render_text(lines, true, "\n"), "one\ntwo\n");
+ }
++
++#[test]
++fn multiple_hunks_do_not_rematch_identical_lines_before_the_cursor() {
++    let patch = concat!(
++        "*** Begin Patch\n*** Update File: file.txt\n",
++        "@@\n-repeat\n+repeat\n+новая строка 🦀\n",
++        "@@\n-repeat\n+last\n tail\n*** End Patch",
++    );
++    assert_eq!(
++        update("header\nrepeat\nmiddle\nrepeat\ntail", patch).unwrap(),
++        "header\nrepeat\nновая строка 🦀\nmiddle\nlast\ntail"
++    );
++}
