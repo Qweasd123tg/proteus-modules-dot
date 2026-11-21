@@ -1,0 +1,77 @@
+diff --git a/src/ui/chat/replies.rs b/src/ui/chat/replies.rs
+index 5052782..8c7ef93 100644
+--- a/src/ui/chat/replies.rs
++++ b/src/ui/chat/replies.rs
+@@ -23,7 +23,7 @@ pub(super) enum Part {
+ 
+ struct Reply {
+     text: Arc<str>,
+-    languages: Vec<(String, &'static str)>,
++    languages: Vec<(&'static str, &'static str)>,
+     renderer: Option<&'static str>,
+     media_type: String,
+     part: Part,
+diff --git a/src/ui/extensions/declarative/content.rs b/src/ui/extensions/declarative/content.rs
+index 132e2a4..692a252 100644
+--- a/src/ui/extensions/declarative/content.rs
++++ b/src/ui/extensions/declarative/content.rs
+@@ -17,10 +17,10 @@ use crate::ui::kit::Hint as _;
+ 
+ /// Enabled contributors in the user's extension order; the first claimant
+ /// wins a duplicate language registration deterministically.
+-pub(in crate::ui) fn languages(cx: &App) -> Vec<(String, &'static str)> {
++fn language_entries(cx: &App) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+     crate::ui::extensions::ordered(cx)
+         .into_iter()
+-        .filter(|manifest| crate::ui::extensions::is_enabled(manifest.id, cx))
++        .filter(move |manifest| crate::ui::extensions::is_enabled(manifest.id, cx))
+         .flat_map(|manifest| {
+             super::installed(manifest.id)
+                 .into_iter()
+@@ -29,17 +29,18 @@ pub(in crate::ui) fn languages(cx: &App) -> Vec<(String, &'static str)> {
+                     content
+                         .languages
+                         .iter()
+-                        .cloned()
+-                        .map(move |language| (language, manifest.id))
++                        .map(move |language| (language.as_str(), manifest.id))
+                 })
+         })
+-        .collect()
++}
++
++pub(in crate::ui) fn languages(cx: &App) -> Vec<(&'static str, &'static str)> {
++    language_entries(cx).collect()
+ }
+ 
+ pub(in crate::ui) fn language_renderer(language: &str, cx: &App) -> Option<&'static str> {
+-    languages(cx)
+-        .into_iter()
+-        .find(|(name, _)| name == language)
++    language_entries(cx)
++        .find(|(name, _)| *name == language)
+         .map(|(_, id)| id)
+ }
+ 
+@@ -67,7 +68,7 @@ fn populate_context(value: &mut serde_json::Value, cx: &App) {
+     let mut contributors = serde_json::Map::new();
+     for (language, id) in &languages {
+         contributors
+-            .entry(language.clone())
++            .entry((*language).to_owned())
+             .or_insert_with(|| serde_json::json!(id));
+     }
+     context.insert(
+diff --git a/src/ui/extensions/declarative/inline_content.rs b/src/ui/extensions/declarative/inline_content.rs
+index 49d9697..e6c0b90 100644
+--- a/src/ui/extensions/declarative/inline_content.rs
++++ b/src/ui/extensions/declarative/inline_content.rs
+@@ -46,7 +46,7 @@ impl Slots {
+         for specification in specifications {
+             let renderer = languages
+                 .iter()
+-                .find(|(language, _)| language == &specification.language)
++                .find(|(language, _)| *language == specification.language.as_str())
+                 .map(|(_, renderer)| *renderer);
+             if let Some(slot) = self.slots.get(&specification.id)
+                 && slot.language == specification.language
