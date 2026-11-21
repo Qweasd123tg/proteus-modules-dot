@@ -1,0 +1,87 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 8cad31e1622d6a27f6dc2b7f38694e8a15141f37..dbc8973cf33c10cef7d802754da424f94b340935 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -192,13 +192,20 @@ fn openai_client_metadata(
+     request: &CanonicalModelRequest,
+     profile: &OpenAiModelProfile,
+ ) -> Result<Option<Value>> {
+-    let mut metadata = profile.client_metadata.clone();
+-    metadata.extend(request.client_metadata.clone());
+-    if metadata.is_empty() {
+-        Ok(None)
+-    } else {
+-        Ok(Some(serde_json::to_value(metadata)?))
+-    }
++    let configured = &profile.client_metadata;
++    let request = &request.client_metadata;
++    let value = match (configured.is_empty(), request.is_empty()) {
++        (true, true) => return Ok(None),
++        (true, false) => serde_json::to_value(request)?,
++        (false, true) => serde_json::to_value(configured)?,
++        (false, false) => {
++            let mut merged = std::collections::BTreeMap::<&String, &String>::new();
++            merged.extend(configured);
++            merged.extend(request);
++            serde_json::to_value(merged)?
++        }
++    };
++    Ok(Some(value))
+ }
+ 
+ fn apply_openai_prompt_cache(
+diff --git a/model/model-pack/src/adapters/openai/request_tests.rs b/model/model-pack/src/adapters/openai/request_tests.rs
+index e3d572c6478ac3895fd069dcdefd2fc554ff3146..9312828ecea5ee40063d6fcdfa358ac1dc032923 100644
+--- a/model/model-pack/src/adapters/openai/request_tests.rs
++++ b/model/model-pack/src/adapters/openai/request_tests.rs
+@@ -70,6 +70,50 @@ fn moved_input_array_preserves_provider_json_bytes_and_order() {
+     assert_eq!(body.to_string(), expected.to_string());
+ }
+ 
++#[test]
++fn client_metadata_keeps_sorted_keys_and_request_overrides_profile() {
++    let profile = OpenAiModelProfile::from_provider_config(&json!({
++        "client_metadata": {"z_profile":"profile", "a_shared":"original"}
++    }))
++    .unwrap();
++    let mut request = CanonicalModelRequest::new(ModelRef::new("openai", "fixture"), vec![]);
++
++    let rendered = |request: &CanonicalModelRequest, profile: &OpenAiModelProfile| {
++        crate::adapters::openai::request::to_openai_request_with_cache(
++            request,
++            &OpenAiPromptCacheConfig::default(),
++            profile,
++        )
++        .unwrap()
++    };
++    let empty_profile = OpenAiModelProfile::from_provider_config(&json!({})).unwrap();
++    assert!(
++        rendered(&request, &empty_profile)
++            .get("client_metadata")
++            .is_none()
++    );
++    assert_eq!(
++        rendered(&request, &profile)["client_metadata"].to_string(),
++        r#"{"a_shared":"original","z_profile":"profile"}"#
++    );
++
++    request
++        .client_metadata
++        .insert("c_request".into(), "запрос 🦀".into());
++    request
++        .client_metadata
++        .insert("a_shared".into(), String::new());
++    assert_eq!(
++        rendered(&request, &empty_profile)["client_metadata"].to_string(),
++        r#"{"a_shared":"","c_request":"запрос 🦀"}"#
++    );
++    assert_eq!(
++        rendered(&request, &profile)["client_metadata"].to_string(),
++        r#"{"a_shared":"","c_request":"запрос 🦀","z_profile":"profile"}"#
++    );
++    assert_eq!(profile.client_metadata["a_shared"], "original");
++}
++
+ #[test]
+ fn request_preserves_instruction_order_and_file_content_without_mutating_source() {
+     let request = CanonicalModelRequest::new(
