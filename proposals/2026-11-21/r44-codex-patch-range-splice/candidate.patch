@@ -1,0 +1,62 @@
+diff --git a/tool/codex-patch/src/tests.rs b/tool/codex-patch/src/tests.rs
+index 3a1c919f1b3beaa0470030e6c59a857218ae90e6..e9cf22bbb1e11c539fa756167997566e6a0955a2 100644
+--- a/tool/codex-patch/src/tests.rs
++++ b/tool/codex-patch/src/tests.rs
+@@ -150,6 +150,35 @@ fn pure_insertions_and_multiple_chunks_use_original_indices() {
+     );
+ }
+ 
++#[test]
++fn eof_deletion_can_shorten_an_earlier_replacement_range() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("f");
++    fs::write(&path, "keep\nfirst\nlast\n").unwrap();
++    apply_patch(
++        &patch("*** Update File: f\n@@\n-first\n-last\n+new\n@@\n-last\n*** End of File"),
++        dir.path(),
++    )
++    .unwrap();
++    assert_eq!(fs::read_to_string(path).unwrap(), "keep\nnew\n");
++}
++
++#[test]
++fn equal_position_insertions_preserve_patch_order_before_final_blank_line() {
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("f");
++    fs::write(&path, "keep\n\n").unwrap();
++    apply_patch(
++        &patch("*** Update File: f\n@@\n+first\n+second\n@@\n+third\n+fourth"),
++        dir.path(),
++    )
++    .unwrap();
++    assert_eq!(
++        fs::read_to_string(path).unwrap(),
++        "keep\nfirst\nsecond\nthird\nfourth\n"
++    );
++}
++
+ #[test]
+ fn add_and_move_overwrite_destinations_and_summary_groups_operation_kinds() {
+     let dir = tempfile::tempdir().unwrap();
+diff --git a/tool/codex-patch/src/update.rs b/tool/codex-patch/src/update.rs
+index 3e5643a9101661c0f6984540dcd31053d092ec3d..4092c536226d83834565dc9536fe901538681beb 100644
+--- a/tool/codex-patch/src/update.rs
++++ b/tool/codex-patch/src/update.rs
+@@ -19,14 +19,9 @@ pub(super) fn contents(
+     // Descending order keeps the original indices valid, including equal-index
+     // insertion chunks. Do not apply chunks eagerly to the changing file.
+     for (start, old_len, new_lines) in replacements.into_iter().rev() {
+-        for _ in 0..old_len {
+-            if start < lines.len() {
+-                lines.remove(start);
+-            }
+-        }
+-        for (offset, line) in new_lines.into_iter().enumerate() {
+-            lines.insert(start + offset, line);
+-        }
++        // An overlapping EOF chunk applied above may have shortened this range.
++        let end = (start + old_len).min(lines.len());
++        lines.splice(start..end, new_lines);
+     }
+     if !lines.last().is_some_and(String::is_empty) {
+         lines.push(String::new());
