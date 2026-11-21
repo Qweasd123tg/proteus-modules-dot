@@ -1,0 +1,75 @@
+diff --git a/crates/tabs/src/geometry.rs b/crates/tabs/src/geometry.rs
+index 5e8bfa6..81b58ae 100644
+--- a/crates/tabs/src/geometry.rs
++++ b/crates/tabs/src/geometry.rs
+@@ -174,7 +174,7 @@ impl TabLayout {
+         if index + 1 >= split.children.len() {
+             return;
+         }
+-        let mut lengths = extents(&split.children, total);
++        let mut lengths: Vec<_> = extents(&split.children, total).collect();
+         let start: f32 = lengths[..index].iter().sum();
+         let before = lengths[index];
+         let requested = at - (start + before);
+diff --git a/crates/tabs/src/lock.rs b/crates/tabs/src/lock.rs
+index 0873b44..83197e3 100644
+--- a/crates/tabs/src/lock.rs
++++ b/crates/tabs/src/lock.rs
+@@ -44,7 +44,7 @@ impl TabLayout {
+         let Some(split) = self.root.split_at_mut(parent) else {
+             return;
+         };
+-        let lengths = extents(&split.children, total);
++        let lengths: Vec<_> = extents(&split.children, total).collect();
+         if locked {
+             split.children[ix].size = Size::Fixed(lengths[ix].max(1.));
+             // Someone has to take the rest: when no neighbour shares it, the
+@@ -162,7 +162,7 @@ fn room(node: &Node, path: &[usize], rect: Rect, gap: f32) -> Option<f32> {
+     let Some((&ix, rest)) = path.split_first() else {
+         return Some(total);
+     };
+-    let lengths = extents(&split.children, total);
++    let lengths: Vec<_> = extents(&split.children, total).collect();
+     let offset: f32 = lengths[..ix].iter().map(|len| len + gap).sum();
+     let part = match split.axis {
+         Axis::Row => Rect {
+diff --git a/crates/tabs/src/size.rs b/crates/tabs/src/size.rs
+index 0ab541f..6accbf7 100644
+--- a/crates/tabs/src/size.rs
++++ b/crates/tabs/src/size.rs
+@@ -38,7 +38,7 @@ impl Size {
+ /// Lengths of `children` along a split `total` pixels long: fixed children
+ /// get their pixels, shrunk together when they do not fit, and weighted
+ /// ones share the rest.
+-pub(super) fn extents(children: &[Child], total: f32) -> Vec<f32> {
++pub(super) fn extents(children: &[Child], total: f32) -> impl ExactSizeIterator<Item = f32> {
+     let fixed: f32 = children
+         .iter()
+         .map(|child| match child.size {
+@@ -53,13 +53,10 @@ pub(super) fn extents(children: &[Child], total: f32) -> Vec<f32> {
+     };
+     let rest = (total - fixed).max(0.);
+     let weights: f32 = children.iter().map(|child| child.size.weight()).sum();
+-    children
+-        .iter()
+-        .map(|child| match child.size {
+-            Size::Fixed(px) => px * scale,
+-            Size::Weight(weight) => rest * weight / weights,
+-        })
+-        .collect()
++    children.iter().map(move |child| match child.size {
++        Size::Fixed(px) => px * scale,
++        Size::Weight(weight) => rest * weight / weights,
++    })
+ }
+ 
+ /// Gives children the lengths `lengths`: fixed children among `changed`
+@@ -137,7 +134,7 @@ pub(super) fn hand_over<T>(entries: &mut [(Size, Option<T>)]) {
+ pub(super) fn merge(outer: Size, inner: Vec<Child>) -> impl Iterator<Item = Child> {
+     let weights: f32 = inner.iter().map(|child| child.size.weight()).sum();
+     let lengths = match outer {
+-        Size::Fixed(px) => extents(&inner, px),
++        Size::Fixed(px) => extents(&inner, px).collect(),
+         Size::Weight(_) => Vec::new(),
+     };
+     inner.into_iter().enumerate().map(move |(ix, child)| {
