@@ -1,0 +1,165 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 050f1ef..547be2d 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -7,6 +7,8 @@ use std::{
+ };
+ 
+ pub(crate) const MAX_STAGING_BYTES: u64 = 512 * 1024 * 1024;
++// Keep at most one small scratch buffer per request, not per open snapshot.
++const MAX_REUSABLE_LINE_CAPACITY: usize = 8 * 1024;
+ 
+ pub(crate) struct DisplayWriter {
+     writer: BufWriter<File>,
+@@ -67,14 +69,19 @@ pub(crate) struct DisplayRecords {
+ }
+ 
+ impl DisplayRecords {
+-    fn next(&mut self) -> Result<Option<(JournalRecord, usize)>> {
+-        let mut line = Vec::new();
+-        if self.reader.read_until(b'\n', &mut line)? == 0 {
++    fn next(&mut self, line: &mut Vec<u8>) -> Result<Option<(JournalRecord, usize)>> {
++        line.clear();
++        if self.reader.read_until(b'\n', line)? == 0 {
+             return Ok(None);
+         }
+         ensure!(line.ends_with(b"\n"), "incomplete display staging record");
+         let bytes = line.len() - 1;
+-        Ok(Some((serde_json::from_slice(&line)?, bytes)))
++        let record = serde_json::from_slice(line)?;
++        if line.capacity() > MAX_REUSABLE_LINE_CAPACITY {
++            // Large rows still release their temporary bytes before page assembly.
++            *line = Vec::new();
++        }
++        Ok(Some((record, bytes)))
+     }
+ 
+     pub fn page(
+@@ -93,12 +100,13 @@ impl DisplayRecords {
+         }
+         self.after = None;
+         let mut records = Vec::new();
++        let mut line = Vec::new();
+         let mut bytes = 0;
+         let mut finished = false;
+         while records.len() < limit as usize {
+             let next = match self.pending.take() {
+                 Some(record) => Some(record),
+-                None => self.next()?,
++                None => self.next(&mut line)?,
+             };
+             let Some((record, record_bytes)) = next else {
+                 finished = true;
+@@ -140,3 +148,61 @@ pub(crate) fn state_fits(state: &StorageResumeState) -> bool {
+     }
+     serde_json::to_writer(Limit(SESSION_STORAGE_MAX_DISPLAY_STATE_BYTES), state).is_ok()
+ }
++
++#[cfg(test)]
++#[test]
++fn display_line_scratch_reuses_small_capacity_but_releases_a_large_row() {
++    use proteus_contracts::{
++        domain::*,
++        model_standard::{CanonicalMessage, MessageRole},
++    };
++
++    let id = new_session_id();
++    let mut writer = DisplayWriter::new(MAX_STAGING_BYTES).unwrap();
++    for (index, size) in [100, 200, 64 * 1024, 300].into_iter().enumerate() {
++        writer
++            .push(&JournalRecord {
++                schema_version: JOURNAL_SCHEMA_VERSION,
++                record_id: new_record_id(),
++                session_id: id,
++                session_seq: index as u64 + 1,
++                timestamp_ms: 23,
++                execution_id: None,
++                thread_id: Some(new_thread_id()),
++                turn_id: None,
++                entry: JournalEntry::HistoryMutated(HistoryMutated {
++                    previous_revision: index as u64,
++                    new_revision: index as u64 + 1,
++                    mutation: HistoryMutationKind::Append,
++                    messages: vec![CanonicalMessage::text(MessageRole::User, "x".repeat(size))],
++                    compaction: None,
++                    tool_results: vec![],
++                }),
++            })
++            .unwrap();
++    }
++    let mut reader = writer.finish().unwrap();
++    reader.reader.rewind().unwrap();
++    let mut scratch = Vec::new();
++    let mut small_capacity = None;
++    for expected in 1..=4 {
++        let (record, bytes) = reader.next(&mut scratch).unwrap().unwrap();
++        assert_eq!(record.session_seq, expected);
++        assert_eq!(bytes, serde_json::to_vec(&record).unwrap().len());
++        if expected == 3 {
++            assert_eq!(scratch.capacity(), 0, "do not retain a large scratch");
++        } else {
++            assert_eq!(scratch.len(), bytes + 1);
++            assert!(scratch.capacity() <= MAX_REUSABLE_LINE_CAPACITY);
++            if expected == 1 {
++                // Ensure the second test row already fits the same allocation.
++                scratch.reserve(1024);
++                small_capacity = Some((scratch.as_ptr(), scratch.capacity()));
++            }
++            if expected == 2 {
++                assert_eq!(Some((scratch.as_ptr(), scratch.capacity())), small_capacity);
++            }
++        }
++    }
++    assert!(reader.next(&mut scratch).unwrap().is_none());
++}
+diff --git a/storage/session-storage/src/tests/display.rs b/storage/session-storage/src/tests/display.rs
+index 46fc3bd..88532c3 100644
+--- a/storage/session-storage/src/tests/display.rs
++++ b/storage/session-storage/src/tests/display.rs
+@@ -167,3 +167,46 @@ fn display_pages_reject_rewritten_fixed_prefix() {
+             .is_err()
+     );
+ }
++
++#[test]
++fn display_reuses_page_scratch_without_reordering_pending_rows() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("first small row")]);
++        for letter in ['А', 'Б', 'В'] {
++            f.append(vec![text(&letter.to_string().repeat(1024 * 1024))]);
++        }
++        f.append(vec![text("last small row")]);
++        let projection = open(&f);
++        let read = |after_seq| {
++            let req = SessionStorageRequest::ReadDisplayRecords {
++                snapshot: projection.snapshot.clone(),
++                after_seq,
++                limit: 64,
++            };
++            let response = f.service.execute(req.clone()).unwrap();
++            req.validate_response(&response).unwrap();
++            let SessionStorageResponse::Records { page } = response else {
++                panic!()
++            };
++            page
++        };
++        let seqs = |page: &StorageRecordPage| {
++            page.records
++                .iter()
++                .map(|r| r.session_seq)
++                .collect::<Vec<_>>()
++        };
++        let first = read(0);
++        assert_eq!(seqs(&first), [1, 2]);
++        assert_eq!(first.next_after_seq, Some(2));
++        let second = read(2);
++        assert_eq!(seqs(&second), [3]);
++        assert_eq!(second.next_after_seq, Some(3));
++        let final_page = read(3);
++        assert_eq!(seqs(&final_page), [4, 5]);
++        assert_eq!(final_page.next_after_seq, None);
++        assert_eq!(read(0), first);
++        assert_eq!(read(2), second);
++    }
++}
