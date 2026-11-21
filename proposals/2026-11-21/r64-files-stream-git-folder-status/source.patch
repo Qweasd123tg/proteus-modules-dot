@@ -1,0 +1,139 @@
+diff --git a/packages/files/src/git.rs b/packages/files/src/git.rs
+index e09ab89..9e01b36 100644
+--- a/packages/files/src/git.rs
++++ b/packages/files/src/git.rs
+@@ -66,8 +66,14 @@ impl Git {
+                 continue;
+             };
+             for parent in paths::parents(path) {
+-                let strongest = git.folders.entry(parent.to_owned()).or_insert(status);
+-                *strongest = (*strongest).max(status);
++                match git.folders.get_mut(parent) {
++                    // Ancestors already carry at least the status of this folder.
++                    Some(strongest) if *strongest >= status => break,
++                    Some(strongest) => *strongest = status,
++                    None => {
++                        git.folders.insert(parent.to_owned(), status);
++                    }
++                }
+             }
+         }
+         git
+@@ -119,6 +125,54 @@ mod tests {
+         assert!(git.restorable("src/b.rs") && !git.restorable("src/a/x.py"));
+     }
+ 
++    #[test]
++    fn folder_rollup_matches_full_walk_for_shared_and_lexical_parents() {
++        let rows = [
++            ("src//папка/a.rs", "modified"),
++            ("src//папка/b.rs", "added"),
++            ("src/other/c.rs", "deleted"),
++            ("src//папка/a.rs", "untracked"),
++            ("src//папка/b.rs", "conflict"),
++            ("src//папка/c.rs/", "renamed"),
++            ("src/other/c.rs", "ignored"),
++            ("src/other/no-status.rs", "unknown"),
++            ("src/flat.rs", ""),
++            ("root.rs", "untracked"),
++            ("../skipped.rs", "conflict"),
++            ("", "deleted"),
++            ("///", "deleted"),
++            ("/src/file.rs", "deleted"),
++        ];
++        for offset in 0..rows.len() {
++            let mut expected_files = HashMap::new();
++            let mut expected_folders = HashMap::new();
++            let entries: Vec<_> = rows
++                .iter()
++                .cycle()
++                .skip(offset)
++                .take(rows.len())
++                .map(|&(path, raw)| {
++                    if !path.is_empty() && !path.starts_with("../") {
++                        expected_files.insert(path.to_owned(), raw.to_owned());
++                        if let Some(status) = Status::parse(raw) {
++                            let mut parent = path.trim_end_matches('/');
++                            while !parent.is_empty() {
++                                parent = paths::parent(parent);
++                                let strongest =
++                                    expected_folders.entry(parent.to_owned()).or_insert(status);
++                                *strongest = (*strongest).max(status);
++                            }
++                        }
++                    }
++                    json!({"path": path, "status": raw})
++                })
++                .collect();
++            let git = Git::parse(&json!({"repository": true, "entries": entries}));
++            assert_eq!(git.files, expected_files, "offset {offset}");
++            assert_eq!(git.folders, expected_folders, "offset {offset}");
++        }
++    }
++
+     #[test]
+     fn tones_follow_zed_priority() {
+         assert_eq!(tone(Some(Status::Conflict), false), "warning");
+diff --git a/packages/files/src/paths.rs b/packages/files/src/paths.rs
+index 834fb14..c1e5b04 100644
+--- a/packages/files/src/paths.rs
++++ b/packages/files/src/paths.rs
+@@ -20,14 +20,15 @@ const LANGUAGES: &[(&str, &str)] = &[
+ ];
+ 
+ /// Ancestors from the nearest one up to the session folder: `a/b/c` → `a/b`, `a`, `""`.
+-pub fn parents(path: &str) -> Vec<&str> {
+-    let mut out = Vec::new();
++pub fn parents(path: &str) -> impl Iterator<Item = &str> {
+     let mut current = path.trim_end_matches('/');
+-    while !current.is_empty() {
++    std::iter::from_fn(move || {
++        if current.is_empty() {
++            return None;
++        }
+         current = parent(current);
+-        out.push(current);
+-    }
+-    out
++        Some(current)
++    })
+ }
+ 
+ pub fn parent(path: &str) -> &str {
+@@ -109,9 +110,12 @@ mod tests {
+ 
+     #[test]
+     fn parents_end_at_the_session_folder() {
+-        assert_eq!(parents("a/b/c"), ["a/b", "a", ""]);
+-        assert_eq!(parents("a"), [""]);
+-        assert!(parents("").is_empty());
++        assert!(parents("a/b/c").eq(["a/b", "a", ""]));
++        assert!(parents("a").eq([""]));
++        assert!(parents("папка//leaf///").eq(["папка/", "папка", ""]));
++        assert!(parents("/папка/leaf").eq(["/папка", ""]));
++        assert_eq!(parents("").next(), None);
++        assert_eq!(parents("///").next(), None);
+         assert_eq!(
+             (name("a/b.rs"), parent("a/b.rs"), parent("b")),
+             ("b.rs", "a", "")
+diff --git a/packages/files/src/tree.rs b/packages/files/src/tree.rs
+index 3acdfe8..a53f9f4 100644
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -285,7 +285,7 @@ impl Project {
+     /// Opens every folder above `path`.
+     pub fn reveal(&mut self, path: &str) {
+         self.expanded
+-            .extend(paths::parents(path).into_iter().map(str::to_owned));
++            .extend(paths::parents(path).map(str::to_owned));
+     }
+ 
+     /// Zed's `Развернуть всё`: every folder below `path`, within limits.
+@@ -295,7 +295,6 @@ impl Project {
+         if let Some(head) = self.heads.get(path) {
+             self.expanded.extend(
+                 paths::parents(path)
+-                    .into_iter()
+                     .take_while(|parent| paths::within(parent, head))
+                     .map(str::to_owned),
+             );
