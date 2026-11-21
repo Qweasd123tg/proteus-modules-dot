@@ -1,0 +1,137 @@
+diff --git a/packages/git/src/details.rs b/packages/git/src/details.rs
+index 367e28c88fa71da1b843b0ba72d95551cbc4f420..7f2655a3068e173f6ab37f97b619f385472e81fd 100644
+--- a/packages/git/src/details.rs
++++ b/packages/git/src/details.rs
+@@ -57,7 +57,8 @@ fn files_in(
+ 
+ impl Git {
+     pub(crate) fn graph_document(&mut self, host: &Host) -> Result<Vec<Value>> {
+-        let log = self.history(host, true)?;
++        self.ensure_history(host, true)?;
++        let log = self.graph.as_ref().expect("graph history was loaded");
+         if log.entries.is_empty() {
+             return Ok(vec![empty("Коммитов нет")]);
+         }
+diff --git a/packages/git/src/history.rs b/packages/git/src/history.rs
+index dfb3393c8bab8ce169274d9a0935210ae3dc8668..af5a689c0e2866b54587d10efa3153df9a11d391 100644
+--- a/packages/git/src/history.rs
++++ b/packages/git/src/history.rs
+@@ -182,33 +182,34 @@ impl Git {
+     fn fetch_log(host: &Host, all: bool, skip: usize) -> Result<Log> {
+         let (limit, skip) = (PAGE.to_string(), skip.to_string());
+         let all = if all { "true" } else { "false" };
+-        let page = host.api(
++        let mut page = host.api(
+             "/workspace/log",
+             &[("limit", &limit), ("skip", &skip), ("all", all)],
+         )?;
+-        Ok(Log {
+-            entries: page.list("entries").to_vec(),
+-            more: page.bool("has_more"),
+-        })
++        let more = page.bool("has_more");
++        let entries = match page.get_mut("entries").map(Value::take) {
++            Some(Value::Array(entries)) => entries,
++            _ => Vec::new(),
++        };
++        Ok(Log { entries, more })
+     }
+ 
+-    /// History of the current branch, or of every ref with `all`.
+-    pub fn history(&mut self, host: &Host, all: bool) -> Result<Log> {
+-        let slot = if all { &self.graph } else { &self.log };
+-        if let Some(log) = slot {
+-            return Ok(log.clone());
++    /// Load history for the current branch or, with `all`, every ref.
++    pub fn ensure_history(&mut self, host: &Host, all: bool) -> Result<()> {
++        let slot = if all { &mut self.graph } else { &mut self.log };
++        if slot.is_none() {
++            *slot = Some(Self::fetch_log(host, all, 0)?);
+         }
+-        let log = Self::fetch_log(host, all, 0)?;
+-        *(if all { &mut self.graph } else { &mut self.log }) = Some(log.clone());
+-        Ok(log)
++        Ok(())
+     }
+ 
+     pub fn more(&mut self, host: &Host, all: bool) -> Result {
+-        let mut log = self.history(host, all)?;
++        self.ensure_history(host, all)?;
++        let slot = if all { &mut self.graph } else { &mut self.log };
++        let log = slot.as_mut().expect("history was loaded");
+         let page = Self::fetch_log(host, all, log.entries.len())?;
+         log.entries.extend(page.entries);
+         log.more = page.more;
+-        *(if all { &mut self.graph } else { &mut self.log }) = Some(log);
+         Ok(())
+     }
+ 
+diff --git a/packages/git/src/main.rs b/packages/git/src/main.rs
+index f008ca054e95694f68c90bc99b6b2448694bb348..4381a252b6529eb4b57f47d1ea47363dc08af397 100644
+--- a/packages/git/src/main.rs
++++ b/packages/git/src/main.rs
+@@ -25,7 +25,7 @@ const REMOTE: Duration = Duration::from_secs(130);
+ const HOOKS: Duration = Duration::from_secs(120);
+ 
+ /// Loaded pages of `/workspace/log`.
+-#[derive(Clone, Debug, Default)]
++#[derive(Debug, Default)]
+ pub struct Log {
+     pub entries: Vec<Value>,
+     pub more: bool,
+diff --git a/packages/git/src/panel.rs b/packages/git/src/panel.rs
+index 89f512e8e8e1f7c5fb7057e998b4eb06bbe0f02e..0625c1063ad8617866b96245b9f41e2652b0ebbd 100644
+--- a/packages/git/src/panel.rs
++++ b/packages/git/src/panel.rs
+@@ -407,9 +407,10 @@ impl Git {
+         if self.tabs.get(view).copied().unwrap_or(0) != 1 {
+             return vec![proteus_extension::ui::loading("Загрузка истории…")];
+         }
+-        let Ok(log) = self.history(host, false) else {
++        if self.ensure_history(host, false).is_err() {
+             return vec![empty("Не удалось загрузить историю коммитов")];
+-        };
++        }
++        let log = self.log.as_ref().expect("branch history was loaded");
+         if log.entries.is_empty() {
+             return vec![empty("Коммитов пока нет")];
+         }
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 8922950c543a77a17fc08be0d294d329fd3d82e8..f74237bbce93f135b2faa12ff8313bac813db3f8 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -164,6 +164,34 @@ fn button<'a>(all: &'a [Value], action: &str) -> &'a Value {
+         .unwrap()
+ }
+ 
++#[test]
++fn pagination_preserves_the_owned_history_on_success_and_error() {
++    let mut fake = Fake::new();
++    fake.git.ensure_history(&fake.host, false).unwrap();
++    let summary = fake.git.log.as_ref().unwrap().entries[0]
++        .str("summary")
++        .as_ptr();
++    fake.fail.store(true, Ordering::SeqCst);
++    assert!(fake.git.more(&fake.host, false).is_err());
++    let log = fake.git.log.as_ref().unwrap();
++    assert!(log.more);
++    assert_eq!(log.entries.len(), 1);
++    assert_eq!(log.entries[0].str("summary").as_ptr(), summary);
++
++    fake.fail.store(false, Ordering::SeqCst);
++    fake.responses.lock().unwrap().insert(
++        "/workspace/log".into(),
++        json!({"has_more":false,"entries":[{"hash":"older","summary":"старый"}]}),
++    );
++    fake.git.more(&fake.host, false).unwrap();
++    let log = fake.git.log.as_ref().unwrap();
++    assert!(!log.more);
++    assert_eq!(log.entries.len(), 2);
++    assert_eq!(log.entries[1].str("summary"), "старый");
++    assert_eq!(log.entries[0].str("summary").as_ptr(), summary);
++    assert!(fake.git.graph.is_none());
++}
++
+ #[test]
+ fn remote_operations_and_explicit_refresh_reload_branches_with_an_unchanged_head() {
+     for action in ["fetch", "push", "refresh"] {
