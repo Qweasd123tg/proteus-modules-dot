@@ -1,0 +1,143 @@
+diff --git a/context/context-pack/src/lib.rs b/context/context-pack/src/lib.rs
+index 793dcb3..98540ab 100644
+--- a/context/context-pack/src/lib.rs
++++ b/context/context-pack/src/lib.rs
+@@ -460,7 +460,7 @@ fn retag_context_chunks(
+         if let Some(rest) = chunk.source.strip_prefix(from_prefix) {
+             chunk.source = format!("{to_prefix}{rest}");
+         }
+-        chunk.metadata = metadata_with(chunk.metadata.clone(), "context_profile", json!(to_prefix));
++        chunk.metadata = metadata_with(chunk.metadata.take(), "context_profile", json!(to_prefix));
+     }
+     chunks
+ }
+diff --git a/context/context-pack/src/retrieval.rs b/context/context-pack/src/retrieval.rs
+index 871264c..55cd3a3 100644
+--- a/context/context-pack/src/retrieval.rs
++++ b/context/context-pack/src/retrieval.rs
+@@ -15,7 +15,7 @@ pub(super) fn memory_chunks(
+     for chunk in &mut chunks {
+         chunk.source = format!("repo_aware:{}", chunk.source);
+         chunk.score = Some(0.7);
+-        chunk.metadata = metadata("memory", "memory recall", chunk.metadata.clone());
++        chunk.metadata = metadata("memory", "memory recall", chunk.metadata.take());
+     }
+     Ok(chunks)
+ }
+@@ -63,7 +63,7 @@ pub(super) fn search_chunks(
+             chunk.metadata = metadata(
+                 "search",
+                 "search result",
+-                metadata_with(chunk.metadata.clone(), "query", json!(query)),
++                metadata_with(chunk.metadata.take(), "query", json!(query)),
+             );
+             chunks.push(chunk);
+             if chunks.len() >= config.max_search_results {
+diff --git a/context/context-pack/src/tests.rs b/context/context-pack/src/tests.rs
+index 7102983..9fe6e20 100644
+--- a/context/context-pack/src/tests.rs
++++ b/context/context-pack/src/tests.rs
+@@ -332,3 +332,103 @@ fn extract_search_queries_splits_filenames_before_selecting_terms() {
+     );
+     assert_eq!(extract_search_queries(" lib.rs "), vec!["lib.rs"]);
+ }
++
++#[test]
++fn provider_enrichment_preserves_metadata_precedence_and_non_object_handling() {
++    use proteus_contracts::{
++        contracts::ExecutionAttribution,
++        domain::{AgentTask, new_execution_id},
++        process_module::{ContextBuilderModuleHost, ProcessModuleResult},
++    };
++
++    struct FixtureHost;
++    impl ContextBuilderModuleHost for FixtureHost {
++        fn context_provider_json(
++            &self,
++            provider_id: String,
++            request: String,
++        ) -> ProcessModuleResult<String> {
++            let request: ProcessContextProviderInput = serde_json::from_str(&request).unwrap();
++            assert_eq!(request.provider_id, provider_id);
++            let object = json!({
++                "provider": "provided",
++                "reason": "from fixture",
++                "query": "stale",
++                "context_profile": "original",
++                "nested": {"examples": ["Пример🙂", null, 17]}
++            });
++            let chunks = match provider_id.as_str() {
++                "memory-fixture" => vec![
++                    ContextChunk::new("memory:fact", "object").with_metadata(object),
++                    ContextChunk::new("memory:preference", "array").with_metadata(json!([1, 2])),
++                ],
++                "search-fixture" => vec![
++                    ContextChunk::new("rg", "matched line")
++                        .with_path("src/fixture.rs".into())
++                        .with_metadata(object),
++                    ContextChunk::new("rg", "matched line")
++                        .with_path("src/fixture.rs".into())
++                        .with_metadata(json!({"should_be_deduped": true})),
++                ],
++                "external-fixture" => vec![
++                    ContextChunk::new("other", "scalar").with_metadata(json!("text")),
++                    ContextChunk::new("repo_aware:other", "external object").with_metadata(object),
++                ],
++                _ => panic!("unexpected fixture provider {provider_id}"),
++            };
++            Ok(serde_json::to_string(&chunks).unwrap())
++        }
++    }
++
++    let config = json!({
++        "providers": ["memory", "search", "external-fixture"],
++        "memory_provider": "memory-fixture",
++        "search_provider": "search-fixture",
++    });
++    let input = serde_json::to_string(&ContextBuilderModuleInput {
++        task: AgentTask::new("needle", PathBuf::from("fixture")),
++        attribution: ExecutionAttribution::detached(new_execution_id()),
++        config,
++    })
++    .unwrap();
++
++    let codex: ContextBundle = serde_json::from_str(
++        &CodexContextBuilderModule
++            .build_json(input.clone(), &mut FixtureHost)
++            .unwrap(),
++    )
++    .unwrap();
++    let repo: ContextBundle = serde_json::from_str(
++        &RepoAwareContextBuilderModule
++            .build_json(input, &mut FixtureHost)
++            .unwrap(),
++    )
++    .unwrap();
++    let expected = json!({
++        "provider": "provided",
++        "reason": "from fixture",
++        "query": "stale",
++        "context_profile": "codex_context",
++        "nested": {"examples": ["Пример🙂", null, 17]}
++    });
++    assert_eq!(codex.chunks.len(), 5);
++    assert_eq!(codex.chunks[0].metadata, expected);
++    assert_eq!(
++        codex.chunks[1].metadata,
++        json!({"provider": "memory", "reason": "memory recall", "context_profile": "codex_context"})
++    );
++    assert_eq!(codex.chunks[2].metadata["query"], "needle");
++    assert_eq!(codex.chunks[2].metadata["provider"], "provided");
++    assert_eq!(codex.chunks[2].metadata["nested"], expected["nested"]);
++    assert_eq!(
++        codex.chunks[3].metadata,
++        json!({"context_profile": "codex_context"})
++    );
++    assert_eq!(codex.chunks[4].source, "codex_context:other");
++    assert_eq!(codex.chunks[4].metadata, expected);
++    assert_eq!(repo.chunks.len(), 6);
++    assert_eq!(repo.chunks[1].metadata["context_profile"], "original");
++    assert_eq!(repo.chunks[3].metadata["query"], "needle");
++    assert_eq!(repo.chunks[4].metadata, "text");
++    assert_eq!(repo.chunks[5].metadata["context_profile"], "original");
++}
