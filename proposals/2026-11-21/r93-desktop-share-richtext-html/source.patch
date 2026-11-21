@@ -1,0 +1,97 @@
+diff --git a/src/declarative/widget.rs b/src/declarative/widget.rs
+index 67e6b2a..cca481d 100644
+--- a/src/declarative/widget.rs
++++ b/src/declarative/widget.rs
+@@ -177,7 +177,8 @@ pub enum Node {
+     /// Native selectable HTML text; parsing Markdown belongs to the producer.
+     RichText {
+         id: String,
+-        html: String,
++        #[serde(deserialize_with = "rich_html")]
++        html: std::sync::Arc<String>,
+         /// Atomic content slots referenced by HTML `data-content` attributes.
+         #[serde(default)]
+         inlines: Vec<InlineContent>,
+@@ -527,6 +528,13 @@ fn muted() -> Tone {
+     Tone::Muted
+ }
+ 
++/// Decode the same required HTML string and share it with the native update guard.
++fn rich_html<'de, D: serde::Deserializer<'de>>(
++    d: D,
++) -> std::result::Result<std::sync::Arc<String>, D::Error> {
++    String::deserialize(d).map(std::sync::Arc::new)
++}
++
+ pub(super) fn known_icon(name: Option<&str>) -> Result<()> {
+     match name {
+         Some(name) if super::icons::lucide(name).is_none() => {
+diff --git a/src/ui/extensions/declarative/content/tests.rs b/src/ui/extensions/declarative/content/tests.rs
+index 5a029cd..6ddc239 100644
+--- a/src/ui/extensions/declarative/content/tests.rs
++++ b/src/ui/extensions/declarative/content/tests.rs
+@@ -149,7 +149,7 @@ fn native_rich_text_prepares_behind_fallback_and_keeps_ready_replacements_visibl
+             view.show(
+                 Node::RichText {
+                     id: id.into(),
+-                    html: html.into(),
++                    html: std::sync::Arc::new(html.into()),
+                     inlines: vec![],
+                 },
+                 0,
+diff --git a/src/ui/extensions/declarative/rich_text.rs b/src/ui/extensions/declarative/rich_text.rs
+index d4090e5..8ed5919 100644
+--- a/src/ui/extensions/declarative/rich_text.rs
++++ b/src/ui/extensions/declarative/rich_text.rs
+@@ -5,10 +5,11 @@ use super::{code_block, content::ContentView, view::DeclarativeView};
+ use gpui_kit::component::text::{TextView, TextViewState};
+ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
++use std::sync::Arc;
+ 
+ pub(super) struct RichText {
+     state: Entity<TextViewState>,
+-    html: String,
++    html: Arc<String>,
+     slots: super::inline_content::Slots,
+     _changed: Subscription,
+ }
+@@ -18,21 +19,22 @@ impl RichText {
+         self.state.read(cx).is_ready()
+     }
+ 
+-    fn new(html: &str, cx: &mut Context<DeclarativeView>) -> Self {
+-        let state = cx.new(|cx| TextViewState::html(html, cx).scrollable(false));
++    fn new(html: &Arc<String>, cx: &mut Context<DeclarativeView>) -> Self {
++        let state = cx.new(|cx| TextViewState::html(html.as_str(), cx).scrollable(false));
+         let changed = cx.observe(&state, |_, _, cx| cx.notify());
+         Self {
+             state,
+-            html: html.into(),
++            html: Arc::clone(html),
+             slots: super::inline_content::Slots::default(),
+             _changed: changed,
+         }
+     }
+ 
+-    fn set_html(&mut self, html: &str, cx: &mut Context<DeclarativeView>) {
+-        if self.html != html {
+-            self.html = html.into();
+-            self.state.update(cx, |state, cx| state.set_text(html, cx));
++    fn set_html(&mut self, html: &Arc<String>, cx: &mut Context<DeclarativeView>) {
++        if self.html.as_str() != html.as_str() {
++            self.html = Arc::clone(html);
++            self.state
++                .update(cx, |state, cx| state.set_text(html.as_str(), cx));
+         }
+     }
+ 
+@@ -79,7 +81,7 @@ impl DeclarativeView {
+     pub(super) fn prepare_rich_text(
+         &mut self,
+         id: &str,
+-        html: &str,
++        html: &Arc<String>,
+         inlines: &[crate::declarative::widget::InlineContent],
+         window: &mut Window,
+         cx: &mut Context<Self>,
