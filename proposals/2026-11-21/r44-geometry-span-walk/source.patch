@@ -1,0 +1,72 @@
+diff --git a/src/ui/chat/scroller/scrollbar/height_map.rs b/src/ui/chat/scroller/scrollbar/height_map.rs
+index 90f62b8..64d688e 100644
+--- a/src/ui/chat/scroller/scrollbar/height_map.rs
++++ b/src/ui/chat/scroller/scrollbar/height_map.rs
+@@ -313,6 +313,16 @@ impl HeightMap {
+             .map(|span| span.height())
+     }
+ 
++    /// Seek once for a contiguous window. The first span may start before it.
++    pub fn estimates_from(&self, row: usize) -> impl Iterator<Item = f64> + '_ {
++        let mut cursor = self.tree.cursor::<Position>(());
++        cursor.seek(&Row(row), Bias::Right);
++        let mut skip = row - cursor.start().rows;
++        cursor.flat_map(move |span| {
++            std::iter::repeat_n(span.height(), span.rows - std::mem::take(&mut skip))
++        })
++    }
++
+     /// Locate a global row without materializing its message or widget.
+     /// Zero-height runs have no pixel interval and are skipped to the right.
+     pub fn target(&self, pixel: f64) -> Option<(usize, f64)> {
+diff --git a/src/ui/chat/scroller/scrollbar/geometry.rs b/src/ui/chat/scroller/scrollbar/geometry.rs
+index 407a3db..329df11 100644
+--- a/src/ui/chat/scroller/scrollbar/geometry.rs
++++ b/src/ui/chat/scroller/scrollbar/geometry.rs
+@@ -312,10 +312,10 @@ impl Geometry {
+                 self.prefix.push(0.);
+                 let mut height = 0.;
+                 self.resident_delta = 0.;
+-                for (ix, value) in self.heights.iter().enumerate() {
+-                    let estimate = map
+-                        .estimate(range.start + ix)
+-                        .unwrap_or(f64::from(f32::from(self.estimate)));
++                let estimates = map
++                    .estimates_from(range.start)
++                    .chain(std::iter::repeat(f64::from(f32::from(self.estimate))));
++                for (value, estimate) in self.heights.iter().zip(estimates) {
+                     let value = value
+                         .map(|height| f64::from(f32::from(height)))
+                         .unwrap_or(estimate);
+diff --git a/src/ui/chat/scroller/scrollbar/height_map/tests.rs b/src/ui/chat/scroller/scrollbar/height_map/tests.rs
+index d7fe671..d3476ef 100644
+--- a/src/ui/chat/scroller/scrollbar/height_map/tests.rs
++++ b/src/ui/chat/scroller/scrollbar/height_map/tests.rs
+@@ -277,3 +277,27 @@ fn the_last_approximate_row_and_facts_exceeding_the_aggregate_can_change_extent(
+     map.set(1, 90.);
+     assert_eq!(map.total_height(), 240.);
+ }
++
++#[test]
++fn window_estimates_match_point_queries_across_span_boundaries() {
++    fn check(map: &HeightMap) {
++        for start in 0..=map.total_rows() + 1 {
++            let expected: Vec<_> = (start..map.total_rows())
++                .map(|row| map.estimate(row).unwrap())
++                .collect();
++            assert_eq!(map.estimates_from(start).collect::<Vec<_>>(), expected);
++        }
++    }
++    let mut map = HeightMap::new(0, 80.);
++    check(&map);
++    map.resize(32);
++    map.set(3, 0.);
++    map.set(4, 0.);
++    map.set(7, 140.);
++    map.invalidate(7..8);
++    map.set(19, 33.);
++    map.set(22, 123.);
++    check(&map);
++    assert!(map.compact(16..32, 3));
++    check(&map);
++}
