@@ -1,0 +1,19 @@
+# Desktop: encode image attachments only when sent
+
+This production patch targets Proteus Desktop at `b6a7ec2d8d7e486c8aba01291aa8c89774c4cded`. The same patch also applies cleanly after sealed M150 and the Desktop changes through #408. It needs no dependency, schema, image budget, or Core change.
+
+An unsent attachment used to keep both its raw preview bytes and a standalone base64 copy. Now the draft, preview and saved-on-failure draft retain only the same immutable raw image and its name. The existing background worker uses the contract encoder immediately before dispatch; the desktop supplies ordered names to the existing send receipt logic without needing to encode. Admission still uses the same remaining-byte, image-count and magic-format checks in the same order. The wire fields, request ID, attachment order, optimistic echo and refusal restoration are unchanged.
+
+## Focused evidence
+
+Four offline headless runs (stock and cumulative, each before and after) built the same small exact-source probe using 125 confirmed locked Desktop dependency identities. The verifier checked Cargo's fresh executable artifact path and hash, the case input bytes, and the exact applied source. It executed the original admission, attachment, receipt and extracted send/restore code over small native/HTTP substitutes, using the pinned Contracts serializer. These are not native GPUI, actual network, full-workspace or process-memory results.
+
+* A two-image fixture fills the existing 5 MiB budget. At both the active draft and the saved failed-draft boundary, raw image payload remained 5,242,880 bytes and had the same backing within each draft lifecycle. Separately retained base64 fell from 6,990,512 bytes to zero at either boundary. Do not sum these observations across boundaries: they describe the same draft.
+* The four recorded typed send bodies per run (two hard-limit attempts plus two image-only receipt controls) matched byte for byte and totaled 13,982,118 bytes with the fixture's LF framing. SHA-256: `45376ea8c52e744447d4941c66ee36d4ee49849c49b8ca323318586abac20e09`. Same name, ordered images, MIME, data, request ID and original draft restoration. A retry sent the originally admitted image even after the source file was replaced.
+* Parity covered PNG/JPEG/GIF/WebP magic validation, inclusive byte limit and invalid-format-vs-over-limit precedence, count guard, previews retaining the admitted bytes, refusal/restore with a second editor draft, ordered image-only submissions, observed-error handling, and existing empty/loading/disconnected/read-only/Codex guards. Native image decoding was not exercised.
+
+Sending still allocates the encoded request and may also allocate while serializing it. Each actual send or retry encodes again; the improvement is deletion of the *retained draft copy*, not all send peak or a latency/interleaving claim. No runtime diagnostics are added to production. The generated request bodies are not distributed; the packet has only deterministic synthetic generators and digests.
+
+## Verify
+
+From the packet directory, `sha256sum -c SHA256SUMS` checks the bundled patch, source projector and evidence. `bash verify.sh --prepare WORKSPACE_WITH_PINNED_INPUTS` checks exact sealed input identities, both patch stacks, unchanged source neighborhoods, format and locked dependency identities without building. For `--run`, supply the explicitly admitted locked offline warm cache/target and shared lock via `CARGO_HOME`, `CARGO_TARGET_DIR`, `R86_BUILD_LOCK` and a fresh private output directory via `R86_RAW_CARGO_DIR`. The runner admits one Cargo job with minimum target/temporary reserves and bounded growth; it does not fetch dependencies. `cargo-provenance.json` is the sanitized artifact and request-identity record, `behavior.trace` is the common trace and `work.log` the measured payload ownership.

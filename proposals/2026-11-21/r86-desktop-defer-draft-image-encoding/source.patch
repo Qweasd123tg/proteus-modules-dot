@@ -1,0 +1,231 @@
+diff --git a/src/ui/chat/actions.rs b/src/ui/chat/actions.rs
+index 5014b83..c1ae7f1 100644
+--- a/src/ui/chat/actions.rs
++++ b/src/ui/chat/actions.rs
+@@ -108,7 +108,7 @@ impl Chat {
+         let request = SendRequest {
+             id: Some(format!("run-{}", uuid::Uuid::new_v4().simple())),
+             text: text.clone(),
+-            images: draft.images(),
++            images: Vec::new(),
+             options: RunOptions::default(),
+             session_dir: self.session.dir.clone(),
+         };
+@@ -119,9 +119,12 @@ impl Chat {
+             .as_ref()
+             .map(|pending| pending.queued_user_messages.as_slice())
+             .unwrap_or_default();
+-        self.session
+-            .feedback
+-            .begin(request_id.clone(), text.clone(), &request.images, queued);
++        self.session.feedback.begin_with_names(
++            request_id.clone(),
++            text.clone(),
++            draft.image_names(),
++            queued,
++        );
+         self.composer.update(cx, |state, cx| {
+             state.clean(window, cx);
+             state.focus(window, cx);
+@@ -133,10 +136,18 @@ impl Chat {
+         let Some(api) = self.api.clone() else {
+             return;
+         };
++        let images = draft.images();
+         cx.spawn(async move |this, cx| {
+             let result = cx
+                 .background_executor()
+-                .spawn(async move { api.send(&request) })
++                .spawn(async move {
++                    let mut request = request;
++                    request.images = images
++                        .into_iter()
++                        .map(|image| image.encode())
++                        .collect::<anyhow::Result<_>>()?;
++                    api.send(&request)
++                })
+                 .await;
+             let Ok(owner) = this.read_with(cx, |this, _| this.window_handle) else {
+                 return;
+diff --git a/src/ui/chat/attachment_io.rs b/src/ui/chat/attachment_io.rs
+index 3fac726..2b30354 100644
+--- a/src/ui/chat/attachment_io.rs
++++ b/src/ui/chat/attachment_io.rs
+@@ -3,7 +3,7 @@
+ use std::io::Read as _;
+ use std::path::{Path, PathBuf};
+ 
+-use proteus_contracts::domain::{ImageAttachment, image_mime_type};
++use proteus_contracts::domain::{MAX_IMAGE_BYTES, image_mime_type};
+ 
+ #[derive(Clone, Copy)]
+ pub(super) struct Budget {
+@@ -17,7 +17,8 @@ pub(super) enum Source {
+ }
+ 
+ pub(super) struct Prepared {
+-    pub image: ImageAttachment,
++    pub name: String,
++    pub mime_type: &'static str,
+     pub bytes: Vec<u8>,
+ }
+ 
+@@ -28,9 +29,16 @@ pub(super) struct Batch {
+ }
+ 
+ pub(super) fn prepare(name: String, bytes: Vec<u8>) -> Result<Prepared, String> {
+-    let image = ImageAttachment::from_bytes(name.clone(), &bytes)
+-        .map_err(|error| format!("{name}: {error}"))?;
+-    Ok(Prepared { image, bytes })
++    if bytes.len() > MAX_IMAGE_BYTES {
++        return Err(format!("{name}: image exceeds 5 MiB"));
++    }
++    let mime_type =
++        image_mime_type(&bytes).ok_or_else(|| format!("{name}: unsupported image format"))?;
++    Ok(Prepared {
++        name,
++        mime_type,
++        bytes,
++    })
+ }
+ 
+ pub(super) fn read_batch(sources: Vec<Source>, mut budget: Budget) -> Batch {
+diff --git a/src/ui/chat/attachments.rs b/src/ui/chat/attachments.rs
+index 6d958c0..b032efb 100644
+--- a/src/ui/chat/attachments.rs
++++ b/src/ui/chat/attachments.rs
+@@ -17,12 +17,19 @@ use crate::ui::{kit, prefs};
+ 
+ const THUMB: f32 = 56.;
+ 
+-/// An image of the draft with the bytes its preview decodes.
++/// One immutable raw image for the preview, failed draft and send worker.
++#[derive(Clone)]
+ pub(super) struct Attachment {
+-    image: ImageAttachment,
++    name: String,
+     preview: Arc<Image>,
+ }
+ 
++impl Attachment {
++    pub(super) fn encode(self) -> anyhow::Result<ImageAttachment> {
++        ImageAttachment::from_bytes(self.name, &self.preview.bytes)
++    }
++}
++
+ #[derive(Default)]
+ pub(super) struct Attachments {
+     items: Vec<Attachment>,
+@@ -37,8 +44,12 @@ impl Attachments {
+         self.items.len()
+     }
+ 
+-    pub fn images(&self) -> Vec<ImageAttachment> {
+-        self.items.iter().map(|item| item.image.clone()).collect()
++    pub(super) fn images(&self) -> Vec<Attachment> {
++        self.items.clone()
++    }
++
++    pub(super) fn image_names(&self) -> Vec<String> {
++        self.items.iter().map(|item| item.name.clone()).collect()
+     }
+ 
+     fn budget(&self) -> Budget {
+@@ -62,9 +73,12 @@ impl Attachments {
+     }
+ 
+     fn add_prepared(&mut self, prepared: Prepared) -> Result<(), String> {
+-        let Prepared { image, bytes } = prepared;
+-        let name = &image.name;
+-        let format = ImageFormat::from_mime_type(&image.mime_type)
++        let Prepared {
++            name,
++            mime_type,
++            bytes,
++        } = prepared;
++        let format = ImageFormat::from_mime_type(mime_type)
+             .ok_or_else(|| format!("{name}: поддерживаются PNG, JPEG, WebP и GIF"))?;
+         if self.items.len() >= MAX_INPUT_IMAGES {
+             return Err(format!(
+@@ -76,7 +90,7 @@ impl Attachments {
+             return Err(format!("{name}: изображения сообщения вместе больше 5 МиБ"));
+         }
+         self.items.push(Attachment {
+-            image,
++            name,
+             preview: Arc::new(Image::from_bytes(format, bytes)),
+         });
+         Ok(())
+@@ -242,7 +256,7 @@ impl Chat {
+                     .relative()
+                     .size(prefs::scaled(THUMB))
+                     .frame(cx)
+-                    .tip_text(item.image.name.clone())
++                    .tip_text(item.name.clone())
+                     .child(
+                         img(item.preview.clone())
+                             .size_full()
+@@ -309,7 +323,11 @@ mod tests {
+             .add("fits.png".into(), png(MAX_IMAGE_BYTES - 48))
+             .unwrap();
+ 
+-        let images = draft.images();
++        let images: Vec<_> = draft
++            .images()
++            .into_iter()
++            .map(|image| image.encode().unwrap())
++            .collect();
+         assert_eq!(images.len(), MAX_INPUT_IMAGES);
+         assert_eq!(images[0].mime_type, "image/png");
+     }
+diff --git a/src/ui/chat/feedback/mod.rs b/src/ui/chat/feedback/mod.rs
+index 43572d3..ed938c0 100644
+--- a/src/ui/chat/feedback/mod.rs
++++ b/src/ui/chat/feedback/mod.rs
+@@ -6,7 +6,7 @@
+ use std::collections::HashSet;
+ 
+ use proteus_contracts::app_protocol::{AppExecutionState, AppQueuedUserMessage, AppRunStatus};
+-use proteus_contracts::domain::{Event, ImageAttachment, ImageRef, MessageId};
++use proteus_contracts::domain::{Event, ImageRef, MessageId};
+ 
+ #[derive(Default)]
+ pub(super) struct Feedback {
+@@ -35,17 +35,34 @@ enum Phase {
+ }
+ 
+ impl Feedback {
+-    pub fn begin(
++    // Exercise the same receipt path from the existing wire-oriented tests.
++    #[cfg(test)]
++    fn begin(
++        &mut self,
++        id: String,
++        text: String,
++        images: &[proteus_contracts::domain::ImageAttachment],
++        queued: &[AppQueuedUserMessage],
++    ) {
++        self.begin_with_names(
++            id,
++            text,
++            images.iter().map(|image| image.name.clone()).collect(),
++            queued,
++        );
++    }
++
++    pub fn begin_with_names(
+         &mut self,
+         id: String,
+         text: String,
+-        images: &[ImageAttachment],
++        images: Vec<String>,
+         queued: &[AppQueuedUserMessage],
+     ) {
+         self.sends.push(PendingSend {
+             id,
+             text,
+-            images: images.iter().map(|image| image.name.clone()).collect(),
++            images,
+             accepted: false,
+             observed: false,
+             message_id: None,
