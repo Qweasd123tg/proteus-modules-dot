@@ -1,0 +1,171 @@
+diff --git a/crates/diff/src/lib.rs b/crates/diff/src/lib.rs
+index 390f47b..608a292 100644
+--- a/crates/diff/src/lib.rs
++++ b/crates/diff/src/lib.rs
+@@ -57,7 +57,25 @@ pub struct File {
+     pub added: usize,
+     pub removed: usize,
+     /// Exactly the input block, including Git metadata and newline markers.
+-    pub patch: String,
++    pub patch: FilePatch,
++}
++
++/// Raw clipboard text for this file, independently owned from its parsed lines.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct FilePatch(Option<std::sync::Arc<String>>);
++
++impl FilePatch {
++    fn new(text: String) -> Self {
++        Self((!text.is_empty()).then(|| std::sync::Arc::new(text)))
++    }
++
++    pub fn as_str(&self) -> &str {
++        self.0.as_deref().map_or("", String::as_str)
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.0.is_none()
++    }
+ }
+ 
+ impl File {
+diff --git a/crates/diff/src/parse.rs b/crates/diff/src/parse.rs
+index d0f9db5..1487858 100644
+--- a/crates/diff/src/parse.rs
++++ b/crates/diff/src/parse.rs
+@@ -1,7 +1,8 @@
+-use super::{File, Kind, Line};
++use super::{File, FilePatch, Kind, Line};
+ 
+ pub(super) fn files(patch: &str) -> Vec<File> {
+-    let mut files = Vec::new();
++    let mut files: Vec<File> = Vec::new();
++    let mut block = String::new();
+     let (mut old, mut new) = (None, None);
+     let (mut hunk, mut envelope) = (false, false);
+     let mut remaining = None;
+@@ -25,10 +26,8 @@ pub(super) fn files(patch: &str) -> Vec<File> {
+             && (files.is_empty()
+                 || matches!(binary, BinaryPart::Header)
+                 || hunk
+-                || files.last().is_some_and(|file: &File| {
+-                    file.patch.starts_with("--- ")
+-                        && file.patch.lines().any(|line| line.starts_with("+++ "))
+-                }));
++                || (block.starts_with("--- ")
++                    && block.lines().any(|line| line.starts_with("+++ "))));
+         let start = if plain_header {
+             let old_path = path(&line[4..]);
+             let mut file = File::default();
+@@ -63,8 +62,11 @@ pub(super) fn files(patch: &str) -> Vec<File> {
+                 })
+             })
+         };
+-        if let Some(mut file) = start {
+-            file.patch.push_str(raw);
++        if let Some(file) = start {
++            if let Some(previous) = files.last_mut() {
++                previous.patch = FilePatch::new(std::mem::take(&mut block));
++            }
++            block.push_str(raw);
+             new = (file.status == "added").then_some(1);
+             old = None;
+             hunk = envelope;
+@@ -80,7 +82,7 @@ pub(super) fn files(patch: &str) -> Vec<File> {
+             files.push(File::default());
+         }
+         let file = files.last_mut().expect("a file was started");
+-        file.patch.push_str(raw);
++        block.push_str(raw);
+         if binary.hide(line) {
+             continue;
+         }
+@@ -172,6 +174,9 @@ pub(super) fn files(patch: &str) -> Vec<File> {
+             file.note(line);
+         }
+     }
++    if let Some(last) = files.last_mut() {
++        last.patch = FilePatch::new(block);
++    }
+     for file in &mut files {
+         if file.old_path.as_ref() == Some(&file.path) {
+             file.old_path = None;
+diff --git a/crates/diff/src/tests.rs b/crates/diff/src/tests.rs
+index 1856324..d11ac9f 100644
+--- a/crates/diff/src/tests.rs
++++ b/crates/diff/src/tests.rs
+@@ -9,7 +9,7 @@ fn aligns_replacements_without_losing_unified_order() {
+         (file.path.as_str(), file.added, file.removed),
+         ("src/a.rs", 2, 1)
+     );
+-    assert_eq!(file.patch, input);
++    assert_eq!(file.patch.as_str(), input);
+     assert_eq!((file.lines[2].old, file.lines[2].new), (Some(9), None));
+     assert_eq!((file.lines[5].old, file.lines[5].new), (Some(10), Some(11)));
+     assert_eq!(
+@@ -125,7 +125,7 @@ fn missing_newline_metadata_does_not_split_a_replacement() {
+     let input = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
+     let files = parse(input, &[]);
+     let file = &files[0];
+-    assert_eq!(file.patch, input);
++    assert_eq!(file.patch.as_str(), input);
+     assert_eq!(file.unified, [1, 2]);
+     assert_eq!(file.pairs, [Pair::Lines(Some(1), Some(2))]);
+     assert!(file.lines[1].no_newline);
+@@ -169,7 +169,7 @@ fn metadata_without_a_patch_does_not_claim_to_know_the_contents() {
+         let files = parse(raw, &[info]);
+         assert_eq!(files.len(), 2);
+         assert_eq!(files[0].lines[0].text, "Пустой файл");
+-        assert_eq!(files[0].patch, raw);
++        assert_eq!(files[0].patch.as_str(), raw);
+         let card = &files[1];
+         assert_eq!(
+             card.lines[0].text, "Текст изменений не предоставлен",
+@@ -204,7 +204,7 @@ fn git_control_escapes_merge_file_metadata() {
+         );
+         assert_eq!(files.len(), 1, "escape {escape}: duplicate file card");
+         assert_eq!(files[0].path, expected);
+-        assert_eq!(files[0].patch, patch);
++        assert_eq!(files[0].patch.as_str(), patch);
+         assert_eq!((files[0].added, files[0].removed), (1, 1));
+     }
+ }
+@@ -230,20 +230,20 @@ HcmV?d00001
+     let file = &files[0];
+     assert_eq!(file.path, "after/tile.png");
+     assert_eq!(file.status, "added");
+-    assert_eq!(file.patch, image);
++    assert_eq!(file.patch.as_str(), image);
+     assert_eq!((file.added, file.removed), (0, 0));
+     assert_eq!(file.unified, [0]);
+     assert_eq!(file.pairs, [Pair::Full(0)]);
+     assert_eq!(file.lines[0].kind, Kind::Note);
+     assert_eq!(file.lines[0].text, "Двоичный файл");
+-    assert_eq!(files[1].patch, text);
++    assert_eq!(files[1].patch.as_str(), text);
+     assert_eq!((files[1].added, files[1].removed), (1, 1));
+ 
+     // A finished binary record must not hide unrelated annotations.
+     let footer = "-- \n2.52.0\n";
+     let with_footer = format!("{image}{footer}");
+     let file = &parse(&with_footer, &[])[0];
+-    assert_eq!(file.patch, with_footer);
++    assert_eq!(file.patch.as_str(), with_footer);
+     assert_eq!(
+         file.lines
+             .iter()
+diff --git a/src/ui/diff/file.rs b/src/ui/diff/file.rs
+index b44f90f..152b4fc 100644
+--- a/src/ui/diff/file.rs
++++ b/src/ui/diff/file.rs
+@@ -92,7 +92,9 @@ impl DiffView {
+                                 let patch = file.patch.clone();
+                                 move |_, _, cx| {
+                                     cx.stop_propagation();
+-                                    cx.write_to_clipboard(ClipboardItem::new_string(patch.clone()));
++                                    cx.write_to_clipboard(ClipboardItem::new_string(
++                                        patch.as_str().to_owned(),
++                                    ));
+                                 }
+                             }),
+                     ),
