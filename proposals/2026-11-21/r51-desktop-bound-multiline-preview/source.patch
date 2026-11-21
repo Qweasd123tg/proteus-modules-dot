@@ -1,0 +1,124 @@
+diff --git a/src/tool_display/mod.rs b/src/tool_display/mod.rs
+index 96650d4..6e8c839 100644
+--- a/src/tool_display/mod.rs
++++ b/src/tool_display/mod.rs
+@@ -249,12 +249,12 @@ fn generic_subject_key(args: &Value) -> Option<String> {
+ 
+ fn subject_text(key: &str, value: &Value) -> Option<String> {
+     let text = match value {
+-        Value::String(text) => single_line(text)?,
++        Value::String(text) => return single_line(text, SUBJECT_LIMIT),
+         Value::Array(items) => {
+             let parts = items.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+             match parts.as_slice() {
+                 [] => return None,
+-                [only] => single_line(only)?,
++                [only] => return single_line(only, SUBJECT_LIMIT),
+                 [first, rest @ ..] if key.ends_with('s') => format!("{first} +{}", rest.len()),
+                 _ => parts.join(" "),
+             }
+@@ -267,22 +267,53 @@ fn subject_text(key: &str, value: &Value) -> Option<String> {
+ 
+ /// Several lines become one, joined by `↵`; the row fades out what does
+ /// not fit.
+-fn single_line(text: &str) -> Option<String> {
+-    let line = text
+-        .lines()
+-        .map(str::trim)
+-        .filter(|line| !line.is_empty())
+-        .collect::<Vec<_>>()
+-        .join(" ↵ ");
+-    (!line.is_empty()).then_some(line)
++fn single_line(text: &str, max_chars: usize) -> Option<String> {
++    const SEPARATOR: &str = " ↵ ";
++    let mut remaining = max_chars;
++    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
++    let first = take_chars(lines.next()?, &mut remaining);
++    if remaining == 0 {
++        return Some(first.to_owned());
++    }
++    let Some(next) = lines.next() else {
++        return Some(first.to_owned());
++    };
++    // The bounded input size estimates a starting capacity. Leave room for
++    // two separators so a short multiline caption need not grow repeatedly.
++    let capacity = first.len().max(text.len().min(max_chars)) + 2 * SEPARATOR.len();
++    let mut result = String::with_capacity(capacity);
++    result.push_str(first);
++    for line in std::iter::once(next).chain(lines) {
++        let separator = take_chars(SEPARATOR, &mut remaining);
++        let line = take_chars(line, &mut remaining);
++        result.reserve(separator.len() + line.len());
++        result.push_str(separator);
++        result.push_str(line);
++        if remaining == 0 {
++            break;
++        }
++    }
++    Some(result)
++}
++
++/// Borrow at most the remaining scalar budget and advance that budget.
++fn take_chars<'a>(text: &'a str, remaining: &mut usize) -> &'a str {
++    if text.len() <= *remaining {
++        *remaining -= text.chars().count();
++        return text;
++    }
++    for (at, _) in text.char_indices() {
++        if *remaining == 0 {
++            return &text[..at];
++        }
++        *remaining -= 1;
++    }
++    text
+ }
+ 
+ fn arg_preview(value: &Value) -> String {
+     match value {
+-        Value::String(text) => match single_line(text) {
+-            Some(line) => limit(line, ARG_LIMIT),
+-            None => String::new(),
+-        },
++        Value::String(text) => single_line(text, ARG_LIMIT).unwrap_or_default(),
+         Value::Array(items) => format!("[{}]", items.len()),
+         Value::Object(map) => format!("{{{}}}", map.len()),
+         other => other.to_string(),
+diff --git a/src/tool_display/tests.rs b/src/tool_display/tests.rs
+index e34509e..ea39d92 100644
+--- a/src/tool_display/tests.rs
++++ b/src/tool_display/tests.rs
+@@ -28,6 +28,34 @@ fn known_tools_name_the_action_and_its_subject() {
+     assert_eq!(headline("git_status", &json!({})).subject, None);
+ }
+ 
++#[test]
++fn string_previews_clip_normalized_text_at_scalar_boundaries() {
++    let prefix = "я🦀".repeat(149);
++    let tail = "\r\n\n\u{2002}  \r\n  🦀 done  \r\nignored";
++    let cmd = format!(" \t{prefix}{tail}");
++    let args = json!({"cmd": cmd, "note": format!("{}\n ⛳ remaining", "а".repeat(159))});
++    let subject = headline("exec_command", &args).subject.unwrap();
++    assert_eq!(subject, format!("{prefix} ↵"));
++    assert_eq!(subject.chars().count(), 300);
++    assert_eq!(
++        headline("external", &args).subject.as_deref(),
++        Some(subject.as_str())
++    );
++    assert_eq!(
++        other_args(&args, Some("cmd")),
++        vec![("note".to_owned(), format!("{} ", "а".repeat(159)))]
++    );
++    let singleton = json!({"paths":[false, cmd, null]});
++    assert_eq!(
++        headline("read_many_files", &singleton).subject,
++        Some(subject)
++    );
++    assert_eq!(
++        headline("exec_command", &json!({"cmd":"\r\n\u{2002}\t "})).subject,
++        None
++    );
++}
++
+ #[test]
+ fn unknown_tools_keep_their_name_and_find_a_conventional_subject() {
+     let hover = headline("lsp_hover", &json!({"line": 3, "file_path": "src/lib.rs"}));
