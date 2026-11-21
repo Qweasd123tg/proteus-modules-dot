@@ -1,0 +1,437 @@
+diff --git a/storage/session-storage/README.md b/storage/session-storage/README.md
+index 5bac8ce..9df65a3 100644
+--- a/storage/session-storage/README.md
++++ b/storage/session-storage/README.md
+@@ -42,7 +42,11 @@ pending record, без повторного декодирования хвос
+ последняя запись ещё не проверенного JSONL snapshot, полный fold может передать
+ её в текущую страницу без второго декодирования журнала. Для этого отдельно
+ проверяются все фиксированные байты, стабильность версии и отсутствие внешних
+-payload; SQLite и изменившийся источник используют прежнее повторное чтение.
++payload; при изменении источника остаётся прежнее повторное чтение. SQLite
++не переносит запись из fold. После совпадения полного SHA-256 в конце
++прохода SQLite может начать страницу с нужной строки в той же read-only
++транзакции. До завершения собственной проверки префикса reader использует
++обычный проход, даже если получил подтверждённую подсказку от writer.
+ Запись не кешируется в handle. Изменение JSONL-файла
+ сбрасывает подтверждение prefix и требует повторной проверки. `CompareSnapshots` принимает descriptor
+ старого prefix после освобождения старого handle. Строгий проход сохраняет
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 25635a3..9b55686 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -53,6 +53,10 @@ pub(crate) trait RecordSnapshot: Send {
+         Ok(false)
+     }
+     fn next(&mut self) -> Result<Option<JournalRecord>>;
++    /// Continue the page cursor established by `reset_for_page`, if any.
++    fn next_page(&mut self) -> Result<Option<JournalRecord>> {
++        self.next()
++    }
+     fn fingerprint(&self) -> &str;
+     /// Digest of bytes consumed by `next`. A complete validated replay seeds the writer head.
+     fn read_hash(&self) -> ring::digest::Context;
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index 0016653..054f412 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -98,6 +98,8 @@ fn snapshot_source(
+         id,
+         fingerprint,
+         current_hash: HashContext::new(&SHA256),
++        verified_eof: false,
++        page_after: None,
+     }))
+ }
+ 
+@@ -187,27 +189,34 @@ struct SqliteSnapshot {
+     id: SessionId,
+     fingerprint: String,
+     current_hash: HashContext,
++    verified_eof: bool,
++    // Never share a moved page cursor or its progress with the strict replay.
++    page_after: Option<u64>,
+ }
+ impl RecordSnapshot for SqliteSnapshot {
+     fn reset(&mut self) -> Result<()> {
+         self.after = 0;
+         self.current_hash = HashContext::new(&SHA256);
++        self.page_after = None;
+         Ok(())
+     }
++    fn reset_for_page(&mut self, after: u64) -> Result<()> {
++        if after != 0
++            && self.verified_eof
++            && let Some(conn) = &self.conn
++            && !conn.is_autocommit()
++            && ordinary_journal_table(conn).unwrap_or(false)
++        {
++            self.page_after = Some(after);
++            return Ok(());
++        }
++        self.reset()
++    }
+     fn next(&mut self) -> Result<Option<JournalRecord>> {
+         let Some(conn) = &self.conn else {
+             return Ok(None);
+         };
+-        let mut stmt = conn.prepare_cached(
+-            "SELECT sequence,payload FROM journal WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 1",
+-        )?;
+-        let row: Option<(i64, Vec<u8>)> = stmt
+-            .query_row(
+-                params![i64::try_from(self.after)?, i64::try_from(self.end)?],
+-                |r| Ok((r.get(0)?, r.get(1)?)),
+-            )
+-            .optional()?;
+-        let Some((sequence, bytes)) = row else {
++        let Some((sequence, bytes)) = next_row(conn, self.after, self.end)? else {
+             let actual: String = self
+                 .current_hash
+                 .clone()
+@@ -217,23 +226,28 @@ impl RecordSnapshot for SqliteSnapshot {
+                 .map(|b| format!("{b:02x}"))
+                 .collect();
+             ensure!(actual == self.fingerprint, "SQLite snapshot prefix changed");
++            self.verified_eof = !conn.is_autocommit();
+             return Ok(None);
+         };
+         crate::diagnostics::decoded();
+         self.current_hash.update(&bytes);
+-        let sequence = u64::try_from(sequence)?;
+-        ensure!(
+-            bytes.len() <= crate::io::MAX_PAYLOAD_BYTES * 2,
+-            "SQLite record exceeds maximum"
+-        );
+-        let record = record::decode(&bytes)?;
+-        ensure!(
+-            record.session_seq == sequence
+-                && record.session_id == self.id
+-                && record.schema_version == JOURNAL_SCHEMA_VERSION,
+-            "SQLite journal record identity mismatch"
+-        );
+-        self.after = sequence;
++        let record = decode_record(self.id, sequence, &bytes)?;
++        self.after = record.session_seq;
++        Ok(Some(record))
++    }
++    fn next_page(&mut self) -> Result<Option<JournalRecord>> {
++        let Some(after) = self.page_after else {
++            return self.next();
++        };
++        let conn = self.conn.as_ref().context("SQLite page has no source")?;
++        // The initial EOF proof belongs only to this read transaction.
++        ensure!(!conn.is_autocommit(), "SQLite snapshot transaction ended");
++        let Some((sequence, bytes)) = next_row(conn, after, self.end)? else {
++            return Ok(None);
++        };
++        crate::diagnostics::decoded();
++        let record = decode_record(self.id, sequence, &bytes)?;
++        self.page_after = Some(record.session_seq);
+         Ok(Some(record))
+     }
+     fn consumed_fingerprint(&self) -> String {
+@@ -281,6 +295,43 @@ impl RecordSnapshot for SqliteSnapshot {
+     }
+ }
+ 
++fn ordinary_journal_table(conn: &Connection) -> Result<bool> {
++    // Only a physical table pins this result stream (not a dynamic view).
++    Ok(conn.query_row(
++        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
++                       WHERE type='table' AND name='journal' AND rootpage>0)",
++        [],
++        |row| row.get(0),
++    )?)
++}
++
++fn next_row(conn: &Connection, after: u64, end: u64) -> Result<Option<(i64, Vec<u8>)>> {
++    let mut stmt = conn.prepare_cached(
++        "SELECT sequence,payload FROM journal WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 1",
++    )?;
++    Ok(stmt
++        .query_row(params![i64::try_from(after)?, i64::try_from(end)?], |row| {
++            Ok((row.get(0)?, row.get(1)?))
++        })
++        .optional()?)
++}
++
++fn decode_record(id: SessionId, sequence: i64, bytes: &[u8]) -> Result<JournalRecord> {
++    let sequence = u64::try_from(sequence)?;
++    ensure!(
++        bytes.len() <= crate::io::MAX_PAYLOAD_BYTES * 2,
++        "SQLite record exceeds maximum"
++    );
++    let record = record::decode(bytes)?;
++    ensure!(
++        record.session_seq == sequence
++            && record.session_id == id
++            && record.schema_version == JOURNAL_SCHEMA_VERSION,
++        "SQLite journal record identity mismatch"
++    );
++    Ok(record)
++}
++
+ #[cfg(test)]
+ #[test]
+ fn fingerprint_payload_matches_owned_blob_reads_and_errors() {
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index d1c9ac9..71bdfc4 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -206,7 +206,7 @@ impl SnapshotState {
+         while records.len() < limit as usize {
+             let record = match self.pending.take() {
+                 Some(record) => record,
+-                None => match self.source.next()? {
++                None => match self.source.next_page()? {
+                     Some(record) => record,
+                     None => break,
+                 },
+diff --git a/storage/session-storage/src/tests/paging.rs b/storage/session-storage/src/tests/paging.rs
+index 6126b63..e06cc6f 100644
+--- a/storage/session-storage/src/tests/paging.rs
++++ b/storage/session-storage/src/tests/paging.rs
+@@ -211,3 +211,221 @@ fn jsonl_suffix_appends_during_validation_and_between_pages_preserve_fixed_prefi
+     );
+     assert!(rest.next_after_seq.is_none());
+ }
++
++#[test]
++fn sqlite_verified_seek_preserves_pinned_records_across_nonmonotonic_pages() {
++    let mut f = Fixture::new(BackendKind::Sqlite);
++    for seq in 1..=32 {
++        f.append(vec![text(&format!("строка {seq}"))]);
++    }
++    let session = f.descriptor.session.clone();
++    let resident = f.snapshot();
++    // The writer supplied a verified catalog head, but this SQL connection
++    // has not yet checked its own EOF digest. Keep the original scan.
++    crate::diagnostics::reset();
++    let resident_page = page_for(&f.service, &resident, 26, 2);
++    assert_eq!(crate::diagnostics::get().decoded, 28);
++
++    // This is a provisional disk-hint snapshot. The first page must still
++    // decode and validate all 32 rows before the direct page can run.
++    let reader = StorageService::new(BackendKind::Sqlite);
++    let SessionStorageResponse::Snapshot { snapshot } = reader
++        .execute(SessionStorageRequest::OpenSnapshot { session })
++        .unwrap()
++    else {
++        panic!();
++    };
++    crate::diagnostics::reset();
++    let first = page_for(&reader, &snapshot, 26, 2);
++    let first_decoded = crate::diagnostics::get().decoded;
++    assert_eq!(resident_page.records, first.records);
++    assert_eq!(first.next_after_seq, Some(28));
++
++    // Ordinary append on an independent writable connection changes the
++    // journal head while this reader's pinned transaction is still open.
++    f.append(vec![text("committed after SQLite snapshot")]);
++    crate::diagnostics::reset();
++    let end = page_for(&reader, &snapshot, 30, 8);
++    assert_eq!(
++        end.records
++            .iter()
++            .map(|r| r.session_seq)
++            .collect::<Vec<_>>(),
++        [31, 32]
++    );
++    assert_eq!(end.next_after_seq, None);
++
++    let retry = page_for(&reader, &snapshot, 26, 2);
++    assert_eq!(retry, first);
++    assert_eq!(page_for(&reader, &snapshot, 28, 3).next_after_seq, Some(31));
++    assert!(page_for(&reader, &snapshot, 32, 1).records.is_empty());
++    let later_decoded = crate::diagnostics::get().decoded;
++
++    let SessionStorageResponse::Conversation { conversation } = reader
++        .execute(SessionStorageRequest::ReadConversation {
++            snapshot: snapshot.clone(),
++            point: StorageHistoryPoint::Current,
++        })
++        .unwrap()
++    else {
++        panic!();
++    };
++    assert_eq!(conversation.revision.session_seq, 32);
++    assert_eq!(conversation.messages.len(), 32);
++    assert_eq!(page_for(&reader, &snapshot, 26, 2), first);
++
++    eprintln!(
++        "SQLite rows decoded: unproven=28; warm first={first_decoded}; four later pages={later_decoded}"
++    );
++    assert_eq!(first_decoded, 34);
++    assert_eq!(later_decoded, 7);
++}
++
++#[test]
++fn sqlite_verified_seek_preserves_pending_records_at_the_page_byte_budget() {
++    let mut f = Fixture::new(BackendKind::Sqlite);
++    for seq in 0..8 {
++        f.append(vec![text(&format!("small {seq}"))]);
++    }
++    for ch in ['A', 'B', 'C'] {
++        f.append(vec![text(&ch.to_string().repeat(2 * 1024 * 1024))]);
++    }
++    let source = StorageService::new(BackendKind::Sqlite);
++    let SessionStorageResponse::Snapshot { snapshot } = source
++        .execute(SessionStorageRequest::OpenSnapshot {
++            session: f.descriptor.session.clone(),
++        })
++        .unwrap()
++    else {
++        panic!();
++    };
++    crate::diagnostics::reset();
++    for after in [8, 9, 10] {
++        let page = page_for(&source, &snapshot, after, 10);
++        assert_eq!(page.records.len(), 1);
++        assert_eq!(page.records[0].session_seq, after + 1);
++        assert_eq!(page.next_after_seq, (after != 10).then_some(after + 1));
++    }
++    let decoded = crate::diagnostics::get().decoded;
++    eprintln!("SQLite rows decoded with the page byte budget: {decoded}");
++    assert_eq!(decoded, 3);
++}
++
++fn page_for(
++    service: &StorageService,
++    snapshot: &StorageSnapshot,
++    after_seq: u64,
++    limit: u32,
++) -> StorageRecordPage {
++    let SessionStorageResponse::Records { page } = service
++        .execute(SessionStorageRequest::ReadRecords {
++            snapshot: snapshot.clone(),
++            after_seq,
++            limit,
++        })
++        .unwrap()
++    else {
++        panic!();
++    };
++    page
++}
++
++#[test]
++fn sqlite_interrupted_seek_does_not_reuse_cursor_or_change_strict_digest() {
++    use crate::{
++        backend::{JournalBackend, RecordSnapshot, Sqlite},
++        snapshot::{Fold, SnapshotState},
++    };
++    use proteus_contracts::domain::SessionId;
++
++    // Inject one ordinary I/O interruption, after the page-only backend cursor
++    // advanced. Do not alter any SQLite rows or filesystem state.
++    struct InterruptPage {
++        inner: Box<dyn RecordSnapshot>,
++        next_error: bool,
++    }
++    impl RecordSnapshot for InterruptPage {
++        fn reset(&mut self) -> anyhow::Result<()> {
++            self.inner.reset()
++        }
++        fn reset_for_page(&mut self, sequence: u64) -> anyhow::Result<()> {
++            self.inner.reset_for_page(sequence)
++        }
++        fn next(&mut self) -> anyhow::Result<Option<JournalRecord>> {
++            self.inner.next()
++        }
++        fn next_page(&mut self) -> anyhow::Result<Option<JournalRecord>> {
++            let record = self.inner.next_page()?;
++            if self.next_error {
++                self.next_error = false;
++                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
++            }
++            Ok(record)
++        }
++        fn fingerprint(&self) -> &str {
++            self.inner.fingerprint()
++        }
++        fn read_hash(&self) -> ring::digest::Context {
++            self.inner.read_hash()
++        }
++        fn extent(&self) -> u64 {
++            self.inner.extent()
++        }
++        fn prefix_fingerprint(&mut self, sequence: u64) -> anyhow::Result<Option<String>> {
++            self.inner.prefix_fingerprint(sequence)
++        }
++    }
++
++    let mut f = Fixture::new(BackendKind::Sqlite);
++    for index in 1..=20 {
++        f.append(vec![text(&format!("safe record {index}"))]);
++    }
++    let session = f.descriptor.session.clone();
++    let id: SessionId = session.session_id;
++    let mut inner = Sqlite::default()
++        .snapshot(f.descriptor.local_path.as_ref().unwrap(), id)
++        .unwrap();
++    let mut fold = Fold::default();
++    while let Some(record) = inner.next().unwrap() {
++        fold.apply(id, &record).unwrap();
++    }
++    let fingerprint = inner.fingerprint().to_owned();
++    assert_eq!(inner.consumed_fingerprint(), fingerprint);
++    let mut state = SnapshotState::new(
++        StorageSnapshot {
++            session,
++            snapshot_id: uuid::Uuid::new_v4().to_string(),
++            content_sha256: fingerprint.clone(),
++            revision: fold.revision(),
++        },
++        Box::new(InterruptPage {
++            inner,
++            next_error: true,
++        }),
++        true,
++        None,
++    )
++    .unwrap();
++    let error = state.page(17, 2).unwrap_err();
++    assert_eq!(
++        error.downcast_ref::<std::io::Error>().unwrap().kind(),
++        std::io::ErrorKind::Interrupted
++    );
++    let sequences = |page: StorageRecordPage| {
++        page.records
++            .into_iter()
++            .map(|record| record.session_seq)
++            .collect::<Vec<_>>()
++    };
++    assert_eq!(sequences(state.page(17, 2).unwrap()), [18, 19]);
++    assert_eq!(state.source.consumed_fingerprint(), fingerprint);
++    assert_eq!(
++        state.source.prefix_fingerprint(20).unwrap().as_deref(),
++        Some(fingerprint.as_str())
++    );
++    assert_eq!(sequences(state.page(0, 2).unwrap()), [1, 2]);
++    assert_ne!(state.source.consumed_fingerprint(), fingerprint);
++    assert_eq!(sequences(state.page(19, 2).unwrap()), [20]);
++    assert_eq!(state.fold().unwrap().revision(), fold.revision());
++    assert_eq!(state.source.consumed_fingerprint(), fingerprint);
++}
+diff --git a/storage/session-storage/src/tests/seek.rs b/storage/session-storage/src/tests/seek.rs
+index f4360ac..93b5f7f 100644
+--- a/storage/session-storage/src/tests/seek.rs
++++ b/storage/session-storage/src/tests/seek.rs
+@@ -145,7 +145,7 @@ fn small_old_cut_before_large_new_tail_keeps_the_short_scan() {
+ }
+ 
+ #[test]
+-fn freshly_validated_terminal_page_decodes_each_pinned_record_once() {
++fn freshly_validated_terminal_page_avoids_rescanning_pinned_prefix() {
+     for kind in backends() {
+         let mut f = Fixture::new(kind);
+         for i in 0..8 {
+@@ -164,7 +164,7 @@ fn freshly_validated_terminal_page_decodes_each_pinned_record_once() {
+                 crate::diagnostics::get().decoded,
+                 match kind {
+                     BackendKind::Jsonl => 8,
+-                    BackendKind::Sqlite => 16, // Unchanged: no physical version.
++                    BackendKind::Sqlite => 9, // Full validation, then only the terminal row.
+                 }
+             );
+             if matches!(kind, BackendKind::Jsonl) {
