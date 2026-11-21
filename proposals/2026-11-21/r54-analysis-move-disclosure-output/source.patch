@@ -1,0 +1,142 @@
+diff --git a/packages/analysis/src/details.rs b/packages/analysis/src/details.rs
+index 2bbc7787300ec3fd76c22087d23804cb570800d3..03a45864e19518fb0a8e341c8bb8d4f7debec8a6 100644
+--- a/packages/analysis/src/details.rs
++++ b/packages/analysis/src/details.rs
+@@ -143,8 +143,9 @@ fn tool(data: &Value, key: &dyn Fn(&str) -> String, open: &Open) -> Vec<Value> {
+     if result.at("error").truthy() {
+         nodes.push(label(plain(result.at("error")), "danger"));
+     }
+-    let output = result.get("output").cloned().unwrap_or_else(|| "".into());
+-    nodes.push(disclosure(&key("output"), "Результат", &output, open));
++    let empty = Value::String(String::new());
++    let output = result.get("output").unwrap_or(&empty);
++    nodes.push(disclosure(&key("output"), "Результат", output, open));
+     nodes
+ }
+ 
+diff --git a/packages/analysis/src/nodes.rs b/packages/analysis/src/nodes.rs
+index f483450f0e80070ff326288e547957f8f4a9a98c..9e60315fde3e570a7b4b5de7b37dca818cb7b095 100644
+--- a/packages/analysis/src/nodes.rs
++++ b/packages/analysis/src/nodes.rs
+@@ -1,7 +1,9 @@
+ //! Widget helpers of the analysis page on top of the closed public schema.
+ 
++use std::borrow::Cow;
++
+ use proteus_extension::ui::Node;
+-use proteus_extension::{Value, json};
++use proteus_extension::{Map, Value, json};
+ 
+ /// Disclosures with these suffixes start revealed.
+ const OPEN: [&str; 4] = [":args", ":output", ":answer", ":summary"];
+@@ -84,16 +86,22 @@ pub fn disclosure(key: &str, title: &str, body: &Value, open: &Open) -> Value {
+     let revealed = open.is(key);
+     let wrap = body.is_string();
+     let text = match body.as_str() {
+-        Some(text) => text.to_owned(),
+-        None => serde_json::to_string_pretty(body).unwrap_or_default(),
++        Some(text) => Cow::Borrowed(text),
++        None => Cow::Owned(serde_json::to_string_pretty(body).unwrap_or_default()),
+     };
+     let text = if text.is_empty() {
+-        "—".to_owned()
++        Cow::Borrowed("—")
+     } else {
+         text
+     };
+-    let block = json!({"type": "code", "id": format!("analysis-{key}"), "text": text,
+-                       "language": if wrap { "text" } else { "json" }, "height": height(&text, wrap)})
++    let height = height(&text, wrap);
++    let block = Value::Object(Map::from_iter([
++        ("type".into(), "code".into()),
++        ("id".into(), format!("analysis-{key}").into()),
++        ("text".into(), text.into_owned().into()),
++        ("language".into(), if wrap { "text" } else { "json" }.into()),
++        ("height".into(), height.into()),
++    ]))
+     .maybe("wrap", wrap.then_some(true));
+     proteus_extension::ui::disclosure(key, title, vec![block]).with("open", revealed)
+ }
+diff --git a/packages/analysis/src/summary.rs b/packages/analysis/src/summary.rs
+index 713ab218299e39770dde985138c83df2a218fbf3..e085caeb42a74be4c79b95ed8933f7b3d4b18e96 100644
+--- a/packages/analysis/src/summary.rs
++++ b/packages/analysis/src/summary.rs
+@@ -114,12 +114,14 @@ pub fn turn_summary(turn: &Value, number: &Value, status: &Value, open: &Open) -
+         ));
+     }
+     let output = turn.at("output").at("text");
++    let missing;
+     let output = if output.truthy() {
+-        output.clone()
++        output
+     } else {
+-        "Итоговый ответ не записан.".into()
++        missing = "Итоговый ответ не записан.".into();
++        &missing
+     };
+-    nodes.push(disclosure(&key("output"), "Итоговый ответ", &output, open));
++    nodes.push(disclosure(&key("output"), "Итоговый ответ", output, open));
+     let config = format!(
+         "Конфигурация при запуске · epoch {}",
+         plain(turn.at("module_epoch"))
+diff --git a/packages/analysis/src/tests.rs b/packages/analysis/src/tests.rs
+index 138ad72fc7242686c126b0e1773aefbb0d8aad6d..4bbbf7268d25d8a2faeb7eb76626eda5d9404fd4 100644
+--- a/packages/analysis/src/tests.rs
++++ b/packages/analysis/src/tests.rs
+@@ -238,6 +238,56 @@ fn selected_turn_outside_the_visible_limit_keeps_all_matching_rows() {
+     }
+ }
+ 
++#[test]
++fn disclosure_output_keeps_empty_text_null_and_structured_values_distinct() {
++    let open = crate::nodes::Open;
++    let outputs = [
++        (json!({}), "—", "text"),
++        (json!({"output": ""}), "—", "text"),
++        (json!({"output": null}), "null", "json"),
++        (json!({"output": false}), "false", "json"),
++        (
++            json!({"output": {"z": "строка", "a": 0}}),
++            "{\n  \"z\": \"строка\",\n  \"a\": 0\n}",
++            "json",
++        ),
++    ];
++    for (result, text, language) in outputs {
++        let step = json!({"sequence": 3, "data": {"kind": "tool", "result": result}});
++        let root = crate::details::step_card(&step, &open);
++        let field = root
++            .list("children")
++            .iter()
++            .find(|node| node.str("id") == "3:output")
++            .unwrap();
++        let block = &field["children"][0];
++        assert_eq!((block.str("text"), block.str("language")), (text, language));
++        assert_eq!(block.bool("wrap"), language == "text");
++        assert!(field.bool("open"));
++    }
++    for (raw, expected, language) in [
++        (Value::Null, "Итоговый ответ не записан.", "text"),
++        (json!(false), "Итоговый ответ не записан.", "text"),
++        (json!(""), "Итоговый ответ не записан.", "text"),
++        (json!("ответ"), "ответ", "text"),
++        (json!(true), "true", "json"),
++    ] {
++        let turn = json!({"turn_id":"turn", "output":{"text":raw}});
++        let root = crate::summary::turn_summary(&turn, &Value::Null, &Value::Null, &open);
++        let field = root
++            .list("children")
++            .iter()
++            .find(|node| node.str("id") == "turn:turn:output")
++            .unwrap();
++        let block = &field["children"][0];
++        assert_eq!(
++            (block.str("text"), block.str("language")),
++            (expected, language)
++        );
++        assert!(field.bool("open"));
++    }
++}
++
+ #[test]
+ fn analysis_page_matches_the_closed_widget_schema() {
+     let mut worker = Analysis::default();
