@@ -1,0 +1,146 @@
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 136b46e..4ccdf5d 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -1,14 +1,18 @@
+ //! Disposable read caches are not canonical storage and never acquire a writer.
+ use super::*;
+ use serde::{Deserialize, Serialize};
+-use std::{fs::OpenOptions, io::Write};
++use std::{
++    fs::OpenOptions,
++    io::{BufWriter, Write},
++};
+ 
+-const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
++const CACHE_ENVELOPE_ALLOWANCE: usize = 1024 * 1024;
++const MAX_CACHE_FILE_BYTES: usize = SESSION_STORAGE_MAX_CACHE_BYTES + CACHE_ENVELOPE_ALLOWANCE;
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Cache {
+-    source: StorageSnapshot,
+-    value: serde_json::Value,
++struct Cache<S = StorageSnapshot, V = serde_json::Value> {
++    source: S,
++    value: V,
+ }
+ fn path(dir: &Path, key: &str) -> PathBuf {
+     dir.join(format!(
+@@ -25,7 +29,7 @@ pub(super) fn read_cache(
+     source: Option<StorageSnapshot>,
+ ) -> Result<SessionStorageResponse> {
+     let dir = checked_path(&session)?;
+-    let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_CACHE_BYTES + 1024 * 1024) {
++    let bytes = match crate::io::bounded_read(&path(&dir, &key), MAX_CACHE_FILE_BYTES) {
+         Ok(bytes) => bytes,
+         Err(_) => return Ok(SessionStorageResponse::Metadata { document: None }),
+     };
+@@ -73,19 +77,32 @@ impl State {
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+         let cache = Cache { source, value };
+-        let bytes = serde_json::to_vec(&cache)?;
+-        ensure!(
+-            bytes.len() <= MAX_CACHE_BYTES + 1024 * 1024,
+-            "cache value exceeds maximum"
+-        );
++        // execute() has already checked the compact value against the contract limit.
++        // A small header therefore proves the whole file fits. For unusual snapshot
++        // IDs count the exact envelope, still before opening the temporary file.
++        let header = Cache {
++            source: &cache.source,
++            value: (),
++        };
++        if crate::codec::encoded_bytes(&header)? > CACHE_ENVELOPE_ALLOWANCE {
++            ensure!(
++                crate::codec::encoded_bytes(&cache)? <= MAX_CACHE_FILE_BYTES,
++                "cache value exceeds maximum"
++            );
++        }
+         // No create_dir_all: a cache write may never resurrect a deleted session.
+         let temp = dir.join(format!(".storage-cache-{}.tmp", Uuid::new_v4()));
+         let result = (|| {
+-            let mut file = OpenOptions::new()
++            let file = OpenOptions::new()
+                 .create_new(true)
+                 .write(true)
+                 .open(&temp)?;
+-            file.write_all(&bytes)?;
++            {
++                // Compact headers stay cheap; long string runs bypass the buffer.
++                let mut writer = BufWriter::with_capacity(1024, &file);
++                serde_json::to_writer(&mut writer, &cache)?;
++                writer.flush()?;
++            }
+             file.sync_data()?;
+             ensure!(
+                 identity::resolve_session_identity(&dir)?.session_id == session.session_id,
+diff --git a/storage/session-storage/src/tests/cache.rs b/storage/session-storage/src/tests/cache.rs
+new file mode 100644
+index 0000000..9adb997
+--- /dev/null
++++ b/storage/session-storage/src/tests/cache.rs
+@@ -0,0 +1,51 @@
++use super::*;
++
++#[test]
++fn cache_file_bytes_and_failed_replacement_are_stable() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("cache source")]);
++        let mut source = f.snapshot();
++        // A long, escaped handle still describes the same prefix.
++        source.snapshot_id = "\n".repeat(530_000);
++        source.snapshot_id.push('x');
++        let value = serde_json::json!({"parts":["\u{0000}","юникод", {"text":"Z".repeat(24_000)}]});
++        let key = "display.pages";
++        let expected = format!(
++            r#"{{"source":{},"value":{}}}"#,
++            serde_json::to_string(&source).unwrap(),
++            serde_json::to_string(&value).unwrap()
++        );
++        let request = SessionStorageRequest::WriteCache {
++            session: source.session.clone(),
++            key: key.into(),
++            source,
++            value: value.clone(),
++        };
++        let path = f.descriptor.local_path.as_ref().unwrap().join(format!(
++            ".storage-cache-{}.json",
++            crate::io::sha256_hex(key.as_bytes())
++        ));
++        assert_eq!(
++            f.service.execute(request.clone()).unwrap(),
++            SessionStorageResponse::CacheWritten {
++                etag: Some(storage_value_etag(&value).unwrap())
++            }
++        );
++        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
++        std::fs::remove_file(&path).unwrap();
++        std::fs::create_dir(&path).unwrap(); // force rename failure
++        assert_eq!(
++            f.service.execute(request).unwrap(),
++            SessionStorageResponse::CacheWritten { etag: None }
++        );
++        assert!(path.is_dir());
++        assert!(
++            !std::fs::read_dir(path.parent().unwrap()).unwrap().any(|e| e
++                .unwrap()
++                .file_name()
++                .to_string_lossy()
++                .ends_with(".tmp"))
++        );
++    }
++}
+diff --git a/storage/session-storage/src/tests/mod.rs b/storage/session-storage/src/tests/mod.rs
+index c8426bc..21a6642 100644
+--- a/storage/session-storage/src/tests/mod.rs
++++ b/storage/session-storage/src/tests/mod.rs
+@@ -120,6 +120,7 @@ pub(crate) fn text(value: &str) -> CanonicalMessage {
+     CanonicalMessage::text(MessageRole::User, value)
+ }
+ 
++mod cache;
+ mod journal;
+ mod metadata;
+ mod ownership;
