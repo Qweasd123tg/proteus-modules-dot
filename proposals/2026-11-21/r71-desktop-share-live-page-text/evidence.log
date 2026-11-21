@@ -1,0 +1,56 @@
+Final stamped run: each arm compiled its own test and probe (eight confirmed crate compilations).
+PASS sealed Desktop source fb8e0a5389c7bd7600d65111a6b52c3b8e70afdd3fb32f52b4f88876c9891768 (1465 entries), Cargo.lock 8fc397dc286d38c630ed30d79c7112c226e4521756e58fe7a111cd51ec921251
+PASS pin exact projection/apply/reverse/diff checks
+PASS after-393 exact projection/apply/reverse/diff checks
+PASS identical proposed append_page source on pin and after-393
+PASS 125 pinned dependency identities including Desktop contracts
+rustc 1.95.0 (59807616e 2026-04-14)
+=== pin baseline exact scoped history/transcript tests ===
+test transcript::page_reuse_tests::page_reuses_first_live_text_without_changing_identity_fields_or_next_key ... ok
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+ARM pin/baseline
+WORK crossing 50 35 50 54850 38395 54850
+WORK changed 50 28 50 54857 30716 54857
+WORK nonoverlap 50 0 50 54850 0 54850
+WORK near 50 45 50 54850 49365 54850
+=== pin candidate exact scoped history/transcript tests ===
+test transcript::page_reuse_tests::page_reuses_first_live_text_without_changing_identity_fields_or_next_key ... ok
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+ARM pin/candidate
+WORK crossing 50 35 15 54850 38395 16455
+WORK changed 50 28 22 54857 30716 24141
+WORK nonoverlap 50 0 50 54850 0 54850
+WORK near 50 45 5 54850 49365 5485
+f5cf33f81edb89f3b2b68900167ea4c626f5f238a3141357ef454fd0594b2ee6  candidate.trace
+PASS crossing: rows=50 shared=35 conversions=50->15 UTF-8 payload bytes copied into Arc<str>=54850->16455
+PASS changed: rows=50 shared=28 conversions=50->22 UTF-8 payload bytes copied into Arc<str>=54857->24141
+PASS nonoverlap: rows=50 shared=0 conversions=50->50 UTF-8 payload bytes copied into Arc<str>=54850->54850
+PASS near: rows=50 shared=45 conversions=50->5 UTF-8 payload bytes copied into Arc<str>=54850->5485
+=== after-393 baseline exact scoped history/transcript tests ===
+test transcript::page_reuse_tests::page_reuses_first_live_text_without_changing_identity_fields_or_next_key ... ok
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+ARM after-393/baseline
+WORK crossing 50 35 50 54850 38395 54850
+WORK changed 50 28 50 54857 30716 54857
+WORK nonoverlap 50 0 50 54850 0 54850
+WORK near 50 45 50 54850 49365 54850
+=== after-393 candidate exact scoped history/transcript tests ===
+test transcript::page_reuse_tests::page_reuses_first_live_text_without_changing_identity_fields_or_next_key ... ok
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+ARM after-393/candidate
+WORK crossing 50 35 15 54850 38395 16455
+WORK changed 50 28 22 54857 30716 24141
+WORK nonoverlap 50 0 50 54850 0 54850
+WORK near 50 45 5 54850 49365 5485
+2b55dc13191c77f7a94e8485e4a8bcea568875b5b6abfad2e1324db6718e5efd  candidate.trace
+PASS crossing: rows=50 shared=35 conversions=50->15 UTF-8 payload bytes copied into Arc<str>=54850->16455
+PASS changed: rows=50 shared=28 conversions=50->22 UTF-8 payload bytes copied into Arc<str>=54857->24141
+PASS nonoverlap: rows=50 shared=0 conversions=50->50 UTF-8 payload bytes copied into Arc<str>=54850->54850
+PASS near: rows=50 shared=45 conversions=50->5 UTF-8 payload bytes copied into Arc<str>=54850->5485
+PASS sealed Desktop source fb8e0a5389c7bd7600d65111a6b52c3b8e70afdd3fb32f52b4f88876c9891768 (1465 entries), Cargo.lock 8fc397dc286d38c630ed30d79c7112c226e4521756e58fe7a111cd51ec921251
+PASS exact stock and cumulative traces; no native GUI, timing or RSS measured.
+All four probes assert the exact append splice and 100 retained rows (no eviction). Anchor, payload, latest transition and next key are compared within-tier.
+Across tiers operation counts match. Prior #274 changed seek keyspace, so cross-tier raw trace equality is not claimed.
+Same new duplicate/timestamp test passed on both baselines via test-only overlay.
+Earlier harness-only attempts used an incorrect stock next-key expectation, then a stale unstamped probe in the shared target. Both excluded.
+Final gate: one offline locked job at a time, no fence trip, 9476 KiB peak lane growth.
