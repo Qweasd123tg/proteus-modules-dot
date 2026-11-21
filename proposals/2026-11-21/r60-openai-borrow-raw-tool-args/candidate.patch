@@ -1,0 +1,89 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 8cad31e1622d6a27f6dc2b7f38694e8a15141f37..d745df1b9ac1d2e006eb9829a8ff270b79a4f036 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -1,4 +1,7 @@
+-use std::collections::{BTreeSet, HashMap};
++use std::{
++    borrow::Cow,
++    collections::{BTreeSet, HashMap},
++};
+ 
+ use anyhow::{Result, anyhow};
+ use serde_json::{Value, json};
+@@ -409,8 +412,9 @@ fn to_openai_input(
+                             "call_id": call.id,
+                             "name": call.name,
+                             "arguments": match call.raw_arguments.as_deref() {
+-                                Some(raw) => raw.to_owned(),
+-                                None => serde_json::to_string(&call.args)?,
++                                // json! already copies this string into the wire value.
++                                Some(raw) => Cow::Borrowed(raw),
++                                None => Cow::Owned(serde_json::to_string(&call.args)?),
+                             },
+                         })),
+                         ToolCallSurface::Freeform => input.push(json!({
+@@ -559,11 +563,10 @@ fn openai_reasoning_item(summary: &str, encrypted_content: Option<&str>) -> Valu
+     })
+ }
+ 
+-fn freeform_tool_input(call: &ToolCall) -> Result<String> {
++fn freeform_tool_input(call: &ToolCall) -> Result<&str> {
+     call.args
+         .get("input")
+         .and_then(Value::as_str)
+-        .map(str::to_owned)
+         .ok_or_else(|| {
+             anyhow!(
+                 "freeform tool call '{}' requires string arg 'input'",
+diff --git a/model/model-pack/src/adapters/openai/request_tests.rs b/model/model-pack/src/adapters/openai/request_tests.rs
+index e3d572c6478ac3895fd069dcdefd2fc554ff3146..8f9baf0956243fc47cb21ae9ed98c91651c605aa 100644
+--- a/model/model-pack/src/adapters/openai/request_tests.rs
++++ b/model/model-pack/src/adapters/openai/request_tests.rs
+@@ -119,3 +119,46 @@ fn request_preserves_instruction_order_and_file_content_without_mutating_source(
+             .is_none()
+     );
+ }
++
++#[test]
++fn rendered_tool_calls_keep_argument_bytes_and_wire_key_order() {
++    // Replay preserves even malformed raw provider arguments, byte for byte.
++    let raw = " {bad \"пример\"\n";
++    let args = json!({"z": [42], "a": "строка\t"});
++    let encoded = args.to_string();
++    let freeform = "  заметка\n🦀 ";
++    let req = |calls: Vec<ToolCall>| {
++        CanonicalModelRequest::new(
++            ModelRef::new("openai", "fixture"),
++            vec![CanonicalMessage::new(
++                MessageRole::Assistant,
++                calls
++                    .into_iter()
++                    .map(|call| ContentPart::ToolCall { call })
++                    .collect(),
++            )],
++        )
++    };
++    let request = req(vec![
++        ToolCall::new("call_raw", "fixture_fn", json!({})).with_raw_arguments(raw),
++        ToolCall::new("call_json", "fixture_fn", args),
++        ToolCall::new("call_note", "fixture_note", json!({"input":freeform}))
++            .with_surface(ToolCallSurface::Freeform),
++    ]);
++    let expected = json!([
++        {"type":"function_call","call_id":"call_raw","name":"fixture_fn","arguments":raw},
++        {"type":"function_call","call_id":"call_json","name":"fixture_fn","arguments":encoded},
++        {"type":"custom_tool_call","call_id":"call_note","name":"fixture_note","input":freeform},
++    ]);
++    let body = to_openai_request(&request).unwrap();
++    assert_eq!(body["input"].to_string(), expected.to_string());
++
++    let invalid = req(vec![
++        ToolCall::new("bad", "fixture_note", json!({"input":42}))
++            .with_surface(ToolCallSurface::Freeform),
++    ]);
++    assert_eq!(
++        to_openai_request(&invalid).unwrap_err().to_string(),
++        "freeform tool call 'fixture_note' requires string arg 'input'"
++    );
++}
