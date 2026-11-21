@@ -1,0 +1,95 @@
+diff --git a/storage/session-storage/src/metadata.rs b/storage/session-storage/src/metadata.rs
+index 1e2bcbe..5eab061 100644
+--- a/storage/session-storage/src/metadata.rs
++++ b/storage/session-storage/src/metadata.rs
+@@ -110,6 +110,25 @@ pub(crate) fn read(dir: &Path, key: &str) -> Result<Option<StorageMetadataDocume
+         legacy(dir, key)
+     }
+ }
++// Keep hashing the original compact JSON tuple, without retaining its bytes.
++fn hash_request(request: &impl Serialize) -> Result<String> {
++    struct HashWriter(ring::digest::Context);
++    impl std::io::Write for HashWriter {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            self.0.update(bytes);
++            Ok(bytes.len())
++        }
++
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    let mut writer = HashWriter(ring::digest::Context::new(&ring::digest::SHA256));
++    serde_json::to_writer(&mut writer, request)?;
++    Ok(crate::io::digest_hex(writer.0.finish()))
++}
++
+ pub(crate) fn compare_exchange(
+     dir: &Path,
+     operation_id: Uuid,
+@@ -117,7 +136,7 @@ pub(crate) fn compare_exchange(
+     expected: Option<String>,
+     value: Option<serde_json::Value>,
+ ) -> Result<Option<StorageMetadataDocument>> {
+-    let request_hash = sha256_hex(&serde_json::to_vec(&(&key, &expected, &value))?);
++    let request_hash = hash_request(&(&key, &expected, &value))?;
+     let mut envelope = load(dir)?;
+     if let Some(receipt) = envelope.receipts.get(&operation_id) {
+         ensure!(
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+index 61bbbbe..35513c8 100644
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -40,6 +40,51 @@ fn metadata_cas_receipts_survive_reopen_and_reject_conflicts() {
+     }
+ }
+ 
++#[test]
++fn metadata_receipt_keeps_the_original_tuple_fingerprint() {
++    for kind in backends() {
++        let f = Fixture::new(kind);
++        let key = "settings.compatibility".to_owned();
++        let first = Some(serde_json::json!({
++            "nested": {"z": [null, -2, 0.5, true], "a": "quote:\" tab:\t Русский 🦀"},
++            "text": "ordinary metadata"
++        }));
++        let mut expected = None;
++        for (operation_id, value) in [
++            (uuid::Uuid::from_u128(111), first),
++            (uuid::Uuid::from_u128(222), None),
++        ] {
++            let legacy =
++                crate::io::sha256_hex(&serde_json::to_vec(&(&key, &expected, &value)).unwrap());
++            let request = SessionStorageRequest::CompareExchangeMetadata {
++                lease: f.lease.clone(),
++                operation_id,
++                key: key.clone(),
++                expected_etag: expected.take(),
++                value,
++            };
++            let written = f.service.execute(request.clone()).unwrap();
++            assert_eq!(f.service.execute(request).unwrap(), written);
++            let path = f
++                .descriptor
++                .local_path
++                .as_ref()
++                .unwrap()
++                .join(".storage-metadata.json");
++            let ledger: serde_json::Value =
++                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
++            assert_eq!(
++                ledger["receipts"][operation_id.to_string()]["request_sha256"],
++                legacy
++            );
++            let SessionStorageResponse::Metadata { document } = written else {
++                panic!("expected metadata response");
++            };
++            expected = document.map(|document| document.etag);
++        }
++    }
++}
++
+ #[test]
+ fn cache_is_disposable_source_bound_and_does_not_acquire_writer() {
+     for kind in backends() {
