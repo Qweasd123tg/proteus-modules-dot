@@ -1,0 +1,94 @@
+From 2070fa7e52a8452760e298ffd95b273b921be334 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 21 Nov 2026 10:03:54 +0800
+Subject: [PATCH] Compare fuzzy patch context without allocating normalized
+ strings
+
+---
+ tool/codex-patch/src/seek_sequence.rs | 35 ++++++++++++---------------
+ tool/codex-patch/src/tests.rs         | 18 ++++++++++++++
+ 2 files changed, 34 insertions(+), 19 deletions(-)
+
+diff --git a/tool/codex-patch/src/seek_sequence.rs b/tool/codex-patch/src/seek_sequence.rs
+index a0d6fcd..87d9f28 100644
+--- a/tool/codex-patch/src/seek_sequence.rs
++++ b/tool/codex-patch/src/seek_sequence.rs
+@@ -74,30 +74,27 @@ pub(crate) fn seek_sequence(
+     // differences when locating context lines.
+     // ------------------------------------------------------------------
+ 
+-    fn normalise(s: &str) -> String {
+-        s.trim()
+-            .chars()
+-            .map(|c| match c {
+-                // Various dash / hyphen code-points → ASCII '-'
+-                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+-                | '\u{2212}' => '-',
+-                // Fancy single quotes → '\''
+-                '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+-                // Fancy double quotes → '"'
+-                '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+-                // Non-breaking space and other odd spaces → normal space
+-                '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+-                | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+-                | '\u{3000}' => ' ',
+-                other => other,
+-            })
+-            .collect::<String>()
++    fn normalise(s: &str) -> impl Iterator<Item = char> + '_ {
++        s.trim().chars().map(|c| match c {
++            // Various dash / hyphen code-points → ASCII '-'
++            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
++            | '\u{2212}' => '-',
++            // Fancy single quotes → '\''
++            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
++            // Fancy double quotes → '"'
++            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
++            // Non-breaking space and other odd spaces → normal space
++            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
++            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
++            | '\u{3000}' => ' ',
++            other => other,
++        })
+     }
+ 
+     for i in search_start..=lines.len().saturating_sub(pattern.len()) {
+         let mut ok = true;
+         for (p_idx, pat) in pattern.iter().enumerate() {
+-            if normalise(&lines[i + p_idx]) != normalise(pat) {
++            if !normalise(&lines[i + p_idx]).eq(normalise(pat)) {
+                 ok = false;
+                 break;
+             }
+diff --git a/tool/codex-patch/src/tests.rs b/tool/codex-patch/src/tests.rs
+index 3a1c919..60a0d97 100644
+--- a/tool/codex-patch/src/tests.rs
++++ b/tool/codex-patch/src/tests.rs
+@@ -120,6 +120,24 @@ fn matching_uses_exact_before_whitespace_and_unicode_passes() {
+     );
+ }
+ 
++#[test]
++fn unicode_fallback_compares_whole_lines_and_every_line_in_the_block() {
++    let dir = tempfile::tempdir().unwrap();
++    let file = dir.path().join("f");
++    let prefixes = "α—\nα—βx\nα—β\na b extra\n";
++    fs::write(&file, format!("{prefixes}  α—β  \na\u{a0}b\n")).unwrap();
++
++    apply_patch(
++        &patch("*** Update File: f\n@@\n-α-β\n-a\u{2009}b\n+updated"),
++        dir.path(),
++    )
++    .unwrap();
++    assert_eq!(
++        fs::read_to_string(file).unwrap(),
++        format!("{prefixes}updated\n")
++    );
++}
++
+ #[test]
+ fn bare_empty_context_and_missing_final_newline_follow_pinned_default() {
+     let dir = tempfile::tempdir().unwrap();
+-- 
+2.52.0
+
