@@ -1,0 +1,173 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 050f1ef..35c0215 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -14,10 +14,34 @@ pub(crate) struct DisplayWriter {
+     remaining: u64,
+ }
+ 
++const LARGE_JSONL_STAGE_MIN_SOURCE_BYTES: u64 = 1024 * 1024;
++const LARGE_JSONL_STAGE_BUFFER_BYTES: usize = 64 * 1024;
++
+ impl DisplayWriter {
+     pub fn new(budget: u64) -> Option<Self> {
++        Self::open(budget, None)
++    }
++
++    pub fn for_jsonl(budget: u64, source_bytes: u64) -> Option<Self> {
++        // Do not reserve a bigger transient buffer for short sources, or when
++        // the remaining staging budget offers too little space to batch.
++        if source_bytes >= LARGE_JSONL_STAGE_MIN_SOURCE_BYTES
++            && budget >= LARGE_JSONL_STAGE_BUFFER_BYTES as u64
++        {
++            Self::open(budget, Some(LARGE_JSONL_STAGE_BUFFER_BYTES))
++        } else {
++            Self::new(budget)
++        }
++    }
++
++    fn open(budget: u64, capacity: Option<usize>) -> Option<Self> {
++        let file = tempfile::tempfile().ok()?;
++        let writer = match capacity {
++            Some(bytes) => BufWriter::with_capacity(bytes, file),
++            None => BufWriter::new(file),
++        };
+         Some(Self {
+-            writer: BufWriter::new(tempfile::tempfile().ok()?),
++            writer,
+             budget,
+             remaining: budget,
+         })
+@@ -59,6 +83,115 @@ impl Write for DisplayWriter {
+     }
+ }
+ 
++#[cfg(test)]
++#[test]
++fn display_writer_batches_large_jsonl_and_keeps_small_default() {
++    let small = DisplayWriter::new(MAX_STAGING_BYTES)
++        .unwrap()
++        .writer
++        .capacity();
++    assert_eq!(
++        DisplayWriter::for_jsonl(MAX_STAGING_BYTES, LARGE_JSONL_STAGE_MIN_SOURCE_BYTES - 1)
++            .unwrap()
++            .writer
++            .capacity(),
++        small
++    );
++    assert_eq!(
++        DisplayWriter::for_jsonl(
++            LARGE_JSONL_STAGE_BUFFER_BYTES as u64 - 1,
++            LARGE_JSONL_STAGE_MIN_SOURCE_BYTES
++        )
++        .unwrap()
++        .writer
++        .capacity(),
++        small
++    );
++    assert_eq!(
++        DisplayWriter::for_jsonl(MAX_STAGING_BYTES, LARGE_JSONL_STAGE_MIN_SOURCE_BYTES)
++            .unwrap()
++            .writer
++            .capacity(),
++        LARGE_JSONL_STAGE_BUFFER_BYTES
++    );
++}
++
++#[cfg(test)]
++#[test]
++fn display_writer_keeps_stage_bytes_budget_and_failed_flush_fallback() {
++    use proteus_contracts::{
++        domain::*,
++        model_standard::{CanonicalMessage, MessageRole},
++    };
++    let record = JournalRecord {
++        schema_version: JOURNAL_SCHEMA_VERSION,
++        session_id: new_session_id(),
++        record_id: new_record_id(),
++        session_seq: 1,
++        timestamp_ms: 1,
++        execution_id: None,
++        thread_id: Some(new_thread_id()),
++        turn_id: None,
++        entry: JournalEntry::HistoryMutated(HistoryMutated {
++            previous_revision: 0,
++            new_revision: 1,
++            mutation: HistoryMutationKind::Append,
++            messages: vec![CanonicalMessage::text(
++                MessageRole::User,
++                "x".repeat(24 * 1024),
++            )],
++            compaction: None,
++            tool_results: vec![],
++        }),
++    };
++    let mut expected_line = serde_json::to_vec(&record).unwrap();
++    expected_line.push(b'\n');
++    for mut writer in [
++        DisplayWriter::new(MAX_STAGING_BYTES).unwrap(),
++        DisplayWriter::for_jsonl(MAX_STAGING_BYTES, LARGE_JSONL_STAGE_MIN_SOURCE_BYTES).unwrap(),
++    ] {
++        writer.push(&record).unwrap();
++        let mut stage = writer.finish().unwrap();
++        stage.reader.rewind().unwrap();
++        let mut bytes = Vec::new();
++        stage.reader.read_until(b'\n', &mut bytes).unwrap();
++        assert!(
++            bytes == expected_line,
++            "stage bytes or final rewind changed"
++        );
++        assert_eq!(stage.bytes, expected_line.len() as u64);
++        assert!(stage.reader.fill_buf().unwrap().is_empty());
++    }
++    let budget = LARGE_JSONL_STAGE_BUFFER_BYTES as u64;
++    for mut writer in [
++        DisplayWriter::new(budget).unwrap(),
++        DisplayWriter::for_jsonl(budget, LARGE_JSONL_STAGE_MIN_SOURCE_BYTES).unwrap(),
++    ] {
++        for _ in 0..budget / expected_line.len() as u64 {
++            writer.push(&record).unwrap();
++        }
++        assert!(writer.push(&record).is_err());
++    }
++
++    // Controlled local I/O failure on an ordinary file opened read-only.
++    // An earlier error from push or a later error from finish are both a
++    // private staging failure, never a published display snapshot.
++    let file = tempfile::NamedTempFile::new().unwrap();
++    let cap = DisplayWriter::new(MAX_STAGING_BYTES)
++        .unwrap()
++        .writer
++        .capacity();
++    for capacity in [cap, LARGE_JSONL_STAGE_BUFFER_BYTES] {
++        let mut failing = DisplayWriter {
++            writer: BufWriter::with_capacity(capacity, File::open(file.path()).unwrap()),
++            budget: MAX_STAGING_BYTES,
++            remaining: MAX_STAGING_BYTES,
++        };
++        let projection = failing.push(&record).ok().and_then(|()| failing.finish());
++        assert!(projection.is_none());
++    }
++}
++
+ pub(crate) struct DisplayRecords {
+     reader: BufReader<File>,
+     pub(crate) bytes: u64,
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 4ae8aab..2a270b8 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -26,7 +26,11 @@ impl State {
+             .filter_map(|snapshot| snapshot.display.as_ref())
+             .map(|display| display.bytes)
+             .sum();
+-        let mut display = DisplayWriter::new(MAX_STAGING_BYTES.saturating_sub(staged));
++        let budget = MAX_STAGING_BYTES.saturating_sub(staged);
++        let mut display = match self.kind {
++            BackendKind::Jsonl => DisplayWriter::for_jsonl(budget, source.extent()),
++            BackendKind::Sqlite => DisplayWriter::new(budget),
++        };
+         while let Some(record) = source.next()? {
+             state.apply(session.session_id, &record)?;
+             if cut == Some(record.session_seq) {
