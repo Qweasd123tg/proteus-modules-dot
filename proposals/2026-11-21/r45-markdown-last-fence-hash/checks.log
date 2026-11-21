@@ -1,0 +1,17 @@
+Base: Proteus-harness/Proteus-desktop-extensions 892f627570369ed60d7205eb0d351c753ec4305f
+rustc 1.95.0 (59807616e 2026-04-14)
+cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+Debug, cargo test --locked -p extension-markdown-render (stock then candidate):
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+Release, cargo test --release --locked -p extension-markdown-render, fresh isolated checkout and target (stock then candidate):
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Both arms include official 3 real-process protocol tests.
+Forward/reverse git apply checks, git diff --check, cargo fmt --check -p extension-markdown-render: PASS.
+Wire equality and counted byte assertions for separate release binaries: PASS, see measurements.log and reproduce.py.
+Separate synthetic Err and caught-panic injection: original error preserved, next corrected revision equals a cold root in both candidate cases.

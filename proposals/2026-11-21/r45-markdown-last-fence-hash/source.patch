@@ -1,0 +1,153 @@
+diff --git a/packages/markdown-render/src/render.rs b/packages/markdown-render/src/render.rs
+index 29cd3ef..0933617 100644
+--- a/packages/markdown-render/src/render.rs
++++ b/packages/markdown-render/src/render.rs
+@@ -48,24 +48,27 @@ impl Document {
+             hash.finish()
+         }
+         let mut old = std::mem::take(&mut self.segments);
+-        let reuse = self.prefix.bytes > 0
++        // The SDK can recover from an extension error or unwind. Never leave a
++        // prefix pointing into segments that have already moved out of the cache.
++        let mut prefix = std::mem::take(&mut self.prefix);
++        let reuse = prefix.bytes > 0
+             && self.languages == languages
+             // The fingerprint excludes this lookahead byte. Recheck the
+             // ended-line condition that made the closing fence cacheable.
+             && matches!(
+-                source.as_bytes().get(self.prefix.bytes),
++                source.as_bytes().get(prefix.bytes),
+                 Some(b'\r' | b'\n')
+             )
+             && source
+-                .get(..self.prefix.bytes)
+-                .is_some_and(|prefix| fingerprint(prefix) == self.prefix.hash);
++                .get(..prefix.bytes)
++                .is_some_and(|bytes| fingerprint(bytes) == prefix.hash);
+         let (boundary, ordinal) = if reuse {
+-            (self.prefix.bytes, self.prefix.blocks)
++            (prefix.bytes, prefix.blocks)
+         } else {
+             (0, 0)
+         };
+         let parsed = fences::parse(&source[boundary..], languages);
+-        let prefix_definitions = if reuse { self.prefix.definitions } else { 0 };
++        let prefix_definitions = if reuse { prefix.definitions } else { 0 };
+         let mut definitions = self.definitions[..prefix_definitions].to_vec();
+         definitions.extend(
+             parsed
+@@ -76,7 +79,7 @@ impl Document {
+         let definitions_changed = self.definitions != definitions;
+         let policy_changed = self.languages != languages;
+         let mut pieces = if reuse {
+-            old.drain(..self.prefix.segments).collect::<Vec<_>>()
++            old.drain(..prefix.segments).collect::<Vec<_>>()
+         } else {
+             Vec::new()
+         };
+@@ -92,7 +95,7 @@ impl Document {
+             }
+         }
+         if !reuse {
+-            self.prefix = Prefix::default();
++            prefix = Prefix::default();
+         }
+         let mut start = boundary;
+         let mut blocks = ordinal;
+@@ -103,7 +106,7 @@ impl Document {
+         {
+             self.parsed_bytes = source.len() - boundary;
+         }
+-        let mut definitions_before = 0;
++        let mut last_closed = None;
+         for block in parsed.blocks {
+             let end = boundary + block.range.end;
+             let begin = boundary + block.range.start;
+@@ -132,22 +135,25 @@ impl Document {
+             start = end;
+             blocks = index + 1;
+             if block.closed && matches!(source.as_bytes().get(end), Some(b'\r' | b'\n')) {
+-                while parsed
+-                    .definitions
+-                    .get(definitions_before)
+-                    .is_some_and(|definition| definition.end <= block.range.end)
+-                {
+-                    definitions_before += 1;
+-                }
+-                self.prefix = Prefix {
+-                    bytes: end,
+-                    hash: fingerprint(&source[..end]),
+-                    segments: pieces.len(),
+-                    blocks,
+-                    definitions: prefix_definitions + definitions_before,
+-                };
++                last_closed = Some((end, pieces.len(), blocks));
+             }
+         }
++        // Only the last terminated fence can become the next reuse boundary.
++        // Hash it once rather than hashing every growing prefix of this render.
++        if let Some((end, segments, blocks)) = last_closed {
++            let definitions_before = parsed
++                .definitions
++                .iter()
++                .take_while(|definition| definition.end <= end - boundary)
++                .count();
++            prefix = Prefix {
++                bytes: end,
++                hash: fingerprint(&source[..end]),
++                segments,
++                blocks,
++                definitions: prefix_definitions + definitions_before,
++            };
++        }
+         if start < source.len() || pieces.is_empty() {
+             pieces.push(segment(
+                 &mut old,
+@@ -161,6 +167,7 @@ impl Document {
+         self.segments = pieces;
+         self.languages = languages.to_vec();
+         self.definitions = definitions;
++        self.prefix = prefix;
+         Ok(self.root())
+     }
+ 
+diff --git a/packages/markdown-render/src/render/boundary_tests.rs b/packages/markdown-render/src/render/boundary_tests.rs
+index e5532cc..10bfd90 100644
+--- a/packages/markdown-render/src/render/boundary_tests.rs
++++ b/packages/markdown-render/src/render/boundary_tests.rs
+@@ -105,3 +105,35 @@ fn retained_line_endings_keep_incremental_reuse_including_crlf_edits() {
+         }
+     }
+ }
++
++#[test]
++fn several_new_fences_retain_only_the_last_terminated_boundary() {
++    let languages = vec!["mermaid".into(), "latex".into()];
++    let mut document = Document::default();
++    let base = "[a]: /a\n\n```mermaid\nα\n```\n";
++    document.render(base, &languages).unwrap();
++    let first = document.prefix.bytes;
++
++    // Two new, terminated fences, then a closer at EOF (not cacheable yet).
++    let prefix = format!("{base}\n[b]: /b\n\n~~~rust\nx\n~~~\r\n\r\n$$\ny\n$$");
++    let edited = format!("{prefix}\r\n\r\n[c]: /c\n\n```md\nliteral\n```");
++    let warm = document.render(&edited, &languages).unwrap();
++    assert_eq!(
++        warm,
++        Document::default().render(&edited, &languages).unwrap()
++    );
++    assert_eq!(document.parsed_bytes, edited.len() - first);
++    assert_eq!(document.prefix.bytes, prefix.len());
++    assert_eq!(document.prefix.blocks, 3);
++    assert_eq!(document.prefix.definitions, 2);
++
++    let appended = format!("{edited}\n\n[a] [b] [c]");
++    let warm = document.render(&appended, &languages).unwrap();
++    assert_eq!(
++        warm,
++        Document::default().render(&appended, &languages).unwrap()
++    );
++    assert_eq!(document.parsed_bytes, appended.len() - prefix.len());
++    assert_eq!(document.prefix.bytes, edited.len());
++    assert_eq!(document.prefix.definitions, 3);
++}
