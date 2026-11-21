@@ -1,0 +1,73 @@
+diff --git a/context_provider/memory-pack/src/lib.rs b/context_provider/memory-pack/src/lib.rs
+index 3a57858664c1111e2fca00df3f3a6f1debc46518..65e2c274be7e2f3a00c0f0e61d64e518ff0ad968 100644
+--- a/context_provider/memory-pack/src/lib.rs
++++ b/context_provider/memory-pack/src/lib.rs
+@@ -86,9 +86,7 @@ impl JsonlMemoryStoreModule {
+             .map_err(|error| ProcessModuleError::new(format!("{error:#}")))
+     }
+     fn recall(&self, query: &MemoryQuery) -> Result<Vec<MemoryItem>, ProcessModuleError> {
+-        let payload = serde_json::to_string(query)
+-            .map_err(|error| ProcessModuleError::new(error.to_string()))?;
+-        recall_impl(&self.path, &payload)
++        recall_impl(&self.path, query)
+             .map_err(|error| ProcessModuleError::new(format!("{error:#}")))
+     }
+ }
+@@ -115,9 +113,7 @@ fn remember_impl(path: &PathBuf, lock: &Mutex<()>, item_json: &str) -> Result<()
+     Ok(())
+ }
+ 
+-fn recall_impl(path: &PathBuf, query_json: &str) -> Result<Vec<MemoryItem>> {
+-    let query: MemoryQuery =
+-        serde_json::from_str(query_json).with_context(|| "invalid MemoryQuery JSON")?;
++fn recall_impl(path: &PathBuf, query: &MemoryQuery) -> Result<Vec<MemoryItem>> {
+     if query.limit == 0 {
+         return Ok(Vec::new());
+     }
+@@ -205,30 +201,28 @@ mod tests {
+         );
+         fs::write(&path, contents).expect("memory file");
+ 
+-        let error = recall_impl(&path, r#"{"text":"keep","limit":10}"#)
++        let store = JsonlMemoryStoreModule::new(path.clone());
++        assert_eq!(store.recall(&MemoryQuery::new("keep", 1)).unwrap(), [first]);
++        let error = store
++            .recall(&MemoryQuery::new("keep", 10))
+             .expect_err("malformed memory line must fail");
+-        assert!(error.to_string().contains("line 2"), "{error:#}");
++        assert!(
++            error.message.starts_with(&format!(
++                "invalid MemoryItem JSON in {} line 2:",
++                path.display()
++            )),
++            "{error}"
++        );
+     }
+ 
+     #[test]
+     fn jsonl_recall_limit_zero_returns_no_items() {
+         let dir = tempfile::tempdir().unwrap();
+         let path = dir.path().join("memory.jsonl");
+-        let item = MemoryItem::new("fact", "remembered", Value::Null);
+-        fs::write(
+-            &path,
+-            format!("{}\n", serde_json::to_string(&item).unwrap()),
+-        )
+-        .unwrap();
+-        assert!(
+-            recall_impl(&path, r#"{"text":"","limit":0}"#)
+-                .unwrap()
+-                .is_empty()
+-        );
+-        assert!(
+-            recall_impl(&path, r#"{"text":"remembered","limit":0}"#)
+-                .unwrap()
+-                .is_empty()
+-        );
++        fs::write(&path, "not-json\n").unwrap();
++        let store = JsonlMemoryStoreModule::new(path);
++        for text in ["", "remembered"] {
++            assert!(store.recall(&MemoryQuery::new(text, 0)).unwrap().is_empty());
++        }
+     }
+ }
