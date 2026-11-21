@@ -1,0 +1,65 @@
+diff --git a/packages/analysis/src/tests.rs b/packages/analysis/src/tests.rs
+index 138ad72..24e18a2 100644
+--- a/packages/analysis/src/tests.rs
++++ b/packages/analysis/src/tests.rs
+@@ -201,6 +201,23 @@ fn step_texts_are_readable() {
+     assert_eq!(facts::duration(&json!(1000), &Value::Null), "—");
+ }
+ 
++#[test]
++fn preview_truncates_normalized_unicode_by_scalar_not_byte() {
++    for source in [
++        "",
++        "\t\n\u{2003}",
++        "\tпервая\r\n вторая\u{00a0}🦀  ",
++        "Ａ🧬e\u{301}\u{2029}b",
++        "x\u{200b}y\u{0085}z",
++    ] {
++        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
++        for limit in 0..=source.chars().count() + 1 {
++            let expected: String = flat.chars().take(limit).collect();
++            assert_eq!(text::preview(source, limit), expected.trim_end());
++        }
++    }
++}
++
+ #[test]
+ fn turns_are_newest_first_and_keep_the_selection() {
+     let data = analysis();
+diff --git a/packages/analysis/src/text.rs b/packages/analysis/src/text.rs
+index 1531504..6b5b3c7 100644
+--- a/packages/analysis/src/text.rs
++++ b/packages/analysis/src/text.rs
+@@ -51,12 +51,26 @@ pub fn short_id(value: &Value) -> String {
+ }
+ 
+ pub fn preview(text: &str, limit: usize) -> String {
+-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+-    flat.chars()
+-        .take(limit)
+-        .collect::<String>()
+-        .trim_end()
+-        .to_owned()
++    let mut out = String::new();
++    let mut remaining = limit;
++    for ch in text.chars() {
++        if remaining == 0 {
++            break;
++        }
++        if ch.is_whitespace() {
++            if out.is_empty() || out.ends_with(' ') {
++                continue;
++            }
++            out.push(' ');
++        } else {
++            out.push(ch);
++        }
++        remaining -= 1;
++    }
++    if out.ends_with(' ') {
++        out.pop();
++    }
++    out
+ }
+ 
+ /// Name of an externally tagged serde enum: `"other"` or `{"retryable": {...}}`.
