@@ -1,0 +1,128 @@
+diff --git a/src/ui/chat/row_layout.rs b/src/ui/chat/row_layout.rs
+index a17fce3..001da9f 100644
+--- a/src/ui/chat/row_layout.rs
++++ b/src/ui/chat/row_layout.rs
+@@ -22,11 +22,8 @@ impl RowContext {
+         }
+     }
+ 
+-    pub(super) fn incomplete_rows(self) -> Vec<Range<usize>> {
+-        [self.leading, self.trailing, self.footer]
+-            .into_iter()
+-            .filter(|rows| !rows.is_empty())
+-            .collect()
++    pub(super) fn is_complete(&self, row: usize) -> bool {
++        self.missing(row).is_none()
+     }
+ }
+ 
+@@ -101,3 +98,22 @@ pub(super) fn row_layout(entries: &[Entry], change: Change) -> Option<RowLayout>
+         chain,
+     })
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn layout_measurements_are_incomplete_only_inside_each_clipped_range() {
++        let context = RowContext {
++            leading: 0..3,
++            trailing: 7..9,
++            footer: 5..7,
++        };
++        let complete: Vec<_> = (0..=9).filter(|&row| context.is_complete(row)).collect();
++        assert_eq!(complete, [3, 4, 9]);
++        assert_eq!(context.missing(1), Some(Direction::Older));
++        assert_eq!(context.missing(5), Some(Direction::Newer));
++        assert_eq!(context.missing(7), Some(Direction::Newer));
++    }
++}
+diff --git a/src/ui/chat/scroller.rs b/src/ui/chat/scroller.rs
+index 65403dd..69c5823 100644
+--- a/src/ui/chat/scroller.rs
++++ b/src/ui/chat/scroller.rs
+@@ -19,6 +19,7 @@ use gpui_kit::component::*;
+ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
++use super::row_layout::RowContext;
+ use crate::ui::floor::TailFloor;
+ use crate::ui::motion;
+ 
+@@ -632,7 +633,7 @@ pub(super) struct ChatList {
+     id: ElementId,
+     state: Entity<ChatScroller>,
+     render_row: RenderRow,
+-    incomplete_rows: Vec<Range<usize>>,
++    row_context: RowContext,
+     footer: Option<(FooterState, RenderFooter)>,
+     running: bool,
+     scrollbar: bool,
+@@ -648,7 +649,7 @@ impl ChatList {
+             id: id.into(),
+             state,
+             render_row: Box::new(render_row),
+-            incomplete_rows: Vec::new(),
++            row_context: RowContext::default(),
+             footer: None,
+             running: false,
+             scrollbar: true,
+@@ -664,8 +665,8 @@ impl ChatList {
+         self
+     }
+ 
+-    pub(super) fn incomplete_rows(mut self, rows: Vec<Range<usize>>) -> Self {
+-        self.incomplete_rows = rows;
++    pub(super) fn row_context(mut self, context: RowContext) -> Self {
++        self.row_context = context;
+         self
+     }
+ 
+@@ -734,7 +735,7 @@ impl RenderOnce for ChatList {
+         let mut render_row = self.render_row;
+         let measured_footer = self.state.clone();
+         let measured_rows = scrollbar.clone();
+-        let incomplete_rows = self.incomplete_rows;
++        let row_context = self.row_context;
+         let rows = list(list_state.clone(), move |ix, window, cx| {
+             if ix == tail_row {
+                 // keep_end runs immediately before native list prepaint.
+@@ -764,7 +765,7 @@ impl RenderOnce for ChatList {
+             measured_rows.measure_chat_row(
+                 ix,
+                 div().w_full().min_w_0().child(render_row(ix, window, cx)),
+-                !incomplete_rows.iter().any(|rows| rows.contains(&ix)),
++                row_context.is_complete(ix),
+             )
+         })
+         .size_full()
+diff --git a/src/ui/chat/view.rs b/src/ui/chat/view.rs
+index eba6edf..aa870a4 100644
+--- a/src/ui/chat/view.rs
++++ b/src/ui/chat/view.rs
+@@ -46,12 +46,11 @@ impl Render for Chat {
+         });
+         let running = self.session.connected && self.session.running();
+         let scrollbar = self.scroller.read(cx).scrollbar();
+-        let incomplete_rows = super::row_layout::row_context(
++        let row_context = super::row_layout::row_context(
+             self.display_transcript().entries(),
+             prefs::visual(cx).view.compact_tools,
+             self.history.range(&self.session.transcript),
+-        )
+-        .incomplete_rows();
++        );
+         v_flex()
+             .id("chat")
+             .relative()
+@@ -78,7 +77,7 @@ impl Render for Chat {
+                     .child(
+                         ChatList::new("thread", self.scroller.clone(), renderer)
+                             .scrollbar(false)
+-                            .incomplete_rows(incomplete_rows)
++                            .row_context(row_context)
+                             .footer(footer_state, move |window, cx| footer(thinking, window, cx))
+                             .running(running),
+                     )
