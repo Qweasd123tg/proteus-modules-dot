@@ -1,0 +1,30 @@
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 136b46e..09564aa 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -91,14 +91,18 @@ impl State {
+                 identity::resolve_session_identity(&dir)?.session_id == session.session_id,
+                 "cache target identity changed"
+             );
+-            std::fs::rename(&temp, path(&dir, &key))?;
+-            Ok::<(), anyhow::Error>(())
++            let destination = path(&dir, &key);
++            std::fs::rename(&temp, &destination)?;
++            Ok::<_, anyhow::Error>(destination)
+         })();
+-        if result.is_err() {
+-            let _ = std::fs::remove_file(&temp);
+-            return Ok(SessionStorageResponse::CacheWritten { etag: None });
+-        }
+-        evict(&dir, &path(&dir, &key))?;
++        let destination = match result {
++            Ok(destination) => destination,
++            Err(_) => {
++                let _ = std::fs::remove_file(&temp);
++                return Ok(SessionStorageResponse::CacheWritten { etag: None });
++            }
++        };
++        evict(&dir, &destination)?;
+         Ok(SessionStorageResponse::CacheWritten {
+             etag: Some(storage_value_etag(&cache.value)?),
+         })
