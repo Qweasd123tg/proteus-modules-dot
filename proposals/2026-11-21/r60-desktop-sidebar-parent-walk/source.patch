@@ -1,0 +1,79 @@
+diff --git a/src/sessions.rs b/src/sessions.rs
+index af442cb..a38fa80 100644
+--- a/src/sessions.rs
++++ b/src/sessions.rs
+@@ -290,22 +290,27 @@ fn break_cycles(parents: &mut [Option<usize>]) {
+         if colors[start] != 0 {
+             continue;
+         }
+-        let mut path = Vec::new();
+         let mut next = Some(start);
+         while let Some(i) = next {
+-            if colors[i] == 1 {
+-                parents[i] = None;
+-                break;
+-            }
+-            if colors[i] == 2 {
++            if colors[i] != 0 {
+                 break;
+             }
+             colors[i] = 1;
+-            path.push(i);
+             next = parents[i];
+         }
+-        for i in path {
++        let cycle = next.filter(|&i| colors[i] == 1);
++        // Rewalk only this path's active nodes. Keep the links intact until
++        // they are all marked, including when the edge to cut is at start.
++        let mut next = Some(start);
++        while let Some(i) = next {
++            if colors[i] != 1 {
++                break;
++            }
+             colors[i] = 2;
++            next = parents[i];
++        }
++        if let Some(i) = cycle {
++            parents[i] = None;
+         }
+     }
+ }
+@@ -600,6 +605,38 @@ mod tests {
+         assert!(json.get("chat:/s/shared").is_some());
+         assert!(json.get("codex:/s/shared").is_some());
+     }
++
++    #[test]
++    fn cycle_cut_keeps_the_same_edge_when_other_chains_join_it() {
++        let mut parents = [
++            Some(1),
++            Some(2),
++            Some(0), // the first walk returns to index 0
++            Some(2),
++            Some(3), // enter the same cycle from other components
++            Some(6),
++            Some(7),
++            Some(6), // a later walk starts outside a cycle
++            None,
++            Some(8),
++        ];
++        super::break_cycles(&mut parents);
++        assert_eq!(
++            parents,
++            [
++                None,
++                Some(2),
++                Some(0),
++                Some(2),
++                Some(3),
++                Some(6),
++                None,
++                Some(6),
++                None,
++                Some(8)
++            ]
++        );
++    }
+ }
+ 
+ #[cfg(test)]
