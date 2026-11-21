@@ -1,0 +1,96 @@
+diff --git a/crates/diff/src/lib.rs b/crates/diff/src/lib.rs
+index 390f47b..b75596b 100644
+--- a/crates/diff/src/lib.rs
++++ b/crates/diff/src/lib.rs
+@@ -140,38 +140,35 @@ pub fn parse(patch: &str, info: &[FileInfo]) -> Vec<File> {
+ 
+ fn pairs(lines: &[Line]) -> Vec<Pair> {
+     let mut result = Vec::new();
+-    let mut at = 0;
+-    while at < lines.len() {
+-        match lines[at].kind {
+-            Kind::Context => {
+-                result.push(Pair::Lines(Some(at), Some(at)));
+-                at += 1;
+-            }
+-            Kind::Hunk => {
+-                at += 1;
+-            }
+-            Kind::Note => {
+-                result.push(Pair::Full(at));
+-                at += 1;
+-            }
+-            Kind::Added | Kind::Removed => {
+-                let mut old = Vec::new();
+-                let mut new = Vec::new();
+-                while at < lines.len() && matches!(lines[at].kind, Kind::Added | Kind::Removed) {
+-                    match lines[at].kind {
+-                        Kind::Added => new.push(at),
+-                        _ => old.push(at),
+-                    }
+-                    at += 1;
++    // In one change run the nth removal pairs with the nth addition, even
++    // when the two kinds are interleaved. Fill either side in output order.
++    let (mut old, mut new) = (0, 0);
++    for (at, line) in lines.iter().enumerate() {
++        match line.kind {
++            Kind::Removed => {
++                if let Some(Pair::Lines(left, _)) = result.get_mut(old) {
++                    *left = Some(at);
++                } else {
++                    result.push(Pair::Lines(Some(at), None));
+                 }
+-                for index in 0..old.len().max(new.len()) {
+-                    result.push(Pair::Lines(
+-                        old.get(index).copied(),
+-                        new.get(index).copied(),
+-                    ));
++                old += 1;
++                continue;
++            }
++            Kind::Added => {
++                if let Some(Pair::Lines(_, right)) = result.get_mut(new) {
++                    *right = Some(at);
++                } else {
++                    result.push(Pair::Lines(None, Some(at)));
+                 }
++                new += 1;
++                continue;
+             }
++            Kind::Context => result.push(Pair::Lines(Some(at), Some(at))),
++            Kind::Note => result.push(Pair::Full(at)),
++            Kind::Hunk => {}
+         }
++        old = result.len();
++        new = old;
+     }
+     result
+ }
+diff --git a/crates/diff/src/tests.rs b/crates/diff/src/tests.rs
+index 1856324..a5d7c99 100644
+--- a/crates/diff/src/tests.rs
++++ b/crates/diff/src/tests.rs
+@@ -252,3 +252,23 @@ HcmV?d00001
+         ["Двоичный файл", "-- ", "2.52.0"]
+     );
+ }
++
++#[test]
++fn interleaved_edits_pair_in_order_without_crossing_run_boundaries() {
++    let patch =
++        "*** Update File: a\n+a\n+b\n-x\n+c\n-y\n context\n-old\n@@ next\n+new\nnotice\n-other\n";
++    let file = &parse(patch, &[])[0];
++    assert_eq!(
++        file.pairs,
++        [
++            Pair::Lines(Some(2), Some(0)),
++            Pair::Lines(Some(4), Some(1)),
++            Pair::Lines(None, Some(3)),
++            Pair::Lines(Some(5), Some(5)),
++            Pair::Lines(Some(6), None),
++            Pair::Lines(None, Some(8)),
++            Pair::Full(9),
++            Pair::Lines(Some(10), None),
++        ]
++    );
++}
