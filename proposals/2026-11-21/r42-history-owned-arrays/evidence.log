@@ -1,0 +1,49 @@
+Pinned upstream main: 892f627570369ed60d7205eb0d351c753ec4305f
+sdk/src/ui.rs base blob: ea9f40af6aab1eccc26bcd448ea567c94042212b
+rustc 1.95.0 (59807616e 2026-04-14) x86_64-unknown-linux-gnu; serde_json 1.0.152 with preserve_order
+Stock with new probe test, red after byte-equality checks at ownership assertion:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+Candidate SDK crate (includes ui tests), direct rustc --test:
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+Candidate extension-git crate, direct rustc --test:
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
+Byte/allocator replay with exact baseline + patch:
+
+running 4 tests
+test tests::setting_reset_is_an_optional_action_and_preserves_its_payload ... ok
+test tests::builds_check_states_and_split_buttons ... ok
+test tests::sortable_preserves_nested_control_contracts ... ok
+test tests::setting_row_keeps_one_control_and_optional_help ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+test tests::history_widgets_move_owned_arrays_without_changing_the_wire ... ok
+test tests::sortable_preserves_nested_control_contracts ... ok
+test tests::setting_reset_is_an_optional_action_and_preserves_its_payload ... ok
+test tests::setting_row_keeps_one_control_and_optional_help ... ok
+test tests::builds_check_states_and_split_buttons ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Byte-identical output:
+0e5c8c6cc6e95ed5887f4bd3d1a485b50f76cfe98a0158812d66b1a23871f008  candidate.jsonl
+widget rows alloc_calls requested_B extra_peak_live_B
+list	0	11	1206	842
+lanes	0	25	2037	1673
+list	1	36	2734	2370
+lanes	1	54	4085	3721
+list	100	2412	154096	153732
+lanes	100	2826	207017	206653
+list	1000	24012	1531096	1530732
+lanes	1000	28026	2053817	2053453
+Patched:
+list	0	11	1206	842
+lanes	0	12	1222	858
+list	1	11	1206	842
+lanes	1	12	1222	858
+list	100	11	1206	842
+lanes	100	12	1222	858
+list	1000	11	1206	842
+lanes	1000	12	1222	858
