@@ -1,0 +1,52 @@
+diff --git a/crates/proteus-core/src/core/agent_control/process/messaging.rs b/crates/proteus-core/src/core/agent_control/process/messaging.rs
+index ee83baa..fd8eabf 100644
+--- a/crates/proteus-core/src/core/agent_control/process/messaging.rs
++++ b/crates/proteus-core/src/core/agent_control/process/messaging.rs
+@@ -83,7 +83,7 @@ impl PeerMessageDelivery {
+         &mut self,
+         id: &str,
+         ok: bool,
+-        output: Option<&Value>,
++        output: &mut Option<Value>,
+         error: Option<&str>,
+     ) -> Result<Option<PeerMessageResponse>> {
+         if !self.pending_receipts.remove(id) {
+@@ -95,7 +95,8 @@ impl PeerMessageDelivery {
+                 error.unwrap_or("unknown error")
+             );
+         }
+-        let output = output.ok_or_else(|| {
++        // An unrelated response still belongs to the caller's primary Send path.
++        let output = output.take().ok_or_else(|| {
+             anyhow::anyhow!("subagent child returned an empty agent-control response")
+         })?;
+         if output.get("queued").and_then(Value::as_bool) == Some(true) {
+@@ -104,7 +105,7 @@ impl PeerMessageDelivery {
+             }
+             return Ok(Some(PeerMessageResponse::Queued));
+         }
+-        let output = serde_json::from_value::<AgentOutput>(output.clone())
++        let output = serde_json::from_value::<AgentOutput>(output)
+             .context("subagent child returned an invalid agent-control turn output")?;
+         Ok(Some(PeerMessageResponse::TurnCompleted(output)))
+     }
+diff --git a/crates/proteus-core/src/core/agent_control/process/turn.rs b/crates/proteus-core/src/core/agent_control/process/turn.rs
+index 78b48bb..ac214c5 100644
+--- a/crates/proteus-core/src/core/agent_control/process/turn.rs
++++ b/crates/proteus-core/src/core/agent_control/process/turn.rs
+@@ -404,13 +404,13 @@ async fn handle_output(
+         StdioOutput::Response {
+             id: Some(id),
+             ok,
+-            output,
++            mut output,
+             error,
+         } => {
+             if let Some(response) =
+                 tracker
+                     .message_delivery
+-                    .confirm(&id, ok, output.as_ref(), error.as_deref())?
++                    .confirm(&id, ok, &mut output, error.as_deref())?
+             {
+                 return Ok(match response {
+                     PeerMessageResponse::Queued => {
