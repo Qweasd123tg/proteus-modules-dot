@@ -1,0 +1,71 @@
+diff --git a/sdk/src/ui.rs b/sdk/src/ui.rs
+index ea9f40a..ecec93f 100644
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -235,7 +235,8 @@
+             |(value, label)| json!({"label": label, "value": value, "selected": value == selected}),
+         )
+         .collect();
+-    json!({"type": "select", "id": id, "label": label, "action": action, "options": options})
++    json!({"type": "select", "id": id, "label": label, "action": action})
++        .with("options", Value::Array(options))
+ }
+ 
+ /// Native search, virtualized rows and keyboard selection; value is sent directly.
+@@ -248,7 +249,9 @@
+         .iter()
+         .map(|(value, label)| json!({"value":value,"label":label,"selected":value==selected}))
+         .collect();
+-    json!({"type":"picker","id":id,"options":options,"action":action})
++    json!({"type":"picker","id":id})
++        .with("options", Value::Array(options))
++        .with("action", action)
+ }
+ 
+ pub fn code(id: &str, text: &str, language: &str) -> Value {
+@@ -368,6 +371,45 @@
+     use super::*;
+ 
+     #[test]
++    fn option_envelopes_keep_order_and_all_matching_identities() {
++        let chosen = json!({"z": [null, -0.0, u64::MAX], "a": false});
++        let choices = [
++            (Value::Null, "Все".to_owned()),
++            (chosen.clone(), "Первый".to_owned()),
++            (chosen.clone(), "Второй".to_owned()),
++        ];
++        let selected = select("id", "", &choices, &chosen, "choose");
++        let picked = picker("id", &choices, &chosen, "choose");
++
++        assert_eq!(
++            selected.to_string(),
++            json!({"type":"select","id":"id","label":"","action":"choose","options":[
++                {"label":"Все","value":null,"selected":false},
++                {"label":"Первый","value":chosen,"selected":true},
++                {"label":"Второй","value":chosen,"selected":true}
++            ]})
++            .to_string()
++        );
++        assert_eq!(
++            picked.to_string(),
++            json!({"type":"picker","id":"id","options":[
++                {"value":null,"label":"Все","selected":false},
++                {"value":chosen,"label":"Первый","selected":true},
++                {"value":chosen,"label":"Второй","selected":true}
++            ],"action":"choose"})
++            .to_string()
++        );
++        assert_eq!(
++            picker("id", &[], &Value::Null, "").to_string(),
++            r#"{"type":"picker","id":"id","options":[],"action":""}"#
++        );
++        assert_eq!(
++            select("id", "None", &choices, &Value::Null, "choose")["options"][0]["selected"],
++            true
++        );
++    }
++
++    #[test]
+     fn setting_row_keeps_one_control_and_optional_help() {
+         let row = setting_row("radius", "Радиус", input("r", "8", "0", "radius"))
+             .with("description", "Enter сохраняет значение")
