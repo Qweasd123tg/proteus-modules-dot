@@ -1,0 +1,146 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 77243bc..ae7035f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2851,6 +2851,7 @@ version = "0.1.0-alpha.3"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
++ "memchr",
+  "proteus-contracts",
+  "proteus-session-semantics",
+  "ring",
+diff --git a/storage/session-storage/Cargo.toml b/storage/session-storage/Cargo.toml
+index f36f55e..afa55cc 100644
+--- a/storage/session-storage/Cargo.toml
++++ b/storage/session-storage/Cargo.toml
+@@ -10,6 +10,7 @@ proteus-contracts = { workspace = true }
+ proteus-session-semantics = { workspace = true }
+ anyhow = "1"
+ base64 = "0.22"
++memchr = "2"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ ring = "0.17"
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 5cac324..1c203a6 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -290,6 +290,42 @@ impl RecordSnapshot for JsonlSnapshot {
+         let Some(reader) = &mut self.file else {
+             return Ok(None);
+         };
++        let mut decode = |line: &[u8]| -> Result<Option<JournalRecord>> {
++            ensure!(
++                line.len() <= MAX_PAYLOAD_BYTES * 2,
++                "journal line exceeds maximum"
++            );
++            let Some(payload) = line.strip_suffix(b"\n") else {
++                bail!("journal snapshot lost a complete line");
++            };
++            self.consumed += line.len() as u64;
++            self.current_hash.update(line);
++            ensure!(
++                !payload.is_empty(),
++                "journal contains an empty complete line"
++            );
++            let (record, external) = codec::decode(&self.dir, self.id, payload)?;
++            self.has_external_payloads |= external;
++            Ok(Some(record))
++        };
++
++        // Borrow only complete lines. The buffered file remains the same pinned
++        // source used by read_until, and no extra storage lives on the snapshot.
++        match reader.fill_buf() {
++            Ok(bytes) => {
++                if let Some(end) = memchr::memchr(b'\n', bytes)
++                    && end < MAX_PAYLOAD_BYTES * 2
++                {
++                    let count = end + 1;
++                    let result = decode(&bytes[..count]);
++                    reader.consume(count);
++                    return result;
++                }
++            }
++            // read_until already retries interrupted reads.
++            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
++            Err(err) => return Err(err.into()),
++        }
+         let mut line = Vec::new();
+         // Bound even a malicious unterminated line before allocation reaches file size.
+         let count = reader
+@@ -309,20 +345,7 @@ impl RecordSnapshot for JsonlSnapshot {
+             self.fully_read = true;
+             return Ok(None);
+         }
+-        ensure!(
+-            line.len() <= MAX_PAYLOAD_BYTES * 2,
+-            "journal line exceeds maximum"
+-        );
+-        if !line.ends_with(b"\n") {
+-            bail!("journal snapshot lost a complete line");
+-        }
+-        self.consumed += line.len() as u64;
+-        self.current_hash.update(&line);
+-        line.pop();
+-        ensure!(!line.is_empty(), "journal contains an empty complete line");
+-        let (record, external) = codec::decode(&self.dir, self.id, &line)?;
+-        self.has_external_payloads |= external;
+-        Ok(Some(record))
++        decode(&line)
+     }
+     fn consumed_fingerprint(&self) -> String {
+         crate::io::digest_hex(self.current_hash.clone().finish())
+diff --git a/storage/session-storage/src/tests/seek.rs b/storage/session-storage/src/tests/seek.rs
+index f4360ac..4abba51 100644
+--- a/storage/session-storage/src/tests/seek.rs
++++ b/storage/session-storage/src/tests/seek.rs
+@@ -313,3 +313,48 @@ fn jsonl_terminal_fold_discards_its_capture_on_append_during_validation() {
+         "changed source uses the ordinary second scan"
+     );
+ }
++
++#[test]
++fn jsonl_buffer_boundaries_preserve_records_and_prefix_hashes() {
++    use crate::backend::JournalBackend;
++
++    let mut f = Fixture::new(BackendKind::Jsonl);
++    // The large lines are inline but cross the underlying 64 KiB buffer.
++    // Small records before and after must survive both forward reads and rewinds.
++    let values = [
++        "first small".to_owned(),
++        "c".repeat(120_000),
++        "middle small".to_owned(),
++        "д".repeat(40_000),
++        "final small".to_owned(),
++    ];
++    let entries: Vec<_> = values
++        .iter()
++        .map(|v| f.append(vec![text(v)]).entry)
++        .collect();
++    let raw = std::fs::read(f.descriptor.record_location.as_ref().unwrap()).unwrap();
++    let whole_hash = crate::io::sha256_hex(&raw);
++    let mut source = crate::backend::Jsonl::new()
++        .snapshot(
++            f.descriptor.local_path.as_ref().unwrap(),
++            f.descriptor.session.session_id,
++        )
++        .unwrap();
++    for _ in 0..2 {
++        let mut consumed = 0;
++        for (i, line) in raw.split_inclusive(|&byte| byte == b'\n').enumerate() {
++            let record = source.next().unwrap().unwrap();
++            assert_eq!(record.session_seq, i as u64 + 1);
++            assert_eq!(record.entry, entries[i]);
++            consumed += line.len();
++            assert_eq!(
++                source.consumed_fingerprint(),
++                crate::io::sha256_hex(&raw[..consumed])
++            );
++        }
++        assert_eq!(consumed, raw.len());
++        assert!(source.next().unwrap().is_none());
++        assert_eq!(source.fingerprint(), whole_hash);
++        source.reset().unwrap();
++    }
++}
