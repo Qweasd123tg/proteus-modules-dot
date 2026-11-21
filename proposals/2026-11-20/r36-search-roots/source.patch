@@ -1,0 +1,79 @@
+diff --git a/context_provider/rg-search/src/lib.rs b/context_provider/rg-search/src/lib.rs
+index eb00d19a99ad780759ff28affd3c5353f655e613..5d5c5a35fa5c19f6824d941c8b8c03b17805b181 100644
+--- a/context_provider/rg-search/src/lib.rs
++++ b/context_provider/rg-search/src/lib.rs
+@@ -79,22 +79,22 @@ fn search_roots(query: &SearchQuery) -> Vec<PathBuf> {
+                 root.to_path_buf()
+             })
+         })
+-        .collect::<std::collections::BTreeSet<_>>()
+-        .into_iter()
+-        .collect::<Vec<_>>();
+-    if roots.is_empty() || roots.iter().any(|root| root == Path::new(".")) {
+-        vec![PathBuf::from(".")]
+-    } else {
+-        roots
+-            .iter()
+-            .filter(|root| {
+-                !roots
+-                    .iter()
+-                    .any(|parent| parent != *root && root.starts_with(parent))
+-            })
+-            .cloned()
+-            .collect()
++        .collect::<std::collections::BTreeSet<_>>();
++    if roots.is_empty() || roots.contains(Path::new(".")) {
++        return vec![PathBuf::from(".")];
++    }
++    // Paths sort by component: all descendants of a retained root precede
++    // the next sibling. Only the last retained root can cover this candidate.
++    let mut selected = Vec::new();
++    for root in roots {
++        if selected
++            .last()
++            .is_none_or(|parent| !root.starts_with(parent))
++        {
++            selected.push(root);
++        }
+     }
++    selected
+ }
+ 
+ fn safe_relative_root(prefix: &str) -> Option<PathBuf> {
+diff --git a/context_provider/rg-search/src/tests.rs b/context_provider/rg-search/src/tests.rs
+index 258922281f9b3686131417d7700e37f879b360dd..bf7616bfdb76e7cb08b09c656eff720b92800622 100644
+--- a/context_provider/rg-search/src/tests.rs
++++ b/context_provider/rg-search/src/tests.rs
+@@ -65,6 +65,32 @@ fn rg_command_uses_safe_path_filters_as_search_roots_and_globs() {
+     fs::remove_dir_all(dir).unwrap();
+ }
+ 
++#[test]
++fn search_roots_keep_distinct_siblings_and_drop_all_covered_descendants() {
++    let dir = temp_workspace();
++    for path in ["a/b/c", "a/b/d", "a!/x", "ab/y", "z/k"] {
++        fs::create_dir_all(dir.join(path)).unwrap();
++    }
++    let query = SearchQuery::new("needle", dir.clone(), 1).with_path_filters(
++        [
++            "z/k/",
++            "./a/b/c/",
++            "a!/",
++            "a/b/d/",
++            "ab/y/missing/",
++            "a/",
++            "a/b/c/",
++            "a!/x/",
++        ],
++        [] as [&str; 0],
++    );
++    assert_eq!(
++        search_roots(&query),
++        ["a", "a!", "ab/y", "z/k"].map(PathBuf::from)
++    );
++    fs::remove_dir_all(dir).unwrap();
++}
++
+ #[cfg(unix)]
+ #[test]
+ fn literal_path_filters_match_python_component() {
