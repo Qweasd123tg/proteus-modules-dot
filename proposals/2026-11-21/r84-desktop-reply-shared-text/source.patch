@@ -1,0 +1,308 @@
+diff --git a/src/declarative/protocol.rs b/src/declarative/protocol.rs
+index 7bff51e..21968e5 100644
+--- a/src/declarative/protocol.rs
++++ b/src/declarative/protocol.rs
+@@ -4,7 +4,7 @@
+ //! and host events. The process answers with whole view trees whenever it
+ //! wants: after a request, an action or on its own timer.
+ 
+-use std::path::PathBuf;
++use std::{path::PathBuf, sync::Arc};
+ 
+ pub use proteus_contracts::app_protocol::settings::SessionSettingUpdate as SessionSetting;
+ use serde::{Deserialize, Serialize};
+@@ -153,11 +153,66 @@ pub struct Server {
+     pub token: String,
+ }
+ 
++/// Reply bodies borrow the transcript's immutable allocation. Other content
++/// producers keep the existing owned-string path.
++#[derive(Clone, Debug)]
++pub enum ContentSource {
++    Owned(String),
++    Shared(Arc<str>),
++}
++
++impl ContentSource {
++    pub fn as_str(&self) -> &str {
++        match self {
++            Self::Owned(source) => source,
++            Self::Shared(source) => source,
++        }
++    }
++}
++
++impl PartialEq for ContentSource {
++    fn eq(&self, other: &Self) -> bool {
++        self.as_str() == other.as_str()
++    }
++}
++
++impl Eq for ContentSource {}
++
++impl Serialize for ContentSource {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_str(self.as_str())
++    }
++}
++
++impl From<String> for ContentSource {
++    fn from(source: String) -> Self {
++        Self::Owned(source)
++    }
++}
++
++impl From<&String> for ContentSource {
++    fn from(source: &String) -> Self {
++        Self::Owned(source.clone())
++    }
++}
++
++impl From<&str> for ContentSource {
++    fn from(source: &str) -> Self {
++        Self::Owned(source.into())
++    }
++}
++
++impl From<&Arc<str>> for ContentSource {
++    fn from(source: &Arc<str>) -> Self {
++        Self::Shared(Arc::clone(source))
++    }
++}
++
+ /// Original closed fence contents, separate from its stable view address.
+ #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+ pub struct Content {
+     pub language: String,
+-    pub source: String,
++    pub source: ContentSource,
+     pub context: Value,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub source_revision: Option<u64>,
+diff --git a/src/ui/chat/replies.rs b/src/ui/chat/replies.rs
+index 5052782..37a4f34 100644
+--- a/src/ui/chat/replies.rs
++++ b/src/ui/chat/replies.rs
+@@ -64,7 +64,7 @@ impl Replies {
+         let (part, changes, resize) = if let Some(extension) = renderer {
+             let payload = Content {
+                 language: media_type.into(),
+-                source: text.to_string(),
++                source: text.into(),
+                 context: serde_json::Value::Null,
+                 source_revision: Some(0),
+             };
+diff --git a/src/ui/extensions/declarative/content.rs b/src/ui/extensions/declarative/content.rs
+index 132e2a4..1ad3b51 100644
+--- a/src/ui/extensions/declarative/content.rs
++++ b/src/ui/extensions/declarative/content.rs
+@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+ use super::{code_block, view::DeclarativeView};
+-use crate::declarative::protocol::{Content, SurfaceKind};
++use crate::declarative::protocol::{Content, ContentSource, SurfaceKind};
+ use crate::ui::extensions::Host;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+@@ -88,10 +88,13 @@ fn populate_context(value: &mut serde_json::Value, cx: &App) {
+ fn updated_content(
+     current: &Content,
+     language: &str,
+-    source: &str,
++    source: impl AsRef<str> + Into<ContentSource>,
+     context: serde_json::Value,
+ ) -> Option<Arc<Content>> {
+-    if current.language == language && current.source == source && current.context == context {
++    if current.language == language
++        && current.source.as_str() == source.as_ref()
++        && current.context == context
++    {
+         return None;
+     }
+     Some(Arc::new(Content {
+@@ -102,6 +105,13 @@ fn updated_content(
+     }))
+ }
+ 
++fn source_label(source: &ContentSource) -> SharedString {
++    match source {
++        ContentSource::Owned(source) => SharedString::from(source.clone()),
++        ContentSource::Shared(source) => SharedString::from(Arc::clone(source)),
++    }
++}
++
+ pub(in crate::ui) struct WillResize;
+ 
+ impl EventEmitter<WillResize> for ContentView {}
+@@ -268,7 +278,7 @@ impl ContentView {
+     pub(in crate::ui) fn set_source(
+         &mut self,
+         language: &str,
+-        source: &str,
++        source: impl AsRef<str> + Into<ContentSource>,
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+@@ -338,7 +348,7 @@ impl Render for ContentView {
+                 )
+             })
+             .child(if raw {
+-                let source = SharedString::from(self.content.source.clone());
++                let source = source_label(&self.content.source);
+                 width = Some(super::code_geometry::Width::Source(source.clone()));
+                 if self.body {
+                     gpui_kit::base::SelectableText::new("content-source-text", source)
+@@ -379,7 +389,7 @@ impl Render for ContentView {
+         code_block::shell(
+             "copy-content-source",
+             &self.content.language,
+-            move |_, _| content.source.clone().into(),
++            move |_, _| source_label(&content.source),
+             Some(toggle.into_any_element()),
+             body.into_any_element(),
+             cx,
+@@ -425,7 +435,7 @@ impl Render for FormattedText {
+             self.view = contributor.map(|id| {
+                 let content = Content {
+                     language: self.format.clone(),
+-                    source: self.source.to_string(),
++                    source: self.source.to_string().into(),
+                     context: serde_json::Value::Null,
+                     source_revision: Some(0),
+                 };
+diff --git a/src/ui/extensions/declarative/content/tests.rs b/src/ui/extensions/declarative/content/tests.rs
+index 5a029cd..ce72acb 100644
+--- a/src/ui/extensions/declarative/content/tests.rs
++++ b/src/ui/extensions/declarative/content/tests.rs
+@@ -13,17 +13,17 @@ fn current(revision: Option<u64>) -> Content {
+ #[test]
+ fn unchanged_borrowed_source_keeps_the_current_snapshot_and_revision() {
+     let current = current(Some(7));
+-    let source_pointer = current.source.as_ptr();
++    let source_pointer = current.source.as_str().as_ptr();
+     assert!(
+         updated_content(
+             &current,
+             &current.language,
+-            &current.source,
++            current.source.as_str(),
+             current.context.clone(),
+         )
+         .is_none()
+     );
+-    assert_eq!(current.source.as_ptr(), source_pointer);
++    assert_eq!(current.source.as_str().as_ptr(), source_pointer);
+     assert_eq!(current.source_revision, Some(7));
+ }
+ 
+@@ -34,11 +34,14 @@ fn changed_source_is_owned_once_then_shared_without_a_payload_clone() {
+     let next = updated_content(&current, "fixture", &source, current.context.clone()).unwrap();
+     let runtime = std::sync::Arc::clone(&next);
+     assert!(std::sync::Arc::ptr_eq(&next, &runtime));
+-    assert_eq!(next.source.as_ptr(), runtime.source.as_ptr());
+-    assert_eq!(next.source, source);
++    assert_eq!(
++        next.source.as_str().as_ptr(),
++        runtime.source.as_str().as_ptr()
++    );
++    assert_eq!(next.source.as_str(), source);
+     assert_eq!(next.source_revision, Some(8));
+     assert_eq!(next.context, current.context);
+-    assert_eq!(current.source, "original source\n");
++    assert_eq!(current.source.as_str(), "original source\n");
+     assert_eq!(
+         serde_json::to_value(next.as_ref()).unwrap(),
+         json!({
+@@ -53,14 +56,25 @@ fn changed_source_is_owned_once_then_shared_without_a_payload_clone() {
+ #[test]
+ fn language_and_context_changes_still_advance_the_revision() {
+     let current = current(Some(7));
+-    let language =
+-        updated_content(&current, "other", &current.source, current.context.clone()).unwrap();
++    let language = updated_content(
++        &current,
++        "other",
++        current.source.as_str(),
++        current.context.clone(),
++    )
++    .unwrap();
+     assert_eq!(language.source_revision, Some(8));
+     assert_eq!(language.language, "other");
+     assert_eq!(language.source, current.source);
+ 
+     let context = json!({"languages": ["fixture", "new"], "custom": {"preserve": true}});
+-    let next = updated_content(&current, "fixture", &current.source, context.clone()).unwrap();
++    let next = updated_content(
++        &current,
++        "fixture",
++        current.source.as_str(),
++        context.clone(),
++    )
++    .unwrap();
+     assert_eq!(next.source_revision, Some(8));
+     assert_eq!(next.context, context);
+     assert_eq!(next.source, current.source);
+@@ -72,10 +86,35 @@ fn absent_and_wrapping_revisions_keep_existing_semantics() {
+         let current = current(before);
+         let next = updated_content(&current, "fixture", "", current.context.clone()).unwrap();
+         assert_eq!(next.source_revision, after);
+-        assert!(next.source.is_empty());
++        assert!(next.source.as_str().is_empty());
+     }
+ }
+ 
++#[test]
++fn reply_source_shares_text_across_themed_payload_clones() {
++    let current = current(Some(4));
++    let text: std::sync::Arc<str> = std::sync::Arc::from("shared reply 🦀");
++    let next = updated_content(&current, "fixture", &text, current.context.clone()).unwrap();
++    let mut themed = next.as_ref().clone();
++    themed.context["theme"] = json!({"dark": true});
++    assert_eq!(next.source.as_str().as_ptr(), text.as_ptr());
++    assert_eq!(themed.source.as_str().as_ptr(), text.as_ptr());
++    assert!(themed.source == super::ContentSource::from(text.as_ref()));
++    assert_eq!(
++        serde_json::to_value(&themed).unwrap()["source"],
++        text.as_ref()
++    );
++    assert_eq!(themed.source_revision, Some(5));
++    let equal = std::sync::Arc::<str>::from(text.as_ref());
++    assert!(!std::sync::Arc::ptr_eq(&text, &equal));
++    assert!(updated_content(&next, "fixture", &equal, next.context.clone()).is_none());
++    let contextual = updated_content(&next, "fixture", &text, json!({"variant": 2})).unwrap();
++    assert_eq!(contextual.source_revision, Some(6));
++    assert_eq!(contextual.source.as_str().as_ptr(), text.as_ptr());
++
++    assert!(updated_content(&next, "fixture", text.as_ref(), next.context.clone()).is_none());
++}
++
+ #[::core::prelude::v1::test]
+ fn native_rich_text_prepares_behind_fallback_and_keeps_ready_replacements_visible() {
+     use super::*;
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+index bda711e..48d80bc 100644
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -298,7 +298,7 @@ impl Runtime {
+             // synthetic source and calls its own production renderer.
+             Some(Content {
+                 language: String::new(),
+-                source: String::new(),
++                source: "".into(),
+                 context: theme.clone(),
+                 source_revision: None,
+             })
+diff --git a/src/ui/extensions/declarative/runtime/content_queue.rs b/src/ui/extensions/declarative/runtime/content_queue.rs
+index 3dbe06c..6d77bca 100644
+--- a/src/ui/extensions/declarative/runtime/content_queue.rs
++++ b/src/ui/extensions/declarative/runtime/content_queue.rs
+@@ -50,7 +50,7 @@ mod tests {
+     fn snapshot(revision: u64) -> Arc<Content> {
+         Arc::new(Content {
+             language: "fixture".into(),
+-            source: format!("revision {revision}\n{}", "αβ😀\n".repeat(1024)),
++            source: format!("revision {revision}\n{}", "αβ😀\n".repeat(1024)).into(),
+             context: serde_json::json!({"custom": "preserved"}),
+             source_revision: Some(revision),
+         })
