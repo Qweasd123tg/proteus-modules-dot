@@ -1,0 +1,123 @@
+diff --git a/packages/git/src/cache.rs b/packages/git/src/cache.rs
+index 41b64cc7ecd9f5b50ad977eb4f5696bd96786df8..4cc98aacda1fb0ad319946a94c05b4aa407edc97 100644
+--- a/packages/git/src/cache.rs
++++ b/packages/git/src/cache.rs
+@@ -8,6 +8,7 @@
+ 
+ use std::collections::VecDeque;
+ use std::io::{self, Write};
++use std::rc::Rc;
+ use std::sync::Arc;
+ 
+ use proteus_extension::{Value, ValueExt};
+@@ -73,19 +74,20 @@ pub(crate) fn encoded_text_bytes(value: &str) -> Option<usize> {
+ /// budget; immutable commit records cannot crowd them out (or vice versa).
+ #[derive(Default)]
+ pub(crate) struct WorkingCache {
+-    entries: VecDeque<(String, Value, usize)>,
++    entries: VecDeque<(String, Rc<Value>, usize)>,
+     bytes: usize,
+ }
+ 
+ impl WorkingCache {
+-    pub(crate) fn get(&mut self, path: &str) -> Option<&Value> {
++    pub(crate) fn get(&mut self, path: &str) -> Option<Rc<Value>> {
+         let index = self.entries.iter().position(|(key, _, _)| key == path)?;
+         let entry = self.entries.remove(index)?;
++        let diff = Rc::clone(&entry.1);
+         self.entries.push_back(entry);
+-        self.entries.back().map(|(_, value, _)| value)
++        Some(diff)
+     }
+ 
+-    pub(crate) fn insert(&mut self, path: String, value: Value) {
++    pub(crate) fn insert(&mut self, path: String, value: Rc<Value>) {
+         self.remove(&path);
+         let Some(bytes) = encoded_bytes(&value).and_then(|size| size.checked_add(path.len()))
+         else {
+@@ -238,7 +240,7 @@ mod tests {
+         for n in 0..100 {
+             cache.insert(
+                 n.to_string(),
+-                json!({"patch":"\n\\\"Ж".repeat(30_000), "revision":"r"}),
++                json!({"patch":"\n\\\"Ж".repeat(30_000), "revision":"r"}).into(),
+             );
+             assert!(cache.bytes <= BYTES);
+             assert!(cache.len() <= ENTRIES);
+@@ -246,13 +248,30 @@ mod tests {
+         assert!(cache.get("0").is_none());
+         assert!(cache.get("99").is_some());
+         // Touching an entry promotes it; byte-heavy insertion evicts older ones.
+-        cache.insert("large".into(), json!({"patch":"x".repeat(BYTES)}));
++        cache.insert("large".into(), json!({"patch":"x".repeat(BYTES)}).into());
+         assert!(!cache.contains_key("large"));
+         assert!(cache.contains_key("99"));
+         cache.retain(|_, _| false);
+         assert_eq!(cache.bytes, 0);
+     }
+ 
++    #[test]
++    fn working_hits_share_the_value_and_discard_the_owner_on_invalidation() {
++        let mut cache = WorkingCache::default();
++        let value = Rc::new(json!({"patch":"кошка", "revision":"r"}));
++        let weak = Rc::downgrade(&value);
++        cache.insert("a".into(), value);
++        let first = cache.get("a").unwrap();
++        let second = cache.get("a").unwrap();
++        assert!(Rc::ptr_eq(&first, &second));
++        assert_eq!(Rc::strong_count(&first), 3);
++        cache.remove("a");
++        assert!(cache.get("a").is_none());
++        assert_eq!(Rc::strong_count(&first), 2);
++        drop((first, second));
++        assert!(weak.upgrade().is_none());
++    }
++
+     fn commit(hash: &str, short: &str) -> Arc<Value> {
+         Arc::new(json!({"hash": hash, "short": short, "patch": "synthetic"}))
+     }
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index 2388e8e8e78d52be42fa95c0d696139cc739bc38..d40d0cd0cb37d5efd384b229cf9b5a5194abc163 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -107,15 +107,15 @@ impl Git {
+         fill(children)
+     }
+ 
+-    fn working_diff(&mut self, host: &Host, path: &str) -> proteus_extension::Result<Value> {
++    fn working_diff(&mut self, host: &Host, path: &str) -> proteus_extension::Result<Rc<Value>> {
+         if let Some(diff) = self.diffs.get(path) {
+-            return Ok(diff.clone());
++            return Ok(diff);
+         }
+-        let diff = host.api("/workspace/diff", &[("path", path)])?;
++        let diff = Rc::new(host.api("/workspace/diff", &[("path", path)])?);
+         // A null token means the source changed during the read, or the
+         // filesystem cannot provide a usable revision. Show it once only.
+         if diff.opt_str("revision").is_some() {
+-            self.diffs.insert(path.to_owned(), diff.clone());
++            self.diffs.insert(path.to_owned(), Rc::clone(&diff));
+         }
+         Ok(diff)
+     }
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 8922950c543a77a17fc08be0d294d329fd3d82e8..0737c3a7180aea2560b77717212d4501bdc15bb1 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -556,11 +556,12 @@ fn source_revisions_expire_only_changed_working_patches() {
+     fake.git.update(initial.clone());
+     fake.git.diffs.insert(
+         "src/a.rs".into(),
+-        json!({"revision":"a-v1", "patch":"old a"}),
++        json!({"revision":"a-v1", "patch":"old a"}).into(),
++    );
++    fake.git.diffs.insert(
++        "b.py".into(),
++        json!({"revision":"b-v1", "patch":"b"}).into(),
+     );
+-    fake.git
+-        .diffs
+-        .insert("b.py".into(), json!({"revision":"b-v1", "patch":"b"}));
+     fake.git.update(initial.clone());
+     assert_eq!(fake.git.diffs.len(), 2);
+     // Same statuses and +N/−M; only source bytes/revision changed.
