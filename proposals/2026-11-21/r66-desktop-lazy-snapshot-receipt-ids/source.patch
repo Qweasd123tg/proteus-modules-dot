@@ -1,0 +1,109 @@
+diff --git a/src/ui/chat/feedback/mod.rs b/src/ui/chat/feedback/mod.rs
+index 43572d3..7d1ff01 100644
+--- a/src/ui/chat/feedback/mod.rs
++++ b/src/ui/chat/feedback/mod.rs
+@@ -119,12 +119,13 @@ impl Feedback {
+ 
+     /// A reconnect snapshot is an authoritative handoff even when the user
+     /// row has already left its bounded live tail. Correlate by the request's
+-    /// run id, never by an old identical message's text.
++    /// run id, never by an old identical message's text. Only look up a
++    /// transcript message when its ID is known and the run did not match.
+     pub fn snapshot(
+         &mut self,
+         execution: &AppExecutionState,
+         tools_running: bool,
+-        message_ids: &[MessageId],
++        mut has_message: impl FnMut(MessageId) -> bool,
+     ) {
+         for send in &mut self.sends {
+             if execution
+@@ -132,7 +133,7 @@ impl Feedback {
+                 .iter()
+                 .chain(&execution.last)
+                 .any(|run| run.run_id == send.id)
+-                || send.message_id.is_some_and(|id| message_ids.contains(&id))
++                || send.message_id.is_some_and(&mut has_message)
+             {
+                 send.observed = true;
+             }
+diff --git a/src/ui/chat/feedback/tests.rs b/src/ui/chat/feedback/tests.rs
+index 82a99b8..fb885c5 100644
+--- a/src/ui/chat/feedback/tests.rs
++++ b/src/ui/chat/feedback/tests.rs
+@@ -75,18 +75,48 @@ fn reconnect_uses_run_or_queued_message_identity() {
+     let mut feedback = Feedback::default();
+     feedback.begin("one".into(), "same".into(), &[], &[]);
+     feedback.complete("one", true, None);
+-    feedback.snapshot(&running("other"), false, &[]);
++    feedback.snapshot(&running("other"), false, |_| false);
+     assert_eq!(feedback.visible_sends().count(), 1);
+-    feedback.snapshot(&running("one"), false, &[]);
++    feedback.snapshot(&running("one"), false, |_| false);
+     assert_eq!(feedback.visible_sends().count(), 0);
+ 
+     let message_id = new_message_id();
+     feedback.begin("queued".into(), "same".into(), &[], &[]);
+     feedback.complete("queued", true, Some(message_id));
+-    feedback.snapshot(&AppExecutionState::default(), false, &[message_id]);
++    feedback.snapshot(&AppExecutionState::default(), false, |id| id == message_id);
+     assert_eq!(feedback.visible_sends().count(), 0);
+ }
+ 
++#[test]
++fn reconnect_looks_up_only_known_send_ids_not_already_matched_by_run() {
++    let already_matched = new_message_id();
++    let in_transcript = new_message_id();
++    let missing = new_message_id();
++    let mut feedback = Feedback::default();
++    for (id, message_id) in [
++        ("run", Some(already_matched)),
++        ("other", Some(in_transcript)),
++        ("absent", Some(missing)),
++        ("not-yet-accepted", None),
++    ] {
++        feedback.begin(id.into(), "same".into(), &[], &[]);
++        if let Some(message_id) = message_id {
++            feedback.complete(id, true, Some(message_id));
++        }
++    }
++    let mut looked_up = Vec::new();
++    feedback.snapshot(&running("run"), false, |id| {
++        looked_up.push(id);
++        id == in_transcript
++    });
++    assert_eq!(looked_up, [in_transcript, missing]);
++    let visible: Vec<_> = feedback
++        .visible_sends()
++        .map(|send| send.id.as_str())
++        .collect();
++    assert_eq!(visible, ["absent", "not-yet-accepted"]);
++}
++
+ #[test]
+ fn activity_survives_text_and_yields_to_tools_questions_cancel_and_settlement() {
+     let mut feedback = Feedback::default();
+diff --git a/src/ui/chat/session.rs b/src/ui/chat/session.rs
+index a47c9a7..48c2934 100644
+--- a/src/ui/chat/session.rs
++++ b/src/ui/chat/session.rs
+@@ -143,13 +143,13 @@ impl Session {
+                 .as_ref()
+                 .is_some_and(|tool| super::tool_row::is_running(&tool.status))
+         });
+-        let message_ids: Vec<_> = snapshot
+-            .transcript
+-            .iter()
+-            .filter_map(|entry| entry.message_id)
+-            .collect();
+         self.feedback
+-            .snapshot(&snapshot.execution, tools_running, &message_ids);
++            .snapshot(&snapshot.execution, tools_running, |id| {
++                snapshot
++                    .transcript
++                    .iter()
++                    .any(|entry| entry.message_id == Some(id))
++            });
+         self.snapshot_identity = Some((snapshot.session_id, snapshot.stream_id));
+         self.execution = snapshot.execution;
+         self.root_thread = snapshot.root_thread_id;
