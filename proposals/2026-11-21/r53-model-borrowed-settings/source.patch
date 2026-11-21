@@ -1,0 +1,94 @@
+diff --git a/packages/model/src/main.rs b/packages/model/src/main.rs
+index 5f4ab7d85e67b81f937db07bcec330f720d83553..588291d1e9bf28c8504f88c281ca58e0ce4beaa0 100644
+--- a/packages/model/src/main.rs
++++ b/packages/model/src/main.rs
+@@ -59,9 +59,10 @@ impl Extension for Model {
+                             value
+                                 .as_u64()
+                                 .and_then(|index| {
+-                                    settings::efforts(sample).get(index as usize).cloned()
++                                    settings::efforts(sample)
++                                        .get(index as usize)
++                                        .map(|option| option.at("value").clone())
+                                 })
+-                                .map(|option| option.at("value").clone())
+                                 .unwrap_or(Value::Null),
+                         ),
+                     };
+diff --git a/packages/model/src/settings.rs b/packages/model/src/settings.rs
+index ffc050acbbf28e42239f404d263decad1d09cf51..cfe2f5c935876f4be9384c13e3b26bffaa45b374 100644
+--- a/packages/model/src/settings.rs
++++ b/packages/model/src/settings.rs
+@@ -35,7 +35,7 @@ pub fn model_name(host: &Host) -> Option<String> {
+ }
+ 
+ /// Unique explicit efforts in provider order; the profile default is the reset button.
+-pub fn efforts(host: &Host) -> Vec<Value> {
++pub fn efforts(host: &Host) -> Vec<&Value> {
+     let options = host
+         .setting("reasoning_effort")
+         .map(|control| control.list("options"))
+@@ -49,7 +49,6 @@ pub fn efforts(host: &Host) -> Vec<Value> {
+                 .as_str()
+                 .is_some_and(|value| value != DEFAULT && seen.insert(value))
+         })
+-        .cloned()
+         .collect()
+ }
+ 
+@@ -61,7 +60,7 @@ pub fn by_profile(host: &Host) -> bool {
+         == Some(DEFAULT)
+ }
+ 
+-pub fn effort_position(host: &Host, efforts: &[Value]) -> usize {
++pub fn effort_position(host: &Host, efforts: &[&Value]) -> usize {
+     let effort = host
+         .setting_value("reasoning_effort")
+         .unwrap_or(Value::Null);
+@@ -94,10 +93,9 @@ fn current_option(host: &Host) -> &Value {
+ }
+ 
+ /// Select settings beyond mode, model and reasoning.
+-pub fn extra(host: &Host) -> Vec<Value> {
++pub fn extra(host: &Host) -> Vec<&Value> {
+     host.session_settings()
+         .into_iter()
+         .filter(|setting| !matches!(setting.str("id"), "mode" | "model" | "reasoning_effort"))
+-        .cloned()
+         .collect()
+ }
+diff --git a/packages/model/src/tests.rs b/packages/model/src/tests.rs
+index 51eb067c3e66ce8daa2d12c69b847503af69137c..320e2cd907b224974555ffa97ff793ba807d72fa 100644
+--- a/packages/model/src/tests.rs
++++ b/packages/model/src/tests.rs
+@@ -250,3 +250,30 @@ fn picker_labels_keep_first_catalog_match_and_unknown_model_names() {
+         [("second/y", true), ("unknown", false), ("first/x", false)]
+     );
+ }
++
++#[test]
++fn projections_borrow_only_visible_settings_and_first_unique_efforts() {
++    let host = host(json!({"session_settings": [
++        {"id":"reasoning_effort","control":{"type":"select","value":"_default","options":[
++            {"name":"Default","value":"_default"},
++            {"name":"Low","value":"effort:low","opaque":{"fixture":[1,2,3]}},
++            {"name":"Duplicate","value":"effort:low"},
++            {"name":"Invalid","value":{"unsupported":true}},
++            {"name":"High","value":"effort:high"}
++        ]}},
++        {"id":"style","control":{"type":"select","value":"short","options":[]}},
++        {"id":"hidden","control":{"type":"slider","value":1}},
++        {"id":"model","control":{"type":"select","value":"astra","options":[]}},
++        {"id":"tone","control":{"type":"select","value":"dry","options":[]}}
++    ]}));
++    let raw = settings::config(&host).list("session_settings");
++    let efforts = settings::efforts(&host);
++    let options = raw[0].at("control").list("options");
++    assert_eq!(efforts.len(), 2);
++    assert!(std::ptr::eq(efforts[0], &options[1]));
++    assert!(std::ptr::eq(efforts[1], &options[4]));
++    let extra = settings::extra(&host);
++    assert_eq!(extra.len(), 2);
++    assert!(std::ptr::eq(extra[0], &raw[1]));
++    assert!(std::ptr::eq(extra[1], &raw[4]));
++}
