@@ -1,0 +1,40 @@
+Pinned source: 9469e3b12529d08b1f4a76882693e2065e842c51
+rustc 1.95.0 (59807616e 2026-04-14)
+binary: rustc
+commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860
+commit-date: 2026-04-14
+host: x86_64-unknown-linux-gnu
+release: 1.95.0
+LLVM version: 22.1.2
+SDK dependency: 0c1b7572313230e5d123e95c722e1258a2e9ecd6
+Composed source tree (through #377): cd0c20c6f04af0a84e39042b37e19c1cb837d179
+Clean exact-main apply, reverse, format, diff and cumulative source-only all passed
+Locked packages:
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+Actual test binary SHA-256 (not distributed):
+574e09f7610539b3c2f2284127ebc94a98e350b589f998f6d67395e50997f911  r49/modules/target/release/deps/session_storage-d136437a7d5081b6
+Narrow exact serde_json implementation; to_vec delegates to to_writer:
+pub fn to_writer<W, T>(writer: W, value: &T) -> Result<()>
+where
+    W: io::Write,
+    T: ?Sized + Serialize,
+{
+    let mut ser = Serializer::new(writer);
+    value.serialize(&mut ser)
+}
+pub fn to_vec<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: ?Sized + Serialize,
+{
+    let mut writer = Vec::with_capacity(128);
+    tri!(to_writer(&mut writer, value));
+    Ok(writer)
+}
+Confirmed does not overlap #263 request hash or #386 code; static composition only.
