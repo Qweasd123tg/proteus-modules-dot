@@ -1,0 +1,124 @@
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 6de1b91..c829906 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -80,12 +80,39 @@ pub(crate) fn restore_offset(path: &Path, committed: u64) -> Result<()> {
+     }
+ }
+ 
+-pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
++fn open_regular(path: &Path) -> Result<File> {
+     let file = File::open(path)?;
+     ensure!(
+         file.metadata()?.is_file(),
+         "storage object must be a regular file"
+     );
++    Ok(file)
++}
++
++/// Compare an existing object without retaining a second copy. Read through to
++/// EOF (or maximum + 1) even after a mismatch so size and I/O errors still win.
++pub(crate) fn bounded_file_eq(path: &Path, expected: &[u8], maximum: usize) -> Result<bool> {
++    let mut file = open_regular(path)?.take(maximum as u64 + 1);
++    let mut buffer = [0; 16 * 1024];
++    let mut remaining = Some(expected);
++    let mut total = 0;
++    loop {
++        let count = match file.read(&mut buffer) {
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++            result => result?,
++        };
++        if count == 0 {
++            break;
++        }
++        total += count;
++        remaining = remaining.and_then(|rest| rest.strip_prefix(&buffer[..count]));
++    }
++    ensure!(total <= maximum, "storage object exceeds {maximum} bytes");
++    Ok(remaining == Some(&[]))
++}
++
++pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
++    let file = open_regular(path)?;
+     let mut bytes = Vec::new();
+     file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+     if bytes.len() > maximum {
+diff --git a/storage/session-storage/src/service/objects.rs b/storage/session-storage/src/service/objects.rs
+index 71c51f9..6f402c5 100644
+--- a/storage/session-storage/src/service/objects.rs
++++ b/storage/session-storage/src/service/objects.rs
+@@ -32,7 +32,7 @@ impl State {
+         );
+         if path.try_exists()? {
+             ensure!(
+-                crate::io::bounded_read(&path, SESSION_STORAGE_MAX_BLOB_BYTES as usize)? == bytes,
++                crate::io::bounded_file_eq(&path, &bytes, SESSION_STORAGE_MAX_BLOB_BYTES as usize)?,
+                 "content-addressed blob collision"
+             );
+         } else {
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+index 61bbbbe..bdd2d95 100644
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -741,3 +741,61 @@ fn candidate_discovery_never_decodes_history_and_strict_list_still_validates() {
+         assert!(crate::diagnostics::get().decoded > 0);
+     }
+ }
++
++#[test]
++fn repeated_blob_put_checks_existing_bytes_through_eof_before_writing_a_receipt() {
++    use base64::{Engine, engine::general_purpose::STANDARD};
++    for kind in backends() {
++        let f = Fixture::new(kind);
++        let bytes = (0..40_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
++        let blob = StorageBlobRef {
++            sha256: crate::io::sha256_hex(&bytes),
++            bytes: bytes.len() as u64,
++        };
++        let put = |operation_id| {
++            f.service.execute(SessionStorageRequest::PutBlob {
++                lease: f.lease.clone(),
++                operation_id,
++                data_base64: STANDARD.encode(&bytes),
++                expected: blob.clone(),
++            })
++        };
++        let SessionStorageResponse::Blob {
++            local_path: Some(path),
++            ..
++        } = put(uuid::Uuid::new_v4()).unwrap()
++        else {
++            panic!()
++        };
++        let ledger = f
++            .descriptor
++            .local_path
++            .as_ref()
++            .unwrap()
++            .join(".storage-metadata.json");
++        let receipt = std::fs::read(&ledger).unwrap();
++        let retry = uuid::Uuid::new_v4();
++        for corrupt in [
++            Vec::new(),
++            bytes[..bytes.len() - 1].to_vec(),
++            [&bytes[..], &[0xff]].concat(),
++            {
++                let mut v = bytes.clone();
++                *v.last_mut().unwrap() ^= 1;
++                v
++            },
++        ] {
++            std::fs::write(&path, &corrupt).unwrap();
++            assert!(
++                put(retry)
++                    .unwrap_err()
++                    .to_string()
++                    .contains("content-addressed blob collision")
++            );
++            assert_eq!(std::fs::read(&ledger).unwrap(), receipt);
++            assert_eq!(std::fs::read(&path).unwrap(), corrupt);
++        }
++        std::fs::write(&path, &bytes).unwrap();
++        assert!(put(retry).is_ok());
++    }
++}
