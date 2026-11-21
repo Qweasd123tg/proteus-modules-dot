@@ -1,0 +1,111 @@
+diff --git a/context/context-pack/src/lib.rs b/context/context-pack/src/lib.rs
+index 793dcb31c791a2a8432b4fd0e68a587712dc172d..79a15c3a1430ff2e23dfa0d93d2029aa97b866c8 100644
+--- a/context/context-pack/src/lib.rs
++++ b/context/context-pack/src/lib.rs
+@@ -54,11 +54,11 @@ impl ContextBuilderModule for SimpleContextBuilderModule {
+         input_json: String,
+         host: &mut ContextBuilderModuleHostMut<'_>,
+     ) -> Result<String, ProcessModuleError> {
+-        let input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
++        let mut input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
+             Ok(input) => input,
+             Err(error) => return context_err(error),
+         };
+-        let config = match config_or_default::<SimpleContextConfig>(input.config.clone()) {
++        let config = match config_or_default::<SimpleContextConfig>(input.config.take()) {
+             Ok(config) => config,
+             Err(error) => return context_err(error),
+         };
+@@ -75,11 +75,11 @@ impl ContextBuilderModule for RepoAwareContextBuilderModule {
+         input_json: String,
+         host: &mut ContextBuilderModuleHostMut<'_>,
+     ) -> Result<String, ProcessModuleError> {
+-        let input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
++        let mut input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
+             Ok(input) => input,
+             Err(error) => return context_err(error),
+         };
+-        let config = match config_or_default::<RepoAwareContextConfig>(input.config.clone()) {
++        let config = match config_or_default::<RepoAwareContextConfig>(input.config.take()) {
+             Ok(config) => config,
+             Err(error) => return context_err(error),
+         };
+@@ -96,11 +96,11 @@ impl ContextBuilderModule for CodexContextBuilderModule {
+         input_json: String,
+         host: &mut ContextBuilderModuleHostMut<'_>,
+     ) -> Result<String, ProcessModuleError> {
+-        let input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
++        let mut input: ContextBuilderModuleInput = match serde_json::from_str(input_json.as_str()) {
+             Ok(input) => input,
+             Err(error) => return context_err(error),
+         };
+-        let config = match config_or_default::<CodexContextConfig>(input.config.clone()) {
++        let config = match config_or_default::<CodexContextConfig>(input.config.take()) {
+             Ok(config) => config,
+             Err(error) => return context_err(error),
+         };
+diff --git a/context/context-pack/src/tests.rs b/context/context-pack/src/tests.rs
+index 7102983ac5c1741205084f94cf01fa3df2a34754..31d299d33688a2fda89d52e330fe1a3631a581f1 100644
+--- a/context/context-pack/src/tests.rs
++++ b/context/context-pack/src/tests.rs
+@@ -2,6 +2,60 @@ use super::*;
+ use crate::search_queries::extract_search_queries;
+ use std::process::Command;
+ 
++#[test]
++fn context_entrypoints_decode_config_before_calling_providers() {
++    use proteus_contracts::process_module::{ContextBuilderModuleHost, ProcessModuleResult};
++
++    #[derive(Default)]
++    struct FixtureHost(std::sync::Mutex<Vec<String>>);
++
++    impl ContextBuilderModuleHost for FixtureHost {
++        fn context_provider_json(
++            &self,
++            provider: String,
++            _request: String,
++        ) -> ProcessModuleResult<String> {
++            self.0.lock().unwrap().push(provider);
++            Ok("[]".to_owned())
++        }
++    }
++
++    let task = proteus_contracts::domain::AgentTask::new("inspect the note", "fixture-root".into());
++    let invocation = |config| {
++        serde_json::to_string(&ContextBuilderModuleInput {
++            task: task.clone(),
++            config,
++            attribution: proteus_contracts::contracts::ExecutionAttribution::detached(
++                proteus_contracts::domain::new_execution_id(),
++            ),
++        })
++        .unwrap()
++    };
++    for (builder, config) in [
++        (
++            &SimpleContextBuilderModule as &dyn ContextBuilderModule,
++            json!({"memory_provider":"fixture_provider","max_search_results":0}),
++        ),
++        (
++            &RepoAwareContextBuilderModule as &dyn ContextBuilderModule,
++            json!({"providers":["fixture_provider"]}),
++        ),
++        (
++            &CodexContextBuilderModule as &dyn ContextBuilderModule,
++            json!({"providers":["fixture_provider"]}),
++        ),
++    ] {
++        let mut host = FixtureHost::default();
++        let error = builder
++            .build_json(invocation(json!({"fixture_typo":true})), &mut host)
++            .unwrap_err();
++        assert!(error.message.contains("unknown field `fixture_typo`"));
++        assert!(host.0.lock().unwrap().is_empty());
++        builder.build_json(invocation(config), &mut host).unwrap();
++        assert_eq!(host.0.into_inner().unwrap(), ["fixture_provider"]);
++    }
++}
++
+ #[test]
+ fn context_configs_reject_unknown_keys_and_keep_known_limits() {
+     for invalid in [
