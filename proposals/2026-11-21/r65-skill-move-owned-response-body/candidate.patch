@@ -1,0 +1,71 @@
+diff --git a/tool/skill-pack/src/lib.rs b/tool/skill-pack/src/lib.rs
+index 77a8aa1a165947ee6ab2161ab550bd040daeca78..f25903f57d5a630a50bcff1948c5463cf6d250a8 100644
+--- a/tool/skill-pack/src/lib.rs
++++ b/tool/skill-pack/src/lib.rs
+@@ -174,10 +174,10 @@ fn invoke_skill(call: &ToolCallDto, cwd: &Path, settings: &SkillRuntimeSettings)
+             format!("skill '{}' is not available in this workspace", args.name),
+         );
+     };
+-    json!({
++    let mut result = json!({
+         "call_id": call.id,
+         "ok": true,
+-        "output": skill.body,
++        "output": null,
+         "content": [],
+         "error": null,
+         "metadata": {
+@@ -187,7 +187,10 @@ fn invoke_skill(call: &ToolCallDto, cwd: &Path, settings: &SkillRuntimeSettings)
+             "path": skill.path,
+             "source": skill.source.as_str()
+         }
+-    })
++    });
++    // Preserve the existing wire slot while moving the already-owned body.
++    *result.get_mut("output").expect("skill result output slot") = Value::String(skill.body);
++    result
+ }
+ 
+ fn tool_error(call_id: &str, error: String) -> Value {
+@@ -270,6 +273,41 @@ mod tests {
+         assert_eq!(chunk.metadata["skill_count"], 1);
+     }
+ 
++    #[test]
++    fn loaded_skill_reply_keeps_the_original_wire_shape() {
++        let workspace = tempfile::tempdir().unwrap();
++        fs::create_dir(workspace.path().join(".git")).unwrap();
++        let file = workspace.path().join(".proteus/skills/review/SKILL.md");
++        fs::create_dir_all(file.parent().unwrap()).unwrap();
++        let body = "Inspect \"заметка\".\nKeep 🦀\tspaces.";
++        fs::write(
++            &file,
++            format!("---\nname: review\ndescription: Review a note\n---\n\n{body}\n"),
++        )
++        .unwrap();
++        let call = ToolCallDto {
++            id: "call-ю".into(),
++            name: TOOL_NAME.into(),
++            args: json!({"name":"review"}),
++        };
++        let expected = json!({
++            "call_id": "call-ю",
++            "ok": true,
++            "output": body,
++            "content": [],
++            "error": null,
++            "metadata": {
++                "tool": TOOL_NAME,
++                "name": "review",
++                "description": "Review a note",
++                "path": file.canonicalize().unwrap(),
++                "source": "project"
++            }
++        });
++        let response = invoke_skill(&call, workspace.path(), &Default::default());
++        assert_eq!(response.to_string(), expected.to_string());
++    }
++
+     #[test]
+     fn skill_tool_loads_body_without_frontmatter() {
+         let workspace = tempfile::tempdir().expect("workspace");
