@@ -1,0 +1,49 @@
+diff --git a/model/model-pack/src/adapters/anthropic/sanitize.rs b/model/model-pack/src/adapters/anthropic/sanitize.rs
+index 68349476b736dcd83996077d76925fe20324ceb4..a2653c292d3356bcd4274aa52aa7d19cb5787e38 100644
+--- a/model/model-pack/src/adapters/anthropic/sanitize.rs
++++ b/model/model-pack/src/adapters/anthropic/sanitize.rs
+@@ -12,6 +12,14 @@ pub(super) struct DsmlStreamFilter {
+ 
+ impl DsmlStreamFilter {
+     pub(super) fn filter(&mut self, text: &str) -> String {
++        // All markers (including a prefix held for the next delta) start with '<'.
++        if self.pending.is_empty() && !text.contains('<') {
++            return if self.in_tool_block {
++                String::new()
++            } else {
++                text.to_owned()
++            };
++        }
+         let mut input = String::new();
+         input.push_str(&self.pending);
+         input.push_str(text);
+diff --git a/model/model-pack/src/adapters/anthropic/stream/block_tests.rs b/model/model-pack/src/adapters/anthropic/stream/block_tests.rs
+index 0f07034af67b3ac60fbeedb831cf08baacb411fc..126f7e78751759789b7603e62fa1e8885ac5bf85 100644
+--- a/model/model-pack/src/adapters/anthropic/stream/block_tests.rs
++++ b/model/model-pack/src/adapters/anthropic/stream/block_tests.rs
+@@ -263,3 +263,25 @@ fn text_delta_without_a_text_owner_is_ignored_without_touching_other_blocks() {
+         ]
+     );
+ }
++
++#[test]
++fn marker_free_deltas_respect_pending_marker_and_hidden_block() {
++    let mut state = AnthropicStreamState::default();
++    let events = start(&mut state, 0, json!({"type": "text", "text": "visible<"}));
++    assert_eq!(text(&events), "visible");
++    for (delta, expected) in [
++        ("｜｜DSML｜｜tool_calls>", ""),
++        ("do not emit 🌍", ""),
++        ("</｜", ""),
++        ("｜DSML｜｜tool_calls> ok", " ok"),
++        ("!", "!"),
++    ] {
++        let events = translate(
++            &mut state,
++            "content_block_delta",
++            json!({"index": 0, "delta": {"type": "text_delta", "text": delta}}),
++        );
++        assert_eq!(text(&events), expected, "delta={delta:?}");
++    }
++    assert!(stop(&mut state, 0).is_empty());
++}
