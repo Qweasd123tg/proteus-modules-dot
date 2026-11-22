@@ -1,0 +1,33 @@
+diff --git a/src/catalog/connections.rs b/src/catalog/connections.rs
+index 82891c7..745a649 100644
+--- a/src/catalog/connections.rs
++++ b/src/catalog/connections.rs
+@@ -215,7 +215,7 @@ pub struct Discovery {
+ /// Bundled and already installed packages share one metadata format. No
+ /// provider calls, key reads or package downloads are part of discovery.
+ pub fn discover(installed: &[Installed]) -> Discovery {
+-    discover_with_inventory(installed, Inventory::local())
++    discover_with_inventory(installed, Inventory::local_modules())
+ }
+ 
+ fn discover_with_inventory(installed: &[Installed], inventory: Inventory) -> Discovery {
+diff --git a/src/catalog/inventory.rs b/src/catalog/inventory.rs
+index 856faec..5cc2fc5 100644
+--- a/src/catalog/inventory.rs
++++ b/src/catalog/inventory.rs
+@@ -35,6 +35,15 @@ impl Inventory {
+             .map(|(id, package)| (id.as_str(), package))
+     }
+ 
++    /// Provider choices only consume module paths; leave extension presence to the catalog.
++    pub(super) fn local_modules() -> Self {
++        let mut inventory = Self::default();
++        if let Some(backend) = resolve_binary(&crate::backend::proteus_binary()) {
++            inventory.read_modules(&backend);
++        }
++        inventory
++    }
++
+     pub fn local() -> Self {
+         let backend = resolve_binary(&crate::backend::proteus_binary());
+         let bundled = crate::declarative::manifest::bundled_root();
