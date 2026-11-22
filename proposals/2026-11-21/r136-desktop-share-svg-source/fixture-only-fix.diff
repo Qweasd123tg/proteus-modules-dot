@@ -1,0 +1,25 @@
+--- materialize.py.before
++++ materialize.py.after
+@@ -28,7 +28,8 @@
+ for name,target in (("harness.toml","Cargo.toml"),("harness.lock","Cargo.lock"),
+                     ("probe.rs","src/lib.rs"),("counter.rs","src/counter.rs")):
+     shutil.copyfile(packet/name,out/target)
+-shutil.copyfile(settings,src/"settings.inc.rs")
++(src/"app_protocol").mkdir()
++shutil.copyfile(settings,src/"app_protocol/settings.rs")
+ 
+ hash=lambda x:hashlib.sha256(x.encode()).hexdigest()
+ def cut(text, a, b):
+--- probe.rs.before
++++ probe.rs.after
+@@ -10,9 +10,7 @@
+ use proteus_diff as diff;
+ 
+ pub mod app_protocol {
+-    pub mod settings {
+-        include!("settings.inc.rs");
+-    }
++    pub mod settings;
+ }
+ 
+ pub mod assets {
