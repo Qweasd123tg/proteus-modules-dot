@@ -1,0 +1,77 @@
+diff --git a/src/sessions.rs b/src/sessions.rs
+index 15f2880..560a78f 100644
+--- a/src/sessions.rs
++++ b/src/sessions.rs
+@@ -200,6 +200,8 @@ impl SessionMarks {
+             archived_count,
+             ..Listing::default()
+         };
++        // Keep the Vec in first-seen order: equal activity dates must stay stable.
++        let mut project_indices = HashMap::new();
+         for root in roots {
+             let row = rows[root].take().unwrap();
+             if row.mark.archived {
+@@ -208,20 +210,23 @@ impl SessionMarks {
+                 listing.pinned.push(row);
+             } else {
+                 let path = row.summary.workspace_path.as_path();
+-                if let Some(project) = listing
+-                    .projects
+-                    .iter_mut()
+-                    .find(|project| project.path == path)
+-                {
++                // Single-folder lists need no hash lookup for each following row.
++                if let Some(project) = listing.projects.last_mut().filter(|p| p.path == path) {
+                     project.rows.push(row);
+-                } else {
++                    continue;
++                }
++                let index = *project_indices.entry(path).or_insert_with(|| {
++                    let index = listing.projects.len();
+                     listing.projects.push(Project {
+                         path,
+-                        rows: vec![row],
++                        rows: Vec::new(),
+                     });
+-                }
++                    index
++                });
++                listing.projects[index].rows.push(row);
+             }
+         }
++        drop(project_indices);
+         let newest_first = |project: &Project<'_>| std::cmp::Reverse(project.updated_at_ms());
+         if listing.projects.len() <= 2 {
+             // At most one comparison, so a key cache would only add an allocation.
+@@ -481,6 +486,31 @@ mod tests {
+         assert_eq!(projects("root"), ["/m", "/a", "/z"].map(Path::new));
+     }
+ 
++    #[test]
++    fn project_sort_uses_included_descendants_and_preserves_first_seen_ties() {
++        let mut child = changed("/s/child", "/elsewhere", Some(50), Some("child"));
++        child.parent = Some(key("/s/a1"));
++        let sessions = [
++            changed("/s/b", "/b", Some(50), Some("root")),
++            changed("/s/a1", "/a", None, Some("root")),
++            changed("/s/c", "/c", Some(30), Some("root")),
++            changed("/s/a2", "/a", Some(10), Some("root")),
++            child,
++        ];
++        let marks = SessionMarks::default();
++        let listing = marks.arrange(&sessions, &view(false, ""));
++        assert_eq!(shown(&listing), ["/s/b", "/s/a1", "/s/a2", "/s/c"].map(key));
++        assert_eq!(
++            dirs(&listing.projects[1].rows[0].children),
++            [key("/s/child")]
++        );
++        // Filtering out the newest descendant changes the project order.
++        assert_eq!(
++            shown(&marks.arrange(&sessions, &view(false, "root"))),
++            ["/s/b", "/s/c", "/s/a1", "/s/a2"].map(key)
++        );
++    }
++
+     #[test]
+     fn search_matches_titles_and_reaches_the_archive() {
+         let sessions = [

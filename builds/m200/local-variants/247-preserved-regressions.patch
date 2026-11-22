@@ -1,0 +1,72 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 6a3b59e..8c11e88 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -3,6 +3,67 @@ mod support;
+ use super::*;
+ use support::{Backend, append, full};
+ 
++#[test]
++fn summary_previews_the_first_nonblank_user_part_in_unicode_scalars() {
++    use proteus_contracts::model_standard::{CanonicalMessage, ContentPart, MessageRole};
++
++    let (_, store) = Backend::store();
++    // The last visible scalar is a space in the truncated case; trimming the
++    // excerpt instead of the source would silently lose it.
++    let prefix = "🦀".repeat(159);
++    for (source, expected) in [
++        (format!("　{prefix}я　"), format!("{prefix}я")),
++        (format!("　{prefix} я　"), format!("{prefix} ...")),
++    ] {
++        let messages = [
++            CanonicalMessage::text(MessageRole::Assistant, "fallback"),
++            CanonicalMessage::new(
++                MessageRole::User,
++                vec![
++                    ContentPart::Text { text: "　".into() },
++                    ContentPart::ReasoningSummary { text: source },
++                ],
++            ),
++            CanonicalMessage::text(MessageRole::User, "later user"),
++        ];
++        let summary = cache::summary(&store, &messages).unwrap();
++        assert_eq!(summary.preview, Some(expected));
++        assert_eq!(summary.message_count, 3);
++        assert_eq!(summary.session_id, store.session_id());
++        assert_eq!(summary.updated_at_ms, Some(1));
++    }
++}
++
++#[test]
++fn summary_keeps_tool_status_fallback_and_skips_blank_text() {
++    use proteus_contracts::{
++        domain::{ToolResult, new_call_id},
++        model_standard::{CanonicalMessage, ContentPart, MessageRole},
++    };
++
++    let (_, store) = Backend::store();
++    let messages = [
++        CanonicalMessage::text(MessageRole::User, "　\n "),
++        CanonicalMessage::new(
++            MessageRole::Tool,
++            vec![ContentPart::ToolResult {
++                result: ToolResult::ok(new_call_id(), ""),
++            }],
++        ),
++    ];
++    assert_eq!(
++        cache::summary(&store, &messages[..1]).unwrap().preview,
++        None
++    );
++    assert_eq!(
++        cache::summary(&store, &messages)
++            .unwrap()
++            .preview
++            .as_deref(),
++        Some("(no output)")
++    );
++}
++
+ #[test]
+ fn prepared_view_never_mixes_an_older_summary_with_a_newer_transcript() {
+     use super::super::prepared::PreparedSession;
