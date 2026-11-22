@@ -1,0 +1,74 @@
+diff --git a/src/ui/extensions/mod.rs b/src/ui/extensions/mod.rs
+index 4bc01a4..034c32d 100644
+--- a/src/ui/extensions/mod.rs
++++ b/src/ui/extensions/mod.rs
+@@ -354,7 +354,7 @@ mod tests {
+ 
+ pub(super) fn next_document(
+     command: &str,
+-    layout: &crate::tabs::TabLayout,
++    max_tab_suffix: impl FnOnce(&str) -> Option<u32>,
+     cx: &App,
+ ) -> Option<String> {
+     let manifest = ordered(cx).into_iter().find(|manifest| {
+@@ -365,13 +365,7 @@ pub(super) fn next_document(
+                 .is_some_and(|document| document.command == Some(command))
+     })?;
+     let prefix = format!("{}:", manifest.id);
+-    let last = layout
+-        .panes()
+-        .iter()
+-        .flat_map(|pane| &pane.tabs)
+-        .filter_map(|tab| tab.strip_prefix(&prefix)?.parse::<u32>().ok())
+-        .max()
+-        .unwrap_or(0);
++    let last = max_tab_suffix(&prefix).unwrap_or(0);
+     Some(format!("{prefix}{}", last + 1))
+ }
+ impl DocumentSurface {
+diff --git a/src/ui/tabs/mod.rs b/src/ui/tabs/mod.rs
+index a332b92..0591bcf 100644
+--- a/src/ui/tabs/mod.rs
++++ b/src/ui/tabs/mod.rs
+@@ -104,8 +104,11 @@ impl Workspace {
+         if !self.begin_navigation(cx) {
+             return;
+         }
+-        let Some(id) = extensions::next_document("terminal.new", &self.windows.all_tabs(), cx)
+-        else {
++        let Some(id) = extensions::next_document(
++            "terminal.new",
++            |prefix| self.windows.max_tab_suffix(prefix),
++            cx,
++        ) else {
+             return;
+         };
+         if self.ensure_document(&id, window, cx).is_none() {
+diff --git a/src/ui/workspace/windows.rs b/src/ui/workspace/windows.rs
+index 8c9ee66..9a9fe06 100644
+--- a/src/ui/workspace/windows.rs
++++ b/src/ui/workspace/windows.rs
+@@ -161,14 +161,15 @@ impl WindowGroup {
+         }
+     }
+ 
+-    pub(in crate::ui) fn all_tabs(&self) -> TabLayout {
+-        let mut all = TabLayout::default();
+-        if let Some(spaces) = self.0.borrow().saved_layout() {
+-            for id in spaces.all_tabs() {
+-                all.open(id, |_| false);
+-            }
+-        }
+-        all
++    /// The largest numeric tab suffix across saved spaces in every window.
++    pub(in crate::ui) fn max_tab_suffix(&self, prefix: &str) -> Option<u32> {
++        self.0
++            .borrow()
++            .windows
++            .iter()
++            .flat_map(|(_, spaces)| spaces.all_tabs())
++            .filter_map(|tab| tab.strip_prefix(prefix)?.parse::<u32>().ok())
++            .max()
+     }
+ 
+     pub(super) fn watch_backend(
