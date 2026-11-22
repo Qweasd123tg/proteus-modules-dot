@@ -1,0 +1,13 @@
+# Use fixed visibility flags in the OpenCode response collector
+
+`source.patch` changes only `model/opencode-provider/response.mjs`. Each collector now tracks whether text and reasoning have emitted with two private booleans rather than a Set. The two kinds are already fixed by the event dispatcher. The first nonempty visible delta for a distinct block still gets one inserted newline only if that kind has already emitted. Returning to an already-visible block adds no other newline. Empty and metadata-only blocks still add no separator; whitespace is visible. Event validation, block order, opaque provider metadata, completion corrections, and the separate recursive tool-JSON validation Set are unchanged.
+
+## Focused verification
+
+- Stock Modules pin: `9469e3b12529d08b1f4a76882693e2065e842c51`. The corresponding sealed cumulative Modules tree has 56 verified selected inputs in the anchor, no collector or adapter overlap, and no further Modules overlays in the reviewed roster. The stock and cumulative collector and its real adapter consumer were byte-identical at this seam.
+- The same five built-in Node tests imported each real collector projection directly. Stock baseline, stock candidate, cumulative baseline, and cumulative candidate each passed 5/5 with no failures, cancellations, skips, todos, or stderr. The focused assertions cover independent kinds with identical IDs, repeated blocks, empty or signed-only metadata blocks, Unicode and whitespace, suffix and authoritative end corrections, step boundaries, fresh collectors, validation and post-finish behavior, and inert tool input validation. All arms agreed on the same case list.
+- The source-level work result is one collector-owned Set construction per collector before, zero after. This is not a heap, CPU, throughput, latency, or whole-provider claim.
+
+`collector.test.mjs` is the exact focused fixture. For reproduction, place it beside the real collector in separate disposable baseline and candidate projections of the pinned sources, apply `source.patch` only to the candidates, and use built-in `node --test --test-reporter=tap collector.test.mjs` from that fixture directory. The test imports only the local product collector and Node built-ins. No npm installation, provider client, external process from the test, credentials, or network is needed.
+
+`evidence.json` binds the tested source, fixture, exact Node binary digest, four arm summaries, and structural result. Raw test streams, timings, binaries, and stand-local paths are not included. This gate does not verify the upstream provider schema/client, full Modules, storage, or native Desktop.
