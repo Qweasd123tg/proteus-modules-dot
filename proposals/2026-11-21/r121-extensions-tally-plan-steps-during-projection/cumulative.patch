@@ -1,0 +1,96 @@
+diff --git a/packages/plan/src/model.rs b/packages/plan/src/model.rs
+index 179ecef..5a109f4 100644
+--- a/packages/plan/src/model.rs
++++ b/packages/plan/src/model.rs
+@@ -68,6 +68,7 @@ impl<'a> Snapshot<'a> {
+     }
+ 
+     fn from_args<'b>(args: &'b Value, text: impl Fn(&'b str) -> Cow<'a, str>) -> Self {
++        let mut done = 0;
+         let steps: Vec<_> = args
+             .list("plan")
+             .iter()
+@@ -75,17 +76,16 @@ impl<'a> Snapshot<'a> {
+                 Some(Step {
+                     text: text(step.opt_str("step")?),
+                     status: match step.opt_str("status")? {
+-                        "completed" => Status::Completed,
++                        "completed" => {
++                            done += 1;
++                            Status::Completed
++                        }
+                         "in_progress" => Status::InProgress,
+                         _ => Status::Pending,
+                     },
+                 })
+             })
+             .collect();
+-        let done = steps
+-            .iter()
+-            .filter(|step| step.status == Status::Completed)
+-            .count();
+         Self { steps, done }
+     }
+ 
+diff --git a/packages/plan/src/tests.rs b/packages/plan/src/tests.rs
+index 43dc378..ea1406b 100644
+--- a/packages/plan/src/tests.rs
++++ b/packages/plan/src/tests.rs
+@@ -247,3 +247,57 @@ fn not_ready_has_visible_recovery_without_a_fabricated_empty_plan() {
+     assert!(!root.to_string().contains("0/0"));
+     assert_eq!(UNAVAILABLE, "План недоступен");
+ }
++
++#[test]
++fn projected_completed_rows_keep_typed_status_and_duplicates_in_order() {
++    let args = json!({"plan":[
++        {"step":"repeat","status":"completed"},
++        {"status":"completed"},
++        {"step":42,"status":"completed"},
++        {"step":"repeat","status":"in_progress"},
++        {"step":"","status":"completed"},
++        {"step":"repeat","status":"completed"},
++        {"step":"later","status":"in_progress"},
++        {"step":"case","status":"Completed"},
++        {"step":"blank status","status":""},
++        {"step":"wrong status","status":42},
++        {"step":"missing status"},
++        null
++    ]});
++    let mut tool = json!({"name":"update_plan","status":"done","args":args,"effective_args":null});
++    let original = Snapshot::from_tool(&tool);
++    assert_eq!(original.done, 3);
++    assert_eq!(original.summary(), "План 3/7");
++    assert_eq!(original.current(), Some("repeat"));
++    let rows: Vec<_> = original
++        .steps
++        .iter()
++        .map(|step| (step.text.to_string(), step.status))
++        .collect();
++    assert_eq!(
++        rows,
++        [
++            ("repeat".to_owned(), Status::Completed),
++            ("repeat".to_owned(), Status::InProgress),
++            ("".to_owned(), Status::Completed),
++            ("repeat".to_owned(), Status::Completed),
++            ("later".to_owned(), Status::InProgress),
++            ("case".to_owned(), Status::Pending),
++            ("blank status".to_owned(), Status::Pending),
++        ]
++    );
++
++    let mut edited = tool.clone();
++    edited["effective_args"] = json!(tool["args"].to_string());
++    assert_eq!(Snapshot::from_tool(&edited), original);
++
++    tool["effective_args"] = json!({"plan":[
++        {"step":"","status":"completed"},
++        {"step":false,"status":"completed"},
++        {"step":"missing status"}
++    ]});
++    let entry = json!({"role":"assistant","tool":tool});
++    let entries = [entry];
++    assert!(current(&entries, false).is_none());
++    assert_eq!(current(&entries, true).unwrap().summary(), "План 1/1");
++}
