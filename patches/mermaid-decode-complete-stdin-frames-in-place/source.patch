@@ -1,0 +1,22 @@
+--- a/packages/mermaid-render/worker.mjs
++++ b/packages/mermaid-render/worker.mjs
+@@ -63,14 +63,15 @@
+     let start = 0;
+     for (let end = 0; end < chunk.length; end++) {
+       if (chunk[end] !== 10) continue;
+-      const piece = chunk.subarray(start, end);
+-      if (pending.length + piece.length > MAX_REQUEST) throw new Error('worker request is too large');
+-      reply(Buffer.concat([pending, piece]).toString('utf8'));
++      if (pending.length + end - start > MAX_REQUEST) throw new Error('worker request is too large');
++      reply(pending.length
++        ? Buffer.concat([pending, chunk.subarray(start, end)]).toString('utf8')
++        : chunk.toString('utf8', start, end));
+       pending = Buffer.alloc(0);
+       start = end + 1;
+     }
+     if (pending.length + chunk.length - start > MAX_REQUEST) throw new Error('worker request is too large');
+-    pending = Buffer.concat([pending, chunk.subarray(start)]);
++    if (start < chunk.length) pending = Buffer.concat([pending, chunk.subarray(start)]);
+   }
+   if (pending.length) throw new Error('worker request must end with a newline');
+ }
