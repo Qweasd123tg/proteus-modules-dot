@@ -1,0 +1,16 @@
+diff --git a/src/transcript/external.rs b/src/transcript/external.rs
+--- a/src/transcript/external.rs
++++ b/src/transcript/external.rs
+@@ -250,5 +250,10 @@
+         for item in items {
+-            let identity = (item.turn_id.clone(), item.id.clone());
++            let identity = (item.turn_id, item.id);
+             if self.external_index(&identity).is_none() {
+-                prefix.external_upsert(item);
++                let (turn_id, id) = identity;
++                prefix.external_upsert(Item {
++                    turn_id,
++                    id,
++                    ..item
++                });
+             }
