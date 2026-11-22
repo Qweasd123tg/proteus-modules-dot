@@ -1,0 +1,104 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 0ff95399fa..3bc016f6ee 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -1,5 +1,5 @@
+ //! Lossless content-defined chunks shared by large journal payloads.
+-use crate::io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read, sha256_hex};
++use crate::io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read, bounded_read_into, sha256_hex};
+ use anyhow::{Result, ensure};
+ use serde::{Deserialize, Serialize};
+ use std::{
+@@ -167,22 +167,22 @@
+     }
+     let mut bytes = Vec::with_capacity(manifest.bytes);
+     for chunk in manifest.chunks {
++        let start = bytes.len();
+         ensure!(
+             chunk.bytes > 0
+                 && chunk.bytes <= MAX_CHUNK
+-                && chunk.bytes <= manifest.bytes.saturating_sub(bytes.len()),
++                && chunk.bytes <= manifest.bytes.saturating_sub(start),
+             "shared blob chunk exceeds declared payload"
+         );
+-        let content = bounded_read(&chunk_path(session, &chunk.sha256)?, MAX_CHUNK)?;
+-        ensure!(
+-            content.len() == chunk.bytes,
+-            "shared blob chunk size mismatch"
+-        );
+-        ensure!(
+-            sha256_hex(&content) == chunk.sha256,
++        let path = chunk_path(session, &chunk.sha256)?;
++        bytes.resize(start + chunk.bytes, 0);
++        let content = &mut bytes[start..];
++        let count = bounded_read_into(&path, MAX_CHUNK, content)?;
++        ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
++        ensure!(
++            sha256_hex(content) == chunk.sha256,
+             "shared blob chunk hash mismatch"
+         );
+-        bytes.extend_from_slice(&content);
+     }
+     ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
+     ensure!(
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 6de1b91a75..e69636379d 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -80,12 +80,55 @@
+     }
+ }
+ 
+-pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
++fn open_regular(path: &Path) -> Result<File> {
+     let file = File::open(path)?;
+     ensure!(
+         file.metadata()?.is_file(),
+         "storage object must be a regular file"
+     );
++    Ok(file)
++}
++
++/// Fill the caller's buffer, then count any trailing bytes through EOF or
++/// maximum + 1. Preserve late I/O and limit errors before the caller checks size.
++pub(crate) fn bounded_read_into(path: &Path, maximum: usize, output: &mut [u8]) -> Result<usize> {
++    read_bounded_into(open_regular(path)?, maximum, output)
++}
++
++fn read_bounded_into(reader: impl Read, maximum: usize, output: &mut [u8]) -> Result<usize> {
++    let mut reader = reader.take(maximum as u64 + 1);
++    let mut read = |buffer: &mut [u8]| loop {
++        match reader.read(buffer) {
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++            result => break result,
++        }
++    };
++    let mut total = 0;
++    while total < output.len() {
++        let count = read(&mut output[total..])?;
++        if count == 0 {
++            break;
++        }
++        total += count;
++    }
++    // On an exact fill, check for EOF without allocating a discard buffer.
++    if total == output.len() && read(&mut [0])? != 0 {
++        total += 1;
++        let mut trailing = [0; 8 * 1024];
++        loop {
++            let count = read(&mut trailing)?;
++            if count == 0 {
++                break;
++            }
++            total += count;
++        }
++    }
++    ensure!(total <= maximum, "storage object exceeds {maximum} bytes");
++    Ok(total)
++}
++
++pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
++    let file = open_regular(path)?;
+     let mut bytes = Vec::new();
+     file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+     if bytes.len() > maximum {
