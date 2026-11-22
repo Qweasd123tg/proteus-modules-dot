@@ -1,0 +1,39 @@
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -75,6 +75,10 @@
+   return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+ }
+ 
++function encodeAttribute(key, value) {
++  return ` ${key}="${escapeAttribute(value)}"`;
++}
++
+ function declarations(style) {
+   return style.split(';').flatMap(declaration => {
+     const separator = declaration.indexOf(':');
+@@ -121,15 +125,18 @@
+         if (size) extra.set('font-size', size);
+       } else css.push(`${key}:${resolved}`);
+     }
+-    const output = attributes.flatMap(([key, value]) => {
+-      if (key === 'style') return css.length ? [[key, css.join(';')]] : [];
+-      if (extra.has(key)) return [];
+-      return [[key, PRESENTATION.has(key) ? resolve(value) : value]];
+-    });
+-    output.push(...extra);
++    const output = [];
++    for (const [key, value] of attributes) {
++      if (key === 'style') {
++        if (css.length) output.push(encodeAttribute(key, css.join(';')));
++      } else if (!extra.has(key)) {
++        output.push(encodeAttribute(key, PRESENTATION.has(key) ? resolve(value) : value));
++      }
++    }
++    for (const [key, value] of extra) output.push(encodeAttribute(key, value));
+     const name = tag.match(/^<([\w:-]+)/)?.[1];
+     if (!name) throw new Error('invalid Pele SVG tag');
+     if (!tag.endsWith('/>')) stack.push({ variables, color });
+-    return `<${name}${output.map(([key, value]) => ` ${key}="${escapeAttribute(value)}"`).join('')}${tag.endsWith('/>') ? '/>' : '>'}`;
++    return `<${name}${output.join('')}${tag.endsWith('/>') ? '/>' : '>'}`;
+   });
+ }
