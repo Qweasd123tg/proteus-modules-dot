@@ -1,0 +1,20 @@
+--- a/model/opencode-provider/runtime.mjs
++++ b/model/opencode-provider/runtime.mjs
+@@ -186,9 +186,14 @@
+         return snapshot(signal);
+     }
+     async function info(id, signal) {
+-        const snap = await modelSnapshot(id, signal), model = snap.models.find(model => model.id === id);
+-        if (!model || model.providerID !== providerID) throw new Error('OpenCode model unavailable: ' + id);
+-        if (!supportsChat(model)) throw new Error('OpenCode model does not support canonical chat: ' + id);
++        let snap = seed && id !== undefined ? await seed(signal) : undefined;
++        let model = snap?.models.find(model => eligible(model, id));
++        if (!model) {
++            snap = await snapshot(signal);
++            model = snap.models.find(model => model.id === id);
++            if (!model || model.providerID !== providerID) throw new Error('OpenCode model unavailable: ' + id);
++            if (!supportsChat(model)) throw new Error('OpenCode model does not support canonical chat: ' + id);
++        }
+         return { ...model, package: model.package ?? snap.info.package,
+             settings: mergeOverlay(snap.info.settings, model.settings) };
+     }
