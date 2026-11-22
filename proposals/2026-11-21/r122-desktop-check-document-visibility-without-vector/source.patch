@@ -1,0 +1,38 @@
+diff --git a/crates/tabs/src/layout.rs b/crates/tabs/src/layout.rs
+index c637e53..d8f5c5d 100644
+--- a/crates/tabs/src/layout.rs
++++ b/crates/tabs/src/layout.rs
+@@ -141,6 +141,20 @@ impl TabLayout {
+             .filter_map(|pane| pane.active.as_deref())
+     }
+ 
++    /// Whether the tab is active in any pane, without collecting the panes.
++    pub fn is_visible(&self, id: &str) -> bool {
++        fn is_active(node: &Node, id: &str) -> bool {
++            match node {
++                Node::Pane(pane) => pane.active.as_deref() == Some(id),
++                Node::Split(split) => split
++                    .children
++                    .iter()
++                    .any(|child| is_active(&child.node, id)),
++            }
++        }
++        is_active(&self.root, id)
++    }
++
+     /// Whether moving `tab` to an edge of `pane` changes anything and is
+     /// allowed: a pane cannot be split off its only tab, a locked pane not
+     /// at all.
+diff --git a/src/ui/chats/subagent.rs b/src/ui/chats/subagent.rs
+index 7d50eeb..ba9fbf7 100644
+--- a/src/ui/chats/subagent.rs
++++ b/src/ui/chats/subagent.rs
+@@ -222,7 +222,7 @@ impl Workspace {
+ 
+     pub(in crate::ui) fn document_visible(&self, id: &str, entity: EntityId) -> bool {
+         self.settings.is_none()
+-            && self.layout.visible().any(|visible| visible == id)
++            && self.layout.is_visible(id)
+             && self
+                 .documents
+                 .get(id)
