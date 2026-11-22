@@ -1,0 +1,22 @@
+diff --git a/src/ui/chat/codex/mod.rs b/src/ui/chat/codex/mod.rs
+--- a/src/ui/chat/codex/mod.rs
++++ b/src/ui/chat/codex/mod.rs
+@@ -139,8 +139,8 @@
+         );
+         chat._pump = Some(cx.spawn(async move |this, cx| {
+             while let Ok(first) = events.recv().await {
+-                let mut batch = vec![first];
+-                while batch.len() < 128 {
++                let mut batch = Vec::new();
++                for _ in 1..128 {
+                     match events.try_recv() {
+                         Ok(event) => batch.push(event),
+                         Err(_) => break,
+@@ -148,6 +148,7 @@
+                 }
+                 if this
+                     .update(cx, |this, cx| {
++                        this.apply_codex(first, cx);
+                         for event in batch {
+                             this.apply_codex(event, cx);
+                         }
