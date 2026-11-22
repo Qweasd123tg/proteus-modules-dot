@@ -1,0 +1,78 @@
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 5b1fdc2..5c9f2dd 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -43,9 +43,11 @@ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescr
+     let mut modified = std::fs::metadata(&journal)
+         .and_then(|m| m.modified())
+         .or_else(|_| meta.modified())?;
+-    if let Ok(wal_modified) =
+-        std::fs::metadata(PathBuf::from(format!("{}-wal", journal.to_string_lossy())))
+-            .and_then(|m| m.modified())
++    // Read-only SQLite snapshots can create an empty WAL without any change
++    // to the session. Like source stamps, recency ignores that empty WAL.
++    if let Ok(wal) = std::fs::metadata(PathBuf::from(format!("{}-wal", journal.to_string_lossy())))
++        && (!matches!(kind, BackendKind::Sqlite) || wal.len() != 0)
++        && let Ok(wal_modified) = wal.modified()
+     {
+         modified = modified.max(wal_modified);
+     }
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -822,3 +822,55 @@
+         assert!(put(retry).is_ok());
+     }
+ }
++
++#[test]
++fn empty_sqlite_wal_does_not_change_descriptor_recency() {
++    use std::{
++        fs::{File, FileTimes},
++        time::{Duration, UNIX_EPOCH},
++    };
++
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("last committed message")]);
++        f.service
++            .execute(SessionStorageRequest::ReleaseWriter {
++                lease: f.lease.clone(),
++            })
++            .unwrap();
++        let dir = f.descriptor.local_path.as_ref().unwrap();
++        let journal = f.descriptor.record_location.as_ref().unwrap();
++        let wal = std::path::PathBuf::from(format!("{}-wal", journal.display()));
++        assert!(!wal.exists());
++        let open = || {
++            let SessionStorageResponse::Session { descriptor } = f
++                .service
++                .execute(SessionStorageRequest::Open { path: dir.clone() })
++                .unwrap()
++            else {
++                panic!("expected descriptor");
++            };
++            descriptor.updated_at_ms
++        };
++        File::options()
++            .write(true)
++            .open(journal)
++            .unwrap()
++            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(10)))
++            .unwrap();
++        assert_eq!(open(), 10_000);
++
++        File::create(&wal)
++            .unwrap()
++            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(20)))
++            .unwrap();
++        assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
++        assert_eq!(
++            open(),
++            match kind {
++                BackendKind::Jsonl => 20_000, // Existing JSONL recency is unchanged.
++                BackendKind::Sqlite => 10_000,
++            }
++        );
++    }
++}

@@ -1,0 +1,145 @@
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 9a91c2f..5149561 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -108,10 +108,18 @@ pub(super) fn load(
+     descriptor: &StorageSessionDescriptor,
+     stamps: &SourceStamp,
+ ) -> Option<(StorageSessionSummary, super::super::views::PrefixCache)> {
+-    let bytes = crate::io::bounded_read(&dir.join(FILE), MAX_BYTES).ok()?;
+-    let envelope: Envelope = serde_json::from_slice(&bytes).ok()?;
+-    let index = envelope.data;
+-    if envelope.checksum != crate::io::sha256_hex(&serde_json::to_vec(&index).ok()?)
++    let mut bytes = crate::io::bounded_read(&dir.join(FILE), MAX_BYTES).ok()?;
++    let Envelope {
++        checksum,
++        data: index,
++    } = serde_json::from_slice(&bytes).ok()?;
++    // The envelope owns its data. Reuse the read buffer for the canonical JSON,
++    // which can differ from the JSON spelling accepted by the parser.
++    bytes.clear();
++    serde_json::to_writer(&mut bytes, &index).ok()?;
++    let digest = crate::io::sha256_hex(&bytes);
++    drop(bytes);
++    if checksum != digest
+         || index.summary.descriptor.session != descriptor.session
+         || &index.stamps != stamps
+         || blob_stamps(dir)? != index.blobs
+diff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs
+--- a/storage/session-storage/src/service/catalog/tests.rs
++++ b/storage/session-storage/src/service/catalog/tests.rs
+@@ -1,4 +1,4 @@
+-//! Deterministically interleave a completed, unpublished cold replay with real writes.
++//! Exercise catalog persistence and interleave a detached replay with real writes.
+ use super::*;
+ use crate::tests::{Fixture, backends, text};
+ 
+@@ -185,3 +185,108 @@
+         (MAX_CATALOG_ENTRIES, MAX_CATALOG_ENTRIES)
+     );
+ }
++
++#[test]
++fn sidecar_load_checks_the_canonical_data_not_its_wire_spelling() {
++    use serde_json::{Value, json};
++
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("quote \"; slash \\; unicode: café 🦀")]);
++        let dir = f.descriptor.local_path.as_ref().unwrap();
++        let blobs = dir.join("blobs");
++        std::fs::create_dir_all(&blobs).unwrap();
++        for i in 0..16 {
++            std::fs::write(blobs.join(format!("inventory-{i}")), b"fixture").unwrap();
++        }
++        let expected = StorageService::new(kind)
++            .catalog_summary(dir, false)
++            .unwrap();
++        let descriptor = sessions::open(kind, dir).unwrap();
++        let stamps = source_stamp(dir, kind).unwrap();
++        let index = dir.join(".storage-catalog-v1.json");
++        let canonical = std::fs::read(&index).unwrap();
++        let (_, prefix) = durable::load(dir, &descriptor, &stamps).unwrap();
++        let assert_hit = || {
++            let (summary, actual) = durable::load(dir, &descriptor, &stamps).unwrap();
++            assert_eq!(summary, expected);
++            assert_eq!(actual.revision, prefix.revision);
++            assert_eq!(actual.hint.extent, prefix.hint.extent);
++            assert_eq!(actual.hint.fingerprint, prefix.hint.fingerprint);
++            assert_eq!(actual.blob_digest, prefix.blob_digest);
++        };
++
++        let envelope: Value = serde_json::from_slice(&canonical).unwrap();
++        let checksum = envelope["checksum"].as_str().unwrap();
++        let data = &envelope["data"];
++        let pretty = serde_json::to_string_pretty(data)
++            .unwrap()
++            .replace('é', r"\u00e9");
++        assert!(pretty.contains(r"\u00e9"));
++        let reordered = format!("{{\n  \"data\": {pretty},\n  \"checksum\": \"{checksum}\"\n}}\n");
++        std::fs::write(&index, reordered).unwrap();
++        assert_hit();
++
++        // Serde also accepts positional struct representations. On this input
++        // the canonical object form is larger than the entire sidecar on disk.
++        let mut blobs = data["blobs"].clone();
++        for stamp in blobs.as_object_mut().unwrap().values_mut() {
++            *stamp = json!([
++                stamp["len"],
++                stamp["modified"],
++                stamp["device"],
++                stamp["inode"],
++                stamp["changed"]
++            ]);
++        }
++        let positional = json!([
++            checksum,
++            [
++                data["summary"],
++                data["stamps"],
++                blobs,
++                data["revision"],
++                data["extent"],
++                data["fingerprint"]
++            ]
++        ]);
++        let compact = serde_json::to_vec(&positional).unwrap();
++        assert!(compact.len() + 87 < canonical.len());
++        std::fs::write(&index, &compact).unwrap();
++        assert_hit();
++
++        // Keep the checksum but change a typed field. A miss must not be
++        // concealed by the ordinary List path's replay-and-rewrite fallback.
++        let mut changed = envelope;
++        changed["data"]["summary"]["preview"] = json!("different");
++        std::fs::write(&index, serde_json::to_vec(&changed).unwrap()).unwrap();
++        assert!(durable::load(dir, &descriptor, &stamps).is_none());
++    }
++}
++
++#[test]
++fn sidecar_load_limit_still_covers_the_original_wire_bytes() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("bounded input")]);
++        let dir = f.descriptor.local_path.as_ref().unwrap();
++        let expected = StorageService::new(kind)
++            .catalog_summary(dir, false)
++            .unwrap();
++        let descriptor = sessions::open(kind, dir).unwrap();
++        let stamps = source_stamp(dir, kind).unwrap();
++        let index = dir.join(".storage-catalog-v1.json");
++        let mut bytes = std::fs::read(&index).unwrap();
++        let limit = 4 * 1024 * 1024;
++        assert!(bytes.len() < limit);
++        bytes.resize(limit, b' ');
++        std::fs::write(&index, &bytes).unwrap();
++        assert_eq!(
++            durable::load(dir, &descriptor, &stamps).unwrap().0,
++            expected
++        );
++        bytes.push(b' ');
++        std::fs::write(&index, &bytes).unwrap();
++        assert!(durable::load(dir, &descriptor, &stamps).is_none());
++    }
++}
