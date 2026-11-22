@@ -1,0 +1,53 @@
+diff --git a/src/transcript/external.rs b/src/transcript/external.rs
+--- a/src/transcript/external.rs
++++ b/src/transcript/external.rs
+@@ -88,17 +88,18 @@
+ 
+     pub(crate) fn external_delta(
+         &mut self,
+-        turn: &str,
+-        id: &str,
++        turn: impl Into<String>,
++        id: impl Into<String>,
+         delta: &str,
+         reasoning: bool,
+         tool: bool,
+     ) -> Change {
+-        let identity = (turn.to_owned(), id.to_owned());
++        let identity = (turn.into(), id.into());
+         let Some(index) = self.external_index(&identity) else {
++            let (turn_id, id) = identity;
+             return self.external_upsert(Item {
+-                id: id.into(),
+-                turn_id: turn.into(),
++                id,
++                turn_id,
+                 status: "inProgress".into(),
+                 timestamp_ms: None,
+                 kind: if tool {
+diff --git a/src/ui/chat/codex/mod.rs b/src/ui/chat/codex/mod.rs
+--- a/src/ui/chat/codex/mod.rs
++++ b/src/ui/chat/codex/mod.rs
+@@ -242,19 +242,19 @@
+                 state.output = true;
+                 self.session
+                     .transcript
+-                    .external_delta(&turn_id, &id, &delta, false, false)
++                    .external_delta(turn_id, id, &delta, false, false)
+             }
+             Event::ReasoningDelta { id, turn_id, delta } => {
+                 state.output = false;
+                 self.session
+                     .transcript
+-                    .external_delta(&turn_id, &id, &delta, true, false)
++                    .external_delta(turn_id, id, &delta, true, false)
+             }
+             Event::ToolOutputDelta { id, turn_id, delta } => {
+                 state.output = true;
+                 self.session
+                     .transcript
+-                    .external_delta(&turn_id, &id, &delta, false, true)
++                    .external_delta(turn_id, id, &delta, false, true)
+             }
+             Event::TurnStarted { id } => {
+                 state.started(id);
