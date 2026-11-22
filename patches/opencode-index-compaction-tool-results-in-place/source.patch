@@ -1,0 +1,17 @@
+--- a/workflow/opencode-runtime/compaction.mjs
++++ b/workflow/opencode-runtime/compaction.mjs
+@@ -105,8 +105,12 @@
+         cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+         ...((limits.native_compaction ?? ((providerID === "openai" || providerID === "openai-codex") && /^gpt-/.test(modelID))) ? { compaction: { type: "native" } } : {}),
+     };
+-    const results = new Map(messages.flatMap(message => message.parts.flatMap(({ payload }) =>
+-        payload.ToolResult ? [[payload.ToolResult.result.call_id, payload.ToolResult.result]] : [])));
++    const results = new Map();
++    messages.forEach(message => {
++        message.parts.forEach(({ payload }) => {
++            if (payload.ToolResult) results.set(payload.ToolResult.result.call_id, payload.ToolResult.result);
++        });
++    });
+     const native = [];
+     for (const message of messages) {
+         const previous = message.metadata?.opencode_compaction;
