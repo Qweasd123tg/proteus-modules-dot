@@ -1,0 +1,43 @@
+Exact scoped probes with five identical repeats per arm. Test-only branch interception avoids HTTP, rendering, and serialization of probe output in the allocator scope.
+Columns: tier ops variant case repeats session_bytes full_key_bytes session_clones session_clone_bytes usage_serializations full_key_builds full_key_build_bytes cache_hits cache_misses session_absent next_key_capacity retained_key_capacity allocation_or_reallocation_requests requested_bytes.
+Same counts/output under current #349 and #443 composition. Measures ordinary key work and successful allocator requests only, not wall time, RSS or GET latency.
+base ops stock short-one 1 17 62 1 17 1 1 62 1 0 0 0 68 8 256
+base ops stock short-dozen 12 17 62 12 204 12 12 744 12 0 0 0 68 96 3072
+base ops stock long-one 1 79 124 1 79 1 1 124 1 0 0 0 158 7 436
+base ops stock long-dozen 12 79 124 12 948 12 12 1488 12 0 0 0 158 84 5232
+base ops stock cold 1 79 124 1 79 1 1 124 0 1 0 158 0 7 436
+base ops stock stale 1 79 124 1 79 1 1 124 0 1 0 158 158 7 436
+base ops stock new-view 1 79 124 1 79 1 1 124 0 1 0 158 158 7 436
+base ops stock no-session 1 0 0 0 0 0 0 0 0 0 1 0 0 0 0
+base ops stock absent-state 1 17 18 1 17 0 1 18 0 1 0 34 34 3 68
+base ops stock field-missing 1 17 22 1 17 1 1 22 1 0 0 0 34 4 76
+base ops candidate short-one 1 17 62 0 0 1 0 0 1 0 0 0 68 4 120
+base ops candidate short-dozen 12 17 62 0 0 12 0 0 12 0 0 0 68 48 1440
+base ops candidate long-one 1 79 124 0 0 1 0 0 1 0 0 0 158 4 120
+base ops candidate long-dozen 12 79 124 0 0 12 0 0 12 0 0 0 158 48 1440
+base ops candidate cold 1 79 124 0 0 1 1 124 0 1 0 158 0 6 357
+base ops candidate stale 1 79 124 0 0 1 1 124 0 1 0 158 158 6 357
+base ops candidate new-view 1 79 124 0 0 1 1 124 0 1 0 158 158 6 357
+base ops candidate no-session 1 0 0 0 0 0 0 0 0 0 1 0 0 0 0
+base ops candidate absent-state 1 17 18 0 0 0 1 18 0 1 0 34 34 2 51
+base ops candidate field-missing 1 17 22 0 0 1 0 0 1 0 0 0 34 1 8
+composed ops stock short-one 1 17 62 1 17 1 1 62 1 0 0 0 68 8 256
+composed ops stock short-dozen 12 17 62 12 204 12 12 744 12 0 0 0 68 96 3072
+composed ops stock long-one 1 79 124 1 79 1 1 124 1 0 0 0 158 7 436
+composed ops stock long-dozen 12 79 124 12 948 12 12 1488 12 0 0 0 158 84 5232
+composed ops stock cold 1 79 124 1 79 1 1 124 0 1 0 158 0 7 436
+composed ops stock stale 1 79 124 1 79 1 1 124 0 1 0 158 158 7 436
+composed ops stock new-view 1 79 124 1 79 1 1 124 0 1 0 158 158 7 436
+composed ops stock no-session 1 0 0 0 0 0 0 0 0 0 1 0 0 0 0
+composed ops stock absent-state 1 17 18 1 17 0 1 18 0 1 0 34 34 3 68
+composed ops stock field-missing 1 17 22 1 17 1 1 22 1 0 0 0 34 4 76
+composed ops candidate short-one 1 17 62 0 0 1 0 0 1 0 0 0 68 4 120
+composed ops candidate short-dozen 12 17 62 0 0 12 0 0 12 0 0 0 68 48 1440
+composed ops candidate long-one 1 79 124 0 0 1 0 0 1 0 0 0 158 4 120
+composed ops candidate long-dozen 12 79 124 0 0 12 0 0 12 0 0 0 158 48 1440
+composed ops candidate cold 1 79 124 0 0 1 1 124 0 1 0 158 0 6 357
+composed ops candidate stale 1 79 124 0 0 1 1 124 0 1 0 158 158 6 357
+composed ops candidate new-view 1 79 124 0 0 1 1 124 0 1 0 158 158 6 357
+composed ops candidate no-session 1 0 0 0 0 0 0 0 0 0 1 0 0 0 0
+composed ops candidate absent-state 1 17 18 0 0 0 1 18 0 1 0 34 34 2 51
+composed ops candidate field-missing 1 17 22 0 0 1 0 0 1 0 0 0 34 1 8
