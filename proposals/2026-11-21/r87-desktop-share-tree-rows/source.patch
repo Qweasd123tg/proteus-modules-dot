@@ -1,0 +1,134 @@
+diff --git a/src/declarative/widget.rs b/src/declarative/widget.rs
+index 67e6b2a..d12bf75 100644
+--- a/src/declarative/widget.rs
++++ b/src/declarative/widget.rs
+@@ -9,6 +9,7 @@
+ use anyhow::{Result, bail};
+ use serde::Deserialize;
+ use serde_json::Value;
++use std::sync::Arc;
+ 
+ const MAX_DEPTH: usize = 32;
+ const MAX_NODES: usize = 5_000;
+@@ -47,7 +48,8 @@ pub enum Node {
+     },
+     Tree {
+         id: String,
+-        rows: Vec<super::tree::Row>,
++        #[serde(deserialize_with = "tree_rows")]
++        rows: Arc<Vec<super::tree::Row>>,
+         action: String,
+         /// Pixels per depth level.
+         #[serde(default = "sixteen")]
+@@ -496,6 +498,13 @@ pub struct SortableItem {
+     pub children: Vec<Node>,
+ }
+ 
++/// Decode the original required array, then share its row storage with the native tree.
++fn tree_rows<'de, D: serde::Deserializer<'de>>(
++    d: D,
++) -> std::result::Result<Arc<Vec<super::tree::Row>>, D::Error> {
++    Vec::deserialize(d).map(Arc::new)
++}
++
+ fn search_placeholder() -> String {
+     "Поиск…".into()
+ }
+@@ -791,7 +800,7 @@ impl Node {
+                 if !indent.is_finite() || !(0. ..=64.).contains(indent) {
+                     bail!("tree indent must be within 0..=64");
+                 }
+-                for row in rows {
++                for row in rows.iter() {
+                     known_icon(row.icon.as_deref())?;
+                     super::control::check_items(&row.menu)?;
+                 }
+diff --git a/src/ui/extensions/declarative/fields.rs b/src/ui/extensions/declarative/fields.rs
+index 1ab0df8..252a0e1 100644
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -8,6 +8,7 @@ use crate::declarative::widget::Node;
+ use gpui_kit::component::input::{EditorState, InputEvent, InputState, TextareaState};
+ use gpui_kit::*;
+ use std::collections::HashMap;
++use std::sync::Arc;
+ 
+ pub(super) mod textarea;
+ 
+@@ -604,14 +605,14 @@ impl DeclarativeView {
+                 if let Some(tree) = self.fields.trees.get(id) {
+                     tree.update(cx, |tree, cx| {
+                         tree.action.rebind(action);
+-                        tree.set_rows(rows.clone(), layout, cx);
++                        tree.set_rows(Arc::clone(rows), layout, cx);
+                     });
+                 } else {
+                     let send = self.widget_action(action, cx);
+                     let view = cx.weak_entity();
+                     let natural = self.embedded;
+                     let tree =
+-                        cx.new(|cx| Tree::new(rows.clone(), layout, natural, view, cx, send));
++                        cx.new(|cx| Tree::new(Arc::clone(rows), layout, natural, view, cx, send));
+                     self.fields.trees.insert(id.clone(), tree);
+                 }
+             }
+diff --git a/src/ui/extensions/declarative/tree.rs b/src/ui/extensions/declarative/tree.rs
+index 7f77f6f..db55186 100644
+--- a/src/ui/extensions/declarative/tree.rs
++++ b/src/ui/extensions/declarative/tree.rs
+@@ -10,6 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ use std::collections::HashMap;
+ use std::ops::Range;
++use std::sync::Arc;
+ 
+ /// How rows are indented and joined.
+ #[derive(Clone, Copy, PartialEq)]
+@@ -20,7 +21,7 @@ pub(super) struct Layout {
+ }
+ 
+ pub(super) struct Tree {
+-    pub rows: Vec<Row>,
++    pub rows: Arc<Vec<Row>>,
+     pub layout: Layout,
+     pub(super) cursor: usize,
+     focus: FocusHandle,
+@@ -54,7 +55,7 @@ struct Span {
+ 
+ impl Tree {
+     pub fn new(
+-        rows: Vec<Row>,
++        rows: Arc<Vec<Row>>,
+         layout: Layout,
+         natural: bool,
+         view: WeakEntity<super::view::DeclarativeView>,
+@@ -79,8 +80,9 @@ impl Tree {
+         tree
+     }
+ 
+-    pub fn set_rows(&mut self, rows: Vec<Row>, layout: Layout, cx: &mut Context<Self>) {
+-        if self.rows == rows && self.layout == layout {
++    pub fn set_rows(&mut self, rows: Arc<Vec<Row>>, layout: Layout, cx: &mut Context<Self>) {
++        // Equal payloads keep the current snapshot, including menu value representation.
++        if self.rows.as_slice() == rows.as_slice() && self.layout == layout {
+             return;
+         }
+         self.layout = layout;
+@@ -110,7 +112,7 @@ impl Tree {
+         let prefix = self
+             .rows
+             .iter()
+-            .zip(&rows)
++            .zip(rows.iter())
+             .take_while(|(a, b)| same(a, b))
+             .count();
+         let suffix = self.rows[prefix..]
+@@ -463,7 +465,7 @@ mod navigation_tests {
+             };
+             let tree = cx.new(|cx| {
+                 Tree::new(
+-                    vec![row("staged"), row("unstaged")],
++                    Arc::new(vec![row("staged"), row("unstaged")]),
+                     Layout {
+                         indent: 16.,
+                         chevrons: true,
