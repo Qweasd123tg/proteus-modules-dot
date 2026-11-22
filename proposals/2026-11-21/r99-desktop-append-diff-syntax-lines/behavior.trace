@@ -1,0 +1,27 @@
+APPEND blank: 0 0
+APPEND no-tabs: 12 12
+APPEND sparse-tabs: 10 22
+APPEND dense-tabs: 12 48
+APPEND non-tabs: 9 9
+INPUT renamed-crlf/true: "\n    до        🚀    \n    let before = \"мир\";    \n\nобычная строка\n\nбез перевода\n"; ranges=[None, Some(1..25), Some(26..56), None, None, Some(57..57), Some(58..85), None, Some(87..110), None]
+SIDE renamed-crlf/true: lang=rust bytes=111 rows=10 spans=13 cross_row=7 oracle=91f140efe08e03d0
+INPUT renamed-crlf/false: "\n    до        🚀    \n    let after = \"état\";    \n        \n\nобычная строка\n\nnew without LF\n"; ranges=[None, Some(1..25), None, Some(26..54), Some(55..63), Some(64..64), Some(65..92), None, None, Some(94..108)]
+SIDE renamed-crlf/false: lang=python bytes=109 rows=10 spans=15 cross_row=8 oracle=503af72f663bdc85
+INPUT metadata-only/true: ""; ranges=[None]
+SIDE metadata-only/true: lang=markdown bytes=0 rows=1 spans=0 cross_row=0 oracle=cd9594f32b16f32c
+INPUT metadata-only/false: ""; ranges=[None]
+SIDE metadata-only/false: lang=markdown bytes=0 rows=1 spans=0 cross_row=0 oracle=cd9594f32b16f32c
+SIDE spaces/true: lang=rust bytes=13276 rows=481 spans=1793 cross_row=566 oracle=bcedfcc05374e605
+SIDE spaces/false: lang=rust bytes=13156 rows=481 spans=1825 cross_row=615 oracle=4b7bacb560cbc788
+SIDE sparse-tabs/true: lang=rust bytes=17236 rows=481 spans=2249 cross_row=610 oracle=186719c24dc04970
+SIDE sparse-tabs/false: lang=rust bytes=17116 rows=481 spans=2239 cross_row=617 oracle=3efb2c53796cb85d
+SIDE dense-tabs/true: lang=rust bytes=46069 rows=481 spans=6829 cross_row=608 oracle=ab378a0249a536e8
+SIDE dense-tabs/false: lang=rust bytes=45949 rows=481 spans=6825 cross_row=621 oracle=fa827e938f2dc63d
+INPUT empty-file/true: ""; ranges=[]
+SIDE empty-file/true: lang=text bytes=0 rows=0 spans=0 cross_row=0 oracle=8c2c67c27dc55de3
+INPUT empty-file/false: ""; ranges=[]
+SIDE empty-file/false: lang=text bytes=0 rows=0 spans=0 cross_row=0 oracle=8c2c67c27dc55de3
+INPUT direct-blank-and-end/true: "\n"; ranges=[Some(0..0), None]
+SIDE direct-blank-and-end/true: lang=text bytes=1 rows=2 spans=0 cross_row=0 oracle=a02d93752f5b3a2c
+INPUT direct-blank-and-end/false: "\n    end    \n"; ranges=[Some(0..0), Some(1..12)]
+SIDE direct-blank-and-end/false: lang=text bytes=13 rows=2 spans=2 cross_row=2 oracle=2b5da2a3fcb80f40
