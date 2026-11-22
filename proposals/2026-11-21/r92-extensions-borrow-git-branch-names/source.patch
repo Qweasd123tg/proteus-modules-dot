@@ -1,0 +1,147 @@
+diff --git a/packages/git/src/main.rs b/packages/git/src/main.rs
+index f008ca0..dc0f952 100644
+--- a/packages/git/src/main.rs
++++ b/packages/git/src/main.rs
+@@ -37,7 +37,8 @@ pub struct Git {
+     /// action may borrow its entries while mutating other extension state.
+     changes: Rc<Value>,
+     deadline: Option<Instant>,
+-    branches: Option<Vec<Value>>,
++    // Only menu and picker names survive the branch response.
++    branches: Option<Vec<String>>,
+     /// History of the current branch and, for the graph document, of every ref.
+     log: Option<Log>,
+     graph: Option<Log>,
+@@ -71,6 +72,21 @@ pub struct Git {
+     graph_case: bool,
+ }
+ 
++fn branch_names(mut reply: Value) -> Vec<String> {
++    let Some(Value::Array(branches)) = reply.get_mut("branches").map(Value::take) else {
++        return Vec::new();
++    };
++    let mut names = Vec::with_capacity(branches.len());
++    for mut branch in branches {
++        let name = match branch.get_mut("name").map(Value::take) {
++            Some(Value::String(name)) => name,
++            _ => String::new(),
++        };
++        names.push(name);
++    }
++    names
++}
++
+ impl Extension for Git {
+     fn poll(&self) -> Option<Duration> {
+         Some(POLL)
+@@ -506,15 +522,14 @@ impl Git {
+         }
+     }
+ 
+-    fn branch_list(&mut self, host: &Host) -> Result<Vec<Value>> {
++    fn branch_list(&mut self, host: &Host) -> Result<&[String]> {
+         if self.branches.is_none() {
+-            self.branches = Some(
+-                host.api("/workspace/branches", &[])?
+-                    .list("branches")
+-                    .to_vec(),
+-            );
++            self.branches = Some(branch_names(host.api("/workspace/branches", &[])?));
+         }
+-        Ok(self.branches.clone().unwrap_or_default())
++        Ok(self
++            .branches
++            .as_deref()
++            .expect("branch catalogue was loaded"))
+     }
+ 
+     fn sync_line(&self) -> Option<String> {
+diff --git a/packages/git/src/panel.rs b/packages/git/src/panel.rs
+index 89f512e..d38d3bf 100644
+--- a/packages/git/src/panel.rs
++++ b/packages/git/src/panel.rs
+@@ -284,8 +284,7 @@ impl Git {
+         if branches.is_empty() {
+             items.push(item("Веток нет", "noop").with("disabled", true));
+         }
+-        for entry in branches.iter().take(60) {
+-            let name = entry.str("name");
++        for name in branches.iter().take(60).map(String::as_str) {
+             items.push(
+                 item(name, "checkout")
+                     .with("value", name)
+@@ -313,10 +312,7 @@ impl Git {
+         }
+         let choices: Vec<_> = branches
+             .iter()
+-            .map(|entry| {
+-                let name = entry.str("name");
+-                (json!(name), name.to_owned())
+-            })
++            .map(|name| (json!(name), name.clone()))
+             .collect();
+         children.push(
+             proteus_extension::ui::picker("branches", &choices, &json!(current), "checkout")
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 8922950..67585eb 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -193,6 +193,58 @@ fn remote_operations_and_explicit_refresh_reload_branches_with_an_unchanged_head
+     }
+ }
+ 
++#[test]
++fn branch_names_move_strings_and_keep_legacy_blank_rows() {
++    let response = json!({"current":"not the picker sentinel","branches":[
++        {"name":"папка/β","upstream":"unused","last_commit_summary":"unused"},
++        {"name":"папка/β"},
++        {"name":null},
++        {"name":7},
++        {"name":""},
++        {"not_name":"ignored"},
++        ["a"],
++        true,
++    ]});
++    let first = response["branches"][0]["name"].as_str().unwrap().as_ptr();
++    let names = crate::branch_names(response);
++    assert_eq!(names, ["папка/β", "папка/β", "", "", "", "", "", ""]);
++    assert_eq!(names[0].as_ptr(), first);
++    assert!(crate::branch_names(json!({"branches":{}})).is_empty());
++    assert!(crate::branch_names(Value::Null).is_empty());
++}
++
++#[test]
++fn branch_catalogue_warm_empty_and_error_retry_keep_request_semantics() {
++    let mut fake = Fake::new();
++    fake.fail.store(true, Ordering::SeqCst);
++    assert!(fake.git.branch_list(&fake.host).is_err());
++    assert!(fake.git.branches.is_none());
++
++    fake.fail.store(false, Ordering::SeqCst);
++    let start = fake.git.branch_list(&fake.host).unwrap().as_ptr();
++    let warm = fake.git.branch_list(&fake.host).unwrap();
++    assert_eq!(warm, ["main", "topic"]);
++    assert_eq!(warm.as_ptr(), start);
++
++    fake.git.invalidate_refs();
++    fake.responses
++        .lock()
++        .unwrap()
++        .insert("/workspace/branches".into(), json!({"branches":false}));
++    assert!(fake.git.branch_list(&fake.host).unwrap().is_empty());
++    assert!(fake.git.branches.as_ref().is_some_and(Vec::is_empty));
++    assert!(fake.git.branch_list(&fake.host).unwrap().is_empty());
++    assert_eq!(
++        fake.calls
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(path, _)| path.ends_with("/branches"))
++            .count(),
++        3,
++    );
++}
++
+ #[test]
+ fn external_ref_changes_invalidate_catalog_and_decorations_without_a_head_change() {
+     let mut fake = Fake::new();
