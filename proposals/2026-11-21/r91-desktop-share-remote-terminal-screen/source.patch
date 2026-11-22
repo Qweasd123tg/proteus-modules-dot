@@ -1,0 +1,137 @@
+diff --git a/crates/terminal/src/display.rs b/crates/terminal/src/display.rs
+index 2036ab7..6fad25e 100644
+--- a/crates/terminal/src/display.rs
++++ b/crates/terminal/src/display.rs
+@@ -34,7 +34,7 @@ pub struct SpawnedDisplay {
+ }
+ 
+ struct View {
+-    screen: Screen,
++    screen: Arc<Screen>,
+     base: Base,
+     grid: Grid,
+     scroll: i32,
+@@ -112,12 +112,12 @@ impl Display {
+         let grid = Grid::new(grid.columns, grid.rows);
+         let shared = Arc::new(Shared {
+             view: Mutex::new(View {
+-                screen: Screen {
++                screen: Arc::new(Screen {
+                     columns: grid.columns,
+                     rows: vec![vec![]; grid.rows],
+                     cursor: None,
+                     scrolled: 0,
+-                },
++                }),
+                 base: BASE,
+                 grid,
+                 scroll: 0,
+@@ -266,10 +266,10 @@ impl Display {
+         self.shared.frame_credit.store(true, Ordering::Release);
+         self.wake();
+     }
+-    pub fn snapshot(&self, base: Base) -> Screen {
++    pub fn snapshot(&self, base: Base) -> Arc<Screen> {
+         let mut view = self.shared.view.lock().unwrap();
+         view.base = base;
+-        let screen = view.screen.clone();
++        let screen = Arc::clone(&view.screen);
+         drop(view);
+         self.shared.frame_credit.store(true, Ordering::Release);
+         self.wake();
+@@ -334,7 +334,7 @@ fn run(
+             && last_frame.elapsed() >= FRAME_TIME
+             && shared.frame_credit.swap(false, Ordering::AcqRel)
+         {
+-            let screen = engine.snapshot(base)?;
++            let screen = Arc::new(engine.snapshot(base)?);
+             shared.view.lock().unwrap().screen = screen;
+             let _ = redraw.try_send(());
+             last_frame = Instant::now();
+diff --git a/crates/terminal/src/display/tests.rs b/crates/terminal/src/display/tests.rs
+index 187b4d8..7039502 100644
+--- a/crates/terminal/src/display/tests.rs
++++ b/crates/terminal/src/display/tests.rs
+@@ -16,7 +16,7 @@ fn wait(mut condition: impl FnMut() -> bool) {
+     }
+ }
+ 
+-fn screen(display: &Display, condition: impl Fn(&Screen) -> bool) -> Screen {
++fn screen(display: &Display, condition: impl Fn(&Screen) -> bool) -> Arc<Screen> {
+     let mut found = None;
+     wait(|| {
+         let value = display.snapshot(BASE);
+diff --git a/src/ui/extensions/declarative/terminal.rs b/src/ui/extensions/declarative/terminal.rs
+index 09703d3..3e52dfb 100644
+--- a/src/ui/extensions/declarative/terminal.rs
++++ b/src/ui/extensions/declarative/terminal.rs
+@@ -311,6 +311,7 @@ impl Render for TerminalView {
+                     cell,
+                     foreground,
+                     matches!(self.state, State::Running(_)) && self.focus.is_focused(window),
++                    screen.cursor,
+                 ))
+             }
+         };
+diff --git a/src/ui/terminal/cells.rs b/src/ui/terminal/cells.rs
+index 931a141..4cd8b2b 100644
+--- a/src/ui/terminal/cells.rs
++++ b/src/ui/terminal/cells.rs
+@@ -49,6 +49,7 @@ pub(in crate::ui) fn screen(
+     cell: Size<Pixels>,
+     foreground: Hsla,
+     focused: bool,
++    cursor: Option<(usize, usize)>,
+ ) -> Div {
+     let rows = screen.rows.iter().enumerate().map(|(index, runs)| {
+         div()
+@@ -59,7 +60,7 @@ pub(in crate::ui) fn screen(
+             .h(cell.height)
+             .children(runs.iter().map(|run| render_run(run, cell)))
+     });
+-    let cursor = screen.cursor.map(|(row, column)| {
++    let cursor = cursor.map(|(row, column)| {
+         div()
+             .absolute()
+             .top(px(PADDING) + cell.height * row as f32)
+diff --git a/src/ui/terminal/view.rs b/src/ui/terminal/view.rs
+index 13a6dd8..495fe97 100644
+--- a/src/ui/terminal/view.rs
++++ b/src/ui/terminal/view.rs
+@@ -148,14 +148,10 @@ impl Render for Remote {
+         .absolute()
+         .size_full();
+         let screen = self.display.as_ref().map(|display| {
+-            let mut screen = display.snapshot(Base {
++            display.snapshot(Base {
+                 foreground: cells::rgb_bytes(foreground),
+                 background: cells::rgb_bytes(background),
+-            });
+-            if self.process_finished {
+-                screen.cursor = None;
+-            }
+-            screen
++            })
+         });
+         let state = if self.finished {
+             self.exit_code.map_or_else(
+@@ -217,7 +213,18 @@ impl Render for Remote {
+             }))
+             .child(probe)
+             .children(screen.as_ref().map(|screen| {
+-                cells::screen(screen, cell, foreground, self.focus.is_focused(window))
++                let cursor = if self.process_finished {
++                    None
++                } else {
++                    screen.cursor
++                };
++                cells::screen(
++                    screen,
++                    cell,
++                    foreground,
++                    self.focus.is_focused(window),
++                    cursor,
++                )
+             }));
+         v_flex()
+             .size_full()
