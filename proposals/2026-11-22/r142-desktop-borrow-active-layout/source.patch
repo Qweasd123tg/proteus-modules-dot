@@ -1,0 +1,82 @@
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -122,7 +122,7 @@
+ ) -> Result<Boot> {
+     boot_with_owner(
+         options,
+-        saved.active_layout().clone(),
++        saved.active_layout(),
+         saved.active_root(),
+         connect,
+         spawn_codex,
+@@ -136,12 +136,12 @@
+     connect: impl FnOnce(&LaunchOptions, Option<&Path>) -> Result<(Api, Option<BackendGuard>)>,
+     spawn_codex: impl FnOnce(PathBuf, PathBuf) -> Result<CodexService>,
+ ) -> Result<Boot> {
+-    boot_with_owner(options, saved, None, connect, spawn_codex)
++    boot_with_owner(options, &saved, None, connect, spawn_codex)
+ }
+ 
+ fn boot_with_owner(
+     options: &LaunchOptions,
+-    saved: TabLayout,
++    saved: &TabLayout,
+     owner: Option<&str>,
+     connect: impl FnOnce(&LaunchOptions, Option<&Path>) -> Result<(Api, Option<BackendGuard>)>,
+     spawn_codex: impl FnOnce(PathBuf, PathBuf) -> Result<CodexService>,
+@@ -150,9 +150,15 @@
+     // A config picked by the user must never acquire an old chat merely
+     // because its history is the newest one in the shared session store.
+     let fresh = options.startup == StartupIntent::Fresh;
+-    let saved = if fresh { TabLayout::default() } else { saved };
++    let empty;
++    let saved = if fresh {
++        empty = TabLayout::default();
++        &empty
++    } else {
++        saved
++    };
+     let owner = if fresh { None } else { owner };
+-    let required = required_chats_with_owner(&saved, owner);
++    let required = required_chats_with_owner(saved, owner);
+     let codex_ids: Vec<_> = required
+         .iter()
+         .filter_map(|key| match key {
+@@ -262,13 +268,13 @@
+ #[cfg(test)]
+ fn restore(api: Api, backend: Option<BackendGuard>, saved: TabLayout) -> Result<Boot> {
+     let required = required_chats(&saved);
+-    restore_core(api, backend, saved, true, &required)
++    restore_core(api, backend, &saved, true, &required)
+ }
+ 
+ fn restore_core(
+     api: Api,
+     backend: Option<BackendGuard>,
+-    saved: TabLayout,
++    saved: &TabLayout,
+     fallback: bool,
+     required: &[ChatKey],
+ ) -> Result<Boot> {
+diff --git a/src/ui/workspace/startup/tests.rs b/src/ui/workspace/startup/tests.rs
+--- a/src/ui/workspace/startup/tests.rs
++++ b/src/ui/workspace/startup/tests.rs
+@@ -329,7 +329,7 @@
+             ChatKey::Proteus("/sessions/root".into()),
+         ]
+     );
+-    let boot = restore_core(server.api(), None, layout.clone(), true, &required).unwrap();
++    let boot = restore_core(server.api(), None, &layout, true, &required).unwrap();
+     assert_eq!(boot.resumed, paths(&["/sessions/child", "/sessions/root"]));
+     assert_eq!(
+         boot.projects.get(Path::new("/sessions/root")),
+@@ -355,7 +355,7 @@
+     spaces.set_active(Some("chat:/sessions/root"), fragment.clone());
+     let required = required_chats_with_owner(spaces.active_layout(), spaces.active_root());
+     assert_eq!(required, [ChatKey::Proteus("/sessions/root".into())]);
+-    let boot = restore_core(server.api(), None, fragment.clone(), true, &required).unwrap();
++    let boot = restore_core(server.api(), None, &fragment, true, &required).unwrap();
+     assert_eq!(boot.resumed, paths(&["/sessions/root"]));
+     assert!(boot.restored.is_empty());
+     assert!(boot.startup.is_none());
