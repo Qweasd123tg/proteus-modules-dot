@@ -1,0 +1,153 @@
+diff --git a/packages/files/src/main.rs b/packages/files/src/main.rs
+index 66b7dc4..fbe9209 100644
+--- a/packages/files/src/main.rs
++++ b/packages/files/src/main.rs
+@@ -74,7 +74,7 @@ impl Extension for Files {
+     ) -> Result {
+         if surface == Surface::Preview {
+             let mut load = |path: &str| {
+-                Ok(tree::Listing::parse(&match path {
++                Ok(tree::Listing::parse(match path {
+                     "" => {
+                         json!({"entries":[{"name":"src","path":"src","kind":"directory"},{"name":"README.md","path":"README.md","kind":"file"}]})
+                     }
+@@ -206,7 +206,7 @@ impl Files {
+         let label = self.root_label(host);
+         let mut load = |path: &str| {
+             host.api("/workspace/list", &[("path", path)])
+-                .map(|listing| tree::Listing::parse(&listing))
++                .map(tree::Listing::parse)
+         };
+         self.project.lines(&label, &mut load)
+     }
+@@ -283,7 +283,7 @@ impl Files {
+         if self.project.kind(path) == Some(Kind::Directory) {
+             let mut load = |folder: &str| {
+                 host.api("/workspace/list", &[("path", folder)])
+-                    .map(|listing| tree::Listing::parse(&listing))
++                    .map(tree::Listing::parse)
+             };
+             let open = self.project.is_expanded(path);
+             match event {
+diff --git a/packages/files/src/operations.rs b/packages/files/src/operations.rs
+index db19bba..00b5cce 100644
+--- a/packages/files/src/operations.rs
++++ b/packages/files/src/operations.rs
+@@ -42,7 +42,7 @@ impl Files {
+             "expand-all" => {
+                 let mut load = |folder: &str| {
+                     host.api("/workspace/list", &[("path", folder)])
+-                        .map(|listing| tree::Listing::parse(&listing))
++                        .map(tree::Listing::parse)
+                 };
+                 self.project.expand_all(path, &mut load);
+                 Ok(())
+diff --git a/packages/files/src/tree.rs b/packages/files/src/tree.rs
+index 2c84658..db81678 100644
+--- a/packages/files/src/tree.rs
++++ b/packages/files/src/tree.rs
+@@ -81,11 +81,25 @@ pub struct Listing {
+     pub truncated: bool,
+ }
+ 
++fn take_path(entry: &mut Value) -> String {
++    match entry.get_mut("path") {
++        // Keep the same path capacity as the former normalized copy.
++        Some(Value::String(path)) if path.capacity() == path.len() && !path.starts_with("./") => {
++            std::mem::take(path)
++        }
++        Some(Value::String(path)) => path.trim_start_matches("./").to_owned(),
++        _ => String::new(),
++    }
++}
++
+ impl Listing {
+-    pub fn parse(value: &Value) -> Self {
++    pub fn parse(mut value: Value) -> Self {
+         let entries = value
+-            .list("entries")
+-            .iter()
++            .get_mut("entries")
++            .and_then(Value::as_array_mut)
++            .map(Vec::as_mut_slice)
++            .unwrap_or_default()
++            .iter_mut()
+             .filter(|entry| !EXCLUDED.contains(&entry.str("name")))
+             .map(|entry| {
+                 let kind = match entry.str("kind") {
+@@ -94,11 +108,8 @@ impl Listing {
+                     "symlink" => Kind::Symlink,
+                     _ => Kind::Other,
+                 };
+-                Entry::new(
+-                    entry.str("name"),
+-                    entry.str("path").trim_start_matches("./").to_owned(),
+-                    kind,
+-                )
++                let path = take_path(entry);
++                Entry::new(entry.str("name"), path, kind)
+             })
+             .collect();
+         Self {
+diff --git a/packages/files/src/tree_tests.rs b/packages/files/src/tree_tests.rs
+index 5f8474d..5911cb3 100644
+--- a/packages/files/src/tree_tests.rs
++++ b/packages/files/src/tree_tests.rs
+@@ -13,7 +13,7 @@ fn workspace(folders: &[(&str, &[(&str, bool)])]) -> HashMap<String, Listing> {
+                     json!({"name": name, "path": path, "kind": if *directory { "directory" } else { "file" }})
+                 })
+                 .collect();
+-            (folder.to_string(), Listing::parse(&json!({"entries": entries})))
++            (folder.to_string(), Listing::parse(json!({"entries": entries})))
+         })
+         .collect()
+ }
+@@ -604,7 +604,7 @@ fn listing_names_share_an_exact_path_suffix_and_keep_original_labels() {
+         ],
+         "truncated": true
+     });
+-    let listed = Listing::parse(&source);
++    let listed = Listing::parse(source);
+     assert!(listed.truncated);
+     assert_eq!(
+         listed
+@@ -633,5 +633,38 @@ fn listing_names_share_an_exact_path_suffix_and_keep_original_labels() {
+             ("visible", ".git", Kind::File, false),
+         ]
+     );
+-    assert!(Listing::parse(&json!({"entries":false})).entries.is_empty());
++    assert!(Listing::parse(json!({"entries":false})).entries.is_empty());
++}
++
++#[test]
++fn listing_moves_only_tight_raw_paths_and_preserves_defaults() {
++    let raw = r#"{"entries":[{"name":"same","path":"ordinary/имя","kind":"file"},
++                           {"name":"alias","path":"././dir/имя","kind":"directory"},
++                           {"name":"wide","path":"replace","kind":"file"},
++                           {"name":"wrong","path":7},
++                           {"name":"missing"},
++                           {"name":".git","path":"skip"}],"truncated":true}"#;
++    let mut source: Value = serde_json::from_str(raw).unwrap();
++    let mut wide = String::with_capacity(128);
++    wide.push_str("dir/loose");
++    source["entries"][2]["path"] = Value::String(wide);
++    let ordinary = source["entries"][0]["path"].as_str().unwrap().as_ptr();
++    let listed = Listing::parse(source);
++    assert!(listed.truncated);
++    assert_eq!(listed.entries[0].path.as_ptr(), ordinary);
++    assert_eq!(
++        listed
++            .entries
++            .iter()
++            .map(|e| e.path.as_str())
++            .collect::<Vec<_>>(),
++        ["ordinary/имя", "dir/имя", "dir/loose", "", ""]
++    );
++    assert!(
++        listed
++            .entries
++            .iter()
++            .all(|e| e.path.capacity() == e.path.len())
++    );
++    assert!(Listing::parse(json!({"entries":17})).entries.is_empty());
+ }
