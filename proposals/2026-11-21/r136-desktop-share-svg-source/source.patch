@@ -1,0 +1,128 @@
+diff --git a/src/declarative/widget.rs b/src/declarative/widget.rs
+index 67e6b2a..04b6945 100644
+--- a/src/declarative/widget.rs
++++ b/src/declarative/widget.rs
+@@ -13,6 +13,51 @@ use serde_json::Value;
+ const MAX_DEPTH: usize = 32;
+ const MAX_NODES: usize = 5_000;
+ 
++/// Owned wire text shared with the native image keys. Constructing the handle
++/// moves the decoded String, so preparing an SVG need not copy its contents.
++#[derive(Clone, Deserialize, PartialEq, Eq, Hash)]
++#[serde(from = "String")]
++pub struct SvgSource(std::sync::Arc<String>);
++
++impl From<String> for SvgSource {
++    fn from(source: String) -> Self {
++        Self(std::sync::Arc::new(source))
++    }
++}
++
++#[cfg(test)]
++impl From<&str> for SvgSource {
++    fn from(source: &str) -> Self {
++        source.to_owned().into()
++    }
++}
++
++impl SvgSource {
++    pub fn as_str(&self) -> &str {
++        self.0.as_str()
++    }
++}
++
++impl std::borrow::Borrow<str> for SvgSource {
++    fn borrow(&self) -> &str {
++        self.as_str()
++    }
++}
++
++impl std::ops::Deref for SvgSource {
++    type Target = str;
++
++    fn deref(&self) -> &str {
++        self.as_str()
++    }
++}
++
++impl std::fmt::Debug for SvgSource {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        std::fmt::Debug::fmt(self.as_str(), formatter)
++    }
++}
++
+ /// A settings action, not a second widget or an implicit host-side default.
+ #[derive(Clone, Debug, Deserialize, PartialEq)]
+ #[serde(deny_unknown_fields)]
+@@ -203,7 +248,7 @@ pub enum Node {
+     },
+     /// Self-contained color SVG, rendered as a native cached image.
+     Svg {
+-        source: String,
++        source: SvgSource,
+         width: f32,
+         height: f32,
+         /// Alphabetic baseline measured from the SVG's top edge.
+diff --git a/src/ui/extensions/declarative/images.rs b/src/ui/extensions/declarative/images.rs
+index 8df4ab4..07aa600 100644
+--- a/src/ui/extensions/declarative/images.rs
++++ b/src/ui/extensions/declarative/images.rs
+@@ -13,12 +13,12 @@ use std::sync::Arc;
+ 
+ use gpui_kit::*;
+ 
+-use crate::declarative::widget::Node;
++use crate::declarative::widget::{Node, SvgSource};
+ use crate::ui::render_image::Bitmap;
+ 
+ #[derive(Clone, PartialEq, Eq, Hash)]
+ struct Key {
+-    source: Arc<str>,
++    source: SvgSource,
+     size: budget::RasterSize,
+ }
+ 
+@@ -35,7 +35,7 @@ type Failures = RefCell<HashMap<Key, String>>;
+ 
+ #[derive(Default)]
+ pub(super) struct Images {
+-    parsed: HashMap<Arc<str>, Asset>,
++    parsed: HashMap<SvgSource, Asset>,
+     // A key's owner expires on source/DPI replacement, even if an old Canvas
+     // survives until the next frame. Such a Canvas cannot revive stale work.
+     owners: RefCell<HashMap<Key, Arc<()>>>,
+@@ -59,7 +59,7 @@ impl Images {
+                     match renderer.parse_svg(source.as_bytes()) {
+                         Ok(svg) => {
+                             self.parsed.insert(
+-                                Arc::from(source.as_str()),
++                                source.clone(),
+                                 Asset {
+                                     svg: Arc::new(svg),
+                                     aspect: budget::intrinsic_aspect(source),
+@@ -72,13 +72,13 @@ impl Images {
+             }
+         });
+         self.parsed
+-            .retain(|source, _| used.contains(source.as_ref()));
++            .retain(|source, _| used.contains(source.as_str()));
+         self.owners
+             .get_mut()
+-            .retain(|key, _| used.contains(key.source.as_ref()));
++            .retain(|key, _| used.contains(key.source.as_str()));
+         self.failures
+             .borrow_mut()
+-            .retain(|key, _| used.contains(key.source.as_ref()));
++            .retain(|key, _| used.contains(key.source.as_str()));
+         RASTERS.with(|cache| cache.borrow_mut().prune());
+     }
+ 
+@@ -355,7 +355,7 @@ mod tests {
+         let renderer = SvgRenderer::new(Arc::new(()));
+         let children: Vec<_> = (0..20)
+             .map(|index| Node::Svg {
+-                source: format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><title>large-root-{index}</title><rect width="10" height="10" fill="red"/></svg>"#),
++                source: format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><title>large-root-{index}</title><rect width="10" height="10" fill="red"/></svg>"#).into(),
+                 width: 1024.,
+                 height: 1024.,
+                 baseline: None,
