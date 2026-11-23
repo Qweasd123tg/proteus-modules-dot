@@ -1,0 +1,93 @@
+diff --git a/hook/codex-context-preparation/src/compaction.rs b/hook/codex-context-preparation/src/compaction.rs
+index 87c5edc6a26738cf7257799ca8817dbe386a5d44..28c8df8396831743ff78d44736aa3671b17d7456 100644
+--- a/hook/codex-context-preparation/src/compaction.rs
++++ b/hook/codex-context-preparation/src/compaction.rs
+@@ -84,7 +84,7 @@
+     }
+ 
+     let history = split_history(&input.messages);
+-    if history.compactable_history.is_empty() {
++    if history.compactable_message_count == 0 {
+         return Ok(unchanged(unchanged_with_diagnostics(
+             input.messages,
+             token_estimate,
+@@ -105,7 +105,7 @@
+         );
+     }
+ 
+-    let user_messages = collect_user_messages(&history.compactable_history);
++    let user_messages = collect_user_messages(&input.messages);
+     let preserved_user_messages =
+         select_recent_user_messages(&user_messages, user_message_budget_tokens());
+     let summary = complete_summary_with_recovery(&input, config, history.summary_history, host)?;
+@@ -124,7 +124,7 @@
+     output.trigger_tokens = Some(trigger_tokens);
+     output.summary_source = Some("model".to_owned());
+     output.metadata = json!({
+-        "compacted_messages": history.compactable_history.len(),
++        "compacted_messages": history.compactable_message_count,
+         "preserved_user_messages": retained_count,
+         "ephemeral_context_messages": history.ephemeral_context.len(),
+     });
+diff --git a/hook/codex-context-preparation/src/history.rs b/hook/codex-context-preparation/src/history.rs
+index e2625ffdcada4fd237000c2176787b0bbc739e83..7167052d6e997884b266ad1b5490d75c9cd75d69 100644
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -11,15 +11,14 @@
+     pub(crate) ephemeral_context: Vec<CanonicalMessage>,
+     /// Messages shown to the summary model, including canonical context.
+     pub(crate) summary_history: Vec<CanonicalMessage>,
+-    /// Durable conversation items from which bounded real user messages are
+-    /// selected for replacement history.
+-    pub(crate) compactable_history: Vec<CanonicalMessage>,
++    /// Number of durable conversation items in the input history.
++    pub(crate) compactable_message_count: usize,
+ }
+ 
+ pub(crate) fn split_history(messages: &[CanonicalMessage]) -> HistoryParts {
+     let mut ephemeral_context = Vec::new();
+     let mut summary_history = Vec::new();
+-    let mut compactable_history = Vec::new();
++    let mut compactable_message_count = 0;
+ 
+     for message in messages {
+         summary_history.push(message.clone());
+@@ -36,14 +35,14 @@
+                 ephemeral_context.push(message.clone());
+             }
+         } else {
+-            compactable_history.push(message.clone());
++            compactable_message_count += 1;
+         }
+     }
+ 
+     HistoryParts {
+         ephemeral_context,
+         summary_history,
+-        compactable_history,
++        compactable_message_count,
+     }
+ }
+ 
+diff --git a/hook/codex-context-preparation/src/remote.rs b/hook/codex-context-preparation/src/remote.rs
+index 522c81ee994f5a222b18de54438ca1d0afd53f22..745282275dd7548cb05d8b65a225948f20c1e686 100644
+--- a/hook/codex-context-preparation/src/remote.rs
++++ b/hook/codex-context-preparation/src/remote.rs
+@@ -31,7 +31,7 @@
+     estimates: &ModelInputEstimate,
+     host: &mut dyn HookModuleHost,
+ ) -> Result<ContextPreparationOutput, ProcessModuleError> {
+-    let users = collect_user_messages(&history.compactable_history);
++    let users = collect_user_messages(&input.messages);
+     let retained = select_recent_users(&users, 64_000);
+     let request = request(&input, history.summary_history, estimates)?;
+     let checkpoint = complete_checkpoint(request, config, host)?;
+@@ -62,7 +62,7 @@
+     output.trigger_tokens = Some(trigger_tokens);
+     output.summary_source = Some("model".to_owned());
+     output.metadata = json!({
+-        "compacted_messages": history.compactable_history.len(),
++        "compacted_messages": history.compactable_message_count,
+         "preserved_user_messages": retained_count,
+         "ephemeral_context_messages": history.ephemeral_context.len(),
+         "remote_compaction": true,
