@@ -1,0 +1,28 @@
+--- a/hook/codex-context-preparation/src/budget.rs
++++ b/hook/codex-context-preparation/src/budget.rs
+@@ -32,23 +32,8 @@
+     let left_budget = max_bytes / 2;
+     let right_budget = max_bytes - left_budget;
+     let tail_start = text.len().saturating_sub(right_budget);
+-    let mut prefix_end = 0;
+-    let mut suffix_start = text.len();
+-    let mut suffix_started = false;
+-    for (index, character) in text.char_indices() {
+-        let character_end = index + character.len_utf8();
+-        if character_end <= left_budget {
+-            prefix_end = character_end;
+-        } else if index >= tail_start {
+-            if !suffix_started {
+-                suffix_start = index;
+-                suffix_started = true;
+-            }
+-        }
+-    }
+-    if suffix_start < prefix_end {
+-        suffix_start = prefix_end;
+-    }
++    let prefix_end = text.floor_char_boundary(left_budget);
++    let suffix_start = text.ceil_char_boundary(tail_start.max(prefix_end));
+     let removed_bytes = text.len().saturating_sub(max_bytes);
+     let marker_tokens = removed_bytes.saturating_add(3) / 4;
+     format!(
