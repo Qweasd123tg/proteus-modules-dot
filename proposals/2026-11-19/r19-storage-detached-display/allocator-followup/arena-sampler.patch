@@ -1,0 +1,54 @@
+--- a/archives.py
++++ b/archives.py
+@@ -82,6 +82,16 @@
+     save(out/'identity.json',report)
+     config=cfg/'config.toml'
+     config.write_text(profile(a.reference,0).replace('[modules]\n','[modules]\nsession_storage="jsonl"\n')+'\n[components.store]\ncommand='+json.dumps(str(a.worker))+'\n[components.store.exports.session_storage.jsonl]\n[components.store.transport]\nmax_frame_bytes=134217728\n')
++    report['worker_arena_limit']=a.worker_arena_limit
++    env = {}
++    if a.worker_arena_limit: env['MALLOC_ARENA_MAX'] = str(a.worker_arena_limit)
++    if a.allocator_sampler:
++        env['LD_PRELOAD'] = str(a.allocator_sampler.resolve(strict=True))
++        env['PROTEUS_DIAG_ARENAS_PATH'] = str((out/'arena-trace.txt').resolve())
++    if env:
++        with config.open('a') as f:
++            f.write('\n[components.store.env]\n')
++            for key,value in sorted(env.items()): f.write(key+' = '+json.dumps(value)+'\n')
+     text_probe='r19 foreground proof'
+     phases={}; stage='starting';samples=[]; stop=threading.Event()
+     opened=JournalOpens(dirs)
+@@ -113,6 +123,14 @@
+             require(http('/bootstrap')['session_dir']==str(active),'not active A')
+             check(page(active),9,50,100)
+             stage='idle';time.sleep(.45)
++            worker_pids = {v['pid'] for row in samples for v in row['processes'] if v['role']=='worker'}
++            require(len(worker_pids)==1, 'one worker must be witnessed before timed stage')
++            def arena(pid):
++                raw = Path(f'/proc/{pid}/environ').read_bytes()
++                return next((kv.split(b'=',1)[1].decode() for kv in raw.split(b'\0') if kv.startswith(b'MALLOC_ARENA_MAX=')), None)
++            report['worker_arena_verified']=arena(next(iter(worker_pids)))
++            require(report['worker_arena_verified']==(str(a.worker_arena_limit) if a.worker_arena_limit else None), 'actual worker arena environment differs')
++            require(arena(proc.pid) is None, 'Core env accidentally tuned')
+             sse={};ready_sse=threading.Event();done_sse=threading.Event()
+             def watch_sse():
+                 try:
+@@ -171,6 +189,9 @@
+             hot['overlap']=any(c['start_ns']<=hot.get('start_ns',-1)<c['end_ns'] for c in cold) and bool(hot.get('seen_cold_journals'))
+             report.update(hot=hot,cold=cold)
+             stage='retained';time.sleep(1)
++            if a.extended_idle:
++                stage='retained_2_to_10';time.sleep(8)
++                stage='retained_near_10';time.sleep(2)
+             report['cold_journals_observed']=opened.observed();opened.close()
+             # Keep cold failures failed; only attempt warm tests on previously successful cold heads.
+             ok=[(c['index'],c['revision']) for c in cold if c['ok']]
+@@ -233,6 +254,9 @@
+     for k in ('source','core','worker','reference','golden','out'):ap.add_argument('--'+k,type=Path,required=True)
+     for k in ('core-commit','core-sha256','worker-sha256'):ap.add_argument('--'+k,required=True)
+     ap.add_argument('--expected-corpus')
++    ap.add_argument('--worker-arena-limit',type=int,choices=(1,2,4))
++    ap.add_argument('--extended-idle',action='store_true')
++    ap.add_argument('--allocator-sampler',type=Path)
+     ap.add_argument('--observe',type=float,default=240,help='client timeout only; backend policy unchanged')
+     a=ap.parse_args()
+     for n in ('source','golden','core','worker','reference'):setattr(a,n,getattr(a,n).resolve(strict=True))
