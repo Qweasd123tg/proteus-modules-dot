@@ -1,0 +1,305 @@
+--- a/model/opencode-provider/adapter.mjs
++++ b/model/opencode-provider/adapter.mjs
+@@ -52,10 +52,10 @@
+         throw new Error('Invalid OpenCode model configuration');
+     const runtime = dependencies.runtime ?? createNativeRuntime(config);
+     const quota = config.provider === 'opencode-go' ? (dependencies.quota ?? createGoQuotaReader()) : null;
+-    async function credential(signal) {
++    async function credential(signal, modelID) {
+         return (dependencies.credential ?? createCredentialReader({ providerID: config.provider,
+             databasePath: config.database_path, apiKey: config.api_key,
+-            envNames: config.api_key === undefined ? await runtime.environment(signal) : [] }))(signal);
++            envNames: config.api_key === undefined ? await runtime.environment(signal, modelID) : [] }))(signal);
+     }
+     const stream = dependencies.stream ?? (async (request, signal, accept) => {
+         await Effect.runPromise(Stream.runForEach(LLMClient.stream(request), event => Effect.promise(() => accept(event))).pipe(
+@@ -79,7 +79,7 @@
+                 const r = params.request;
+                 if (r.operation !== undefined && r.operation !== 'Complete')
+                     throw new Error('OpenCode provider bridge does not support native model compaction');
+-                const resolved = await runtime.resolve(r.model.model, r.reasoning.effort, await credential(signal), signal);
++                const resolved = await runtime.resolve(r.model.model, r.reasoning.effort, await credential(signal, r.model.model), signal);
+                 const request = await toNativeRequest(r, resolved.model, { signal, modelInfo: resolved.modelInfo });
+                 await stream(request, signal, async event => {
+                     if (['text-start', 'text-delta', 'reasoning-start', 'reasoning-delta', 'tool-input-start', 'tool-call'].includes(event.type)) started = true;
+--- a/model/opencode-provider/runtime.mjs
++++ b/model/opencode-provider/runtime.mjs
+@@ -1,10 +1,12 @@
+ import { Effect, Layer } from '../../workflow/opencode-runtime/node_modules/effect/dist/index.js';
+ import { LayerNode } from '../../workflow/opencode-runtime/node_modules/@opencode/util/dist/effect/layer-node.js';
++import { FSUtil } from '../../workflow/opencode-runtime/node_modules/@opencode/util/dist/fs-util.js';
+ import * as ModelsDev from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/models-dev.js';
+ import * as KV from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/kv.js';
+ import * as Bus from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/bus.js';
+ import { mergeOverlay } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/provider.js';
+ import { resolveModel } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/model-resolver.js';
++import { hasPackageCatalogSeed, readPackageCatalogSeed } from './catalog-seed.mjs';
+ 
+ const CACHE_MS = 300_000;
+ // ModelsDev's native KV and event bus both acquire the complete session database.
+@@ -72,17 +74,24 @@
+         hidden: !model.enabled || model.status === 'deprecated', reasoning_efforts: efforts,
+         default_reasoning_effort: efforts.includes(model.settings?.reasoningEffort) ? model.settings.reasoningEffort : null };
+ }
+-export function createNativeRuntime(config, { loadSnapshots, now = Date.now, cacheMs = CACHE_MS } = {}) {
+-    const providerID = config.provider;
+-    const load = loadSnapshots ?? (signal => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+-        const service = yield* ModelsDev.Service;
+-        // Own the refresh lifetime: no background fiber remains after this lookup.
+-        if (!config.models_file) yield* service.refresh(false);
+-        return yield* service.get();
+-    }).pipe(Effect.provide(LayerNode.compile(ModelsDev.configured({
+-        fetch: false, ...(config.models_file ? { file: config.models_file } : {}),
+-        ...(config.models_url ? { url: config.models_url, snapshot: false } : {}),
+-    }), { replacements: catalogStateReplacements() })))), { signal }));
++// Private path token: only the in-memory scoped FSUtil below can open it.
++const seedFile = 'proteus:opencode:packaged-model-catalog';
++async function loadPackageSnapshots(provider, signal) {
++    const catalog = await readPackageCatalogSeed(provider, signal);
++    const seedFS = FSUtil.node.replace(Layer.succeed(FSUtil.Service, FSUtil.Service.of({
++        readJson(path) {
++            return path === seedFile ? Effect.succeed(catalog) : Effect.die(new Error('Unexpected catalog seed path'));
++        },
++    })));
++    return Effect.runPromise(Effect.scoped(Effect.gen(function* () {
++        return yield* (yield* ModelsDev.Service).get();
++    }).pipe(Effect.provide(LayerNode.compile(
++        ModelsDev.configured({ file: seedFile, fetch: false, snapshot: false }),
++        { replacements: [...catalogStateReplacements(), seedFS] },
++    )))), { signal });
++}
++
++function snapshotReader(providerID, load, now, cacheMs, requiredCache = false) {
+     let cache, pending;
+     async function snapshot(signal) {
+         signal?.throwIfAborted();
+@@ -98,7 +107,11 @@
+                     if (!model.id?.trim() || ids.has(model.id)) throw new Error('Invalid OpenCode model catalog identity');
+                     ids.add(model.id);
+                 }
+-                if (!controller.signal.aborted && pending === flight) cache = cacheable(value) ? { at: now(), value } : undefined;
++                if (!controller.signal.aborted && pending === flight) {
++                    const fits = cacheable(value);
++                    if (requiredCache && !fits) throw new Error('OpenCode packaged model catalog exceeds the retention budget');
++                    cache = fits ? { at: now(), value } : undefined;
++                }
+                 return value;
+             }).finally(() => { flight.done = true; if (pending === flight) pending = undefined; });
+         }
+@@ -115,18 +128,61 @@
+             if (--flight.readers === 0 && !flight.done) flight.controller.abort(new Error('Catalog readers canceled'));
+         }
+     }
++    return snapshot;
++}
++
++export function createNativeRuntime(config, { loadSnapshots, now = Date.now, cacheMs = CACHE_MS } = {}) {
++    const providerID = config.provider;
++    const load = loadSnapshots ?? (signal => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
++        const service = yield* ModelsDev.Service;
++        // Own the refresh lifetime: no background fiber remains after this lookup.
++        if (!config.models_file) yield* service.refresh(false);
++        return yield* service.get();
++    }).pipe(Effect.provide(LayerNode.compile(ModelsDev.configured({
++        fetch: false, ...(config.models_file ? { file: config.models_file } : {}),
++        ...(config.models_url ? { url: config.models_url, snapshot: false } : {}),
++    }), { replacements: catalogStateReplacements() })))), { signal }));
++    const snapshot = snapshotReader(providerID, load, now, cacheMs);
++    // A covered exact model always resolves from this package, regardless of
++    // previous RPC order, which Worker is alive, or a later remote catalog miss.
++    const seed = !loadSnapshots && hasPackageCatalogSeed(config) ?
++        snapshotReader(providerID, signal => loadPackageSnapshots(providerID, signal), now, Infinity, true) : null;
++    const eligible = (model, id) => model.id === id && model.providerID === providerID && supportsChat(model);
++    async function modelSnapshot(id, signal) {
++        if (seed && id !== undefined) {
++            const local = await seed(signal);
++            if (local.models.some(model => eligible(model, id))) return local;
++        }
++        return snapshot(signal);
++    }
+     async function info(id, signal) {
+-        const snap = await snapshot(signal), model = snap.models.find(model => model.id === id);
++        const snap = await modelSnapshot(id, signal), model = snap.models.find(model => model.id === id);
+         if (!model || model.providerID !== providerID) throw new Error('OpenCode model unavailable: ' + id);
+         if (!supportsChat(model)) throw new Error('OpenCode model does not support canonical chat: ' + id);
+         return { ...model, package: model.package ?? snap.info.package,
+             settings: mergeOverlay(snap.info.settings, model.settings) };
+     }
+     return {
+-        async catalog(signal) { return { models: (await snapshot(signal)).models
+-            .filter(model => model.providerID === providerID && supportsChat(model)).map(catalogEntry) }; },
++        async catalog(signal) {
++            const models = (await snapshot(signal)).models
++                .filter(model => model.providerID === providerID && supportsChat(model)).map(catalogEntry);
++            if (seed && models.length) {
++                const local = new Map((await seed(signal)).models.map(model => [model.id, model]));
++                for (const entry of models) {
++                    const effective = local.get(entry.id);
++                    // Keep live discovery, ordering, labels and visibility. Core
++                    // validates effort here, so these two fields match describe/resolve.
++                    if (effective && eligible(effective, entry.id)) {
++                        const { reasoning_efforts, default_reasoning_effort } = catalogEntry(effective);
++                        entry.reasoning_efforts = reasoning_efforts;
++                        entry.default_reasoning_effort = default_reasoning_effort;
++                    }
++                }
++            }
++            return { models };
++        },
+         async describe(id, signal) { return descriptor(await info(id, signal)); },
+-        async environment(signal) { return (await snapshot(signal)).environment; },
++        async environment(signal, id) { return (await modelSnapshot(id, signal)).environment; },
+         info,
+         async resolve(id, effort, credential, signal) {
+             const modelInfo = await info(id, signal);
+--- /dev/null
++++ b/model/opencode-provider/catalog-seed.mjs
+@@ -0,0 +1,47 @@
++import { createHash } from 'node:crypto';
++import { constants } from 'node:fs';
++import { open } from 'node:fs/promises';
++
++const revision = 'a177c5468699a3ce48b27bc417847a0804af1564';
++const seeds = new Map([
++    ['opencode-go', [22380, '7a87809e9992b264e3649cb3573a96231d95bff98293817869338c12792f8cf3']],
++    ['opencode', [75647, '17262a403753acb2d5899721ba2007c888b49d2c16ac4a70aa328c689818db62']],
++]);
++
++export function hasPackageCatalogSeed(config) {
++    return !config.models_file && !config.models_url && seeds.has(config.provider);
++}
++
++export async function readPackageCatalogSeed(provider, signal) {
++    const [length, digest] = seeds.get(provider);
++    const url = new URL(`./catalog-seeds/${provider}.${revision}.json`, import.meta.url);
++    let file;
++    try {
++        signal.throwIfAborted();
++        file = await open(url, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
++        const stat = await file.stat();
++        if (!stat.isFile() || stat.size !== length) throw new Error('Invalid seed extent');
++        const raw = Buffer.alloc(length + 1);
++        let at = 0;
++        while (at < raw.length) {
++            signal.throwIfAborted();
++            const { bytesRead } = await file.read(raw, at, raw.length - at, at);
++            if (!bytesRead) break;
++            at += bytesRead;
++        }
++        signal.throwIfAborted();
++        if (at !== length || createHash('sha256').update(raw.subarray(0, at)).digest('hex') !== digest)
++            throw new Error('Invalid seed digest');
++        const catalog = JSON.parse(raw.subarray(0, at));
++        if (Object.keys(catalog).length !== 1 || catalog[provider]?.id !== provider)
++            throw new Error('Invalid seed identity');
++        return catalog;
++    } catch (error) {
++        signal.throwIfAborted();
++        // An installation defect must not silently move a restarted Worker to
++        // different model metadata while Core still has a local descriptor.
++        throw new Error('OpenCode packaged model catalog is missing or invalid', { cause: error });
++    } finally {
++        await file?.close();
++    }
++}
+--- /dev/null
++++ b/model/opencode-provider/tests/packaged-catalog.test.mjs
+@@ -0,0 +1,29 @@
++import assert from 'node:assert/strict';
++import { after, test } from 'node:test';
++
++const originalFetch = globalThis.fetch;
++let fetches = 0;
++globalThis.fetch = () => { fetches++; throw new Error('unexpected network in packaged catalog test'); };
++after(() => { globalThis.fetch = originalFetch; assert.equal(fetches, 0); });
++const { createNativeRuntime } = await import('../runtime.mjs');
++
++// Real npm SDK, local package only: no catalog or unknown-model request belongs
++// in this test because those intentionally use stock refresh.
++for (const [provider, model, expected, efforts] of [
++    ['opencode-go', 'deepseek-v4.1-flash', [1_000_000, 384_000], ['low', 'high', 'max']],
++    ['opencode', 'gpt-5.4', [922_000, 128_000], ['none', 'low', 'medium', 'high', 'xhigh']],
++]) {
++    test(`packaged ${provider} exact model survives a fresh Worker runtime whose first request is resolve`, async () => {
++        const signal = new AbortController().signal, config = { provider };
++        const runtime = createNativeRuntime(config);
++        const a = await runtime.describe(model, signal);
++        assert.deepEqual([a.capabilities.max_input_tokens, a.capabilities.max_output_tokens], expected);
++        assert.equal(a.adapter_id, 'opencode');
++        const restarted = createNativeRuntime(config);
++        const resolved = await restarted.resolve(model, efforts[0], { type: 'key', key: 'synthetic-fixture-only' }, signal);
++        assert.ok(resolved.model);
++        assert.deepEqual(resolved.modelInfo.variants.map(variant => variant.id), efforts);
++        assert.deepEqual(await restarted.describe(model, signal), a);
++        assert.deepEqual(await restarted.environment(signal, model), await runtime.environment(signal, model));
++    });
++}
+--- a/workflow/opencode-runtime/README.md
++++ b/workflow/opencode-runtime/README.md
+@@ -15,6 +15,9 @@
+ handlers, общий JSON-RPC broker, model bridge и общий Go quota helper.
+ Он устанавливает pinned npm dependencies; Rust/Core/Desktop для этого не собираются.
+ После обновления перезапустите backend, чтобы worker загрузил новые файлы.
++Для установки с пакетным каталогом используйте новый физический prefix и
++запустите новый Core из него; не заменяйте файлы или путь установки, из которой
++ещё работает Core. Перезапуск одного Worker не является обновлением пакета.
+ 
+ ## Model Export
+ 
+@@ -62,12 +65,22 @@
+ превращается в `max`. При отсутствии canonical output limit SDK получает запрос
+ без `max_tokens`/`max_completion_tokens`; дополнительный cap не добавляется.
+ 
+-Каталог обновляет `ModelsDev`. Адаптер объединяет одновременные запросы и
+-удерживает один provider snapshot на пять минут. После TTL следующий запрос
+-выполняет refresh; фонового refresh fiber нет. На удержание действует логический
+-бюджет metadata 4 MiB / 65 536 nodes, а не оценка heap/RSS. Более крупный каталог
+-возвращается без кеширования. Ошибки refresh сохраняют native error semantics;
+-статический список aliases не подставляется.
++Для публичных маршрутов Go и Zen без `models_file`/`models_url` точные chat-модели,
++присутствующие в комплектном снимке, проходят describe и resolve по одному и тому
++же неизменяемому SDK-каталогу. Первый describe такой модели не ждёт web-каталог.
++Остальные маршруты и отсутствующие в снимке модели используют прежнюю загрузку.
++Ошибка целостности установленного файла не переключает локальную модель молча
++на другие данные; переустановите пакет перед новым запуском Core.
++
++Запрос списка моделей по-прежнему использует live `ModelsDev` (с обычным fallback
++SDK), сохраняет его состав, порядок, display names и hidden status; для совпавших
++локальных моделей варианты и default effort соответствуют фактическому resolve.
++Более новые модели вне пакета продолжают использовать web-каталог. В обычной
++ветке одновременные запросы объединяются, один provider snapshot удерживается
++на пять минут, после TTL следующий запрос выполняет refresh. Фонового refresh
++fiber и постоянного кеша последней web-версии здесь нет. Прежний бюджет на один
++snapshot (4 MiB / 65 536 nodes) — логический, не оценка heap/RSS. Прежние ошибки
++для явных sources и web-loader не заменяются aliases.
+ 
+ Авторизация использует существующую OpenCode v2 credential DB: по умолчанию
+ `$XDG_DATA_HOME/opencode/opencode.db` при абсолютном XDG-пути, иначе
+--- a/workflow/opencode-runtime/NOTICE
++++ b/workflow/opencode-runtime/NOTICE
+@@ -4,3 +4,10 @@
+ OpenCode is copyright Anomaly Inc. and distributed under the MIT License.
+ The upstream license is included as LICENSE.upstream. The npm lockfile records
+ the integrity hashes of all resolved dependency tarballs.
++
++The two packaged ModelsDev seed files are per-provider JSON projections of
++packages/core/src/models-dev/snapshot.txt at the same OpenCode source pin
++(Git blob a177c5468699a3ce48b27bc417847a0804af1564). Original raw SHA-256:
++9c9188aba5c3a6c7e30d9751fa6f1fcdb8d142710695f8ca434c4e5d8c8da3ce.
++The original model catalog is the open-source Models.dev database;
++https://github.com/anomalyco/models.dev/blob/dev/LICENSE
+--- a/workflow/opencode-runtime/install.py
++++ b/workflow/opencode-runtime/install.py
+@@ -52,6 +52,12 @@
+             target = runtime / relative / name
+             target.parent.mkdir(parents=True, exist_ok=True)
+             shutil.copy2(path, target)
++    seed_relative = Path("model/opencode-provider/catalog-seeds")
++    seeds = runtime / seed_relative
++    seeds.mkdir(parents=True, exist_ok=True)
++    for provider in ("opencode-go", "opencode"):
++        filename = f"{provider}.a177c5468699a3ce48b27bc417847a0804af1564.json"
++        shutil.copy2(modules / seed_relative / filename, seeds / filename)
+     binary = args.prefix.resolve() / "bin/proteus-opencode-module"
+     binary.parent.mkdir(parents=True, exist_ok=True)
+     binary.write_text('''#!/usr/bin/env python3
