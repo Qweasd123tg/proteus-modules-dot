@@ -1,0 +1,28 @@
+diff --git a/hook/codex-context-preparation/src/remote_history.rs b/hook/codex-context-preparation/src/remote_history.rs
+index 1eafe83a51b5106471bf0ae8a463cfa52e870fa1..1a0a79f3f4a68aeb31857f1b63b2463af790ede4 100644
+--- a/hook/codex-context-preparation/src/remote_history.rs
++++ b/hook/codex-context-preparation/src/remote_history.rs
+@@ -2,7 +2,7 @@
+ //! compact_remote_v2.rs and compact_remote_v2_images.rs (Apache-2.0).
+ use proteus_contracts::model_standard::input_estimates::ModelInputEstimate;
+ use proteus_contracts::{
+-    domain::{CompactionUserMessageReplacement, ToolContent, new_message_id},
++    domain::{CompactionUserMessageReplacement, ToolContent},
+     model_standard::{CanonicalMessage, CanonicalPart, ContentPart, PartProvenance, PartScope},
+ };
+ 
+@@ -156,9 +156,11 @@
+         if parts.is_empty() {
+             continue;
+         }
+-        let mut replacement = message.clone();
+-        replacement.id = new_message_id();
+-        replacement.parts = parts;
++        let mut replacement = CanonicalMessage::from_parts(message.role.clone(), parts);
++        replacement.phase = message.phase;
++        replacement.name = message.name.clone();
++        replacement.tool_call_id = message.tool_call_id.clone();
++        replacement.metadata = message.metadata.clone();
+         selected
+             .replacements
+             .push(CompactionUserMessageReplacement {
