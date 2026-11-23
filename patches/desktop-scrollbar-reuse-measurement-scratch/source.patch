@@ -1,0 +1,21 @@
+diff --git a/src/ui/chat/scroller/scrollbar/measurement.rs b/src/ui/chat/scroller/scrollbar/measurement.rs
+index 1d2361fc9880e82796be1c779dae8804d6c837fb..ab105e08c45335fcdf176e6ef9902c023131b22f 100644
+--- a/src/ui/chat/scroller/scrollbar/measurement.rs
++++ b/src/ui/chat/scroller/scrollbar/measurement.rs
+@@ -48,8 +48,14 @@
+         });
+         self.range = range;
+         self.epoch = self.epoch.wrapping_add(1);
+-        self.pending = vec![None; range.map_or(0, |range| range.rows + 1)];
+-        self.fraction_ready = vec![false; self.pending.len()];
++        let slots = range.map_or(0, |range| range.rows + 1);
++        if self.pending.len() == slots && self.fraction_ready.len() == slots {
++            self.pending.fill(None);
++            self.fraction_ready.fill(false);
++        } else {
++            self.pending = vec![None; slots];
++            self.fraction_ready = vec![false; slots];
++        }
+         self.dirty.clear();
+     }
+ 
