@@ -1,0 +1,24 @@
+diff --git a/src/ui/format.rs b/src/ui/format.rs
+index c601492c839803744897377d0d4dc93466cd9856..29d746781562b083b8f3a61dc430b26a11969454 100644
+--- a/src/ui/format.rs
++++ b/src/ui/format.rs
+@@ -55,16 +55,16 @@
+ pub fn clip_block(text: &str, max_lines: usize, max_chars: usize) -> String {
+     let mut out = String::new();
+     let mut lines = 0;
+-    for line in text.lines() {
++    let mut input = text.lines();
++    while let Some(line) = input.next() {
+         if lines == max_lines || out.len() + line.len() > max_chars {
+             // A single overlong first line is cut rather than hidden.
+             if lines == 0 {
+                 let cut = line.floor_char_boundary(max_chars);
+                 out.push_str(&line[..cut]);
+                 out.push('\n');
+-                lines = 1;
+             }
+-            let rest = text.lines().count() - lines;
++            let rest = input.count() + usize::from(lines != 0);
+             if rest == 0 {
+                 out.truncate(out.trim_end().len());
+                 out.push_str("\n… Текст обрезан");
