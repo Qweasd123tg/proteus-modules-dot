@@ -1,0 +1,126 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -58,17 +58,7 @@
+     if let Ok(preferences) = &preferences {
+         launch.restore_workspace(preferences);
+     }
+-    let saved_spaces = preferences
+-        .as_ref()
+-        .ok()
+-        .and_then(|preferences| {
+-            launch
+-                .workspace
+-                .as_ref()
+-                .map(|workspace| preferences.spaces_for(workspace, &launch.target))
+-        })
+-        .unwrap_or_default();
+-    let preparation = ui::Preparation::launch(&launch, saved_spaces);
++    let preparation = ui::Preparation::launch(&launch, preferences.as_ref().ok());
+ 
+     gpui_kit::application()
+         .with_assets(gpui_kit::assets::AllAssets)
+diff --git a/src/preferences.rs b/src/preferences.rs
+--- a/src/preferences.rs
++++ b/src/preferences.rs
+@@ -171,12 +171,18 @@
+ 
+     /// Restore all independent chat areas only in their saved server namespace.
+     pub fn spaces_for(&self, workspace: &Path, target: &crate::launch::Target) -> ChatSpaces {
++        self.saved_spaces_for(workspace, target)
++            .cloned()
++            .unwrap_or_default()
++    }
++
++    pub(crate) fn saved_spaces_for(
++        &self,
++        workspace: &Path,
++        target: &crate::launch::Target,
++    ) -> Option<&ChatSpaces> {
+         let owner = TabWorkspace::new(workspace, target);
+-        if owner.is_some() && owner == self.tabs_workspace {
+-            self.tabs.clone()
+-        } else {
+-            ChatSpaces::default()
+-        }
++        (owner.is_some() && owner == self.tabs_workspace).then_some(&self.tabs)
+     }
+ }
+ 
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -24,9 +24,32 @@
+     result: async_channel::Receiver<Result<Boot>>,
+ }
+ 
++/// The pre-graphics worker never reads inactive areas.
++#[derive(Default)]
++struct BootLayout {
++    active: TabLayout,
++    owner: Option<String>,
++}
++
++impl BootLayout {
++    fn from_spaces(spaces: &ChatSpaces) -> Self {
++        Self {
++            active: spaces.active_layout().clone(),
++            owner: spaces.active_root().map(str::to_owned),
++        }
++    }
++}
++
+ impl Preparation {
+-    pub(crate) fn launch(launch: &crate::launch::Launch, saved: ChatSpaces) -> Option<Self> {
++    pub(crate) fn launch(
++        launch: &crate::launch::Launch,
++        preferences: Option<&crate::preferences::Preferences>,
++    ) -> Option<Self> {
+         let workspace = launch.workspace.clone()?;
++        let saved = preferences
++            .and_then(|preferences| preferences.saved_spaces_for(&workspace, &launch.target))
++            .map(BootLayout::from_spaces)
++            .unwrap_or_default();
+         let options = LaunchOptions {
+             workspace: workspace.clone(),
+             target: launch.target.clone(),
+@@ -37,7 +60,11 @@
+         std::thread::Builder::new()
+             .name("proteus-startup".into())
+             .spawn(move || {
+-                let _ = send.send_blocking(boot(&options, saved));
++                let _ = send.send_blocking(boot_from_layout(
++                    &options,
++                    &saved.active,
++                    saved.owner.as_deref(),
++                ));
+             })
+             .ok()?;
+         Some(Self { workspace, result })
+@@ -106,14 +133,24 @@
+ }
+ 
+ pub(super) fn boot(options: &LaunchOptions, saved: ChatSpaces) -> Result<Boot> {
+-    boot_spaces_with(
++    boot_from_layout(options, saved.active_layout(), saved.active_root())
++}
++
++fn boot_from_layout(
++    options: &LaunchOptions,
++    saved: &TabLayout,
++    owner: Option<&str>,
++) -> Result<Boot> {
++    boot_with_owner(
+         options,
+-        saved,
++        saved.clone(),
++        owner,
+         connection::connect_with_preference,
+         |program, cwd| Ok(CodexService::spawn(program, cwd)?),
+     )
+ }
+ 
++#[cfg(test)]
+ fn boot_spaces_with(
+     options: &LaunchOptions,
+     saved: ChatSpaces,
