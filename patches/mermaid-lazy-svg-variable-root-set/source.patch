@@ -1,0 +1,28 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 743564f70b10af9e25b71192bc5f0b641e9114ae..71971f699e331a202cad7b42e1c577b428d123a0 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -38,8 +38,8 @@
+   return variables;
+ }
+ 
+-export function resolveVariables(value, variables, seen = new Set()) {
+-  if (seen.size > 32) throw new Error('SVG variable nesting exceeds 32');
++export function resolveVariables(value, variables, seen = undefined) {
++  if (seen !== undefined && seen.size > 32) throw new Error('SVG variable nesting exceeds 32');
+   let result = '';
+   let position = 0;
+   for (;;) {
+@@ -57,10 +57,10 @@
+     if (depth) throw new Error('unterminated SVG variable');
+     const name = value.slice(start + 4, comma < 0 ? end - 1 : comma).trim();
+     if (!/^--[\w-]+$/.test(name)) throw new Error('invalid SVG variable name');
+-    if (seen.has(name)) throw new Error('cyclic SVG variable');
++    if (seen !== undefined && seen.has(name)) throw new Error('cyclic SVG variable');
+     const raw = variables.get(name) ?? (comma < 0 ? undefined : value.slice(comma + 1, end - 1));
+     if (raw === undefined) throw new Error(`unresolved SVG variable ${name}`);
+-    result += resolveVariables(raw.trim(), variables, new Set([...seen, name]));
++    result += resolveVariables(raw.trim(), variables, new Set(seen === undefined ? [name] : [...seen, name]));
+     position = end;
+   }
+ }
