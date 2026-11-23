@@ -1,0 +1,36 @@
+diff --git a/workflow/coding-workflow/src/output_text.rs b/workflow/coding-workflow/src/output_text.rs
+index 73f1dd474a2617b9f2aae82439ce78c5118c65bf..b8fee51523911684fba1ecd672541efaf50ccebc 100644
+--- a/workflow/coding-workflow/src/output_text.rs
++++ b/workflow/coding-workflow/src/output_text.rs
+@@ -4,15 +4,22 @@
+ };
+ 
+ pub(crate) fn message_text(message: &CanonicalMessage) -> String {
+-    let text = message
+-        .parts
+-        .iter()
+-        .filter_map(|part| match &part.payload {
+-            ContentPart::Text { text } => Some(text.as_str()),
+-            _ => None,
+-        })
+-        .collect::<Vec<_>>()
+-        .join("\n");
++    let mut text_parts = message.parts.iter().filter_map(|part| match &part.payload {
++        ContentPart::Text { text } => Some(text.as_str()),
++        _ => None,
++    });
++    let text = match text_parts.next() {
++        None => String::new(),
++        Some(first) => match text_parts.next() {
++            None => first.to_owned(),
++            Some(second) => {
++                let mut parts = Vec::new();
++                parts.extend([first, second]);
++                parts.extend(text_parts);
++                parts.join("\n")
++            }
++        },
++    };
+     if text.is_empty() {
+         "<empty model response>".to_owned()
+     } else {
