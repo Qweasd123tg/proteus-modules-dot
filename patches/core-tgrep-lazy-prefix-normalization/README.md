@@ -1,0 +1,9 @@
+# Core example: normalize tgrep path prefixes only when first used
+
+The optional Python tgrep adapter now keeps a private list of prefixes already evaluated within the current query. It tests them in their original order and only prepares a new prefix when the same OR condition reaches it. Unused later prefixes are never normalized, and nothing is kept between queries. Suffix checks are unchanged.
+
+Literal matching, handling of `./`, result ordering and limits, and validation and subprocess control are unchanged. This affects only the opt-in example; it does not require or change any default search engine, privilege, index policy, or startup behavior.
+
+The stock and candidate Python bodies were compared on 2,688 literal path pairs and 19 inert search-loop scenarios. The latter cover malformed/filtered rows, filter-before-limit, cancellation and timeout traces, no-hit and short-circuited prefix lists, and independent invocations. In a synthetic stream of 50,020 considered matches with two `./`-prefixed filters, actual normalizer invocations drop from 100,020 to 2, with identical 20 returned rows. The cached prefix list retains one additional reference per visited prefix and an owned string where trimming allocates. No actual tgrep process, timer, index, Cargo, wall-time, CPU, or memory benchmark was run.
+
+`source.patch` targets the Core commit linked in `SOURCE-PROVENANCE.json`. Run `git apply --check --whitespace=error source.patch` from that checkout before applying. To reproduce the scoped proof, materialize its pinned Python paths under sibling `stock/` and `candidate/`, applying the patch to the latter only; run `python3 -I -B packet/proof.py` with assertions enabled. The proof authenticates the exact source blobs and supplies its own inert subprocess, timer and cancellation adapters.
