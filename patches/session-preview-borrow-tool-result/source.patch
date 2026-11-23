@@ -1,0 +1,23 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index ecf417d4ebc712d2c5f724ced3fb676363f39fa6..7c142cd38ccf55e84023addddc088d8619dd2015 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -361,7 +361,17 @@
+             ContentPart::Text { text }
+             | ContentPart::ReasoningSummary { text }
+             | ContentPart::Reasoning { text, .. } => excerpt(text),
+-            ContentPart::ToolResult { result } => excerpt(&result.text_or_status()),
++            ContentPart::ToolResult { result } => {
++                let text = result
++                    .error
++                    .as_deref()
++                    .filter(|text| !text.is_empty())
++                    .or_else(|| (!result.output.is_empty()).then_some(result.output.as_str()));
++                match text {
++                    Some(text) => excerpt(text),
++                    None => excerpt(&result.text_or_status()),
++                }
++            }
+             _ => None,
+         })
+     };

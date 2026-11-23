@@ -1,0 +1,5 @@
+# Borrow tool output before shortening a session preview
+
+Session storage previously cloned the entire plain tool error or output, then trimmed it and kept at most 160 Unicode scalar values. Borrow the first nonempty raw error or output so only the small preview is allocated. If neither has text, use the original SDK formatter for structured content or status. Choosing before trimming preserves whitespace-only precedence, and the existing User-first, part, and message order is unchanged.
+
+The paired harness runs the exact preview functions and pinned SDK formatting method with inert message and structured-content adapters. For either a synthetic 16 MiB Unicode error or output selected as the preview, both arms produce the same 643-byte result. Stock requested two allocations totaling 16,777,859 bytes in the measured call; candidate requested one of 643 bytes. The 16 MiB source remains owned by the result. Six focused checks passed in each Rust 1.95 build profile. No native storage, serialization, replay, or app performance claim.
