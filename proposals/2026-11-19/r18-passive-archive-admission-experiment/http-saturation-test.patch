@@ -1,0 +1,181 @@
+From 451fb32521dd32c382b0de726c05f4a2a09ed884 Mon Sep 17 00:00:00 2001
+From: Dooter <dooter@localhost>
+Date: Fri, 20 Nov 2026 04:52:56 +0800
+Subject: [PATCH] Exercise passive archive overload and cancellation through
+ HTTP routing
+
+---
+ .../proteus-core/src/app_server/http/tests.rs |   2 +
+ .../http/tests/archive_saturation.rs          | 147 ++++++++++++++++++
+ 2 files changed, 149 insertions(+)
+ create mode 100644 crates/proteus-core/src/app_server/http/tests/archive_saturation.rs
+
+diff --git a/crates/proteus-core/src/app_server/http/tests.rs b/crates/proteus-core/src/app_server/http/tests.rs
+index ccbd1aa..8f6671a 100644
+--- a/crates/proteus-core/src/app_server/http/tests.rs
++++ b/crates/proteus-core/src/app_server/http/tests.rs
+@@ -269,6 +269,8 @@ async fn wait_for_transcript_text(
+ 
+ mod addons;
+ mod addressing;
++#[cfg(unix)]
++mod archive_saturation;
+ mod commands;
+ mod config;
+ mod config_loading;
+diff --git a/crates/proteus-core/src/app_server/http/tests/archive_saturation.rs b/crates/proteus-core/src/app_server/http/tests/archive_saturation.rs
+new file mode 100644
+index 0000000..62c9aa4
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/http/tests/archive_saturation.rs
+@@ -0,0 +1,147 @@
++//! Exercise overload through the authenticated HTTP dispatcher, not just the semaphore.
++use super::*;
++use crate::contracts::{
++    SessionStorage, SessionStorageRequest as StorageRequest, SessionStorageResponse,
++};
++use crate::core::{SessionStore, StorageService};
++use std::sync::{Mutex, mpsc};
++use tokio::{sync::oneshot, task::JoinSet, time::timeout};
++
++struct Gate {
++    inner: StorageService,
++    first: Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>>,
++}
++#[async_trait::async_trait]
++impl SessionStorage for Gate {
++    async fn execute(&self, request: StorageRequest) -> anyhow::Result<SessionStorageResponse> {
++        self.inner.execute(request).await
++    }
++    fn execute_blocking(&self, request: StorageRequest) -> anyhow::Result<SessionStorageResponse> {
++        if matches!(&request, StorageRequest::OpenSnapshot { .. }) {
++            let gate = self.first.lock().unwrap().take();
++            if let Some((started, resume)) = gate {
++                let _ = started.send(());
++                resume.recv_timeout(Duration::from_secs(30))?;
++            }
++        }
++        self.inner.execute_blocking(request)
++    }
++}
++
++async fn get(state: HttpAppState, uri: String) -> (StatusCode, Value) {
++    let resp = route_request(state, authed_get_request(&uri))
++        .await
++        .unwrap();
++    let status = resp.status();
++    (
++        status,
++        serde_json::from_slice(&response_bytes(resp).await).unwrap(),
++    )
++}
++
++async fn saturated(state: &HttpAppState, uri: &str) -> JoinSet<(StatusCode, Value)> {
++    let mut wave = JoinSet::new();
++    for _ in 0..9 {
++        wave.spawn(get(state.clone(), uri.to_owned()));
++    }
++    let (status, body) = timeout(Duration::from_secs(10), wave.join_next())
++        .await
++        .expect("ninth request must not wait for the worker")
++        .unwrap()
++        .unwrap();
++    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
++    assert_eq!(body["ok"], false);
++    assert_eq!(
++        body["error"],
++        "archive history recovery queue is full; retry later"
++    );
++    wave
++}
++
++#[tokio::test]
++async fn canceled_http_page_does_not_admit_another_rebuild_and_overload_returns_503() {
++    let root = tempfile::tempdir().unwrap();
++    let cwd = tempfile::tempdir().unwrap();
++    let storage = crate::test_support::storage(std::path::Path::new("."));
++    let archive = SessionStore::new(
++        storage.clone(),
++        root.path(),
++        cwd.path(),
++        crate::domain::new_session_id(),
++    )
++    .unwrap();
++    archive
++        .append_history(
++            crate::domain::new_thread_id(),
++            None,
++            &[crate::model_standard::CanonicalMessage::text(
++                crate::model_standard::MessageRole::User,
++                "archived",
++            )],
++        )
++        .await
++        .unwrap();
++    let original = std::fs::read(archive.journal_path()).unwrap();
++    let config = root.path().join("config.toml");
++    let server = AgentAppServer::launch(
++        crate::test_model::config(),
++        cwd.path().into(),
++        Some(&config),
++    )
++    .await
++    .unwrap();
++    let (shutdown, _) = broadcast::channel(1);
++    let mut state = HttpAppState::new(server.clone(), shutdown, test_security()).await;
++    let (started, entered) = oneshot::channel();
++    let (resume, wait) = mpsc::channel();
++    state.storage = Some(Arc::new(Gate {
++        inner: storage,
++        first: Mutex::new(Some((started, wait))),
++    }));
++    let uri = format!(
++        "/history/page?session_dir={}",
++        archive.session_dir().display()
++    );
++    let first = tokio::spawn(get(state.clone(), uri.clone()));
++    timeout(Duration::from_secs(10), entered)
++        .await
++        .unwrap()
++        .unwrap();
++    first.abort();
++    assert!(first.await.unwrap_err().is_cancelled());
++
++    // All eight waiters are now known to have passed the cache-miss preflight.
++    let mut canceled = saturated(&state, &uri).await;
++    canceled.abort_all();
++    while let Some(result) = canceled.join_next().await {
++        assert!(result.unwrap_err().is_cancelled());
++    }
++
++    // Filling the same eight slots again exercises release on waiter cancellation.
++    let mut retry = saturated(&state, &uri).await;
++    resume.send(()).unwrap();
++    let mut revision = None;
++    let mut pages = 0;
++    while let Some(done) = timeout(Duration::from_secs(10), retry.join_next())
++        .await
++        .unwrap()
++    {
++        let (status, page) = done.unwrap();
++        assert_eq!(status, StatusCode::OK, "{page}");
++        assert_eq!(page["total"], 1);
++        assert_eq!(page["start"], 0);
++        assert_eq!(page["messages"][0]["text"], "archived");
++        let r = page["revision"].as_str().unwrap().to_owned();
++        assert_eq!(revision.get_or_insert(r.clone()), &r);
++        pages += 1;
++    }
++    assert_eq!(pages, 8);
++    assert_eq!(std::fs::read(archive.journal_path()).unwrap(), original);
++    assert!(
++        state
++            .server_for_session_dir(archive.session_dir())
++            .await
++            .is_none()
++    );
++    server.shutdown().await;
++}
+-- 
+2.52.0
+
