@@ -1,0 +1,27 @@
+diff --git a/components/module-runtime/src/lib.rs b/components/module-runtime/src/lib.rs
+index cb6daa80ab2f2beb5578bc47d7ff2f68111a7763..55c76e6110f9876219e58432dac73fc4aa5dc65d 100644
+--- a/components/module-runtime/src/lib.rs
++++ b/components/module-runtime/src/lib.rs
+@@ -51,6 +51,7 @@
+             let mut modules = CollectedModules::with_config(binding.module_config.clone());
+             register(&mut modules, &binding)?;
+             let config_schema = schema(&binding);
++            modules.release_registration_config();
+             Ok(Box::new(ModuleExport::new(binding, modules, config_schema)))
+         })
+     })();
+diff --git a/components/module-runtime/src/registry.rs b/components/module-runtime/src/registry.rs
+index b6d7ba941aa4cd23b72937730ae2d928c294f7f8..bc9ffdb14cc09bdfa8dc72079ae85625b339c30b 100644
+--- a/components/module-runtime/src/registry.rs
++++ b/components/module-runtime/src/registry.rs
+@@ -29,6 +29,10 @@
+             workflows: HashMap::new(),
+             hooks: HashMap::new(),
+         }
++    }
++
++    pub(crate) fn release_registration_config(&mut self) {
++        self.module_config = Value::Null;
+     }
+ }
+ 
