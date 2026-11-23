@@ -1,0 +1,44 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -439,7 +439,17 @@
+         {
+             tools.insert(
+                 tool.name.clone(),
+-                write_content(store, source, &AppToolState::from(tool))?,
++                write_content(
++                    store,
++                    source,
++                    &CompactTool {
++                        call_id: tool.call_id.as_str(),
++                        name: tool.name.as_str(),
++                        status: tool.status.as_str(),
++                        args: &tool.args,
++                        effective_args: tool.effective_args.as_ref(),
++                    },
++                )?,
+             );
+         }
+     }
+@@ -479,13 +489,14 @@
+ struct CompactRow {
+     tool: Option<CompactTool>,
+ }
+-#[derive(Deserialize)]
+-struct CompactTool {
+-    call_id: String,
+-    name: String,
+-    status: String,
+-    args: Value,
+-    effective_args: Option<Value>,
++// Mirrors the AppToolState wire shape. Borrow for writes; own fields on rebuild.
++#[derive(Serialize, Deserialize)]
++struct CompactTool<S = String, A = Value> {
++    call_id: S,
++    name: S,
++    status: S,
++    args: A,
++    effective_args: Option<A>,
+ }
+ 
+ fn rebuild_tools(
