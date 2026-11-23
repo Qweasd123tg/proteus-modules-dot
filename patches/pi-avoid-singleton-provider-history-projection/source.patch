@@ -1,0 +1,177 @@
+--- a/components/pi-runtime-js/messages.mjs
++++ b/components/pi-runtime-js/messages.mjs
+@@ -28,77 +28,79 @@
+ 
+ export function piMessages(messages, model) {
+     const names = new Map();
+-    return messages.map((message) => {
+-        const content = [];
+-        const native = message.role === "Assistant" ? message.metadata?.pi_native : null;
+-        for (const [i, { payload }] of message.parts.entries()) {
+-            if (payload.Text) content.push({ type: "text", text: payload.Text.text });
+-            else if (payload.Context) {
+-                content.push({ type: "text", text: contextText(payload.Context.chunk) });
+-            } else if (payload.ToolCall) {
+-                const { id, name, args } = payload.ToolCall.call;
+-                names.set(id, name);
+-                content.push({ type: "toolCall", id, name, arguments: args });
+-            } else if (payload.ToolResult) {
+-                const r = payload.ToolResult.result;
+-                return {
+-                    role: "toolResult",
+-                    toolName: names.get(r.call_id) ?? message.name,
+-                    toolCallId: r.call_id,
+-                    isError: !r.ok,
+-                    content: piContent(r),
+-                    details: r.metadata?.["pi/details"],
+-                    timestamp: 0,
+-                };
+-            } else if (payload.Reasoning || payload.ReasoningSummary) {
+-                content.push({
+-                    type: "thinking",
+-                    thinking: (payload.Reasoning ?? payload.ReasoningSummary).text,
+-                    ...((payload.Reasoning ?? payload.ReasoningSummary).signature
+-                        ? { thinkingSignature: (payload.Reasoning ?? payload.ReasoningSummary).signature }
+-                        : {}),
+-                });
+-            } else if (payload.Opaque) {
+-                // Redacted Pi thinking is provider replay data, not displayable
+-                // reasoning. Unknown opaque formats stay outside the Pi input.
+-                const { format, data } = payload.Opaque;
+-                if (format === "pi/thinking" && data?.type === "thinking"
+-                    && data.redacted === true && typeof data.thinking === "string")
+-                    content.push(structuredClone(data));
+-            } else if (payload.Image?.image) {
+-                content.push({
+-                    type: "image",
+-                    data: payload.Image.image.data ?? "",
+-                    mimeType: payload.Image.image.mime_type,
+-                });
+-            } else throw new Error("Unsupported Pi message part: " + Object.keys(payload));
+-            if (native && !payload.Opaque) {
+-                // Historical journals retain full native blocks. Preserve their
+-                // provider fields, with the canonical content owning the visible data.
+-                const fields = native.parts?.[i] ?? native.content?.[i];
+-                if (fields) content[content.length - 1] = { ...fields, ...content.at(-1) };
+-            }
+-        }
+-        if (message.role === "System" || message.role === "Developer")
+-            return { role: "system", content: content.map((c) => c.text).join("\n"), timestamp: 0 };
+-        if (message.role === "User") return { role: "user", content, timestamp: 0 };
+-        if (message.role === "Assistant")
++    return messages.map((message) => piMessage(message, model, names));
++}
++
++export function piMessage(message, model, names) {
++    const content = [];
++    const native = message.role === "Assistant" ? message.metadata?.pi_native : null;
++    for (const [i, { payload }] of message.parts.entries()) {
++        if (payload.Text) content.push({ type: "text", text: payload.Text.text });
++        else if (payload.Context) {
++            content.push({ type: "text", text: contextText(payload.Context.chunk) });
++        } else if (payload.ToolCall) {
++            const { id, name, args } = payload.ToolCall.call;
++            names.set(id, name);
++            content.push({ type: "toolCall", id, name, arguments: args });
++        } else if (payload.ToolResult) {
++            const r = payload.ToolResult.result;
+             return {
+-                role: "assistant",
+-                provider: model.provider,
+-                api: model.api,
+-                model: model.id,
++                role: "toolResult",
++                toolName: names.get(r.call_id) ?? message.name,
++                toolCallId: r.call_id,
++                isError: !r.ok,
++                content: piContent(r),
++                details: r.metadata?.["pi/details"],
+                 timestamp: 0,
+-                usage: usage(message.metadata?.pi_usage),
+-                stopReason: content.some((p) => p.type === "toolCall") ? "toolUse" : "stop",
+-                ...(native?.header ??
+-                    (native?.content
+-                        ? Object.fromEntries(Object.entries(native).filter(([k]) => k !== "content"))
+-                        : {})),
+-                content,
+             };
+-        throw new Error("Unsupported Pi history role: " + message.role);
+-    });
++        } else if (payload.Reasoning || payload.ReasoningSummary) {
++            content.push({
++                type: "thinking",
++                thinking: (payload.Reasoning ?? payload.ReasoningSummary).text,
++                ...((payload.Reasoning ?? payload.ReasoningSummary).signature
++                    ? { thinkingSignature: (payload.Reasoning ?? payload.ReasoningSummary).signature }
++                    : {}),
++            });
++        } else if (payload.Opaque) {
++            // Redacted Pi thinking is provider replay data, not displayable
++            // reasoning. Unknown opaque formats stay outside the Pi input.
++            const { format, data } = payload.Opaque;
++            if (format === "pi/thinking" && data?.type === "thinking"
++                && data.redacted === true && typeof data.thinking === "string")
++                content.push(structuredClone(data));
++        } else if (payload.Image?.image) {
++            content.push({
++                type: "image",
++                data: payload.Image.image.data ?? "",
++                mimeType: payload.Image.image.mime_type,
++            });
++        } else throw new Error("Unsupported Pi message part: " + Object.keys(payload));
++        if (native && !payload.Opaque) {
++            // Historical journals retain full native blocks. Preserve their
++            // provider fields, with the canonical content owning the visible data.
++            const fields = native.parts?.[i] ?? native.content?.[i];
++            if (fields) content[content.length - 1] = { ...fields, ...content.at(-1) };
++        }
++    }
++    if (message.role === "System" || message.role === "Developer")
++        return { role: "system", content: content.map((c) => c.text).join("\n"), timestamp: 0 };
++    if (message.role === "User") return { role: "user", content, timestamp: 0 };
++    if (message.role === "Assistant")
++        return {
++            role: "assistant",
++            provider: model.provider,
++            api: model.api,
++            model: model.id,
++            timestamp: 0,
++            usage: usage(message.metadata?.pi_usage),
++            stopReason: content.some((p) => p.type === "toolCall") ? "toolUse" : "stop",
++            ...(native?.header ??
++                (native?.content
++                    ? Object.fromEntries(Object.entries(native).filter(([k]) => k !== "content"))
++                    : {})),
++            content,
++        };
++    throw new Error("Unsupported Pi history role: " + message.role);
+ }
+ 
+ export function assistant(response, model) {
+--- a/model/pi-provider/adapter.mjs
++++ b/model/pi-provider/adapter.mjs
+@@ -8,7 +8,7 @@
+     isRetryableAssistantError,
+ } from "../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/index.js";
+ import { DEFAULT_AGENT_IDENTITY } from "../../tool/pi-tools/node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
+-import { piMessages } from "../../components/pi-runtime-js/messages.mjs";
++import { piMessage } from "../../components/pi-runtime-js/messages.mjs";
+ 
+ // Node's module entry point does not run the native CLI's proxy bootstrap.
+ import undici from "../../tool/pi-tools/node_modules/undici/index.js";
+@@ -43,10 +43,14 @@
+ async function context(request, model) {
+     const history = [];
+     const names = new Map();
++    let rowNames;
+     for (const m of request.messages) {
+         for (const p of m.parts)
+             if (p.payload.ToolCall) names.set(p.payload.ToolCall.call.id, p.payload.ToolCall.call.name);
+-        const native = piMessages([m], model)[0];
++        // Keep the projector's per-row named calls separate from the full prescan above.
++        rowNames ??= new Map();
++        const native = piMessage(m, model, rowNames);
++        if (rowNames.size) rowNames.clear();
+         if (native.role === "toolResult") native.toolName = names.get(native.toolCallId) ?? native.toolName;
+         if (native.role === "user") {
+             for (let i = 0; i < m.parts.length; i++) {
