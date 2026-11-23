@@ -1,0 +1,118 @@
+{
+  "rustc": {
+    "version": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "commit": "59807616e1fa2540724bfbac14d7976d7e4a3860",
+    "host": "x86_64-unknown-linux-gnu",
+    "sha256": "bff349e72704ff70bc08a234a3847338e797065bbedde5e556808bc87b7bf7c6",
+    "edition": "2024",
+    "warnings_denied": true,
+    "rustfmt_check_all_four_sources": true
+  },
+  "application": {
+    "git_check_and_forward_reverse_byte_identical_in_each_tier": true,
+    "gnu_patch_forward_reverse_byte_identical_in_each_tier": true,
+    "gnu_fuzz": 0,
+    "gnu_after_532_offset_lines": 4,
+    "reapplied_and_reversed_532_against_clean_pinned_copy": true
+  },
+  "scope": {
+    "compile": "Byte-identical lifted functions: part_text and message_text, plus the applicable tool_result_text and join_visible helpers; no edits to their bodies.",
+    "bridge": "Local synthetic typed Value with narrow string/array/map/null shape, simple conversion stand-ins, and a counted opaque pretty fallback; not serde_json or native Analysis.",
+    "matrix": "Each executable contains paired baseline/candidate functions; debug and -O in both tiers.",
+    "copy_witness": "Actual lifted part_text output for a canonical ToolResult at the exact helper boundary; new output pointer and capacity equal input. Loose nonempty input takes stock join, matches old capacity and bytes, and does not retain its pointer. Multi remains stock join. This tests ownership, not physical allocator calls.",
+    "tool_result_fixture_body_bytes": [
+      3283,
+      19471,
+      44475
+    ],
+    "limits": "No Cargo/package or serde_json, no actual protected data, network or Desktop, no timing or allocator/performance benchmark."
+  },
+  "proof_hashes": {
+    "lift_script_sha256": "ee54c2b85ccac24a7794afd40543232c39c416611fd7c1e96bc8844ebfe3bf3c",
+    "stage_script_sha256": "884cab8b5a17fca4851637c625a7a4aabfe2d3d954953d2715f2bf77c0ece463",
+    "source_lifts": {
+      "stock": {
+        "before_exact_lift_sha256": "85345f2d15d07cd34cbc03d8890a6b00a4aa0fda5b3a6fb7042c356fd36d6ba8",
+        "after_exact_lift_sha256": "ec565871bb94b5da44f1189258223be656702d40e0bfd8857fabd3f78a9bb89f",
+        "paired_fixture_sha256": "487db3556515446a3285a2c70843907982f5ecf45b2d42967d9671ad04e8e944",
+        "harness_sha256": "da796f42d4ce1352224ee96c007efb68a0f09a4f6c6e122281226f928d214624"
+      },
+      "after_532": {
+        "before_exact_lift_sha256": "65dfac1b44ce03ecb0e23ee919fe02e499e5f3b22ddf103460e4b05e2f7c0e55",
+        "after_exact_lift_sha256": "f61949f82ccd9b6065d536fc79078412be525827ba8f409f1d67d80003255eda",
+        "paired_fixture_sha256": "487db3556515446a3285a2c70843907982f5ecf45b2d42967d9671ad04e8e944",
+        "harness_sha256": "d170ce226d46aa221f375d7c88add464169c599415e5727a4abaaa9275cdc2ba"
+      }
+    }
+  },
+  "runs": {
+    "stock": {
+      "debug": {
+        "opt_level": 0,
+        "passed": 7,
+        "failed": 0,
+        "cases": [
+          "loose_singleton_uses_old_join_and_does_not_retain_excess_capacity",
+          "multiple_visible_parts_join_in_order_with_one_literal_lf",
+          "no_visible_parts_uses_the_whole_message_fallback_once",
+          "one_visible_among_many_raw_parts_and_malformed_parts",
+          "ordinary_tool_results_reuse_exact_tight_formatted_payload",
+          "raw_text_singleton_keeps_original_fast_path_and_whitespace_fallback",
+          "tool_result_rendered_empty_is_not_same_as_no_visible_part"
+        ],
+        "binary_sha256": "74e26c01dd142e06f9c761d6fb9aa999a6402193a412ca168689b127d4ecd292",
+        "transcript_sha256": "1a27cce3a14ad3c2b05db7583816b81c74869d203b84af98a8a30d7d02eaf9da"
+      },
+      "optimized": {
+        "opt_level": 3,
+        "passed": 7,
+        "failed": 0,
+        "cases": [
+          "loose_singleton_uses_old_join_and_does_not_retain_excess_capacity",
+          "multiple_visible_parts_join_in_order_with_one_literal_lf",
+          "no_visible_parts_uses_the_whole_message_fallback_once",
+          "one_visible_among_many_raw_parts_and_malformed_parts",
+          "ordinary_tool_results_reuse_exact_tight_formatted_payload",
+          "raw_text_singleton_keeps_original_fast_path_and_whitespace_fallback",
+          "tool_result_rendered_empty_is_not_same_as_no_visible_part"
+        ],
+        "binary_sha256": "00dc03b6c46e7635a6ef7c8163818283ceb896bf1a5e3005921b6a0424fb7980",
+        "transcript_sha256": "1a27cce3a14ad3c2b05db7583816b81c74869d203b84af98a8a30d7d02eaf9da"
+      }
+    },
+    "after_532": {
+      "debug": {
+        "opt_level": 0,
+        "passed": 7,
+        "failed": 0,
+        "cases": [
+          "loose_singleton_uses_old_join_and_does_not_retain_excess_capacity",
+          "multiple_visible_parts_join_in_order_with_one_literal_lf",
+          "no_visible_parts_uses_the_whole_message_fallback_once",
+          "one_visible_among_many_raw_parts_and_malformed_parts",
+          "ordinary_tool_results_reuse_exact_tight_formatted_payload",
+          "raw_text_singleton_keeps_original_fast_path_and_whitespace_fallback",
+          "tool_result_rendered_empty_is_not_same_as_no_visible_part"
+        ],
+        "binary_sha256": "e9e9cb0b4c0b437e886ea9b396da6d102fc70d687665c92269ff676bb69f391d",
+        "transcript_sha256": "1a27cce3a14ad3c2b05db7583816b81c74869d203b84af98a8a30d7d02eaf9da"
+      },
+      "optimized": {
+        "opt_level": 3,
+        "passed": 7,
+        "failed": 0,
+        "cases": [
+          "loose_singleton_uses_old_join_and_does_not_retain_excess_capacity",
+          "multiple_visible_parts_join_in_order_with_one_literal_lf",
+          "no_visible_parts_uses_the_whole_message_fallback_once",
+          "one_visible_among_many_raw_parts_and_malformed_parts",
+          "ordinary_tool_results_reuse_exact_tight_formatted_payload",
+          "raw_text_singleton_keeps_original_fast_path_and_whitespace_fallback",
+          "tool_result_rendered_empty_is_not_same_as_no_visible_part"
+        ],
+        "binary_sha256": "714df3ec0a189d1a18704d0b369b57bcc58779147d4c518cf1ca015ce7dea5c1",
+        "transcript_sha256": "1a27cce3a14ad3c2b05db7583816b81c74869d203b84af98a8a30d7d02eaf9da"
+      }
+    }
+  }
+}
