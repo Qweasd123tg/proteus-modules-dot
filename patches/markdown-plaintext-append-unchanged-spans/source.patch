@@ -1,0 +1,36 @@
+diff --git a/packages/markdown-render/src/plain.rs b/packages/markdown-render/src/plain.rs
+index 37a30ecd9f65c8115dc82bb1f6c58ff4d31947e6..f572a4b15fdd455ecf352ed69e82fb5daad3c173 100644
+--- a/packages/markdown-render/src/plain.rs
++++ b/packages/markdown-render/src/plain.rs
+@@ -101,14 +101,24 @@
+ }
+ 
+ fn escape(source: &str, output: &mut String) {
+-    for ch in source.chars() {
+-        match ch {
+-            '&' => output.push_str("&amp;"),
+-            '<' => output.push_str("&lt;"),
+-            '>' => output.push_str("&gt;"),
+-            '"' => output.push_str("&quot;"),
+-            _ => output.push(ch),
++    let mut start = 0;
++    for (index, byte) in source.bytes().enumerate() {
++        let replacement = match byte {
++            b'&' => "&amp;",
++            b'<' => "&lt;",
++            b'>' => "&gt;",
++            b'"' => "&quot;",
++            _ => continue,
++        };
++        // Matched ASCII bytes cannot be inside a UTF-8 code point.
++        if start < index {
++            output.push_str(&source[start..index]);
+         }
++        output.push_str(replacement);
++        start = index + 1;
++    }
++    if start < source.len() {
++        output.push_str(&source[start..]);
+     }
+ }
+ 
