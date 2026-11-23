@@ -1,0 +1,74 @@
+--- a/hook/codex-context-preparation/src/budget.rs
++++ b/hook/codex-context-preparation/src/budget.rs
+@@ -1,19 +1,23 @@
+-use crate::history::message_text;
++use crate::history::message_text_len;
+ use proteus_contracts::{contracts::ContextPreparationInput, model_standard::CanonicalMessage};
+ 
+ const DEFAULT_USER_MESSAGE_BUDGET_TOKENS: usize = 20_000;
+ 
+ pub(crate) fn estimate_messages_tokens(messages: &[CanonicalMessage]) -> u32 {
+-    let tokens = messages
+-        .iter()
+-        .filter_map(message_text)
+-        .map(|text| estimate_text_tokens(&text))
+-        .sum::<usize>();
++    estimate_message_text_lengths(messages.iter().filter_map(message_text_len))
++}
++
++fn estimate_message_text_lengths(lengths: impl Iterator<Item = usize>) -> u32 {
++    let tokens = lengths.map(estimate_text_bytes).sum::<usize>();
+     u32::try_from(tokens.max(1)).unwrap_or(u32::MAX)
+ }
+ 
++fn estimate_text_bytes(bytes: usize) -> usize {
++    bytes.saturating_add(3) / 4
++}
++
+ pub(crate) fn estimate_text_tokens(text: &str) -> usize {
+-    text.len().saturating_add(3) / 4
++    estimate_text_bytes(text.len())
+ }
+ 
+ pub(crate) fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -192,13 +192,35 @@
+     replacement
+ }
+ 
+-pub(crate) fn message_text(message: &CanonicalMessage) -> Option<String> {
+-    let pieces = message
++fn message_text_pieces(
++    message: &CanonicalMessage,
++) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
++    message
+         .parts
+         .iter()
+         .filter_map(|part| part_text(&part.payload))
+         .filter(|text| !text.is_empty())
+-        .collect::<Vec<_>>();
++        .map(Into::into)
++}
++
++fn joined_message_len(mut lengths: impl Iterator<Item = usize>) -> Option<usize> {
++    let first = lengths.next()?;
++    // Visit every piece just as the owned renderer does before joining.
++    let length = lengths
++        .fold(Some(first), |total, len| {
++            total.and_then(|total| total.checked_add(1)?.checked_add(len))
++        })
++        .expect("attempt to join into collection with len > usize::MAX");
++    assert!(length <= isize::MAX as usize, "capacity overflow");
++    Some(length)
++}
++
++pub(crate) fn message_text_len(message: &CanonicalMessage) -> Option<usize> {
++    joined_message_len(message_text_pieces(message).map(|text| text.len()))
++}
++
++pub(crate) fn message_text(message: &CanonicalMessage) -> Option<String> {
++    let pieces = message_text_pieces(message).collect::<Vec<_>>();
+     if pieces.is_empty() {
+         None
+     } else {
