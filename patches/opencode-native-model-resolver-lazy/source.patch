@@ -1,0 +1,30 @@
+--- a/model/opencode-provider/runtime.mjs
++++ b/model/opencode-provider/runtime.mjs
+@@ -4,7 +4,16 @@
+ import * as KV from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/kv.js';
+ import * as Bus from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/bus.js';
+ import { mergeOverlay } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/provider.js';
+-import { resolveModel } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/model-resolver.js';
++
++let nativeResolveModel, loadingNativeResolveModel;
++function loadNativeResolveModel() {
++    return loadingNativeResolveModel ??= import('../../workflow/opencode-runtime/node_modules/@opencode/core/dist/model-resolver.js')
++        .then(({ resolveModel }) => {
++            if (typeof resolveModel !== 'function') throw new Error('Invalid OpenCode model resolver');
++            return nativeResolveModel = resolveModel;
++        })
++        .finally(() => { loadingNativeResolveModel = undefined; });
++}
+ 
+ const CACHE_MS = 300_000;
+ // ModelsDev's native KV and event bus both acquire the complete session database.
+@@ -132,6 +141,9 @@
+             const modelInfo = await info(id, signal);
+             if (effort != null && !modelInfo.variants.some(variant => variant.id === effort))
+                 throw new Error('Unsupported OpenCode reasoning effort: ' + effort);
++            signal?.throwIfAborted();
++            const resolveModel = nativeResolveModel ?? await loadNativeResolveModel();
++            signal?.throwIfAborted();
+             const model = await Effect.runPromise(resolveModel(modelInfo, effort ?? undefined, credential), { signal });
+             return { model, modelInfo };
+         },

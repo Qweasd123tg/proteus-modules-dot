@@ -1,0 +1,32 @@
+--- a/model/opencode-provider/runtime.mjs
++++ b/model/opencode-provider/runtime.mjs
+@@ -5,9 +5,18 @@
+ import * as KV from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/kv.js';
+ import * as Bus from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/bus.js';
+ import { mergeOverlay } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/provider.js';
+-import { resolveModel } from '../../workflow/opencode-runtime/node_modules/@opencode/core/dist/model-resolver.js';
+ import { hasPackageCatalogSeed, readPackageCatalogSeed } from './catalog-seed.mjs';
+ 
++let nativeResolveModel, loadingNativeResolveModel;
++function loadNativeResolveModel() {
++    return loadingNativeResolveModel ??= import('../../workflow/opencode-runtime/node_modules/@opencode/core/dist/model-resolver.js')
++        .then(({ resolveModel }) => {
++            if (typeof resolveModel !== 'function') throw new Error('Invalid OpenCode model resolver');
++            return nativeResolveModel = resolveModel;
++        })
++        .finally(() => { loadingNativeResolveModel = undefined; });
++}
++
+ const CACHE_MS = 300_000;
+ // Exact @opencode/core 2.0.22 key for the default public source.
+ const NATIVE_CATALOG_KEY = 'models-dev:catalog';
+@@ -209,6 +218,9 @@
+             const modelInfo = await info(id, signal);
+             if (effort != null && !modelInfo.variants.some(variant => variant.id === effort))
+                 throw new Error('Unsupported OpenCode reasoning effort: ' + effort);
++            signal?.throwIfAborted();
++            const resolveModel = nativeResolveModel ?? await loadNativeResolveModel();
++            signal?.throwIfAborted();
+             const model = await Effect.runPromise(resolveModel(modelInfo, effort ?? undefined, credential), { signal });
+             return { model, modelInfo };
+         },
