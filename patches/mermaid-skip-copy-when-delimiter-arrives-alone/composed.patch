@@ -1,0 +1,11 @@
+--- a/packages/mermaid-render/worker.mjs
++++ b/packages/mermaid-render/worker.mjs
+@@ -65,7 +65,7 @@
+       if (chunk[end] !== 10) continue;
+       if (pending.length + end - start > MAX_REQUEST) throw new Error('worker request is too large');
+       reply(pending.length
+-        ? Buffer.concat([pending, chunk.subarray(start, end)]).toString('utf8')
++        ? (end === start ? pending : Buffer.concat([pending, chunk.subarray(start, end)])).toString('utf8')
+         : chunk.toString('utf8', start, end));
+       pending = Buffer.alloc(0);
+       start = end + 1;
