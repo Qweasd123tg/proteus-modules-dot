@@ -1,0 +1,42 @@
+diff --git a/hook/codex-context-preparation/src/compaction.rs b/hook/codex-context-preparation/src/compaction.rs
+index d603df61ab8e5ba65bce0b5bacc8ebf5ec003f17..87c5edc6a26738cf7257799ca8817dbe386a5d44 100644
+--- a/hook/codex-context-preparation/src/compaction.rs
++++ b/hook/codex-context-preparation/src/compaction.rs
+@@ -109,9 +109,10 @@
+     let preserved_user_messages =
+         select_recent_user_messages(&user_messages, user_message_budget_tokens());
+     let summary = complete_summary_with_recovery(&input, config, history.summary_history, host)?;
++    let retained_count = preserved_user_messages.messages.len();
+     let replacement = replacement_messages(
+         &history.ephemeral_context,
+-        &preserved_user_messages.messages,
++        preserved_user_messages.messages,
+         &summary,
+     );
+     let output_token_estimate = estimate_messages_tokens(&replacement);
+@@ -124,7 +125,7 @@
+     output.summary_source = Some("model".to_owned());
+     output.metadata = json!({
+         "compacted_messages": history.compactable_history.len(),
+-        "preserved_user_messages": preserved_user_messages.messages.len(),
++        "preserved_user_messages": retained_count,
+         "ephemeral_context_messages": history.ephemeral_context.len(),
+     });
+     Ok(output)
+diff --git a/hook/codex-context-preparation/src/history.rs b/hook/codex-context-preparation/src/history.rs
+index b08a08f16cda6b4a96e3c813d0c810e378473d1a..e2625ffdcada4fd237000c2176787b0bbc739e83 100644
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -165,11 +165,9 @@
+ 
+ pub(crate) fn replacement_messages(
+     ephemeral_context: &[CanonicalMessage],
+-    preserved_user_messages: &[CanonicalMessage],
++    mut replacement: Vec<CanonicalMessage>,
+     summary: &str,
+ ) -> Vec<CanonicalMessage> {
+-    let mut replacement = preserved_user_messages.to_vec();
+-
+     // Upstream Codex keeps the compaction summary last. For mid-turn
+     // compaction it re-injects canonical initial context immediately before
+     // the last real user message; if no user survives the budget, context is
