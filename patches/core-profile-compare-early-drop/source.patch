@@ -1,0 +1,21 @@
+diff --git a/crates/proteus-core/src/app_server/profile_watch.rs b/crates/proteus-core/src/app_server/profile_watch.rs
+index 17faba58c14e467fab04097f6b008d957bc5b2ee..37dc586c663c80924320296f7ed707549c50caf0 100644
+--- a/crates/proteus-core/src/app_server/profile_watch.rs
++++ b/crates/proteus-core/src/app_server/profile_watch.rs
+@@ -134,10 +134,12 @@
+             if failed.as_ref() == Some(&expected) {
+                 continue;
+             };
+-            let current = handle.config.read().await.clone();
+-            if expected.config == serde_json::to_vec(&current).unwrap_or_default()
+-                && expected.packages == applied.packages
+-            {
++            let already_published = {
++                let current = handle.config.read().await.clone();
++                expected.config == serde_json::to_vec(&current).unwrap_or_default()
++                    && expected.packages == applied.packages
++            };
++            if already_published {
+                 // A UI save has already published this session; other sessions
+                 // still detect the file and go through normal preparation.
+                 applied = expected;
