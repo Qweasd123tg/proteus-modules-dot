@@ -1,0 +1,45 @@
+diff --git a/src/ui/chat/pump.rs b/src/ui/chat/pump.rs
+index 900e4a6e2719bfc54ea8bf0d735ddeb13986e365..d55d1ffb23a57af5c5b494c64074a691a81d1c23 100644
+--- a/src/ui/chat/pump.rs
++++ b/src/ui/chat/pump.rs
+@@ -313,12 +313,19 @@
+                 .and_then(|binding| binding.archive.as_ref())
+                 .unwrap_or_else(|| self.history.displayed(&self.session.transcript))
+                 .entries();
+-            let keys = entries.iter().map(|entry| entry.key).collect();
+-            self.replies.retain(&keys);
+-            self.tool_diffs.retain(|key, _| keys.contains(key));
+-            self.expanded.retain(|key| keys.contains(key));
+-            self.full_blocks.retain(|(key, _)| keys.contains(key));
+-            self.open_chains.retain(|key| keys.contains(key));
++            if !self.replies.is_empty()
++                || !self.tool_diffs.is_empty()
++                || !self.expanded.is_empty()
++                || !self.full_blocks.is_empty()
++                || !self.open_chains.is_empty()
++            {
++                let keys = entries.iter().map(|entry| entry.key).collect();
++                self.replies.retain(&keys);
++                self.tool_diffs.retain(|key, _| keys.contains(key));
++                self.expanded.retain(|key| keys.contains(key));
++                self.full_blocks.retain(|(key, _)| keys.contains(key));
++                self.open_chains.retain(|key| keys.contains(key));
++            }
+             self.sent_images.retain(entries);
+         }
+         let layout = row_layout(self.display_transcript().entries(), change);
+diff --git a/src/ui/chat/replies.rs b/src/ui/chat/replies.rs
+index 87b40b7ce76ec3130d97b1449b05da8156e8b7db..69380ee6ad7159717618561af9aafbe711610f86 100644
+--- a/src/ui/chat/replies.rs
++++ b/src/ui/chat/replies.rs
+@@ -111,6 +111,10 @@
+         }
+     }
+ 
++    pub(super) fn is_empty(&self) -> bool {
++        self.0.is_empty()
++    }
++
+     pub(super) fn retain(&mut self, keys: &HashSet<u64>) {
+         // Releasing historical rows closes their surfaces and child workers.
+         self.0.retain(|key, _| keys.contains(key));
