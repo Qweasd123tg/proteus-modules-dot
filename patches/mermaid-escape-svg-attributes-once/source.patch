@@ -1,0 +1,14 @@
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -72,6 +72,10 @@
+ }
+ 
++const ATTRIBUTE_SPECIALS = /[&"<>]/g;
++const ATTRIBUTE_ENTITIES = { '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
++const attributeEntity = character => ATTRIBUTE_ENTITIES[character];
++
+ function escapeAttribute(value) {
+-  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
++  return value.replace(ATTRIBUTE_SPECIALS, attributeEntity);
+ }
+ 
