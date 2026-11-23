@@ -1,0 +1,104 @@
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -10,10 +10,18 @@
+   'rx', 'ry', 'stop-color', 'flood-color', 'lighting-color',
+ ]);
+ 
+-export function themeVariables(theme) {
++function requireTheme(theme) {
+   if (!theme || typeof theme !== 'object' || Array.isArray(theme)) {
+     throw new Error('content.context.theme is required');
+   }
++}
++
++export function themeVariables(theme) {
++  requireTheme(theme);
++  return buildThemeVariables(theme);
++}
++
++function buildThemeVariables(theme) {
+   const variables = new Map();
+   for (const [field, token] of Object.entries(COLORS)) {
+     if (typeof theme[field] !== 'string' || !/^#[\da-f]{6}(?:[\da-f]{2})?$/i.test(theme[field])) {
+@@ -82,9 +90,29 @@
+   });
+ }
+ 
++/** Prepare the wire render from single, validated values, not caller-owned state. */
++export function prepareRenderTheme(theme) {
++  requireTheme(theme);
++  const snapshot = Object.create(null);
++  for (const field of Object.keys(COLORS)) snapshot[field] = theme[field];
++  snapshot.font_family = theme.font_family;
++  snapshot.font_family_mono = theme.font_family_mono;
++  const variables = buildThemeVariables(snapshot);
++  const color = variables.get('--pele-fg');
++  return {
++    fontFamily: variables.get('--pele-font'),
++    fontFamilyMono: variables.get('--pele-font-mono'),
++    materialize: svg => materializeWithTheme(svg, variables, color),
++  };
++}
++
+ /** Materialize scoped aliases, fonts and SVG2 CSS rx into native SVG attributes. */
+ export function materializeSvg(svg, theme) {
+-  const root = { variables: themeVariables(theme), color: theme.foreground };
++  return materializeWithTheme(svg, themeVariables(theme), theme.foreground);
++}
++
++function materializeWithTheme(svg, variables, color) {
++  const root = { variables, color };
+   const stack = [root];
+   return svg.replace(/<[^>]*>/g, tag => {
+     if (/^<\//.test(tag)) {
+--- a/packages/mermaid-render/worker.mjs
++++ b/packages/mermaid-render/worker.mjs
+@@ -1,6 +1,6 @@
+ import { pathToFileURL } from 'node:url';
+ import { render, forgetTextWidths } from './vendor/pele/pele.mjs';
+-import { materializeSvg, themeVariables } from './svg-theme.mjs';
++import { materializeSvg, prepareRenderTheme, themeVariables } from './svg-theme.mjs';
+ 
+ export const MAX_SOURCE = 50_000;
+ export const MAX_SVG = 1024 * 1024;
+@@ -12,14 +12,19 @@
+ }
+ 
+ export function renderDiagram(request) {
++  return renderRequest(request, false);
++}
++
++function renderRequest(request, fromWire) {
+   const source = request?.source;
+   if (typeof source !== 'string' || !source.trim()) throw new Error('Mermaid source is empty');
+   if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE) throw new Error('Mermaid source exceeds 50,000 bytes');
+-  const variables = themeVariables(request.theme);
++  const prepared = fromWire ? prepareRenderTheme(request.theme) : null;
++  const variables = prepared ? null : themeVariables(request.theme);
+   try {
+     const result = render(source, {
+-      fontFamily: variables.get('--pele-font'),
+-      fontFamilyMono: variables.get('--pele-font-mono'),
++      fontFamily: prepared ? prepared.fontFamily : variables.get('--pele-font'),
++      fontFamilyMono: prepared ? prepared.fontFamilyMono : variables.get('--pele-font-mono'),
+       fontSize: 16,
+       idPrefix: 'proteus-mermaid',
+       responsive: false,
+@@ -35,7 +40,7 @@
+     }
+     const scale = Math.min(1, 640 / result.width, 4096 / result.height);
+     return {
+-      svg: checkedSvg(materializeSvg(result.svg, request.theme)),
++      svg: checkedSvg(prepared ? prepared.materialize(result.svg) : materializeSvg(result.svg, request.theme)),
+       width: Math.max(1, result.width * scale),
+       height: Math.max(1, result.height * scale),
+     };
+@@ -47,7 +52,7 @@
+ 
+ function reply(line) {
+   try {
+-    const result = renderDiagram(JSON.parse(line));
++    const result = renderRequest(JSON.parse(line), true);
+     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+   } catch (error) {
+     // Never log source or a parser stack. The addressed content view gets the error.
