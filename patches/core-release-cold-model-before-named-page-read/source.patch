@@ -1,0 +1,27 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -96,9 +96,14 @@
+         let source = RemoteCacheSource::from_cursor(&read.cursor());
+         let model = SessionReadModel::from_validated(self, read, render)?;
+         self.save_read_model(&source, &model);
++        let revision = model.conversation.revision;
+         // A concurrent projection may have advanced HEAD. Only this immutable
+         // revision can provide a page for the model's summary, revision and usage.
+         let page = if paged {
++            // Save was the last consumer of these owners. Keep the complete
++            // rendered transcript until the named page is actually available.
++            drop(model.conversation);
++            drop(model.prefix);
+             source
+                 .revision()
+                 .and_then(|revision| self.saved_transcript_page(None, Some(&revision)))
+@@ -118,7 +123,7 @@
+         };
+         Ok(SessionReadView {
+             summary: model.summary,
+-            revision: model.conversation.revision,
++            revision,
+             usage: model.usage,
+             transcript,
+             cursor,
