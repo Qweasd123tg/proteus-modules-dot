@@ -1,0 +1,58 @@
+diff --git a/scripts/settings-migration.py b/scripts/settings-migration.py
+index 8c3f645..841948b 100755
+--- a/scripts/settings-migration.py
++++ b/scripts/settings-migration.py
+@@ -2,15 +2,12 @@
+ """Export Proteus settings and restore them on another machine (Python 3.11+)."""
+ import argparse
+ from datetime import datetime, timezone
+-import hashlib
+-import io
+ import json
+ import os
+ from pathlib import Path, PurePosixPath
+ import re
+ import shutil
+ import sys
+-import tarfile
+ import tempfile
+ import tomllib
+ 
+@@ -96,6 +93,10 @@ def read_settings(path):
+ 
+ 
+ def export_archive(args):
++    import hashlib
++    import io
++    import tarfile
++
+     home, locations = roots(args)
+     files = {}
+     for kind, items in SECTIONS.items():
+@@ -153,6 +154,9 @@ def export_archive(args):
+ 
+ 
+ def read_archive(path):
++    import hashlib
++    import tarfile
++
+     files = {}
+     total = 0
+     with tarfile.open(path, 'r:gz') as archive:
+@@ -390,10 +394,15 @@ def main():
+         parser.error('export and restore require an archive path')
+     if args.dry_run and args.operation == 'export':
+         parser.error('--dry-run applies to restore and upgrade-storage')
++    errors = (OSError, ValueError, KeyError)
++    if args.operation != 'upgrade-storage':
++        from tarfile import TarError
++
++        errors += (TarError,)
+     try:
+         operations = {'export': export_archive, 'restore': restore_archive, 'upgrade-storage': upgrade_storage}
+         operations[args.operation](args)
+-    except (OSError, ValueError, KeyError, tarfile.TarError) as error:
++    except errors as error:
+         parser.exit(1, f'{error}\n')
+ 
+ 
