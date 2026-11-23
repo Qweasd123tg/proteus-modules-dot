@@ -1,0 +1,93 @@
+diff --git a/packages/git/src/graph.rs b/packages/git/src/graph.rs
+index a443d3dc918a89684b1076e784c8f2324b8e995b..e0b11969040736d1c6aa3963e848bf53833ad1e0 100644
+--- a/packages/git/src/graph.rs
++++ b/packages/git/src/graph.rs
+@@ -192,7 +192,7 @@
+         })
+     }
+ 
+-    fn add(&mut self, hash: &'a str, parents: &[&'a str]) {
++    fn add(&mut self, hash: &'a str, parents: impl IntoIterator<Item = &'a str>) {
+         let row = self.commits.len();
+         let lane = self
+             .parent_to_lanes
+@@ -228,7 +228,7 @@
+                 self.lines.push(line);
+             }
+         }
+-        for (index, parent) in parents.iter().enumerate() {
++        for (index, parent) in parents.into_iter().enumerate() {
+             let (column, color, piece) = if index == 0 {
+                 (lane, Some(color), Piece::Straight { to_row: OPEN })
+             } else {
+@@ -354,7 +354,10 @@
+ }
+ 
+ /// Rows of commits listed newest first, each with the hashes of its parents.
+-pub fn layout<'a>(commits: &[(&'a str, Vec<&'a str>)]) -> Vec<Row> {
++pub fn layout<'a, Parents>(commits: impl IntoIterator<Item = (&'a str, Parents)>) -> Vec<Row>
++where
++    Parents: IntoIterator<Item = &'a str>,
++{
+     let mut graph = Graph::default();
+     for (hash, parents) in commits {
+         graph.add(hash, parents);
+@@ -385,7 +388,7 @@
+ 
+     #[test]
+     fn a_linear_history_stays_on_one_lane() {
+-        let rows = layout(&[("c", vec!["b"]), ("b", vec!["a"]), ("a", vec![])]);
++        let rows = layout([("c", vec!["b"]), ("b", vec!["a"]), ("a", vec![])]);
+         assert!(rows.iter().all(|row| row.lane == 0 && row.color == 0));
+         assert_eq!(rows[0].up, []);
+         assert_eq!(rows[0].down, [segment(0, 0, 0)]);
+@@ -396,7 +399,7 @@
+     #[test]
+     fn a_merge_opens_a_lane_and_the_fork_closes_it() {
+         // m merges b into a; both come from c.
+-        let rows = layout(&[
++        let rows = layout([
+             ("m", vec!["a", "b"]),
+             ("a", vec!["c"]),
+             ("b", vec!["c"]),
+@@ -418,7 +421,7 @@
+ 
+     #[test]
+     fn unloaded_parents_run_off_the_bottom() {
+-        let rows = layout(&[("b", vec!["a"]), ("x", vec!["y"])]);
++        let rows = layout([("b", vec!["a"]), ("x", vec!["y"])]);
+         assert_eq!((rows[0].lane, rows[1].lane), (0, 1));
+         assert_eq!(rows[1].up, [segment(0, 0, 0)]);
+         assert_eq!(rows[1].down, [segment(0, 0, 0), segment(1, 1, 1)]);
+@@ -427,7 +430,7 @@
+     #[test]
+     fn a_short_merge_bends_straight_into_its_parent() {
+         // The merged parent is the very next row on another lane.
+-        let rows = layout(&[("m", vec!["a", "b"]), ("b", vec!["a"]), ("a", vec![])]);
++        let rows = layout([("m", vec!["a", "b"]), ("b", vec!["a"]), ("a", vec![])]);
+         assert_eq!(
+             rows.iter().map(|row| row.lane).collect::<Vec<_>>(),
+             [0, 1, 0]
+diff --git a/packages/git/src/history.rs b/packages/git/src/history.rs
+index 81144792a08a8916955fbe9c5c02927451052469..ae4949a232547b53ea1a58495ceb304b9062fb62 100644
+--- a/packages/git/src/history.rs
++++ b/packages/git/src/history.rs
+@@ -136,14 +136,10 @@
+ 
+ /// Rows of the `lanes` widget for commits newest first.
+ pub fn rows(entries: &[LogEntry], selected: Option<&str>, _now: f64) -> Vec<Value> {
+-    let commits: Vec<(&str, Vec<&str>)> = entries
+-        .iter()
+-        .map(|entry| {
+-            let parents = entry.parents.iter().filter_map(Value::as_str);
+-            (entry.hash.as_str(), parents.collect())
+-        })
+-        .collect();
+-    let layout = graph::layout(&commits);
++    let layout = graph::layout(entries.iter().map(|entry| {
++        let parents = entry.parents.iter().filter_map(Value::as_str);
++        (entry.hash.as_str(), parents)
++    }));
+     entries
+         .iter()
+         .zip(layout)
