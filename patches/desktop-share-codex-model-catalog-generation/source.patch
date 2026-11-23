@@ -1,0 +1,106 @@
+diff --git a/src/ui/chat/codex/mod.rs b/src/ui/chat/codex/mod.rs
+index bb1b69c8912efbfa2d3044b37ac76b57a7bb288b..878447a29ec4cbe2d9f7138647457f6ed8d5240b 100644
+--- a/src/ui/chat/codex/mod.rs
++++ b/src/ui/chat/codex/mod.rs
+@@ -68,7 +68,7 @@
+ impl Chat {
+     pub(in crate::ui) fn new_codex(
+         opened: Opened,
+-        models: Vec<Model>,
++        models: std::sync::Arc<[Model]>,
+         is_new: bool,
+         workspace: WeakEntity<crate::ui::workspace::Workspace>,
+         extras: ComposerExtras,
+@@ -106,7 +106,7 @@
+         };
+         chat.codex = Some(Binding {
+             handle,
+-            models: models.into(),
++            models,
+             model,
+             effort,
+             pending: vec![],
+diff --git a/src/ui/chats/codex.rs b/src/ui/chats/codex.rs
+index 46e6fe1db6397eaaf80dda52efa8a59668dc1e17..625958cb8f584ca03fc0d56af2f2cf1429947074 100644
+--- a/src/ui/chats/codex.rs
++++ b/src/ui/chats/codex.rs
+@@ -1,6 +1,6 @@
+ //! Codex lifecycle uses native opaque thread IDs; the Chat view is shared.
+ use super::*;
+-use crate::agents::codex::Opened;
++use crate::agents::codex::{Model, Opened};
+ 
+ impl Workspace {
+     pub(in crate::ui) fn refresh_codex_sessions(&mut self, cx: &mut Context<Self>) {
+@@ -105,6 +105,14 @@
+         .detach();
+     }
+ 
++    pub(in crate::ui) fn replace_codex_models(&mut self, models: Vec<Model>) {
++        self.codex_models = if models.is_empty() {
++            Default::default()
++        } else {
++            models.into()
++        };
++    }
++
+     pub(in crate::ui) fn insert_codex_chat(
+         &mut self,
+         opened: Opened,
+@@ -147,7 +155,7 @@
+                 Ok((service.new_thread(&project)?, models))
+             },
+             move |this, (opened, models), window, cx| {
+-                this.codex_models = models;
++                this.replace_codex_models(models);
+                 if this.finish_chat_creation(&creation, &requested_layout) {
+                     let key = ChatKey::Codex(opened.handle.thread_id().to_owned());
+                     this.select_chat_space(&key, cx);
+@@ -203,7 +211,7 @@
+                         return this.fail_chat_resume(&id, format!("Codex: {error:#}"), cx);
+                     }
+                 };
+-                this.codex_models = models;
++                this.replace_codex_models(models);
+                 let id = this.insert_codex_chat(opened, false, window, cx);
+                 this.finish_chat_resume(&id, open, window, cx);
+             },
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index f08d71fe23f127733036447cda961d83333b37a8..b7fc55e6dc8db7a43f780defd7deca37fece16a4 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -2,6 +2,7 @@
+ use std::collections::{HashMap, HashSet};
+ use std::path::PathBuf;
+ use std::rc::Rc;
++use std::sync::Arc;
+ use std::time::Instant;
+ 
+ use crate::conversations::ConversationSummary;
+@@ -53,7 +54,7 @@
+     target: Target,
+     pub(super) codex_catalog_loading: bool,
+     pub(super) codex_catalogs: HashMap<PathBuf, crate::agents::codex::CatalogCursor>,
+-    pub(super) codex_models: Vec<crate::agents::codex::Model>,
++    pub(super) codex_models: Arc<[crate::agents::codex::Model]>,
+     pub(super) layout: TabLayout,
+     pub(super) spaces: ChatSpaces,
+     parked_spaces: HashMap<Option<String>, spaces::SpaceViews>,
+@@ -259,7 +260,7 @@
+             target,
+             codex_catalog_loading: false,
+             codex_catalogs: HashMap::new(),
+-            codex_models: Vec::new(),
++            codex_models: Default::default(),
+             layout,
+             spaces,
+             parked_spaces: HashMap::new(),
+@@ -332,7 +333,7 @@
+                 if let Some(service) = boot.codex {
+                     self.windows.set_codex(service, cx);
+                 }
+-                self.codex_models = boot.codex_models;
++                self.replace_codex_models(boot.codex_models);
+                 self.startup_streams = boot.streams;
+                 self.sessions = boot.sessions;
+                 self.session_projects = boot.projects;
