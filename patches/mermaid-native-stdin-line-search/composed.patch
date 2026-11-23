@@ -1,0 +1,14 @@
+--- a/packages/mermaid-render/worker.mjs
++++ b/packages/mermaid-render/worker.mjs
+@@ -66,8 +66,9 @@
+   let pending = Buffer.alloc(0);
+   for await (const chunk of process.stdin) {
+     let start = 0;
+-    for (let end = 0; end < chunk.length; end++) {
+-      if (chunk[end] !== 10) continue;
++    while (start < chunk.length) {
++      const end = chunk.indexOf(10, start);
++      if (end < 0) break;
+       if (pending.length + end - start > MAX_REQUEST) throw new Error('worker request is too large');
+       reply(pending.length
+         ? (end === start ? pending : Buffer.concat([pending, chunk.subarray(start, end)])).toString('utf8')
