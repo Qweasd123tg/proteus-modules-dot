@@ -1,0 +1,28 @@
+diff --git a/crates/proteus-core/src/core/assembly/mod.rs b/crates/proteus-core/src/core/assembly/mod.rs
+index 04dd96a38d071d0be9378b3931ecec21b5dd7e72..e7218d76805468b9526bece8fdd7bf817f2f4f05 100644
+--- a/crates/proteus-core/src/core/assembly/mod.rs
++++ b/crates/proteus-core/src/core/assembly/mod.rs
+@@ -89,6 +89,6 @@
+                 let component_id = module_id.as_ref().and_then(|id| {
+                     export_components
+-                        .get(&(slot_id.to_owned(), id.clone()))
+-                        .cloned()
++                        .get(&(slot_id, id.as_str()))
++                        .map(|&owner| owner.to_owned())
+                 });
+                 AssemblySlotPlan {
+@@ -276,12 +276,9 @@
+ }
+ 
+-fn configured_export_components(config: &AppConfig) -> BTreeMap<(String, String), String> {
++fn configured_export_components(config: &AppConfig) -> BTreeMap<(&str, &str), &str> {
+     let mut components = BTreeMap::new();
+     for (component_id, component) in &config.components {
+         for (slot, module_id, _) in component.exports() {
+-            components.insert(
+-                (slot.to_owned(), module_id.to_owned()),
+-                component_id.clone(),
+-            );
++            components.insert((slot, module_id), component_id.as_str());
+         }
+     }
