@@ -1,0 +1,18 @@
+diff --git a/scripts/portable/proteus-native b/scripts/portable/proteus-native
+index e02c655..6ce3c38 100755
+--- a/scripts/portable/proteus-native
++++ b/scripts/portable/proteus-native
+@@ -17,7 +17,12 @@ bundled="${here}/share/configs"
+ 
+ mkdir -p "${configs}"
+ for source in "${bundled}"/*; do
+-  name=$(basename "${source}")
++  name=${source##*/}
++  # Keep command substitution's historical trimming for LF-ending names.
++  case "${name}" in
++    *'
++') name=$(basename "${source}") ;;
++  esac
+   target="${configs}/${name}"
+   if [ -d "${source}" ]; then
+     # Same folder when configs is a symlink to the bundled copy.
