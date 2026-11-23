@@ -1,0 +1,42 @@
+diff --git a/scripts/settings-migration.py b/scripts/settings-migration.py
+index 8c3f645..514bd71 100755
+--- a/scripts/settings-migration.py
++++ b/scripts/settings-migration.py
+@@ -332,11 +332,33 @@ def upgrade_storage(args):
+     apply_settings(settings_state_dir(args, home), updated, args.dry_run, action='update')
+ 
+ 
++def _changed_settings(data_by_path):
++    buffer = None
++    prepared = []
++    for path, data in data_by_path.items():
++        if not path.exists():
++            prepared.append((path, data))
++            continue
++        with path.open('rb') as stream:
++            if buffer is None:
++                buffer = memoryview(bytearray(64 * 1024))
++            desired = memoryview(data)
++            length = 0
++            matches = True
++            while count := stream.readinto(buffer):
++                end = length + count
++                if matches and buffer[:count] != desired[length:end]:
++                    matches = False
++                length = end
++            # A mismatch does not stop the read before EOF: a later I/O
++            # failure must still prevent the whole batch from being written.
++        if not matches or length != len(data):
++            prepared.append((path, data))
++    return prepared
++
++
+ def apply_settings(state_dir, data_by_path, dry_run, action='restore'):
+-    prepared = [
+-        (path, data) for path, data in data_by_path.items()
+-        if not path.exists() or path.read_bytes() != data
+-    ]
++    prepared = _changed_settings(data_by_path)
+     for path, _ in prepared:
+         regular_path(path)
+     if dry_run:
