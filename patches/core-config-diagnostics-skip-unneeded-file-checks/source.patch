@@ -1,0 +1,28 @@
+diff --git a/crates/proteus-core/src/core/config/files.rs b/crates/proteus-core/src/core/config/files.rs
+index 0410b99e974a9f85bfc0efbc51257755b11cde89..e224c7e79ed5d5dd3345df10d50e48da689f6525 100644
+--- a/crates/proteus-core/src/core/config/files.rs
++++ b/crates/proteus-core/src/core/config/files.rs
+@@ -7,17 +7,17 @@
+     };
+     let path = super::physical_config_path(path);
+     if path.is_file() {
+-        return vec![path.to_path_buf()];
++        return vec![path];
+     }
+     let mut files = Vec::new();
+     if let Ok(entries) = std::fs::read_dir(&path) {
+         for entry in entries.flatten() {
+             let path = entry.path();
+-            if path.is_file()
+-                && path
+-                    .extension()
+-                    .and_then(|extension| extension.to_str())
+-                    .is_some_and(|extension| matches!(extension, "toml" | "json"))
++            if path
++                .extension()
++                .and_then(|extension| extension.to_str())
++                .is_some_and(|extension| matches!(extension, "toml" | "json"))
++                && path.is_file()
+             {
+                 files.push(path);
+             }
