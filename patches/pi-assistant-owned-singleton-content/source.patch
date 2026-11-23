@@ -1,0 +1,14 @@
+--- a/components/pi-runtime-js/messages.mjs
++++ b/components/pi-runtime-js/messages.mjs
+@@ -103,9 +103,10 @@
+ 
+ export function assistant(response, model) {
+     const items = piMessages(response.messages, model);
++    const singleContent = items.length === 1 ? items[0]?.content : undefined;
+     return {
+         role: "assistant",
+-        content: items.flatMap((m) => m.content),
++        content: Array.isArray(singleContent) ? singleContent : items.flatMap((m) => m.content),
+         usage: usage(response.usage),
+         api: model.api,
+         provider: model.provider,
