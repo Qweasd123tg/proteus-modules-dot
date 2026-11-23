@@ -1,0 +1,63 @@
+#![allow(dead_code)]
+pub use proteus_contracts::{contracts,domain,model_standard};
+use anyhow::Result;
+use async_trait::async_trait;
+use contracts::{Model,ModelEventStream};
+use domain::{ModelRef,new_part_id};
+use model_standard::*;
+use std::{future::Future,pin::Pin,sync::{Arc,atomic::{AtomicBool,Ordering}},task::{Context,Poll}};
+
+#[path=MODEL_FILE]
+mod service;
+#[path=ALLOC_FILE]
+mod alloc;
+
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+enum Mode { Some, Pending, None, Duplicate, Unknown }
+struct Fixture { mode:Mode, ptr:usize,len:usize, entered: AtomicBool,same: AtomicBool }
+#[async_trait]
+impl Model for Fixture {
+    fn id(&self)->std::borrow::Cow<'static,str>{"sizer".into()}
+    fn capabilities(&self,_:&ModelRef)->Result<ModelCapabilities>{Ok(ModelCapabilities::empty())}
+    async fn stream(&self,_:CanonicalModelRequest)->Result<ModelEventStream>{panic!("estimate cannot invoke inference")}
+    async fn estimate_input(&self,req:ModelInputEstimateRequest)->Result<Option<ModelInputEstimate>>{
+        self.entered.store(true,Ordering::SeqCst);
+        let ContentPart::Opaque{data,..}=&req.parts[0].payload else {panic!("not opaque")};
+        let source=data.as_str().unwrap(); assert_eq!(source.len(),self.len); assert!(source.bytes().all(|b|b==b'x'));
+        self.same.store(self.ptr==source.as_ptr() as usize,Ordering::SeqCst);
+        let id=req.parts[0].part_id; drop(req);
+        let row=ModelPartTokenEstimate{part_id:id,tokens:0};
+        Ok(match self.mode {
+            Mode::Some => Some(ModelInputEstimate{parts:vec![row]}),
+            Mode::Duplicate => Some(ModelInputEstimate{parts:vec![row.clone(),row]}),
+            Mode::Unknown => Some(ModelInputEstimate{parts:vec![ModelPartTokenEstimate{part_id:new_part_id(),tokens:0}]}),
+            Mode::None =>None, Mode::Pending=>std::future::pending().await,
+        })
+    }
+}
+fn main() {
+    for (size,mode) in [(1024,Mode::Some),(1048576,Mode::Some),(8388608,Mode::Some),(8388608,Mode::Pending),(1024,Mode::None),(1024,Mode::Duplicate),(1024,Mode::Unknown)] {
+        let source="x".repeat(size);
+        let fixture=Arc::new(Fixture{mode,ptr:source.as_ptr() as usize,len:size,entered:false.into(),same:false.into()});
+        let model=service::ModelService::new(fixture.clone());
+        let req=ModelInputEstimateRequest{model:ModelRef::new("sizer","fixture"),parts:CanonicalMessage::new(MessageRole::Assistant,vec![ContentPart::Opaque{format:"fixture".into(),data:serde_json::Value::String(source)}]).parts};
+        let id=req.parts[0].part_id;
+        let mut fut=model.estimate_input(req); let mut cx=Context::from_waker(futures_util::task::noop_waker_ref());
+        let (result,count)=alloc::measure(||Pin::new(&mut fut).poll(&mut cx));
+        match mode{
+            Mode::Pending=>assert!(result.is_pending()),
+            Mode::Some=>assert!(matches!(result,Poll::Ready(Ok(Some(v))) if v.parts==vec![ModelPartTokenEstimate{part_id:id,tokens:0}])),
+            Mode::None=>assert!(matches!(result,Poll::Ready(Ok(None)))),
+            Mode::Duplicate|Mode::Unknown=>assert!(matches!(result,Poll::Ready(Err(e)) if e.to_string()=="input estimate contains an unknown or duplicate part id")),
+        }
+        assert!(fixture.entered.load(Ordering::SeqCst));
+        println!("width={} mode={:?} alloc_bytes={} alloc_calls={} moved={}",size,mode,count.bytes,count.calls,fixture.same.load(Ordering::SeqCst));
+    }
+    let fixture=Arc::new(Fixture{mode:Mode::Some,ptr:0,len:0,entered:false.into(),same:false.into()});
+    let model=service::ModelService::new(fixture.clone());
+    let invalid=ModelInputEstimateRequest{model:ModelRef::new("sizer","fixture"),parts:CanonicalMessage::text(MessageRole::User,"text").parts};
+    let mut fut=model.estimate_input(invalid);
+    let mut cx=Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(matches!(Pin::new(&mut fut).poll(&mut cx),Poll::Ready(Err(e)) if e.to_string()=="input estimate requires unique canonical opaque parts"));
+    assert!(!fixture.entered.load(Ordering::SeqCst)); println!("invalid request rejected before dispatch");
+}
