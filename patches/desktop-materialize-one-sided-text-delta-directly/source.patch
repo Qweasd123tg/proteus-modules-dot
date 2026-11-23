@@ -1,0 +1,67 @@
+diff --git a/src/transcript/text_run.rs b/src/transcript/text_run.rs
+index 1061f2221ef432e4bab1488673d2276beb2091f7..b622b00ede37abd3276c683226cdd469c40166d5 100644
+--- a/src/transcript/text_run.rs
++++ b/src/transcript/text_run.rs
+@@ -188,7 +188,9 @@
+         }
+         #[cfg(test)]
+         {
+-            self.text_work.prior_row_prefix_bytes += edit.keep;
++            if !edit.tail.is_empty() {
++                self.text_work.prior_row_prefix_bytes += edit.keep;
++            }
+             self.text_work.delta_row_replacements += 1;
+         }
+         let text = edit.finish();
+@@ -254,6 +256,12 @@
+ 
+     fn finish(self) -> std::sync::Arc<str> {
+         let length = self.keep.checked_add(self.tail.len()).expect("text length");
++        if self.keep == 0 {
++            return self.tail.as_str().into();
++        }
++        if self.tail.is_empty() {
++            return (&self.base[..self.keep]).into();
++        }
+         let mut text = String::with_capacity(length);
+         text.push_str(&self.base[..self.keep]);
+         text.push_str(&self.tail);
+diff --git a/src/transcript/text_run/tests.rs b/src/transcript/text_run/tests.rs
+index 6c31bcdc06a15fc1a43b1d194a95b3aae2d32a00..4938d93544bde27a1849293d979a3dc94a130927 100644
+--- a/src/transcript/text_run/tests.rs
++++ b/src/transcript/text_run/tests.rs
+@@ -355,6 +355,34 @@
+ }
+ 
+ #[test]
++fn one_span_finish_keeps_fresh_arc_and_skips_intermediate_prefix_copy() {
++    let base = "éa";
++    for (operations, expected_text, prefix_bytes) in [
++        ([(3, ""), (3, "")], "éa", 0),
++        ([(2, ""), (2, "")], "é", 0),
++        ([(0, "éa"), (3, "")], "éa", 0),
++        ([(0, ""), (0, "")], "", 0),
++        ([(2, "b"), (3, "")], "éb", 2),
++    ] {
++        let events = operations
++            .into_iter()
++            .enumerate()
++            .map(|(i, (offset, text))| event(offset, text, i as i64 + 11))
++            .collect::<Vec<_>>();
++        let mut actual = fixture(Some(base));
++        let mut expected = fixture(Some(base));
++        let old = actual.entries[1].text.clone();
++        let changes = apply_oracle(&mut expected, &events);
++        let outcome = actual.apply_text_run(&run(&events));
++        assert_eq!(outcome.changes.as_slice(), changes);
++        assert_transcript(&actual, &expected);
++        assert_eq!(&*actual.entries[1].text, expected_text);
++        assert!(!std::sync::Arc::ptr_eq(&old, &actual.entries[1].text));
++        assert_eq!(actual.take_text_work().prior_row_prefix_bytes, prefix_bytes);
++    }
++}
++
++#[test]
+ fn work_budget_for_adjacent_appends() {
+     let base = "p".repeat(4096);
+     let text = "d".repeat(64);
