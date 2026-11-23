@@ -1,0 +1,7 @@
+# Analysis: reuse a tight single visible part
+
+After Analysis renders and filters message parts, the old tail joins the visible strings with a newline. When exactly one nonempty string is visible and its buffer has no spare capacity, return that string by ownership instead of copying its bytes through the join. The existing join is still used for multiple visible strings or a singleton with spare capacity. With no visible strings, the original whole-message fallback still runs. This leaves the early raw Text shortcut, part conversion, ordering and output bytes unchanged.
+
+OpenCode emits each completed tool result as a canonical Tool message with one raw part. Analysis renders these recorded request messages regardless of disclosure state. For the three synthetic tool result fixture bodies of 3,283, 19,471 and 44,475 bytes, the final result reused the exact formatted string pointer and capacity in both source tiers. This removes the final singleton join copy only; it does not eliminate the initial formatting, collection, later answer/node serialization, or any other allocation.
+
+Verified on exact Extensions stock `923077d3` and the same source after #532. One independently applicable patch; apply it once. Paired Rust 1.95 tests ran in debug and optimized mode, seven per pair per mode. They ran exact source-extracted functions against a synthetic typed value bridge, not the real Serde/Analysis/SDK package or Desktop. No timing or allocator measurements.

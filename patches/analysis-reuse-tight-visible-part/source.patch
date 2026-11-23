@@ -1,0 +1,23 @@
+diff --git a/packages/analysis/src/text.rs b/packages/analysis/src/text.rs
+index 42fc9547fa0dbb8eb95e6f7baa5ad4defb5b0563..480b0936cea428efbd61f53f6f5349b5997f5ce3 100644
+--- a/packages/analysis/src/text.rs
++++ b/packages/analysis/src/text.rs
+@@ -180,10 +180,14 @@
+         .map(|part| part_text(part.at("payload")))
+         .filter(|text| !text.is_empty())
+         .collect();
+-    if parts.is_empty() {
+-        pretty(message)
+-    } else {
+-        parts.join("\n")
++    join_visible(parts).unwrap_or_else(|| pretty(message))
++}
++
++fn join_visible(mut parts: Vec<String>) -> Option<String> {
++    match parts.as_slice() {
++        [] => None,
++        [part] if part.len() == part.capacity() => parts.pop(),
++        _ => Some(parts.join("\n")),
+     }
+ }
+ 
