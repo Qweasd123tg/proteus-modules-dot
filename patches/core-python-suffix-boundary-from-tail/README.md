@@ -1,0 +1,9 @@
+# Core: find the Python suffix compaction boundary from the end
+
+This patch changes the optional `python_suffix` example, not the default native or Pi compactor. After the same complete input validation, it finds the required number of qualifying user turns by scanning backward, without storing every matching index or recounting the retained user turns. It uses the same user and request-only context predicates. The returned message references, order, skipped reasons, summary, and metadata are unchanged.
+
+`source.patch` targets Core `b2d2e6dedf0ea423b5f149c12ef98b8a0de01b14`. The `prepare.py` Git blob changes from `3afaeeb40818e3221d02c170f91c8e031fd5943a` to `5cdfc917fb2ae5a3c8aebc207b12e45ddc68294d`. Check with `git apply --check --whitespace=error source.patch` from the pinned Core checkout before applying. The patch does not change the Python component harness or any Core contract/configuration.
+
+The direct Python proof loads the exact stock and patched functions with the same pinned helper and calls `compact()` only. It verifies output bytes and retained object references, request-only and mixed/empty scopes, precise boundary and skip reasons, and unchanged validation errors. For alternating 50,000 synthetic rows at retain=2, the original collects 25,000 user indices; its user predicate runs 50,003 times versus 3 on the candidate. Full validation and the context-prefix scan still happen. These are structural counts, not timings, PSS, Core integration, SDK, worker, or provider measurements.
+
+To reproduce, put the two pinned Python files from `SOURCE-PROVENANCE.json` under sibling `stock/` with their repository-relative paths; duplicate them as `candidate/` and apply only `source.patch` there. The proof checks both source blob identities before each import. Run `python3 -I -B packet/proof.py` with assertions enabled. `proof-result.json` records the actual bounded-scope run.
