@@ -1,0 +1,17 @@
+diff --git a/packages/markdown-render/src/plain.rs b/packages/markdown-render/src/plain.rs
+index 37a30ecd9f65c8115dc82bb1f6c58ff4d31947e6..167f6524452ee998c26893e2a8cab2ffa932c76a 100644
+--- a/packages/markdown-render/src/plain.rs
++++ b/packages/markdown-render/src/plain.rs
+@@ -13,9 +13,11 @@
+     for range in links {
+         escape(&source[cursor..range.start], &mut html);
+         html.push_str("<a href=\"");
++        let escaped_start = html.len();
+         escape(&source[range.clone()], &mut html);
++        let escaped_end = html.len();
+         html.push_str("\">");
+-        escape(&source[range.clone()], &mut html);
++        html.extend_from_within(escaped_start..escaped_end);
+         html.push_str("</a>");
+         cursor = range.end;
+     }
