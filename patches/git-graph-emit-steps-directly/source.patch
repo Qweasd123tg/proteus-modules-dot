@@ -1,0 +1,71 @@
+diff --git a/packages/git/src/graph.rs b/packages/git/src/graph.rs
+index a443d3dc918a89684b1076e784c8f2324b8e995b..d7ba70d5b07e139687f2d40983d06c9f2374a36e 100644
+--- a/packages/git/src/graph.rs
++++ b/packages/git/src/graph.rs
+@@ -289,10 +289,27 @@
+     kind: Curve,
+ }
+ 
+-fn steps(line: &Line, end: usize) -> Vec<Step> {
++struct StepSink<F> {
++    pending: Option<Step>,
++    emit: F,
++}
++
++impl<F: FnMut(Step)> StepSink<F> {
++    fn push(&mut self, step: Step) {
++        // Only the latest pass can still bend farther on the same row.
++        if let Some(previous) = self.pending.replace(step) {
++            (self.emit)(previous);
++        }
++    }
++}
++
++fn steps(line: &Line, end: usize, emit: impl FnMut(Step)) {
+     let (mut row, mut column) = (line.start, line.child_column);
+-    let mut steps: Vec<Step> = Vec::new();
+-    let straight = |steps: &mut Vec<Step>, row: &mut usize, column: usize, to_row: usize| {
++    let mut steps = StepSink {
++        pending: None,
++        emit,
++    };
++    let straight = |steps: &mut StepSink<_>, row: &mut usize, column: usize, to_row: usize| {
+         while *row < to_row.min(end) {
+             steps.push(Step {
+                 row: *row,
+@@ -310,7 +327,7 @@
+                 to_column, on_row, ..
+             } if row >= on_row => {
+                 // Moves sideways on the row it already reached: the last pass bends further.
+-                if let Some(step) = steps.last_mut() {
++                if let Some(step) = steps.pending.as_mut() {
+                     step.to = to_column;
+                 }
+                 column = to_column;
+@@ -337,12 +354,15 @@
+             }
+         }
+     }
+-    steps
++    if let Some(step) = steps.pending {
++        (steps.emit)(step);
++    }
+ }
+ 
+ fn draw(rows: &mut [Row], line: &Line) {
+     let color = line.color;
+-    for step in steps(line, rows.len()) {
++    let end = rows.len();
++    steps(line, end, |step| {
+         // A merge bends right below its commit, a checkout right above the parent.
+         let (down, up) = match step.kind {
+             Curve::Merge => ((step.from, step.to), (step.to, step.to)),
+@@ -350,7 +370,7 @@
+         };
+         put(rows, step.row, false, down.0, down.1, color);
+         put(rows, step.row + 1, true, up.0, up.1, color);
+-    }
++    });
+ }
+ 
+ /// Rows of commits listed newest first, each with the hashes of its parents.
