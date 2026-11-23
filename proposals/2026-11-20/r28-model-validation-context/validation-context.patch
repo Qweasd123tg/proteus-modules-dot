@@ -1,0 +1,74 @@
+diff --git a/crates/proteus-core/src/core/model_service.rs b/crates/proteus-core/src/core/model_service.rs
+index e4cc2755ba0534b09ccff3928cd36ec788d273ed..0bd344c628ba5a58038a108e647940ba5f93a412 100644
+--- a/crates/proteus-core/src/core/model_service.rs
++++ b/crates/proteus-core/src/core/model_service.rs
+@@ -8,8 +8,8 @@ use crate::{
+     contracts::{Model, ModelEventStream},
+     domain::{ModelRef, ToolSpec},
+     model_standard::{
+-        CanonicalModelRequest, ModelCapabilities, ModelStreamEvent, RequestShaper,
+-        validate_model_response_against_request,
++        CanonicalModelRequest, ModelCapabilities, ModelResponseValidationContext, ModelStreamEvent,
++        RequestShaper,
+     },
+ };
+ 
+@@ -82,15 +82,15 @@ impl Model for ModelService {
+ 
+     async fn stream(&self, request: CanonicalModelRequest) -> Result<ModelEventStream> {
+         let request = self.prepare_request(request)?;
+-        let validation_request = request.clone();
++        let validation = ModelResponseValidationContext::from_request(&request).into_owned();
+         let stream = self.start_prepared(request).await?;
+-        Ok(validating_stream(stream, validation_request))
++        Ok(validating_stream(stream, validation))
+     }
+ }
+ 
+ fn validating_stream(
+     mut stream: ModelEventStream,
+-    validation_request: CanonicalModelRequest,
++    validation: ModelResponseValidationContext<'static>,
+ ) -> ModelEventStream {
+     Box::pin(async_stream::try_stream! {
+         let mut terminal_seen = false;
+@@ -98,7 +98,7 @@ fn validating_stream(
+             let event = item?;
+             match &event {
+                 ModelStreamEvent::Response { response } => {
+-                    validate_model_response_against_request(&validation_request, response)
++                    validation.validate_response(response)
+                         .map_err(|error| anyhow!("model protocol error: {error}"))?;
+                     terminal_seen = true;
+                     yield event;
+diff --git a/crates/proteus-core/src/core/prompt_replay.rs b/crates/proteus-core/src/core/prompt_replay.rs
+index 172d5a444a277ecb3344f57b8ec78c0b51262d48..64c535d0b5c2b0ca493e20d16d99048c68ce0bbb 100644
+--- a/crates/proteus-core/src/core/prompt_replay.rs
++++ b/crates/proteus-core/src/core/prompt_replay.rs
+@@ -14,8 +14,8 @@ use crate::{
+     core::{JournalEntry, ModelResponseOutcome, SessionStore},
+     domain::{ExchangeId, ExecutionId, ModelRef, SessionId, ThreadId, ToolSurface, TurnId},
+     model_standard::{
+-        CanonicalModelRequest, CanonicalModelResponse, ContentPart, ModelStreamEvent, TokenUsage,
+-        validate_model_response_against_request,
++        CanonicalModelRequest, CanonicalModelResponse, ContentPart, ModelResponseValidationContext,
++        ModelStreamEvent, TokenUsage,
+     },
+ };
+ 
+@@ -265,12 +265,13 @@ async fn invoke_model(
+     model: Arc<dyn Model>,
+     request: CanonicalModelRequest,
+ ) -> Result<CanonicalModelResponse> {
+-    let validation_request = request.clone();
++    let validation = ModelResponseValidationContext::from_request(&request).into_owned();
+     let mut stream = model.stream(request).await?;
+     while let Some(event) = stream.next().await {
+         match event? {
+             ModelStreamEvent::Response { response } => {
+-                validate_model_response_against_request(&validation_request, &response)
++                validation
++                    .validate_response(&response)
+                     .map_err(|error| anyhow!("invalid replay model response: {error}"))?;
+                 return Ok(response);
+             }
