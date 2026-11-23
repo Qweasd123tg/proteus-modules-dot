@@ -1,0 +1,28 @@
+diff --git a/packages/analysis/src/text.rs b/packages/analysis/src/text.rs
+index 42fc9547fa0dbb8eb95e6f7baa5ad4defb5b0563..306ed20a0816ca5938332597c378d03067c3dc4c 100644
+--- a/packages/analysis/src/text.rs
++++ b/packages/analysis/src/text.rs
+@@ -115,6 +115,12 @@
+     }
+ }
+ 
++fn tool_result_text(call_id: &str, output: &str) -> String {
++    let output = output.trim_end();
++    let separator = if output.is_empty() { ":" } else { ":\n" };
++    ["Результат ", call_id, separator, output].concat()
++}
++
+ fn part_text(part: &Value) -> String {
+     let (name, body) = match part.as_object() {
+         Some(map) if map.len() == 1 => map
+@@ -142,9 +148,7 @@
+                 .into_iter()
+                 .find(|value| value.truthy());
+             let output = output.map(plain).unwrap_or_default();
+-            format!("Результат {}:\n{output}", get(result, "call_id", ""))
+-                .trim_end()
+-                .to_owned()
++            tool_result_text(&get(result, "call_id", ""), &output)
+         }
+         "FileRef" => {
+             let content = body.at("content");
