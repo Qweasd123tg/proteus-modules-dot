@@ -1,0 +1,17 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 743564f70b10af9e25b71192bc5f0b641e9114ae..641d523fe1d2f98d1e44a65a213e8438f3738238 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -78,6 +78,9 @@
+ function declarations(style) {
+-  return style.split(';').flatMap(declaration => {
++  const entries = [];
++  if (style === '') return entries;
++  for (const declaration of style.split(';')) {
+     const separator = declaration.indexOf(':');
+-    return separator < 0 ? [] : [[declaration.slice(0, separator).trim(), declaration.slice(separator + 1).trim()]];
+-  });
++    if (separator >= 0) entries.push([declaration.slice(0, separator).trim(), declaration.slice(separator + 1).trim()]);
++  }
++  return entries;
+ }
