@@ -1,0 +1,32 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -269,17 +269,16 @@
+ 
+ pub(super) fn valid_section(section: &Section) -> bool {
+     section.pages.len() <= MAX_PAGES
+-        && section.pages.iter().all(|page| {
+-            (1..=PAGE_ROWS).contains(&page.rows)
+-                && page.bytes <= SESSION_STORAGE_MAX_CACHE_BYTES
+-                && (page.bytes <= NORMAL_PAGE_BYTES || page.rows == 1)
+-                && page.hash.len() == 64
+-                && page.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+-        })
+-        && section
+-            .pages
+-            .iter()
+-            .try_fold(0usize, |rows, page| rows.checked_add(page.rows))
+-            == Some(section.rows)
++        && section.pages.iter().try_fold(0usize, |rows, page| {
++            if !(1..=PAGE_ROWS).contains(&page.rows)
++                || page.bytes > SESSION_STORAGE_MAX_CACHE_BYTES
++                || (page.bytes > NORMAL_PAGE_BYTES && page.rows != 1)
++                || page.hash.len() != 64
++                || !page.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
++            {
++                return None;
++            }
++            rows.checked_add(page.rows)
++        }) == Some(section.rows)
+         && packs::valid_spans(section)
+ }
