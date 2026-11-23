@@ -1,0 +1,33 @@
+--- a/model/opencode-provider/response.mjs
++++ b/model/opencode-provider/response.mjs
+@@ -47,6 +47,7 @@
+ export class NativeResponseCollector {
+     #seenText = false;
+     #seenReasoning = false;
++    #lastBlock;
+ 
+     constructor(messageId) {
+         this.messageId = messageId;
+@@ -61,12 +62,16 @@
+ 
+     block(event, type) {
+         if (typeof event.id !== 'string' || !event.id) throw malformed('Native content block lacks an id');
+-        const key = `${type}:${event.id}`;
+-        let block = this.blocks.get(key);
+-        if (!block) {
+-            block = { type, id: event.id, text: '', partId: randomUUID() };
+-            this.blocks.set(key, block);
+-            this.parts.push(block);
++        let block = this.#lastBlock;
++        if (!block || block.type !== type || block.id !== event.id) {
++            const key = `${type}:${event.id}`;
++            block = this.blocks.get(key);
++            if (!block) {
++                block = { type, id: event.id, text: '', partId: randomUUID() };
++                this.blocks.set(key, block);
++                this.parts.push(block);
++            }
++            this.#lastBlock = block;
+         }
+         if (event.providerMetadata !== undefined) block.providerMetadata = event.providerMetadata;
+         return block;
