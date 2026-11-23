@@ -1,0 +1,19 @@
+diff --git a/scripts/portable/proteus-native b/scripts/portable/proteus-native
+index e02c655..26e5986 100755
+--- a/scripts/portable/proteus-native
++++ b/scripts/portable/proteus-native
+@@ -17,3 +17,6 @@ bundled="${here}/share/configs"
+ 
+-mkdir -p "${configs}"
++# Keep option-like operands on the legacy mkdir path, even if they exist.
++if [ "${configs#-}" != "${configs}" ] || [ ! -d "${configs}" ]; then
++  mkdir -p "${configs}"
++fi
+ for source in "${bundled}"/*; do
+@@ -24,3 +27,5 @@ for source in "${bundled}"/*; do
+     if [ ! "${source}" -ef "${target}" ]; then
+-      mkdir -p "${target}"
++      if [ "${target#-}" != "${target}" ] || [ ! -d "${target}" ]; then
++        mkdir -p "${target}"
++      fi
+       cp -R --update=none "${source}/." "${target}/"
