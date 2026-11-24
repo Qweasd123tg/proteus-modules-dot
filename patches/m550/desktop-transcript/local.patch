@@ -1,0 +1,24 @@
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -94,2 +94,3 @@
+         let mut entries = Vec::with_capacity(messages.len());
++        let mut local_rows = old.as_slice();
+         for (index, message) in messages.into_iter().enumerate() {
+@@ -125,3 +126,3 @@
+                 let mut entry = self.entry_from_with_text(message, role, None);
+-                entry.time = entry.time.or_else(|| local_time_of(&old, &entry));
++                entry.time = entry.time.or_else(|| local_time_of(&mut local_rows, &entry));
+                 entry
+@@ -595,3 +596,11 @@
+ /// the sent message comes back in the snapshot with its id.
+-fn local_time_of(old: &[Entry], entry: &Entry) -> Option<i64> {
++fn local_time_of(old: &mut &[Entry], entry: &Entry) -> Option<i64> {
++    // A suffix with no provisional timestamps cannot serve any lookup in this
++    // reset. Forget it once, without indexing or hashing message bodies.
++    while let Some((last, rest)) = old.split_last() {
++        if last.message_id.is_none() && last.time.is_some() {
++            break;
++        }
++        *old = rest;
++    }
+     old.iter()
