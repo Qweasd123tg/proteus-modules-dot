@@ -1,0 +1,45 @@
+--- a/crates/proteus-session-semantics/src/journal/projection/facts.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+@@ -355,7 +355,7 @@
+                     && let Some(index) = self.capture_tool_result(&tool.result)?
+                 {
+                     self.history_revision = self.history_revision.saturating_add(1);
+-                    self.check_active_ids(None)?;
++                    self.check_captured_active_ids(index)?;
+                     Self::validate_part_id_stability(
+                         &mut self.known_parts,
+                         &self.history[index..index + 1],
+@@ -384,7 +384,7 @@
+                     for result in pending {
+                         if let Some(index) = self.capture_tool_result(result)? {
+                             self.history_revision = self.history_revision.saturating_add(1);
+-                            self.check_active_ids(None)?;
++                            self.check_captured_active_ids(index)?;
+                             Self::validate_part_id_stability(
+                                 &mut self.known_parts,
+                                 &self.history[index..index + 1],
+--- a/crates/proteus-session-semantics/src/journal/projection/active_ids.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/active_ids.rs
+@@ -13,6 +13,22 @@
+ }
+ 
+ impl JournalValidationState {
++    pub(super) fn check_captured_active_ids(&mut self, index: usize) -> Result<()> {
++        // A collision needs the original ordered scan to report its exact row.
++        // An aliased index must not be mutated or copied for this fast path.
++        if let Some(message) = self.history.get(index)
++            && let [part] = message.parts.as_slice()
++            && let Some(ids) = self.active_ids.as_mut().and_then(Arc::get_mut)
++            && !ids.messages.contains(&message.id)
++            && !ids.parts.contains(&part.part_id)
++        {
++            ids.messages.insert(message.id);
++            ids.parts.insert(part.part_id);
++            return Ok(());
++        }
++        self.check_active_ids(None)
++    }
++
+     pub(super) fn check_active_ids(&mut self, appended: Option<usize>) -> Result<()> {
+         // Take the index before checking. A rejected mutation can leave the
+         // history invalid; the next operation must then check the whole history.
