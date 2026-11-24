@@ -1,0 +1,40 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index f8425049fa8203200a2ed18e7f2a7d947268ee43..37aa9571beabd60566d6a3f8007dad9ff79ba750 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -154,7 +154,7 @@
+ ) -> Option<String> {
+     // Only the latest projection appends to this index. Keep one copy even
+     // when old revisions still serve their immutable display pages.
+-    let value = bounded_value(&prefix.encode_cache()?)?;
++    let value = prefix.encode_cache()?.into_bounded_value()?;
+     let digest = hash(&value)?;
+     write_value(store, source, PREFIX, value)?;
+     Some(digest)
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+index 92c1b89e2658bf2e93913d9dcb97b6ccc61e0137..7505790a193c9b49c05b01373b894b663ac74e7d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+@@ -17,6 +17,22 @@
+     // Each 17-byte record is UUID plus a strict 0/1 explicit membership flag.
+     parts: String,
+     calls: C,
++}
++
++impl<C: Serialize> Packed<C> {
++    pub(in crate::core::session_store::remote::view) fn into_bounded_value(self) -> Option<Value> {
++        crate::core::session_store::json_size::encoded_len(&self, LIMIT)?;
++        // Match the derived field order, including when Map preserves insertion order.
++        let mut object = serde_json::Map::with_capacity(7);
++        object.insert("format".to_owned(), Value::from(self.format));
++        object.insert("history".to_owned(), Value::String(self.history));
++        object.insert("turns".to_owned(), Value::String(self.turns));
++        object.insert("exchanges".to_owned(), Value::String(self.exchanges));
++        object.insert("messages".to_owned(), Value::String(self.messages));
++        object.insert("parts".to_owned(), Value::String(self.parts));
++        object.insert("calls".to_owned(), serde_json::to_value(self.calls).ok()?);
++        Some(Value::Object(object))
++    }
+ }
+ 
+ fn pack<const N: usize>(records: impl Iterator<Item = [u8; N]>, n: usize) -> String {
