@@ -1,0 +1,27 @@
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -194,7 +194,23 @@
+ }
+ 
+ pub fn table(columns: &[&str], rows: Vec<Vec<String>>) -> Value {
+-    json!({"type": "table", "columns": columns, "rows": rows})
++    let mut wire_rows = Vec::with_capacity(rows.len());
++    for row in rows {
++        let mut cells = Vec::with_capacity(row.len());
++        for cell in row {
++            // Keep the tight payload that serialization otherwise copies.
++            let cell = if cell.capacity() == cell.len() {
++                cell
++            } else {
++                cell.as_str().to_owned()
++            };
++            cells.push(Value::String(cell));
++        }
++        wire_rows.push(Value::Array(cells));
++    }
++    let mut table = json!({"type": "table", "columns": columns, "rows": null});
++    *table.get_mut("rows").expect("table has rows") = Value::Array(wire_rows);
++    table
+ }
+ 
+ /// Key/value pairs as a two-column table.
