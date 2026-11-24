@@ -1,0 +1,245 @@
+--- a/src/transcript/cache.rs
++++ b/src/transcript/cache.rs
+@@ -4,7 +4,9 @@
+ 
+ impl Entry {
+     pub fn retained_bytes(&self) -> usize {
+-        std::mem::size_of::<Self>()
++        // Keep the historical eviction charge, even when live and archived
++        // rows share the standalone tool payload.
++        std::mem::size_of::<Entry<proteus_contracts::app_protocol::AppTranscriptTool>>()
+             + self.text.len()
+             + self
+                 .images
+@@ -16,7 +18,7 @@
+                         + image.path.as_os_str().len()
+                 })
+                 .sum::<usize>()
+-            + self.tool.as_ref().map_or(0, tool_bytes)
++            + self.tool.as_deref().map_or(0, tool_bytes)
+             + self.subagent.as_ref().map_or(0, |agent| {
+                 agent.child_thread_id.len()
+                     + agent
+--- a/src/transcript/chains.rs
++++ b/src/transcript/chains.rs
+@@ -103,7 +103,7 @@
+             },
+             text: Arc::from(""),
+             images: Vec::new(),
+-            tool,
++            tool: tool.map(Arc::new),
+             subagent: None,
+             streaming: false,
+             time: None,
+@@ -132,7 +132,7 @@
+     fn early_terminal_binding_keeps_button_visible_and_invalidates_old_chain() {
+         let mut rows: Vec<_> = (0..5).map(|key| entry(key, true)).collect();
+         assert_eq!(tool_chain(&rows, 2), Some(0..5));
+-        rows[2].tool.as_mut().unwrap().terminal =
++        Arc::make_mut(rows[2].tool.as_mut().unwrap()).terminal =
+             Some(proteus_contracts::contracts::ToolTerminalRef {
+                 id: uuid::Uuid::from_u128(19),
+                 title: "running command".into(),
+@@ -152,7 +152,7 @@
+             entry(4, true),
+         ];
+         assert_eq!(tool_chain(&rows, 2), Some(0..5));
+-        rows[2].tool.as_mut().unwrap().metadata =
++        Arc::make_mut(rows[2].tool.as_mut().unwrap()).metadata =
+             serde_json::json!({"tool":"task","child_thread_id":"exact-child"});
+         assert_eq!(tool_chain(&rows, 2), None);
+         assert_eq!(tool_chain(&rows, 0), None);
+@@ -161,7 +161,7 @@
+             session_id: uuid::Uuid::from_u128(5),
+             session_dir: "/saved/child".into(),
+         };
+-        rows[2].tool.as_mut().unwrap().metadata["subagent_session"] =
++        Arc::make_mut(rows[2].tool.as_mut().unwrap()).metadata["subagent_session"] =
+             serde_json::to_value(&bound).unwrap();
+         let mut progress = entry(5, false);
+         progress.role = Role::System;
+--- a/src/transcript/external.rs
++++ b/src/transcript/external.rs
+@@ -3,6 +3,7 @@
+ use crate::agents::codex::{Item, ItemKind};
+ use proteus_contracts::app_protocol::AppTranscriptTool;
+ use serde_json::Value;
++use std::sync::Arc;
+ 
+ impl Transcript {
+     pub(crate) fn external_upsert(&mut self, item: Item) -> Change {
+@@ -65,7 +66,7 @@
+                 row.text = text.into();
+             }
+             row.role = role;
+-            row.tool = tool;
++            row.tool = tool.map(Arc::new);
+             row.streaming = streaming;
+             row.time = item.timestamp_ms.or(row.time);
+             return Change::Updated(index);
+@@ -78,7 +79,7 @@
+             role,
+             text: text.into(),
+             images: vec![],
+-            tool,
++            tool: tool.map(Arc::new),
+             subagent: None,
+             streaming,
+             time: item.timestamp_ms,
+@@ -139,7 +140,10 @@
+         }
+         if tool {
+             if let Some(tool) = &mut entry.tool {
+-                tool.result.get_or_insert_default().push_str(&delta[..end]);
++                Arc::make_mut(tool)
++                    .result
++                    .get_or_insert_default()
++                    .push_str(&delta[..end]);
+             }
+         } else {
+             let mut text = String::with_capacity(entry.text.len() + end);
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -24,14 +24,15 @@
+ }
+ 
+ #[derive(Clone, Debug)]
+-pub struct Entry {
++pub struct Entry<Tool = Arc<AppTranscriptTool>> {
+     /// Stable client identity, reused across snapshots for the same message.
+     pub key: u64,
+     pub message_id: Option<MessageId>,
+     pub role: Role,
+     pub text: Arc<str>,
+     pub images: Vec<ImageRef>,
+-    pub tool: Option<AppTranscriptTool>,
++    /// Display windows share the frozen payload until a live event changes it.
++    pub tool: Option<Tool>,
+     pub subagent: Option<AppTranscriptSubagent>,
+     pub streaming: bool,
+     /// Creation time in Unix milliseconds. Canonical history timestamps take
+@@ -353,7 +354,7 @@
+                     role: Role::System,
+                     text: "".into(),
+                     images: Vec::new(),
+-                    tool: Some(tool),
++                    tool: Some(Arc::new(tool)),
+                     subagent: None,
+                     streaming: false,
+                     time: None,
+@@ -525,7 +526,7 @@
+     ) -> Change {
+         for (index, entry) in self.entries.iter_mut().enumerate().rev() {
+             if let Some(tool) = entry.tool.as_mut().filter(|tool| tool.call_id == call_id) {
+-                update(tool);
++                update(Arc::make_mut(tool));
+                 return Change::Updated(index);
+             }
+             if let Some(tool) = entry.subagent.as_mut().and_then(|subagent| {
+@@ -574,7 +575,7 @@
+             role,
+             text: shared_text.unwrap_or_else(|| message.text.into()),
+             images: message.images,
+-            tool: message.tool,
++            tool: message.tool.map(Arc::new),
+             subagent: message.subagent,
+             streaming: message.streaming,
+             time: message.timestamp_ms,
+@@ -602,7 +603,7 @@
+     identity(
+         entry.message_id,
+         entry.role,
+-        entry.tool.as_ref(),
++        entry.tool.as_deref(),
+         entry.subagent.as_ref(),
+     )
+ }
+--- a/src/transcript/tests.rs
++++ b/src/transcript/tests.rs
+@@ -46,7 +46,7 @@
+         ),
+         Change::Updated(0)
+     );
+-    let live = transcript.entries()[0].tool.as_ref().unwrap();
++    let live = transcript.entries()[0].tool.as_deref().unwrap();
+     assert_eq!(live.status, "running");
+     assert!(live.result.is_none());
+     assert_eq!(live.terminal.as_ref(), Some(&terminal));
+--- a/src/transcript/text_run/tests.rs
++++ b/src/transcript/text_run/tests.rs
+@@ -87,11 +87,11 @@
+     assert_eq!(
+         actual
+             .tool
+-            .as_ref()
++            .as_deref()
+             .map(|value| serde_json::to_value(value).unwrap()),
+         expected
+             .tool
+-            .as_ref()
++            .as_deref()
+             .map(|value| serde_json::to_value(value).unwrap()),
+     );
+     assert_eq!(
+@@ -308,7 +308,7 @@
+             iterations: Some(4),
+             tools: Vec::new(),
+         });
+-        entry.tool = Some(AppTranscriptTool {
++        entry.tool = Some(std::sync::Arc::new(AppTranscriptTool {
+             terminal: None,
+             call_id: "collision".into(),
+             name: "fixture".into(),
+@@ -317,7 +317,7 @@
+             status: "done".into(),
+             result: Some("result".into()),
+             metadata: serde_json::json!({"keep": "all"}),
+-        });
++        }));
+         transcript
+     };
+     let mut actual = make();
+--- a/src/ui/chat/stamp.rs
++++ b/src/ui/chat/stamp.rs
+@@ -186,7 +186,7 @@
+             iterations: None,
+             tools: vec![],
+         });
+-        rows[1].tool.as_mut().unwrap().metadata = serde_json::json!({
++        std::sync::Arc::make_mut(rows[1].tool.as_mut().unwrap()).metadata = serde_json::json!({
+             "tool": "task", "child_thread_id": "child"
+         });
+         assert!(super::hidden(&rows, &rows[1]));
+--- a/src/ui/chat/stream_batch/tests.rs
++++ b/src/ui/chat/stream_batch/tests.rs
+@@ -446,7 +446,7 @@
+                 "role": format!("{:?}", entry.role),
+                 "text": &*entry.text,
+                 "images": entry.images,
+-                "tool": entry.tool,
++                "tool": entry.tool.as_deref(),
+                 "subagent": entry.subagent,
+                 "streaming": entry.streaming,
+                 "time": entry.time,
+--- a/src/ui/chat/thread.rs
++++ b/src/ui/chat/thread.rs
+@@ -245,7 +245,7 @@
+                 Some(chain) if ix == chain.start => {
+                     let tools = entries[chain.clone()]
+                         .iter()
+-                        .filter_map(|entry| entry.tool.as_ref());
++                        .filter_map(|entry| entry.tool.as_deref());
+                     let header =
+                         render_chain_header(key, tools, chain_open, self.session.connected, cx);
+                     let calls = if chain_moving {
+--- a/src/ui/extensions/session.rs
++++ b/src/ui/extensions/session.rs
+@@ -50,7 +50,7 @@
+                 Role::Reasoning => "reasoning",
+                 Role::System => "system",
+             },
+-            tool: entry.tool.clone(),
++            tool: entry.tool.as_deref().cloned(),
+             subagent: entry.subagent.clone(),
+         })
+         .collect()
