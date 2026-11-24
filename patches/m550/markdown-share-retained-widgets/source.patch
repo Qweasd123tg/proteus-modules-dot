@@ -1,0 +1,475 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9b9aa368f874b87c91f367ea5e5eb432a86ef10b..6696604a961d1faa8b6e10a5210f7c301d3d0666 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -224,6 +224,7 @@ name = "proteus-extension"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "serde",
+  "serde_json",
+  "ureq",
+ ]
+@@ -253,6 +254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+ dependencies = [
+  "serde_core",
++ "serde_derive",
+ ]
+ 
+ [[package]]
+diff --git a/packages/markdown-render/src/main.rs b/packages/markdown-render/src/main.rs
+index 488263bf5ffc17091c043e91a4ad613047172340..fe0ecdd83693d1b3b93e18da0b08222d59345cc8 100644
+--- a/packages/markdown-render/src/main.rs
++++ b/packages/markdown-render/src/main.rs
+@@ -24,8 +24,8 @@ impl Extension for Markdown {
+                 .views
+                 .entry(view.into())
+                 .or_default()
+-                .render(SAMPLE, &[])?;
+-            host.show(view, root);
++                .render_shared(SAMPLE, &[])?;
++            host.show_shared_column(view, root);
+             return Ok(());
+         }
+         if surface != Surface::Content {
+@@ -53,8 +53,8 @@ impl Extension for Markdown {
+             .views
+             .entry(view.into())
+             .or_default()
+-            .render(&content.source, &languages)?;
+-        host.show(view, root);
++            .render_shared(&content.source, &languages)?;
++        host.show_shared_column(view, root);
+         Ok(())
+     }
+ 
+diff --git a/packages/markdown-render/src/render.rs b/packages/markdown-render/src/render.rs
+index 1230fb1ea90af592a0859dfc2c482eb01e6a49f0..43cf815092a36087093db1132740d3b01d3af268 100644
+--- a/packages/markdown-render/src/render.rs
++++ b/packages/markdown-render/src/render.rs
+@@ -1,4 +1,6 @@
+ //! GFM policy, retained segment conversions and closed-fence routing.
++use std::sync::Arc;
++
+ use super::fences;
+ use proteus_extension::{Result, Value, json, ui, ui::Node as _};
+ 
+@@ -23,7 +25,7 @@ struct Prefix {
+ struct Segment {
+     id: String,
+     source: Option<String>,
+-    node: Value,
++    node: Arc<Value>,
+ }
+ 
+ /// References are read in source order across the retained prefix and the
+@@ -47,7 +49,18 @@ impl Definitions<'_> {
+ }
+ 
+ impl Document {
++    #[cfg(test)]
+     pub fn render(&mut self, source: &str, languages: &[String]) -> Result<Value> {
++        Ok(serde_json::to_value(
++            self.render_shared(source, languages)?,
++        )?)
++    }
++
++    pub fn render_shared(
++        &mut self,
++        source: &str,
++        languages: &[String],
++    ) -> Result<ui::SharedColumn> {
+         // A single prose segment already retains the complete input. Reuse
+         // that exact source and the full language list, not a hash or another
+         // copy of the document. Fixed parser/HTML options add no dynamic inputs.
+@@ -121,7 +134,7 @@ impl Document {
+                     .as_deref()
+                     .filter(|source| source.contains('['))
+                 {
+-                    piece.node = prose(&piece.id, source, &definitions, languages)?;
++                    piece.node = Arc::new(prose(&piece.id, source, &definitions, languages)?);
+                 }
+             }
+         }
+@@ -165,7 +178,7 @@ impl Document {
+             pieces.push(Segment {
+                 id,
+                 source: None,
+-                node,
++                node: Arc::new(node),
+             });
+             start = end;
+             blocks = index + 1;
+@@ -212,7 +225,7 @@ impl Document {
+         Ok(self.root())
+     }
+ 
+-    fn root(&self) -> Value {
++    fn root(&self) -> ui::SharedColumn {
+         let children = self
+             .segments
+             .iter()
+@@ -224,12 +237,9 @@ impl Document {
+                         .as_str()
+                         .is_some_and(|html| html.trim().is_empty()))
+             })
+-            .map(|segment| segment.node.clone())
+-            .collect::<Vec<_>>();
+-        let mut root =
+-            json!({"type":"stack", "direction":"column", "gap":"medium", "children":null});
+-        root["children"] = Value::Array(children);
+-        root
++            .map(|segment| Arc::clone(&segment.node))
++            .collect();
++        ui::SharedColumn::new("medium", children)
+     }
+ }
+ 
+@@ -253,7 +263,7 @@ fn segment(
+     Ok(Segment {
+         id,
+         source: Some(source.into()),
+-        node,
++        node: Arc::new(node),
+     })
+ }
+ 
+diff --git a/sdk/Cargo.toml b/sdk/Cargo.toml
+index 78d89c741545ffe8622029864d48b2c0471d5a14..0f3b0cdf7d45e43e96182e5af739c62b1d45d6c6 100644
+--- a/sdk/Cargo.toml
++++ b/sdk/Cargo.toml
+@@ -8,5 +8,6 @@ publish.workspace = true
+ 
+ [dependencies]
+ anyhow.workspace = true
++serde = { version = "1", features = ["derive", "rc"] }
+ serde_json.workspace = true
+ ureq.workspace = true
+diff --git a/sdk/src/host.rs b/sdk/src/host.rs
+index 36eb0e06d843bebcbfbee8614ef436ddc4ce1796..ce5f558ff65741fd2df127135a57750d747ad017 100644
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -4,6 +4,7 @@ use std::sync::mpsc;
+ use std::time::Duration;
+ 
+ use anyhow::{anyhow, bail};
++use serde::Serialize;
+ use serde_json::{Value, json};
+ 
+ use crate::ui::{self, Node as _};
+@@ -28,8 +29,10 @@ mod documents;
+ mod inbox;
+ mod instances;
+ mod scopes;
++mod views;
+ mod visual_preferences;
+ use scopes::{Scope, SessionContext};
++use views::Shown;
+ 
+ /// Адрес и токен HTTP API сервера из `hello`.
+ #[derive(Clone, Debug)]
+@@ -87,7 +90,7 @@ pub struct Host {
+     pub active_document: Option<Value>,
+     pub command_error: Option<String>,
+     views: BTreeMap<String, (Surface, Option<String>)>,
+-    shown: HashMap<String, Value>,
++    shown: HashMap<String, Shown>,
+     content: HashMap<String, Content>,
+     sequences: HashMap<String, u64>,
+     pending: Vec<(String, String, Value)>,
+@@ -162,16 +165,19 @@ impl Host {
+         self.send_ref(&message);
+     }
+ 
+-    fn send_ref(&self, message: &Value) {
++    fn send_ref(&self, message: &impl Serialize) {
+         #[cfg(test)]
+         {
+-            self.sent.borrow_mut().push(message.clone());
++            let sent = serde_json::to_value(message).expect("serializing a wire message");
++            self.sent.borrow_mut().push(sent);
+         }
+         #[cfg(not(test))]
+         {
+             use std::io::Write as _;
+             let mut out = std::io::stdout().lock();
+-            let _ = writeln!(out, "{message}");
++            if serde_json::to_writer(&mut out, message).is_ok() {
++                let _ = out.write_all(b"\n");
++            }
+             let _ = out.flush();
+         }
+     }
+@@ -377,21 +383,16 @@ impl Host {
+ 
+     /// Set a document's visible caption without changing its stable argument.
+     pub fn show_with_title(&mut self, view: &str, root: Value, title: &str) {
+-        let mut message = json!({"type":"view","session_dir":self.session,"view":view,"root":null,"title":title,"sequence":self.sequence(view),"source_revision":self.content(view).and_then(|content| content.source_revision)});
+-        message["root"] = root;
+-        self.send_ref(&message);
+-        self.shown.insert(view.to_owned(), message["root"].take());
++        self.show_root(view, Shown::Owned(root), Some(title), None);
+     }
+ 
+     pub fn show_with_keys(&mut self, view: &str, root: Value, keys: Value) {
+-        let mut message = json!({"type": "view", "session_dir": self.session, "view": view, "root": null,
+-                         "sequence": self.sequence(view), "source_revision": self.content(view).and_then(|content| content.source_revision), "keys": null});
+-        // Serialize the owned tree directly, then keep the same allocation
+-        // for error fallback rather than cloning it into the wire envelope.
+-        message["root"] = root;
+-        message["keys"] = keys;
+-        self.send_ref(&message);
+-        self.shown.insert(view.to_owned(), message["root"].take());
++        self.show_root(view, Shown::Owned(root), None, Some(keys));
++    }
++
++    /// Show an immutable column backed by the widgets of a render cache.
++    pub fn show_shared_column(&mut self, view: &str, root: ui::SharedColumn) {
++        self.show_root(view, Shown::Column(root), None, Some(json!({})));
+     }
+ 
+     /// Вид уже показан с открытия поверхности; новая поверхность — повод перечитать данные.
+@@ -537,17 +538,7 @@ impl Host {
+             ui::text(error).with("tone", "danger"),
+             ui::button("Повторить", "refresh").with("icon", "refresh-cw"),
+         ]);
+-        let mut children = vec![notice];
+-        children.extend(self.shown.get_mut(view).map(Value::take));
+-        let mut message = json!({"type": "view", "session_dir": self.session, "view": view, "sequence": self.sequence(view),
+-                                 "keys": {}, "root": null})
+-        .with("root", ui::fill(children));
+-        // Send synchronously while the original tree is in the envelope,
+-        // then restore that exact allocation for the next retry.
+-        self.send_ref(&message);
+-        if let Some(previous) = self.shown.get_mut(view) {
+-            *previous = message["root"]["children"][1].take();
+-        }
++        self.send_failure(view, &notice);
+     }
+ 
+     /// Render only the requested surface. A retained heavy document must
+diff --git a/sdk/src/host/payload_tests.rs b/sdk/src/host/payload_tests.rs
+index ff000627dd5a15a785472df4a96056a45115f27f..8bfe6c77413e951446179265fe009da5c4a5603a 100644
+--- a/sdk/src/host/payload_tests.rs
++++ b/sdk/src/host/payload_tests.rs
+@@ -297,10 +297,10 @@ fn borrowed_view_sends_keep_exact_envelopes_owned_fallback_and_public_send() {
+             host.sent.borrow().last().unwrap().to_string(),
+             expected.to_string()
+         );
+-        assert_eq!(
+-            host.shown["figure"]["text"].as_str().unwrap().as_ptr(),
+-            text
+-        );
++        let Shown::Owned(shown) = &host.shown["figure"] else {
++            panic!("owned fixture");
++        };
++        assert_eq!(shown["text"].as_str().unwrap().as_ptr(), text);
+         host.views.insert("figure".into(), (Surface::Content, None));
+         host.failed("figure", "failed content");
+         assert_eq!(
+@@ -320,10 +320,10 @@ fn borrowed_view_sends_keep_exact_envelopes_owned_fallback_and_public_send() {
+         assert_eq!(fallback["session_dir"], "/fixture/🦀");
+         assert_eq!(fallback["keys"], json!({}));
+         assert_eq!(fallback["root"]["children"][1], expected["root"]);
+-        assert_eq!(
+-            host.shown["figure"]["text"].as_str().unwrap().as_ptr(),
+-            text
+-        );
++        let Shown::Owned(shown) = &host.shown["figure"] else {
++            panic!("owned fixture");
++        };
++        assert_eq!(shown["text"].as_str().unwrap().as_ptr(), text);
+         drop(sent);
+         host.content.insert(
+             "figure".into(),
+diff --git a/sdk/src/host/tests.rs b/sdk/src/host/tests.rs
+index e359aaadd3616cc1d3383b63421ca6471ebd0c9b..c7649292f0e1d432a61a3f3d67089d97c50eff57 100644
+--- a/sdk/src/host/tests.rs
++++ b/sdk/src/host/tests.rs
+@@ -485,7 +485,7 @@ fn a_session_switch_via_render_clears_stale_views_and_prioritizes_the_requester(
+         .push(("old-id".into(), "model".into(), json!("old")));
+     host.command_error = Some("old command".into());
+     host.shown
+-        .insert("panel".into(), ui::text("old fixture view"));
++        .insert("panel".into(), Shown::Owned(ui::text("old fixture view")));
+     extension.fail = true;
+     host.handle(
+         &mut extension,
+diff --git a/sdk/src/host/views.rs b/sdk/src/host/views.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..41b4fa9237fc917531610fb89a3850c68befe93a
+--- /dev/null
++++ b/sdk/src/host/views.rs
+@@ -0,0 +1,138 @@
++//! Borrowed wire envelopes for owned roots and immutable shared widget trees.
++use serde::{Serialize, Serializer, ser::SerializeSeq};
++use serde_json::Value;
++
++use super::Host;
++use crate::ui::SharedColumn;
++
++#[derive(Serialize)]
++#[serde(untagged)]
++pub(super) enum Shown {
++    Owned(Value),
++    Column(SharedColumn),
++}
++
++#[derive(Serialize)]
++struct View<'a> {
++    #[serde(rename = "type")]
++    kind: &'static str,
++    session_dir: Option<&'a str>,
++    view: &'a str,
++    root: &'a Shown,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    title: Option<&'a str>,
++    sequence: u64,
++    source_revision: Option<u64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    keys: Option<Value>,
++}
++
++#[derive(Serialize)]
++struct Failure<'a> {
++    #[serde(rename = "type")]
++    kind: &'static str,
++    session_dir: Option<&'a str>,
++    view: &'a str,
++    sequence: u64,
++    keys: Value,
++    root: Fill<'a>,
++}
++
++#[derive(Serialize)]
++struct Fill<'a> {
++    #[serde(rename = "type")]
++    kind: &'static str,
++    children: ErrorChildren<'a>,
++}
++
++struct ErrorChildren<'a> {
++    notice: &'a Value,
++    previous: Option<&'a Shown>,
++}
++
++impl Serialize for ErrorChildren<'_> {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        let mut children =
++            serializer.serialize_seq(Some(1 + usize::from(self.previous.is_some())))?;
++        children.serialize_element(self.notice)?;
++        if let Some(previous) = self.previous {
++            children.serialize_element(previous)?;
++        }
++        children.end()
++    }
++}
++
++impl Host {
++    pub(super) fn show_root(
++        &mut self,
++        view: &str,
++        root: Shown,
++        title: Option<&str>,
++        keys: Option<Value>,
++    ) {
++        self.send_ref(&View {
++            kind: "view",
++            session_dir: self.session.as_deref(),
++            view,
++            root: &root,
++            title,
++            sequence: self.sequence(view),
++            source_revision: self
++                .content(view)
++                .and_then(|content| content.source_revision),
++            keys,
++        });
++        self.shown.insert(view.to_owned(), root);
++    }
++
++    pub(super) fn send_failure(&self, view: &str, notice: &Value) {
++        self.send_ref(&Failure {
++            kind: "view",
++            session_dir: self.session.as_deref(),
++            view,
++            sequence: self.sequence(view),
++            keys: serde_json::json!({}),
++            root: Fill {
++                kind: "fill",
++                children: ErrorChildren {
++                    notice,
++                    previous: self.shown.get(view),
++                },
++            },
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{Surface, json, ui};
++    use std::sync::Arc;
++
++    #[test]
++    fn shown_column_shares_one_allocation_until_replaced() {
++        let mut host = Host::default();
++        let widget = Arc::new(ui::text("shared 🧪"));
++        let cached = Arc::downgrade(&widget);
++        host.show_shared_column("figure", SharedColumn::new("medium", vec![widget.clone()]));
++        assert_eq!(Arc::strong_count(&widget), 2);
++        drop(widget);
++
++        host.views.insert("figure".into(), (Surface::Content, None));
++        host.failed("figure", "old revision");
++        assert_eq!(host.sent.borrow().last().unwrap()["type"], "content_error");
++        assert_eq!(cached.strong_count(), 1);
++
++        host.views.insert("figure".into(), (Surface::Page, None));
++        for _ in 0..2 {
++            host.failed("figure", "fallback");
++            let sent = host.sent.borrow();
++            let previous = &sent.last().unwrap()["root"]["children"][1];
++            assert_eq!(previous["children"], json!([ui::text("shared 🧪")]));
++            assert_eq!(cached.strong_count(), 1);
++        }
++
++        host.show("figure", ui::text("replacement"));
++        assert!(cached.upgrade().is_none());
++    }
++}
+diff --git a/sdk/src/ui.rs b/sdk/src/ui.rs
+index f2179c77192b16338318755a76e8e1c78277a4d8..8c98e948f45158cdb53b0595066f7f2db26c79f8 100644
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -76,6 +76,28 @@ pub fn stack(children: Vec<Value>) -> Value {
+     json!({"type": "stack", "direction": "column"}).with("children", Value::Array(children))
+ }
+ 
++/// Stack whose immutable widgets are shared with an extension's render cache.
++/// The visible root and error fallback use the same nodes without copying.
++#[derive(serde::Serialize)]
++pub struct SharedColumn {
++    #[serde(rename = "type")]
++    kind: &'static str,
++    direction: &'static str,
++    gap: &'static str,
++    children: Vec<std::sync::Arc<Value>>,
++}
++
++impl SharedColumn {
++    pub fn new(gap: &'static str, children: Vec<std::sync::Arc<Value>>) -> Self {
++        Self {
++            kind: "stack",
++            direction: "column",
++            gap,
++            children,
++        }
++    }
++}
++
+ pub fn row(children: Vec<Value>) -> Value {
+     json!({"type": "stack", "direction": "row"}).with("children", Value::Array(children))
+ }
