@@ -1,0 +1,14 @@
+diff --git a/packages/markdown-render/src/inlines.rs b/packages/markdown-render/src/inlines.rs
+index d1e12686c5e4f0ed8f3043254c05cacacd142127..7dc855b437b2575b1561e2ff3a9b81f523bcfe21 100644
+--- a/packages/markdown-render/src/inlines.rs
++++ b/packages/markdown-render/src/inlines.rs
+@@ -44,6 +44,9 @@ pub(super) fn render(id: &str, source: &str, languages: &[String]) -> Result<Val
+     }
+     rewritten.push_str(&source[end..]);
+     let mut root = compile(id, &rewritten)?;
++    // Expansion can grow the final HTML back to the original source size
++    // or larger. It only needs the compiled HTML and the original slices.
++    drop(rewritten);
+     let html = root["html"].as_str().unwrap();
+     // HTML order may differ from source order (GFM footnotes). Unreferenced
+     // footnote definitions emit nothing. Scan once and retain only visible
