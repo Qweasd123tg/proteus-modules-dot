@@ -1,0 +1,24 @@
+diff --git a/src/ui/chat/thread.rs b/src/ui/chat/thread.rs
+index 33afcd0599974f18eef6cd242f43ed2465ce1359..a1d766d1aef9aa81be7169976405d1ebf6334889 100644
+--- a/src/ui/chat/thread.rs
++++ b/src/ui/chat/thread.rs
+@@ -145,12 +145,15 @@
+         let end_key = entries[end - 1].key;
+         let turn = &entries[..end];
+         let copyable = footer
+-            && (turn
++            && turn
+                 .iter()
+                 .rev()
+-                .take_while(|entry| entry.role != Role::User)
+-                .any(|entry| entry.role == Role::Assistant && !entry.text.trim().is_empty())
+-                || !turn.iter().any(|entry| entry.role == Role::User));
++                .find_map(|entry| match entry.role {
++                    Role::User => Some(false),
++                    Role::Assistant if !entry.text.trim().is_empty() => Some(true),
++                    _ => None,
++                })
++                .unwrap_or(true);
+         let image_edge = super::images::thumbnail_edge(window, cx);
+         let missing = self
+             .api
