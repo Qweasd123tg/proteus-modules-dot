@@ -1,0 +1,29 @@
+--- a/packages/usage/src/report.rs
++++ b/packages/usage/src/report.rs
+@@ -192,14 +192,22 @@
+ /// Every whitespace-separated word occurs in the ids or the model.
+ fn matches(request: &Value, mut terms: std::str::SplitWhitespace<'_>) -> bool {
+     let model = request.at("model");
+-    let haystack = [
++    let fields = [
+         request.str("exchange_id"),
+         request.str("turn_id"),
+         model.str("provider"),
+         model.str("model"),
+-    ]
+-    .join(" ")
+-    .to_lowercase();
++    ];
++    if fields.iter().all(|field| {
++        field
++            .bytes()
++            .all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase())
++    }) {
++        // Search terms are split on whitespace and cannot span a joining space.
++        // Already-lowercase ASCII fields need neither a join nor Unicode casing.
++        return terms.all(|term| fields.iter().any(|field| field.contains(term)));
++    }
++    let haystack = fields.join(" ").to_lowercase();
+     terms.all(|term| haystack.contains(term))
+ }
+ 
