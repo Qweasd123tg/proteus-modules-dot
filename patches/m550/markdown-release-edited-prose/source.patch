@@ -1,0 +1,22 @@
+--- a/packages/markdown-render/src/render.rs
++++ b/packages/markdown-render/src/render.rs
+@@ -240,11 +240,14 @@
+     definitions: &Definitions<'_>,
+     languages: &[String],
+ ) -> Result<Segment> {
+-    if let Some(index) = old
+-        .iter()
+-        .position(|segment| segment.id == id && segment.source.as_deref() == Some(source))
+-    {
+-        return Ok(old.remove(index));
++    // A prose id occurs at most once (before its fence ordinal or at the
++    // final tail). If its source changed, free the old source and widget
++    // before building the replacement.
++    if let Some(index) = old.iter().position(|segment| segment.id == id) {
++        let previous = old.remove(index);
++        if previous.source.as_deref() == Some(source) {
++            return Ok(previous);
++        }
+     }
+     let node = prose(&id, source, definitions, languages)?;
+     Ok(Segment {
