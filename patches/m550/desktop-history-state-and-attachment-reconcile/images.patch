@@ -1,0 +1,23 @@
+--- a/src/ui/chat/images.rs
++++ b/src/ui/chat/images.rs
+@@ -92,11 +92,15 @@
+     }
+ 
+     pub(super) fn retain(&mut self, entries: &[crate::transcript::Entry]) {
+-        let ids: std::collections::HashSet<_> = entries
+-            .iter()
+-            .flat_map(|row| row.images.iter().map(|image| image.id.as_str()))
+-            .collect();
+-        self.by_id.retain(|id, _| ids.contains(id.as_str()));
++        // A cold chat has no local thumbnail slots until its first layout.
++        // Shared cache pruning must still run for other, already opened chats.
++        if !self.by_id.is_empty() {
++            let ids: std::collections::HashSet<_> = entries
++                .iter()
++                .flat_map(|row| row.images.iter().map(|image| image.id.as_str()))
++                .collect();
++            self.by_id.retain(|id, _| ids.contains(id.as_str()));
++        }
+         SHARED.with(|shared| shared.borrow_mut().cache.prune());
+     }
+ 
