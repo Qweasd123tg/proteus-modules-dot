@@ -1,0 +1,117 @@
+diff --git a/workflow/coding-workflow/src/scaffold/preparation.rs b/workflow/coding-workflow/src/scaffold/preparation.rs
+index cd0d7987d8c6085f2bbded43461129d87d52654b..ed77b311e9cf5efeb729600eead62f9cab348ef3 100644
+--- a/workflow/coding-workflow/src/scaffold/preparation.rs
++++ b/workflow/coding-workflow/src/scaffold/preparation.rs
+@@ -73,7 +73,8 @@
+                     ));
+                 }
+                 self.retire_acknowledged_results(&ack.messages)?;
+-                self.model_messages = merge_request_context(&self.model_messages, &ack.messages);
++                let model = std::mem::take(&mut self.model_messages);
++                self.model_messages = merge_request_context(model, &ack.messages);
+                 self.persistent_messages = ack.messages;
+                 self.compactions = ack.history.compactions;
+                 self.history_replacement_len =
+@@ -97,7 +98,7 @@
+ /// Keep request-only context at its next retained canonical anchor while
+ /// adopting the host's accepted history, including newly delivered steering.
+ fn merge_request_context(
+-    model: &[CanonicalMessage],
++    model: Vec<CanonicalMessage>,
+     canonical: &[CanonicalMessage],
+ ) -> Vec<CanonicalMessage> {
+     use proteus_contracts::model_standard::PartScope;
+@@ -120,19 +121,20 @@
+     let mut groups = std::collections::HashMap::<MessageId, Vec<CanonicalMessage>>::new();
+     let mut trailing = Vec::new();
+     let mut next_anchor = None;
++    let capacity = model.len().max(canonical.len());
+     // Walking backwards finds each context's first retained non-request
+     // message without rescanning its suffix or the full canonical history.
+-    for message in model[first_context..].iter().rev() {
+-        if ephemeral(message) {
++    for message in model.into_iter().skip(first_context).rev() {
++        if ephemeral(&message) {
+             match next_anchor {
+-                Some(id) => groups.entry(id).or_default().push(message.clone()),
+-                None => trailing.push(message.clone()),
++                Some(id) => groups.entry(id).or_default().push(message),
++                None => trailing.push(message),
+             }
+         } else if accepted.contains(&message.id) {
+             next_anchor = Some(message.id);
+         }
+     }
+-    let mut merged = Vec::with_capacity(model.len().max(canonical.len()));
++    let mut merged = Vec::with_capacity(capacity);
+     for message in canonical {
+         merged.extend(
+             groups
+diff --git a/workflow/coding-workflow/src/scaffold/preparation/tests.rs b/workflow/coding-workflow/src/scaffold/preparation/tests.rs
+index 872e00c63b9a82d0397d976dd916107add72200f..e905c1e9f8e720fc31bb2f319882d18159a222ec 100644
+--- a/workflow/coding-workflow/src/scaffold/preparation/tests.rs
++++ b/workflow/coding-workflow/src/scaffold/preparation/tests.rs
+@@ -48,7 +48,7 @@
+     accepted_b.metadata = json!({"accepted": true});
+     let canonical = vec![steering.clone(), accepted_b.clone(), a.clone()];
+     assert_eq!(
+-        merge_request_context(&model, &canonical),
++        merge_request_context(model.clone(), &canonical),
+         vec![
+             steering,
+             before_removed,
+@@ -91,9 +91,9 @@
+         multi.clone(),
+     ];
+     let canonical = vec![mixed, empty, trace, named];
+-    assert_eq!(merge_request_context(&model, &canonical), model);
++    assert_eq!(merge_request_context(model.clone(), &canonical), model);
+     assert_eq!(
+-        merge_request_context(&model, &[]),
++        merge_request_context(model, &[]),
+         vec![first, second, third, fourth, multi]
+     );
+ }
+@@ -102,10 +102,10 @@
+ fn no_context_and_empty_inputs_adopt_only_the_canonical_snapshot() {
+     let old = vec![message("old"), message("removed")];
+     let canonical = vec![message("new"), old[0].clone()];
+-    assert_eq!(merge_request_context(&old, &canonical), canonical);
+-    assert_eq!(merge_request_context(&[], &canonical), canonical);
+-    assert!(merge_request_context(&old, &[]).is_empty());
+-    assert!(merge_request_context(&[], &[]).is_empty());
++    assert_eq!(merge_request_context(old.clone(), &canonical), canonical);
++    assert_eq!(merge_request_context(Vec::new(), &canonical), canonical);
++    assert!(merge_request_context(old, &[]).is_empty());
++    assert!(merge_request_context(Vec::new(), &[]).is_empty());
+ }
+ 
+ // Pre-change scan is an independent oracle for anchor placement, not a
+@@ -178,7 +178,7 @@
+             }
+             canonical.insert(canonical.len() / 2, steering.clone());
+             assert_eq!(
+-                merge_request_context(&model, &canonical),
++                merge_request_context(model.clone(), &canonical),
+                 reference_merge(&model, &canonical),
+                 "mask={mask}, order={order}"
+             );
+@@ -203,8 +203,17 @@
+     reordered.rotate_left(3);
+     for model in [&model, &reordered] {
+         assert_eq!(
+-            merge_request_context(model, &canonical),
++            merge_request_context(model.to_vec(), &canonical),
+             reference_merge(model, &canonical)
+         );
+     }
+ }
++
++#[test]
++fn request_parts_keep_their_original_storage_across_ack() {
++    let request_context = context("borrowed by neither output nor ACK");
++    let original_parts = request_context.parts.as_ptr();
++    let anchor = message("kept");
++    let merged = merge_request_context(vec![request_context, anchor.clone()], &[anchor]);
++    assert_eq!(merged[0].parts.as_ptr(), original_parts);
++}
