@@ -1,0 +1,629 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index d2768a3ab674ceb81b3df25ad0090f783721ee74..309de8940b02b355e7a2bf5a66b515d1c1d2f294 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -9,7 +9,8 @@ use anyhow::Result;
+ use crate::{
+     contracts::OperationOwner,
+     core::{
+-        JournalEntry, JournalReadSnapshot, JournalRecord, ModelResponseOutcome, ToolCallRecordPhase,
++        CompactTextRow, DisplayRows, JournalEntry, JournalReadSnapshot, JournalRecord,
++        ModelResponseOutcome, ToolCallRecordPhase,
+     },
+     domain::TurnId,
+     model_standard::ContentPart,
+@@ -26,11 +27,26 @@ pub(crate) fn journal_transcript_from_source(
+     source: &mut JournalReadSnapshot,
+     live_turn_id: Option<TurnId>,
+ ) -> Result<Vec<AppTranscriptMessage>> {
++    render_source(source, live_turn_id, false).map(DisplayRows::into_full)
++}
++
++pub(crate) fn journal_transcript_for_startup(
++    source: &mut JournalReadSnapshot,
++) -> Result<DisplayRows> {
++    render_source(source, None, true)
++}
++
++fn render_source(
++    source: &mut JournalReadSnapshot,
++    live_turn_id: Option<TurnId>,
++    allow_compact: bool,
++) -> Result<DisplayRows> {
+     if let Some((root_threads, single_record)) = source.take_staged_causal_roots() {
+         return render_causal(
+             &mut |visit| source.scan_display(visit),
+             live_turn_id,
+             single_record,
++            allow_compact,
+             TranscriptVisibility {
+                 root_threads,
+                 certified_text_responses: true,
+@@ -38,7 +54,7 @@ pub(crate) fn journal_transcript_from_source(
+             },
+         );
+     }
+-    transcript_from_scan(|visit| source.scan_display(visit), live_turn_id)
++    transcript_from_scan(|visit| source.scan_display(visit), live_turn_id).map(DisplayRows::Full)
+ }
+ 
+ pub(super) fn transcript_from_scan(
+@@ -217,8 +233,9 @@ fn render_causal(
+     scan: &mut impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
+     live_turn_id: Option<TurnId>,
+     single_record: bool,
++    allow_compact: bool,
+     visibility: TranscriptVisibility,
+-) -> Result<Vec<AppTranscriptMessage>> {
++) -> Result<DisplayRows> {
+     let mut replay = TranscriptReplay {
+         state: TranscriptProjectionState {
+             timestamps: TranscriptTimestamps::staged(single_record),
+@@ -228,22 +245,47 @@ fn render_causal(
+         final_results: Default::default(),
+         subagent_bindings: Default::default(),
+     };
++    let mut compact = None;
+     scan(&mut |mut record| {
+         replay.state.timestamps.collect_record::<false>(&record);
+         if let JournalEntry::HistoryMutated(mutation) = &mut record.entry
+             && mutation.mutation == HistoryMutationKind::Append
+         {
+             if !(live_turn_id.is_some() && record.turn_id == live_turn_id) {
+-                if replay.state.timestamps.certified_text_append() {
+-                    replay
+-                        .state
+-                        .transcript
+-                        .certify_text_append(mutation.messages.len());
+-                }
+-                // Only the staged record owns these decoded rows. Release each
+-                // row's unused parts and metadata as its display output grows.
+-                for mut message in std::mem::take(&mut mutation.messages) {
+-                    replay.state.append_staged_message(&mut message);
++                if allow_compact
++                    && replay.state.timestamps.certified_text_append()
++                    && (4_096..=65_536).contains(&mutation.messages.len())
++                    && mutation
++                        .messages
++                        .iter()
++                        .all(|message| message.parts.len() == 1)
++                {
++                    let mut rows = Vec::new();
++                    for mut message in std::mem::take(&mut mutation.messages) {
++                        let timestamp_ms = replay.state.timestamps.message(&message);
++                        if let Some(text) = replay.state.take_staged_text(&mut message.parts[0]) {
++                            rows.push(CompactTextRow {
++                                message_id: message.id,
++                                timestamp_ms,
++                                phase: message.phase,
++                                role: super::super::transcript_role(&message.role),
++                                text,
++                            });
++                        }
++                    }
++                    compact = Some(rows);
++                } else {
++                    if replay.state.timestamps.certified_text_append() {
++                        replay
++                            .state
++                            .transcript
++                            .certify_text_append(mutation.messages.len());
++                    }
++                    // Only the staged record owns these decoded rows. Release each
++                    // row's unused parts and metadata as its display output grows.
++                    for mut message in std::mem::take(&mut mutation.messages) {
++                        replay.state.append_staged_message(&mut message);
++                    }
+                 }
+             }
+         } else {
+@@ -251,7 +293,12 @@ fn render_causal(
+         }
+         Ok(())
+     })?;
+-    Ok(replay.finish())
++    // A compact row owner is eligible only on a certified one-record scan;
++    // an extra or truncated staged record failed before reaching here.
++    Ok(match compact {
++        Some(rows) => DisplayRows::Text(rows),
++        None => DisplayRows::Full(replay.finish()),
++    })
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+index bf937fa0a6f723c84516c30d6f8f1fdc5e978dfd..7fe457b49659f4e8635c90e367055878df81bce2 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -7,7 +7,7 @@ use std::borrow::Borrow;
+ use crate::core::JournalProjection;
+ 
+ mod source;
+-pub(crate) use source::journal_transcript_from_source;
++pub(crate) use source::{journal_transcript_for_startup, journal_transcript_from_source};
+ 
+ mod append;
+ pub(crate) use append::{
+@@ -23,7 +23,7 @@ use crate::{
+         ToolCallRecordPhase, TurnSettled, TurnSettlementStatus,
+     },
+     domain::{CallId, PartId, ThreadId, ToolCallResolution, TurnId},
+-    model_standard::{CanonicalMessage, ContentPart, PartProvenance, PartScope},
++    model_standard::{CanonicalMessage, CanonicalPart, ContentPart, PartProvenance, PartScope},
+ };
+ 
+ use super::{
+@@ -403,18 +403,9 @@ impl TranscriptProjectionState {
+     fn append_staged_message(&mut self, message: &mut CanonicalMessage) {
+         let timestamp_ms = self.timestamps.message(message);
+         if let [part] = message.parts.as_mut_slice()
+-            && let ContentPart::Text { text } = &mut part.payload
++            && matches!(part.payload, ContentPart::Text { .. })
+         {
+-            if self.seen_parts.insert(part.part_id)
+-                && part.scope == PartScope::Conversation
+-                && !text.trim().is_empty()
+-            {
+-                // A row can outlive the scan. Do not retain donor spare capacity.
+-                let text = if text.len() == text.capacity() {
+-                    std::mem::take(text)
+-                } else {
+-                    text.as_str().to_owned()
+-                };
++            if let Some(text) = self.take_staged_text(part) {
+                 super::push_transcript_text(
+                     &mut self.transcript,
+                     super::transcript_role(&message.role),
+@@ -428,6 +419,24 @@ impl TranscriptProjectionState {
+         }
+     }
+ 
++    fn take_staged_text(&mut self, part: &mut CanonicalPart) -> Option<String> {
++        let ContentPart::Text { text } = &mut part.payload else {
++            return None;
++        };
++        if !self.seen_parts.insert(part.part_id)
++            || part.scope != PartScope::Conversation
++            || text.trim().is_empty()
++        {
++            return None;
++        }
++        // A row can outlive the scan. Do not retain donor spare capacity.
++        Some(if text.len() == text.capacity() {
++            std::mem::take(text)
++        } else {
++            text.as_str().to_owned()
++        })
++    }
++
+     fn append_message_at(
+         &mut self,
+         message: &CanonicalMessage,
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+index ff8d3a1902e78fbaab44573b8a409151ebbb3854..d1b3ee8ec56a9a153867ed887c1aabd09bfa00ac 100644
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -13,7 +13,7 @@ use rows::TranscriptRows;
+ pub(crate) use journal::journal_transcript_messages;
+ pub(crate) use journal::{
+     journal_transcript_append_committed, journal_transcript_append_from_source,
+-    journal_transcript_from_source,
++    journal_transcript_for_startup, journal_transcript_from_source,
+ };
+ 
+ pub use proteus_contracts::app_protocol::{
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1477fcd56aaae3e6353e050059655ebe33bcccf7..c9a4400be17a86c22b522d03e170f7909cb38656 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -66,11 +66,11 @@ use path_utils::paths_equal;
+ pub(crate) use transcript::journal_transcript_append_committed;
+ #[cfg(test)]
+ pub(crate) use transcript::journal_transcript_messages;
+-use transcript::transcript_messages;
+ pub use transcript::{AppTranscriptMessage, AppTranscriptSubagent, AppTranscriptTool};
+ pub(crate) use transcript::{
+     journal_transcript_append_from_source, journal_transcript_from_source,
+ };
++use transcript::{journal_transcript_for_startup, transcript_messages};
+ use turn_progress::TurnProgress;
+ mod startup;
+ 
+@@ -665,8 +665,7 @@ impl AgentAppServer {
+         let mut cached_display_source = None;
+         let initial_transcript = if let Some(prepared) = resumed_session {
+             let (session_store, model, cached_source) = tokio::task::spawn_blocking(move || {
+-                let result = prepared
+-                    .into_display_view(|source| journal_transcript_from_source(source, None));
++                let result = prepared.into_startup_view(journal_transcript_for_startup);
+                 read_model::release_projection_memory();
+                 result
+             })
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 227e1c3918baa8cf4221f3b324fd3ffc4cf8c7c5..564d681b285610c45fa879177613a083d9cf3918 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -88,8 +88,9 @@ pub(crate) use session_store::read_cache as session_read_cache;
+ #[cfg(unix)]
+ pub(crate) use session_store::subscribe_catalog_updates;
+ pub(crate) use session_store::{
+-    CommittedDisplay, DisplayRecords, PrefixIdentities, PreparedSession, SessionReadModel,
+-    SessionTranscriptAppend, prepare_latest_workspace_session, session_storage_binding,
++    CommittedDisplay, CompactTextRow, DisplayRecords, DisplayRows, PrefixIdentities,
++    PreparedSession, SessionReadModel, SessionTranscriptAppend, prepare_latest_workspace_session,
++    session_storage_binding,
+ };
+ pub use session_store::{
+     SessionStore, StorageService, canonicalize_session_dir_path, configured_session_storage,
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index c7973a83786689bd6d44d3656725ad709aafc011..d8bffcf88b9a75cf8fda3de85a7c6814653b145d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -2,12 +2,13 @@
+ use std::path::{Path, PathBuf};
+ 
+ use anyhow::Result;
++#[cfg(test)]
+ use proteus_contracts::app_protocol::AppTranscriptMessage;
+ 
+ use super::{
+     RemoteSessionStore, StorageService, catalog,
+     snapshot::{RemoteJournalSnapshot, RemoteValidatedRead},
+-    view::{RemoteCacheSource, SessionReadView},
++    view::{DisplayRows, RemoteCacheSource, SessionReadView},
+ };
+ 
+ pub(crate) struct PreparedSession {
+@@ -54,6 +55,7 @@ impl PreparedSession {
+         }
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn into_display_view(
+         self,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
+@@ -61,10 +63,21 @@ impl PreparedSession {
+         RemoteSessionStore,
+         SessionReadView,
+         Option<RemoteCacheSource>,
++    )> {
++        self.into_startup_view(|snapshot| render(snapshot).map(DisplayRows::Full))
++    }
++
++    pub(crate) fn into_startup_view(
++        self,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<DisplayRows>,
++    ) -> Result<(
++        RemoteSessionStore,
++        SessionReadView,
++        Option<RemoteCacheSource>,
+     )> {
+         let (view, cached_source) = match self.history {
+             PreparedHistory::Validated(read) => {
+-                (self.store.project_validated_view(read, true, render)?, None)
++                (self.store.project_startup_view(read, true, render)?, None)
+             }
+             PreparedHistory::Cached(source, view) => (view, Some(source)),
+         };
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 3267e1b0f3eb4420f26f36df7b6514d2ff05a6cd..581cb0ba0d0990f2118382dc3517a485f3ed178b 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -409,28 +409,63 @@ pub(super) fn save_model(
+         cursor,
+         Cow::Borrowed(&model.conversation.messages),
+         Cow::Borrowed(&model.conversation.model_context),
++        RowsRef::Full(&model.transcript),
+     )
+ }
+ 
+ /// Startup returns a display-only view, never the canonical messages/context.
+ /// Keep the already rendered transcript for a potential named-page miss.
+-pub(super) fn save_startup_model(
++pub(super) fn save_startup_model<T: CacheRows>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+-    model: &mut SessionReadModel,
++    model: &mut SessionReadModel<T>,
+ ) -> Option<()> {
+     let messages = Cow::Owned(std::mem::take(&mut model.conversation.messages));
+     let context = Cow::Owned(std::mem::take(&mut model.conversation.model_context));
+-    save_model_sections(store, source, model, None, messages, context)
++    save_model_sections(
++        store,
++        source,
++        model,
++        None,
++        messages,
++        context,
++        model.transcript.rows_ref(),
++    )
++}
++
++#[derive(Clone, Copy)]
++pub(super) enum RowsRef<'a> {
++    Full(&'a [AppTranscriptMessage]),
++    Text(&'a [CompactTextRow]),
++}
++
++pub(super) trait CacheRows {
++    fn rows_ref(&self) -> RowsRef<'_>;
++}
++
++impl CacheRows for Vec<AppTranscriptMessage> {
++    fn rows_ref(&self) -> RowsRef<'_> {
++        RowsRef::Full(self)
++    }
++}
++
++impl CacheRows for DisplayRows {
++    fn rows_ref(&self) -> RowsRef<'_> {
++        match self {
++            DisplayRows::Full(rows) => RowsRef::Full(rows),
++            DisplayRows::Text(rows) => RowsRef::Text(rows),
++        }
++    }
+ }
+ 
+-fn save_model_sections(
++fn save_model_sections<T>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+-    model: &SessionReadModel,
++    model: &SessionReadModel<T>,
+     cursor: Option<&RemoteJournalCursor>,
+     mut messages: Cow<'_, [CanonicalMessage]>,
+     observations: Cow<'_, [ModelContextObservation]>,
++    rows: RowsRef<'_>,
+ ) -> Option<()> {
+     if !SessionReadModel::matches_parts(store, &model.summary, &model.usage, messages.len()) {
+         return None;
+@@ -445,17 +480,25 @@ fn save_model_sections(
+         }
+         Cow::Borrowed(_) => None,
+     };
+-    let transcript = write_transcript(store, source, &model.transcript)?;
++    let transcript = match rows {
++        RowsRef::Full(rows) => write_transcript(store, source, rows)?,
++        RowsRef::Text(rows) => write_transcript(store, source, rows)?,
++    };
+     let context = write_section(store, source, observations.as_ref())?;
+     drop(observations);
+     let base = previous.and_then(|(old_source, old_transcript)| {
+         Some(AppTranscriptBase {
+             revision: old_source.revision()?,
+-            common_prefix: common_prefix(store, &old_transcript, &transcript, &model.transcript)?,
++            common_prefix: match rows {
++                RowsRef::Full(rows) => common_prefix(store, &old_transcript, &transcript, rows)?,
++                RowsRef::Text(rows) => common_prefix(store, &old_transcript, &transcript, rows)?,
++            },
+         })
+     });
+     let mut tools = BTreeMap::new();
+-    update_tools(store, source, &mut tools, &model.transcript)?;
++    if let RowsRef::Full(rows) = rows {
++        update_tools(store, source, &mut tools, rows)?;
++    }
+     publish(
+         store,
+         &Header {
+@@ -480,11 +523,11 @@ fn save_model_sections(
+     )
+ }
+ 
+-fn common_prefix(
++fn common_prefix<T: Serialize>(
+     store: &RemoteSessionStore,
+     old: &Section,
+     new: &Section,
+-    rows: &[AppTranscriptMessage],
++    rows: &[T],
+ ) -> Option<usize> {
+     let mut common = 0;
+     for (before, after) in old.pages.iter().zip(&new.pages) {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs b/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d36e3f891738ca47f0419f7641b8a3a92564556
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs
+@@ -0,0 +1,106 @@
++//! Private cold-start row owner for one certified text-only append.
++//! Do not change AppTranscriptMessage or the persisted page wire format.
++use proteus_contracts::{
++    app_protocol::AppTranscriptMessage, domain::MessageId, model_standard::MessagePhase,
++};
++use serde::{Serialize, Serializer};
++
++pub(crate) enum DisplayRows {
++    Full(Vec<AppTranscriptMessage>),
++    Text(Vec<CompactTextRow>),
++}
++
++impl DisplayRows {
++    pub(crate) fn into_full(self) -> Vec<AppTranscriptMessage> {
++        match self {
++            Self::Full(rows) => rows,
++            Self::Text(rows) => {
++                let mut full = Vec::with_capacity(rows.len());
++                full.extend(rows.into_iter().map(CompactTextRow::into_full));
++                full
++            }
++        }
++    }
++}
++
++pub(crate) struct CompactTextRow {
++    pub(crate) message_id: MessageId,
++    pub(crate) timestamp_ms: Option<i64>,
++    pub(crate) phase: Option<MessagePhase>,
++    pub(crate) role: &'static str,
++    pub(crate) text: String,
++}
++
++impl CompactTextRow {
++    fn into_full(self) -> AppTranscriptMessage {
++        AppTranscriptMessage {
++            message_id: Some(self.message_id),
++            timestamp_ms: self.timestamp_ms,
++            phase: self.phase,
++            role: self.role.to_owned(),
++            text: self.text,
++            images: Vec::new(),
++            tool: None,
++            subagent: None,
++            streaming: false,
++        }
++    }
++}
++
++// Match AppTranscriptMessage's declaration order even in preserve_order.
++#[derive(Serialize)]
++struct TextWire<'a> {
++    message_id: Option<MessageId>,
++    timestamp_ms: Option<i64>,
++    phase: Option<MessagePhase>,
++    role: &'a str,
++    text: &'a str,
++    images: [(); 0],
++    tool: Option<()>,
++    subagent: Option<()>,
++    streaming: bool,
++}
++
++impl Serialize for CompactTextRow {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        TextWire {
++            message_id: Some(self.message_id),
++            timestamp_ms: self.timestamp_ms,
++            phase: self.phase,
++            role: self.role,
++            text: &self.text,
++            images: [],
++            tool: None,
++            subagent: None,
++            streaming: false,
++        }
++        .serialize(serializer)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn compact_wire_and_owned_fallback_match_the_public_row() {
++        for (role, phase, timestamp_ms) in [
++            ("user", None, None),
++            ("assistant", Some(MessagePhase::FinalAnswer), Some(-8)),
++            ("system", Some(MessagePhase::Commentary), Some(234)),
++        ] {
++            let row = CompactTextRow {
++                message_id: MessageId::nil(),
++                timestamp_ms,
++                phase,
++                role,
++                text: "line\\n𝄞🦀\\u{0}\\\\".repeat(97),
++            };
++            let owner = row.text.as_ptr();
++            let compact = serde_json::to_vec(&row).unwrap();
++            let full = DisplayRows::Text(vec![row]).into_full();
++            assert_eq!(full[0].text.as_ptr(), owner);
++            assert_eq!(compact, serde_json::to_vec(&full[0]).unwrap());
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 5165fd809a855e28ed08d5ad705ed5cff3b3e864..7c350b65d28617711ee77049c371716cd5e59c14 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -20,18 +20,20 @@ mod committed;
+ mod incremental;
+ pub(crate) use committed::CommittedDisplay;
+ mod prefix;
++mod text_rows;
+ pub(crate) use cache::RemoteCacheSource;
+ pub(crate) use prefix::PrefixIdentities;
++pub(crate) use text_rows::{CompactTextRow, DisplayRows};
+ 
+ #[cfg(test)]
+ mod tests;
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-pub(crate) struct SessionReadModel {
++pub(crate) struct SessionReadModel<T = Vec<AppTranscriptMessage>> {
+     pub summary: AppSessionSummary,
+     pub conversation: ConversationSnapshot,
+-    pub transcript: Vec<AppTranscriptMessage>,
++    pub transcript: T,
+     pub usage: SessionUsageSnapshot,
+     #[serde(skip)]
+     pub(super) prefix: Option<PrefixIdentities>,
+@@ -52,11 +54,11 @@ pub(crate) struct SessionTranscriptAppend {
+     pub conversation_appended: usize,
+ }
+ 
+-impl SessionReadModel {
++impl<T> SessionReadModel<T> {
+     pub(crate) fn from_validated(
+         store: &RemoteSessionStore,
+         read: RemoteValidatedRead,
+-        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<T>,
+     ) -> Result<Self> {
+         let (mut snapshot, state) = read.into_parts();
+         let transcript = render(&mut snapshot)?;
+@@ -73,7 +75,9 @@ impl SessionReadModel {
+             prefix: Some(prefix),
+         })
+     }
++}
+ 
++impl SessionReadModel {
+     fn matches_parts(
+         store: &RemoteSessionStore,
+         summary: &AppSessionSummary,
+@@ -97,6 +101,17 @@ impl RemoteSessionStore {
+         read: RemoteValidatedRead,
+         paged: bool,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
++    ) -> Result<SessionReadView> {
++        self.project_startup_view(read, paged, |snapshot| {
++            render(snapshot).map(DisplayRows::Full)
++        })
++    }
++
++    pub(super) fn project_startup_view(
++        &self,
++        read: RemoteValidatedRead,
++        paged: bool,
++        render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<DisplayRows>,
+     ) -> Result<SessionReadView> {
+         let source = RemoteCacheSource::from_cursor(&read.cursor());
+         let mut model = SessionReadModel::from_validated(self, read, render)?;
+@@ -123,7 +138,7 @@ impl RemoteSessionStore {
+                     base: page.base,
+                 }),
+             ),
+-            None => (model.transcript, None),
++            None => (model.transcript.into_full(), None),
+         };
+         Ok(SessionReadView {
+             summary: model.summary,
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index c83a384ec97b12663e34dfd28085d40e33d8e020..d7ff38969f39d2cfad72da8dfa44a491a11869e3 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -19,7 +19,10 @@ pub use remote::StorageService;
+ pub(crate) use remote::{
+     prepared::{PreparedSession, prepare_latest_workspace_session},
+     snapshot::DisplayRecords,
+-    view::{CommittedDisplay, PrefixIdentities, SessionReadModel, SessionTranscriptAppend},
++    view::{
++        CommittedDisplay, CompactTextRow, DisplayRows, PrefixIdentities, SessionReadModel,
++        SessionTranscriptAppend,
++    },
+ };
+ pub use workspace_dir::{decode_workspace_path, encode_workspace_path};
+ pub(crate) mod read_cache {
