@@ -1,0 +1,47 @@
+diff --git a/workflow/coding-workflow/src/scaffold.rs b/workflow/coding-workflow/src/scaffold.rs
+index 2a40f83317b1edf2b6bc6b04d28346eddfab46bf..5c26a37270d38e282a31f168d6a49de6f415ad78 100644
+--- a/workflow/coding-workflow/src/scaffold.rs
++++ b/workflow/coding-workflow/src/scaffold.rs
+@@ -105,7 +105,7 @@
+         .ok_or_else(|| ProcessModuleError::new("workflow input has no current user anchor"))?;
+         if current_user_message.role != MessageRole::User
+             || (input.runtime.continuation.is_none()
+-                && message_text(current_user_message) != input.task.text)
++                && !message_text_matches(current_user_message, &input.task.text))
+         {
+             return Err(ProcessModuleError::new(
+                 "workflow input has no current task user message",
+@@ -348,14 +348,23 @@
+     }
+ }
+ 
+-fn message_text(message: &CanonicalMessage) -> String {
+-    message
+-        .parts
+-        .iter()
+-        .filter_map(|part| match &part.payload {
+-            ContentPart::Text { text } => Some(text.as_str()),
+-            _ => None,
+-        })
+-        .collect::<Vec<_>>()
+-        .join("\n\n")
++fn message_text_matches(message: &CanonicalMessage, mut expected: &str) -> bool {
++    let mut first = true;
++    for part in &message.parts {
++        let ContentPart::Text { text } = &part.payload else {
++            continue;
++        };
++        if !first {
++            let Some(rest) = expected.strip_prefix("\n\n") else {
++                return false;
++            };
++            expected = rest;
++        }
++        let Some(rest) = expected.strip_prefix(text.as_str()) else {
++            return false;
++        };
++        expected = rest;
++        first = false;
++    }
++    expected.is_empty()
+ }
