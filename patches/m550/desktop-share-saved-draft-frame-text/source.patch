@@ -1,0 +1,70 @@
+diff --git a/src/ui/chat/draft.rs b/src/ui/chat/draft.rs
+index 5d1e7e81ae42a040646f0e1805b5ab1b978a9e08..6a35a31b6aeb2872e76209c698aacb4ad686043a 100644
+--- a/src/ui/chat/draft.rs
++++ b/src/ui/chat/draft.rs
+@@ -1,5 +1,7 @@
+ // Адаптировано из Zed: crates/agent_ui/src/conversation_view/message_queue.rs
+ // (failed sends retain their complete content instead of replacing new input).
++use std::rc::Rc;
++
+ use gpui_kit::*;
+ 
+ use super::Chat;
+@@ -8,7 +10,8 @@
+ /// A complete unsent message kept apart from whatever is being typed now.
+ pub(super) struct SavedDraft {
+     pub id: String,
+-    pub text: String,
++    // Keep one existing buffer shared by any live Copy closures.
++    pub text: Rc<String>,
+     pub attachments: Attachments,
+ }
+ 
+@@ -16,7 +19,7 @@
+     pub fn new(text: String, attachments: Attachments) -> Self {
+         Self {
+             id: uuid::Uuid::new_v4().simple().to_string(),
+-            text,
++            text: Rc::new(text),
+             attachments,
+         }
+     }
+@@ -48,7 +51,7 @@
+         }
+         self.attachments = saved.attachments;
+         self.composer.update(cx, |state, cx| {
+-            state.set_value(saved.text, window, cx);
++            state.set_value(saved.text.as_str(), window, cx);
+             state.focus(window, cx);
+         });
+         cx.notify();
+diff --git a/src/ui/chat/composer.rs b/src/ui/chat/composer.rs
+index dc3c47f414ed79b1eff604580328e972bc05a567..a2343522ce3fd073a0e32fc01cb0f1a6ab281961 100644
+--- a/src/ui/chat/composer.rs
++++ b/src/ui/chat/composer.rs
+@@ -1,5 +1,7 @@
+ // Адаптировано из Zed: crates/agent_ui/src/conversation_view/thread_view.rs
+ // (send readiness, retained queued drafts and focus after sending).
++use std::rc::Rc;
++
+ use gpui_kit::component::button::ButtonVariants as _;
+ use gpui_kit::component::input::Textarea;
+ use gpui_kit::component::scroll::ScrollableElement as _;
+@@ -176,7 +178,7 @@
+ fn render_saved(draft: &SavedDraft, loading: bool, cx: &Context<Chat>) -> impl IntoElement {
+     let theme = cx.theme();
+     let restore_id = draft.id.clone();
+-    let copy = draft.text.clone();
++    let copy = Rc::clone(&draft.text);
+     let images = draft.attachments.len();
+     h_flex()
+         .gap_2()
+@@ -217,7 +219,7 @@
+                 .xsmall()
+                 .disabled(copy.is_empty())
+                 .on_click(move |_, _, cx| {
+-                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
++                    cx.write_to_clipboard(ClipboardItem::new_string(copy.as_ref().clone()))
+                 }),
+         )
+         .child(
