@@ -1,0 +1,23 @@
+diff --git a/crates/proteus-core/src/app_server/events/session.rs b/crates/proteus-core/src/app_server/events/session.rs
+index 24102a8c68bd6ee350cc9f4e315ce82d50cde000..fbbcc8986113cd024be7e1b737959a8b7c601395 100644
+--- a/crates/proteus-core/src/app_server/events/session.rs
++++ b/crates/proteus-core/src/app_server/events/session.rs
+@@ -42,8 +42,16 @@
+ 
+ impl SnapshotParts {
+     fn into_snapshot(self) -> AppSessionSnapshot {
+-        let mut transcript = self.history.messages.clone();
+-        transcript.extend(self.progress);
++        let transcript = if self.history.messages.is_empty()
++            && self.progress.len() == self.progress.capacity()
++        {
++            self.progress
++        } else {
++            let mut rows = Vec::with_capacity(self.history.messages.len() + self.progress.len());
++            rows.extend_from_slice(&self.history.messages);
++            rows.extend(self.progress);
++            rows
++        };
+         AppSessionSnapshot {
+             session_id: self.session_id,
+             stream_id: self.stream_id,
