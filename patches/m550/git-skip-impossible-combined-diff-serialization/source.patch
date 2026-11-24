@@ -1,0 +1,43 @@
+--- a/packages/git/src/cache.rs
++++ b/packages/git/src/cache.rs
+@@ -64,10 +64,14 @@
+     Some(counter.0)
+ }
+ 
+-pub(crate) fn encoded_text_bytes(value: &str) -> Option<usize> {
++pub(crate) fn encoded_text_bytes(value: &str, limit: usize) -> Option<usize> {
++    // UTF-8 bytes cannot shrink when JSON-escaped; surrounding quotes add two.
++    if value.len().checked_add(2)? > limit {
++        return None;
++    }
+     let mut counter = Counter(0);
+     serde_json::to_writer(&mut counter, value).ok()?;
+-    Some(counter.0)
++    (counter.0 <= limit).then_some(counter.0)
+ }
+ 
+ /// Mutable worktree snapshots have their own shared per-session retention
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -199,12 +199,16 @@
+             let data = self.working_diff(host, entry.str("path"))?;
+             let file = diff_info(&data, Some(entry));
+             let text = data.opt_str("patch").unwrap_or("");
+-            let cost = crate::cache::encoded_bytes(&file)
+-                .zip(crate::cache::encoded_text_bytes(text))
++            let overhead = crate::cache::encoded_bytes(&file)
++                // Newline, array punctuation and conservative per-file slack.
++                .and_then(|size| size.checked_add(32));
++            let patch_bytes = overhead
++                .and_then(|size| (CHANGES_BYTES - bytes).checked_sub(size))
++                .and_then(|limit| crate::cache::encoded_text_bytes(text, limit));
++            let Some(cost) = overhead
++                .zip(patch_bytes)
+                 .and_then(|(file, patch)| file.checked_add(patch))
+-                // Newline, array punctuation and conservative per-file slack.
+-                .and_then(|cost| cost.checked_add(32));
+-            let Some(cost) = cost.filter(|cost| *cost <= CHANGES_BYTES - bytes) else {
++            else {
+                 break;
+             };
+             bytes += cost;
