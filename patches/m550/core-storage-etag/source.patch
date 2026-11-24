@@ -1,0 +1,26 @@
+diff --git a/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs b/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
+index 67f2b0313b36f7d54dc4ff3a5ccfd4201ed2a546..a60fb7487ce567fd7952cfb00478d0303263194d 100644
+--- a/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
++++ b/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
+@@ -13,13 +13,14 @@
+     let mut writer = DigestWriter(DigestContext::new(&SHA256));
+     serde_json::to_writer(&mut writer, &OrderedValue(value))
+         .context("failed to fingerprint storage value")?;
+-    Ok(writer
+-        .0
+-        .finish()
+-        .as_ref()
+-        .iter()
+-        .map(|byte| format!("{byte:02x}"))
+-        .collect())
++    let digest = writer.0.finish();
++    let mut etag = String::with_capacity(digest.as_ref().len() * 2);
++    const HEX: &[u8; 16] = b"0123456789abcdef";
++    for &byte in digest.as_ref() {
++        etag.push(char::from(HEX[usize::from(byte >> 4)]));
++        etag.push(char::from(HEX[usize::from(byte & 0x0f)]));
++    }
++    Ok(etag)
+ }
+ 
+ struct OrderedValue<'a>(&'a Value);
