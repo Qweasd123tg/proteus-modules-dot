@@ -1,0 +1,27 @@
+--- a/crates/proteus-session-semantics/src/journal/projection/facts.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+@@ -369,8 +369,9 @@
+                 reject_execution_id(record)?;
+                 let turn_id = self.require_root_turn(record)?;
+                 if self.capture_owner == record.thread_id.zip(record.turn_id) {
+-                    let pending = self
+-                        .tool_calls
++                    // Share the lifecycle map, not the pending result payloads.
++                    let tool_calls = self.tool_calls.clone();
++                    let pending = tool_calls
+                         .values()
+                         .filter(|call| {
+                             !call.result
+@@ -379,10 +380,9 @@
+                                         && owner.turn_id == record.turn_id
+                                 })
+                         })
+-                        .filter_map(|call| call.effect.clone())
+-                        .collect::<Vec<_>>();
++                        .filter_map(|call| call.effect.as_ref());
+                     for result in pending {
+-                        if let Some(index) = self.capture_tool_result(&result)? {
++                        if let Some(index) = self.capture_tool_result(result)? {
+                             self.history_revision = self.history_revision.saturating_add(1);
+                             self.check_active_ids(None)?;
+                             Self::validate_part_id_stability(
