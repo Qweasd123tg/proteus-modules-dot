@@ -1,0 +1,68 @@
+--- a/packages/markdown-render/src/render.rs
++++ b/packages/markdown-render/src/render.rs
+@@ -71,8 +71,14 @@
+         // The SDK can recover from an extension error or unwind. Never leave a
+         // prefix pointing into segments that have already moved out of the cache.
+         let mut prefix = std::mem::take(&mut self.prefix);
++        let policy_changed = self.languages != languages;
++        if policy_changed {
++            // None of the old nodes may be reused with a different renderer
++            // policy. Release their source and widgets before parsing.
++            old = Vec::new();
++        }
+         let reuse = prefix.bytes > 0
+-            && self.languages == languages
++            && !policy_changed
+             // The fingerprint excludes this lookahead byte. Recheck the
+             // ended-line condition that made the closing fence cacheable.
+             && matches!(
+@@ -100,13 +106,15 @@
+                 .iter()
+                 .map(String::as_str)
+                 .eq(definitions.tail.iter().map(|item| item.source.as_str()));
+-        let policy_changed = self.languages != languages;
+         let mut pieces = if reuse {
+             old.drain(..prefix.segments).collect::<Vec<_>>()
+         } else {
+             Vec::new()
+         };
+         if definitions_changed {
++            // Keep the verified prefix that moved into pieces; the old
++            // suffix cannot supply any nodes to a new reference scope.
++            old = Vec::new();
+             for piece in &mut pieces {
+                 if let Some(source) = piece
+                     .source
+@@ -140,7 +148,6 @@
+                     format!("prose-{index}"),
+                     &source[start..begin],
+                     &definitions,
+-                    definitions_changed || policy_changed,
+                     languages,
+                 )?);
+             }
+@@ -188,7 +195,6 @@
+                 format!("prose-{blocks}"),
+                 &source[start..],
+                 &definitions,
+-                definitions_changed || policy_changed,
+                 languages,
+             )?);
+         }
+@@ -232,13 +238,11 @@
+     id: String,
+     source: &str,
+     definitions: &Definitions<'_>,
+-    definitions_changed: bool,
+     languages: &[String],
+ ) -> Result<Segment> {
+-    if !definitions_changed
+-        && let Some(index) = old
+-            .iter()
+-            .position(|segment| segment.id == id && segment.source.as_deref() == Some(source))
++    if let Some(index) = old
++        .iter()
++        .position(|segment| segment.id == id && segment.source.as_deref() == Some(source))
+     {
+         return Ok(old.remove(index));
+     }
