@@ -1,0 +1,9 @@
+# Core: skip encoding null metadata when estimating history tokens
+
+Core estimates the token budget of canonical messages by counting bytes. JSON null is always four UTF-8 bytes. Use that constant for the default metadata on messages, context chunks, and tool results; keep the existing serializer for every populated value and for other payloads, including null tool arguments. The compact text-only estimator also uses the constant once per history, not once per row. No token formula, role count, display rule, or wire format changes.
+
+The default-layout LLVM IR from the exact uninstrumented canonical body shows the previous serializer and counting writer really survived optimization. In the new message loop, null contributes 8 bytes (4 metadata plus 4 message overhead) without calling the serializer. Non-null metadata still reaches the same helper. The two nested metadata sites contribute 4 on their null branches.
+
+A separate native probe used locked Contracts and serde_json on each of the default and preserve-order layouts. Seven shapes × four calls per layout matched the independent byte oracle and serialized summary. For 50,000 canonical text messages, counted serializer entries went from 50,000 to zero. For a synthetic 50,000-message history with a tool/context overlay on every tenth message, entries went from 75,000 to 17,000. Counting-writer calls decreased by the same amounts. The original encoded-length budget test passed on both layouts.
+
+These are counts of in-memory work, not I/O, latency, memory, an owner trace, or full-product throughput. Populated metadata has an extra null check. Optimized IR was not evaluated for the preserve-order layout or compact-plain path. The patch targets the exact composed Core preimage, not necessarily the current standalone owner branch.
