@@ -1,0 +1,241 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index cc4a2b10767ba6bb6d355809417ddbb5345162a9..67cabb6cf98ce92a2324fa9a6ae2881deb5de8bb 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -43,7 +43,13 @@ fn render_source(
+ ) -> Result<DisplayRows> {
+     if let Some((root_threads, single_record)) = source.take_staged_causal_roots() {
+         return render_causal(
+-            &mut |visit| source.scan_display(visit),
++            &mut |visit| {
++                if allow_compact && single_record && live_turn_id.is_none() {
++                    source.scan_display_capturing_prefix(visit)
++                } else {
++                    source.scan_display(visit)
++                }
++            },
+             live_turn_id,
+             single_record,
+             allow_compact,
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+index 0b0ab53fc1320ba84549a74bdb77b04813cf7e0a..a6b152072b6b695193ffdbdd750c4a9da883c20a 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+@@ -1,5 +1,6 @@
+ //! Rewindable, snapshot-local render input. No replay-only payloads cross this
+ //! buffer. Failure to stage the records leaves the original streaming reader.
++use super::super::view::PrefixIdentities;
+ use super::{JournalKind, JournalRecord};
+ use crate::{
+     core::{HistoryMutationKind, JournalEntry, ModelResponseOutcome},
+@@ -173,6 +174,7 @@ impl DisplayRecordWriter {
+                 MAX_STAGING_BYTES - self.remaining,
+             ),
+             causal_roots: self.causal_stage.and_then(CausalStage::finish),
++            prefix_witness: None,
+         })
+     }
+ }
+@@ -197,6 +199,14 @@ pub(crate) struct DisplayRecords {
+     count: usize,
+     single_record_reserve: usize,
+     causal_roots: Option<RootBindings>,
++    prefix_witness: Option<PrefixWitness>,
++}
++
++// Private to this staged file, and consumed by its next prefix scan.
++// A successfully rendered record isn't a certificate for a later read.
++struct PrefixWitness {
++    sha256: ring::digest::Digest,
++    prefix: PrefixIdentities,
+ }
+ 
+ impl DisplayRecords {
+@@ -222,6 +232,76 @@ impl DisplayRecords {
+     pub(crate) fn scan(
+         &mut self,
+         mut consume: impl FnMut(JournalRecord) -> Result<()>,
++    ) -> Result<()> {
++        self.scan_lines(|line, last, _| {
++            let record = serde_json::from_slice(line)?;
++            release_scan_line(line, last);
++            consume(record)
++        })
++    }
++
++    pub(super) fn scan_capturing_prefix(
++        &mut self,
++        mut consume: impl FnMut(JournalRecord) -> Result<()>,
++    ) -> Result<()> {
++        self.prefix_witness = None;
++        let expected_bytes = self.single_record_reserve;
++        if self.count != 1 || expected_bytes == 0 {
++            return self.scan(consume);
++        }
++
++        let mut witness = None;
++        self.scan_lines(|line, last, index| {
++            let record: JournalRecord = serde_json::from_slice(line)?;
++            let sha256 = (index == 0 && line.len() == expected_bytes && prefix_candidate(&record))
++                .then(|| ring::digest::digest(&ring::digest::SHA256, line));
++            release_scan_line(line, last);
++            if let Some(sha256) = sha256 {
++                let mut prefix = PrefixIdentities::default();
++                prefix.visit(&record, false);
++                witness = Some(PrefixWitness { sha256, prefix });
++            }
++            consume(record)
++        })?;
++        // Only commit after the renderer and physical EOF/count checks succeed.
++        self.prefix_witness = witness;
++        Ok(())
++    }
++
++    pub(super) fn scan_prefix(&mut self) -> Result<PrefixIdentities> {
++        let mut prefix = PrefixIdentities::default();
++        let Some(witness) = self.prefix_witness.take() else {
++            self.scan(|record| {
++                prefix.visit_owned_prefix(record);
++                Ok(())
++            })?;
++            return Ok(prefix);
++        };
++        let mut first = Some(witness);
++        let expected_bytes = self.single_record_reserve;
++        self.scan_lines(|line, last, _| {
++            if let Some(witness) = first.take()
++                && line.len() == expected_bytes
++                && ring::digest::digest(&ring::digest::SHA256, line).as_ref()
++                    == witness.sha256.as_ref()
++            {
++                release_scan_line(line, last);
++                prefix = witness.prefix;
++                return Ok(());
++            }
++            // A different complete line still follows exactly the original
++            // typed decode. Never turn a serde error into an EOF/count error.
++            let record = serde_json::from_slice(line)?;
++            release_scan_line(line, last);
++            prefix.visit_owned_prefix(record);
++            Ok(())
++        })?;
++        Ok(prefix)
++    }
++
++    fn scan_lines(
++        &mut self,
++        mut consume: impl FnMut(&mut Vec<u8>, bool, usize) -> Result<()>,
+     ) -> Result<()> {
+         self.file.rewind()?;
+         let mut reader = BufReader::new(&mut self.file);
+@@ -236,14 +316,7 @@ impl DisplayRecords {
+                 line.ends_with(b"\n"),
+                 "incomplete transcript staging record"
+             );
+-            let record = serde_json::from_slice(&line)?;
+-            // This is only a memory hint: continue to EOF and validate the count.
+-            if line.capacity() > MAX_RETAINED_FINAL_SCAN_BYTES
+-                && count.checked_add(1) == Some(self.count)
+-            {
+-                line = Vec::new();
+-            }
+-            consume(record)?;
++            consume(&mut line, count.checked_add(1) == Some(self.count), count)?;
+             count += 1;
+             line.clear();
+         }
+@@ -255,6 +328,28 @@ impl DisplayRecords {
+     }
+ }
+ 
++fn release_scan_line(line: &mut Vec<u8>, last: bool) {
++    // A memory hint only: the same loop continues to physical EOF and count.
++    if line.capacity() > MAX_RETAINED_FINAL_SCAN_BYTES && last {
++        *line = Vec::new();
++    }
++}
++
++fn prefix_candidate(record: &JournalRecord) -> bool {
++    matches!(
++        &record.entry,
++        JournalEntry::HistoryMutated(h)
++            if h.mutation == HistoryMutationKind::Append
++                && h.compaction.is_none()
++                && h.tool_results.is_empty()
++                && (4_096..=65_536).contains(&h.messages.len())
++                && h.messages.iter().all(|m| matches!(
++                    m.parts.as_slice(),
++                    [part] if matches!(part.payload, ContentPart::Text { .. })
++                ))
++    )
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index f5045566e02065ce943c6ad24ea5c7c34f823303..c8cb82b2091db0f923637953ce4954467d10380d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -93,6 +93,28 @@ impl RemoteJournalSnapshot {
+             None => self.scan_from(0, is_display_kind, consume),
+         }
+     }
++    pub(crate) fn scan_display_capturing_prefix(
++        &mut self,
++        consume: impl FnMut(JournalRecord) -> Result<()>,
++    ) -> Result<()> {
++        match &mut self.display_records {
++            Some(records) => records.scan_capturing_prefix(consume),
++            None => self.scan_from(0, is_display_kind, consume),
++        }
++    }
++
++    pub(super) fn scan_display_prefix(&mut self) -> Result<super::view::PrefixIdentities> {
++        if let Some(records) = &mut self.display_records {
++            return records.scan_prefix();
++        }
++        let mut prefix = super::view::PrefixIdentities::default();
++        self.scan_display(|record| {
++            prefix.visit_owned_prefix(record);
++            Ok(())
++        })?;
++        Ok(prefix)
++    }
++
+     fn scan_from(
+         &mut self,
+         mut after_seq: u64,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+index 24d4725380537aaddd0b1ab8b545a0e6afc1f953..8c0bc45bbfe781c2bc7a64208e2a68153664828d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+@@ -62,7 +62,10 @@ impl PrefixIdentities {
+         independent
+     }
+ 
+-    pub(super) fn visit_owned_prefix(&mut self, record: JournalRecord) {
++    pub(in crate::core::session_store::remote) fn visit_owned_prefix(
++        &mut self,
++        record: JournalRecord,
++    ) {
+         if let JournalEntry::HistoryMutated(mutation) = record.entry {
+             self.visit_turn(record.turn_id, false);
+             for message in mutation.messages {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index c0f4d4d2420003db1f7fac084a0043fd2d118ca1..db371882d0446cb20470b49be3907f284867f5d5 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -226,11 +226,7 @@ fn display_prefix(
+     snapshot: &mut RemoteJournalSnapshot,
+     history: &[crate::model_standard::CanonicalMessage],
+ ) -> Result<PrefixIdentities> {
+-    let mut prefix = PrefixIdentities::default();
+-    snapshot.scan_display(|record| {
+-        prefix.visit_owned_prefix(record);
+-        Ok(())
+-    })?;
++    let mut prefix = snapshot.scan_display_prefix()?;
+     prefix.history = history
+         .iter()
+         .map(crate::core::history_message_sha256)
