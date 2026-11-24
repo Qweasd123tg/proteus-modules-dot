@@ -1,0 +1,28 @@
+diff --git a/src/ui/extensions/declarative/fields.rs b/src/ui/extensions/declarative/fields.rs
+index 698a9741a3b0dc9194ef1141a8f14e440d071967..56c9ff42aea37771ecbcbe15c556578bc4532bd3 100644
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -566,17 +566,22 @@
+                     editor.set_scroll_beyond_last_line(
+                         if *embedded { Some(0) } else { None },
+                         window,
+                         cx,
+                     );
+                     if *embedded {
+                         editor.set_scroll_bounce(false, cx);
+                     }
+-                    if editor.value().as_ref() != text {
++                    let current = editor.text();
++                    let unchanged = match current.as_str() {
++                        Some(slice) => slice == text.as_str(),
++                        None => current == text.as_str(),
++                    };
++                    if !unchanged {
+                         editor.set_value(text.clone(), window, cx);
+                     }
+                 });
+             }
+             Node::Terminal { id, cwd } => {
+                 if !self.fields.terminals.contains_key(id) {
+                     let terminal = cx.new(|cx| TerminalView::new(cwd.clone(), window, cx));
+                     let focus = self.focus.clone();
