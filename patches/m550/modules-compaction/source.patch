@@ -1,0 +1,41 @@
+diff --git a/hook/codex-context-preparation/src/compaction.rs b/hook/codex-context-preparation/src/compaction.rs
+index 28c8df8396831743ff78d44736aa3671b17d7456..1a8c7fd86b25c9181808f7c6a630cd928f900723 100644
+--- a/hook/codex-context-preparation/src/compaction.rs
++++ b/hook/codex-context-preparation/src/compaction.rs
+@@ -10,9 +10,7 @@
+ 
+ use crate::{
+     budget::{estimate_messages_tokens, resolve_trigger_tokens, user_message_budget_tokens},
+-    history::{
+-        collect_user_messages, replacement_messages, select_recent_user_messages, split_history,
+-    },
++    history::{replacement_messages, select_recent_user_messages, split_history},
+     recovery::complete_summary_with_recovery,
+ };
+ 
+@@ -105,9 +103,9 @@
+         );
+     }
+ 
+-    let user_messages = collect_user_messages(&input.messages);
++    // Filter newest-first so exhausted budgets never classify or clone older users.
+     let preserved_user_messages =
+-        select_recent_user_messages(&user_messages, user_message_budget_tokens());
++        select_recent_user_messages(&input.messages, user_message_budget_tokens());
+     let summary = complete_summary_with_recovery(&input, config, history.summary_history, host)?;
+     let retained_count = preserved_user_messages.messages.len();
+     let replacement = replacement_messages(
+diff --git a/hook/codex-context-preparation/src/history.rs b/hook/codex-context-preparation/src/history.rs
+index a60af5d9780b493c57532416fe72614ba5b6577c..bc36abca719da32ce799a3fbe255f3a5b24dfea7 100644
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -114,6 +114,9 @@
+     for message in messages.iter().rev() {
+         if remaining == 0 {
+             break;
++        }
++        if !is_real_user_message(message) {
++            continue;
+         }
+         let text = message_text(message).unwrap_or_default();
+         let tokens = crate::budget::estimate_text_tokens(&text);
