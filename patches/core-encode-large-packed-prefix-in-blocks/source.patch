@@ -1,0 +1,55 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+index 92c1b89e2658bf2e93913d9dcb97b6ccc61e0137..f47c5c1a372cdb490709b8cc438b1ffc1c109f06 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+@@ -20,11 +20,47 @@
+ }
+ 
+ fn pack<const N: usize>(records: impl Iterator<Item = [u8; N]>, n: usize) -> String {
+-    let mut bytes = Vec::with_capacity(n * N);
++    const BATCH_RECORDS: usize = 48;
++    if n <= BATCH_RECORDS {
++        let mut bytes = Vec::with_capacity(n * N);
++        for item in records {
++            bytes.extend_from_slice(&item);
++        }
++        return STANDARD.encode(bytes);
++    }
++
++    let size = base64::encoded_len(n * N, true).expect("encoded prefix length");
++    let mut output = vec![0; size];
++    let mut written = 0;
++    let mut encode = |batch: &[u8]| {
++        let size = base64::encoded_len(batch.len(), true).expect("encoded prefix batch length");
++        let end = written + size;
++        if end > output.len() {
++            output.resize(end, 0);
++        }
++        STANDARD
++            .encode_slice(batch, &mut output[written..end])
++            .expect("sized prefix batch output");
++        written = end;
++    };
++
++    // Full batches contain a multiple of three bytes. Only the final
++    // partial batch can add Base64 padding.
++    let mut batch = [[0; N]; BATCH_RECORDS];
++    let mut used = 0;
+     for item in records {
+-        bytes.extend_from_slice(&item);
++        batch[used] = item;
++        used += 1;
++        if used == BATCH_RECORDS {
++            encode(batch.as_flattened());
++            used = 0;
++        }
+     }
+-    STANDARD.encode(bytes)
++    if used != 0 {
++        encode(batch[..used].as_flattened());
++    }
++    output.truncate(written);
++    String::from_utf8(output).expect("Base64 is UTF-8")
+ }
+ 
+ fn ids(set: &HashSet<Uuid>) -> String {
