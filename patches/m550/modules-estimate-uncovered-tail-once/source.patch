@@ -1,0 +1,76 @@
+diff --git a/workflow/coding-workflow/src/token_accounting.rs b/workflow/coding-workflow/src/token_accounting.rs
+index 7daf355087afd06fc5ae00b7d9bfcabbc3d9dde6..9d7c18d15575b8e71cedda3b6398c2e60089a07f 100644
+--- a/workflow/coding-workflow/src/token_accounting.rs
++++ b/workflow/coding-workflow/src/token_accounting.rs
+@@ -258,35 +258,51 @@
+         .iter()
+         .flat_map(|message| &message.parts)
+         .any(|part| matches!(part.payload, ContentPart::Opaque { .. }));
++    let (covered, uncovered) = messages.split_at(last.message_count);
+     // With an opaque checkpoint and valid prior usage, only the uncovered
+     // tail needs an estimate. The whole-history fallback would be discarded.
+-    let char_estimate = if has_opaque {
+-        None
+-    } else {
+-        estimate_message_tokens(messages)
+-    };
+-    let delta = if has_opaque && last.message_count == messages.len() {
+-        0
+-    } else {
+-        estimate_message_tokens(&messages[last.message_count..]).unwrap_or(0)
+-    };
+-    let usage_based = known.saturating_add(delta);
+-    Some(char_estimate.map_or(usage_based, |estimate| estimate.max(usage_based)))
++    if has_opaque {
++        let delta = if uncovered.is_empty() {
++            0
++        } else {
++            tokens_from_message_bytes(message_text_bytes(uncovered), uncovered.len())
++        };
++        return Some(known.saturating_add(delta));
++    }
++
++    // Floor and clamp the whole request and the tail independently. Reuse
++    // raw byte totals, not estimated tokens, because rounding is not additive.
++    let covered_bytes = message_text_bytes(covered);
++    let uncovered_bytes = message_text_bytes(uncovered);
++    let whole = tokens_from_message_bytes(
++        covered_bytes.saturating_add(uncovered_bytes),
++        messages.len(),
++    );
++    let delta = tokens_from_message_bytes(uncovered_bytes, uncovered.len());
++    Some(whole.max(known.saturating_add(delta)))
+ }
+ 
+ pub(crate) fn estimate_message_tokens(messages: &[CanonicalMessage]) -> Option<u32> {
+-    let bytes = messages
++    Some(tokens_from_message_bytes(
++        message_text_bytes(messages),
++        messages.len(),
++    ))
++}
++
++fn message_text_bytes(messages: &[CanonicalMessage]) -> usize {
++    messages
+         .iter()
+         .flat_map(|message| &message.parts)
+         .fold(0usize, |total, part| {
+             total.saturating_add(part_text_len(&part.payload))
+-        });
+-    Some(
+-        (bytes / 4)
+-            .saturating_add(messages.len())
+-            .max(1)
+-            .min(u32::MAX as usize) as u32,
+-    )
++        })
++}
++
++fn tokens_from_message_bytes(bytes: usize, message_count: usize) -> u32 {
++    (bytes / 4)
++        .saturating_add(message_count)
++        .max(1)
++        .min(u32::MAX as usize) as u32
+ }
+ 
+ fn part_text_len(part: &ContentPart) -> usize {
