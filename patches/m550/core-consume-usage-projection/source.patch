@@ -1,0 +1,35 @@
+diff --git a/crates/proteus-session-semantics/src/journal/usage.rs b/crates/proteus-session-semantics/src/journal/usage.rs
+index e6e6d3e2c8c494135bf5b29cdfc3c3e2e0ea2bfe..0ef68ba92c6fdded5f2641a488ff6e986df24a5c 100644
+--- a/crates/proteus-session-semantics/src/journal/usage.rs
++++ b/crates/proteus-session-semantics/src/journal/usage.rs
+@@ -71,6 +71,17 @@
+         self.revision = record.session_seq;
+     }
+ 
++    /// Finalize a temporary fold without duplicating its requests. Drop any
++    /// geometric spare capacity before returning the detached view.
++    pub fn into_snapshot(self, session_id: SessionId) -> SessionUsageSnapshot {
++        SessionUsageSnapshot {
++            session_id,
++            revision: self.revision,
++            latest_turn_id: self.latest_turn_id,
++            requests: self.requests.into_boxed_slice().into_vec(),
++        }
++    }
++
+     pub fn snapshot(&self, session_id: SessionId) -> SessionUsageSnapshot {
+         SessionUsageSnapshot {
+             session_id,
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index f0deea8f35c2cb6e63b4d876ffc44d1df850946b..aa613166076f6cb2df47f84fb1a416ddee6070f8 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -350,7 +350,7 @@
+                 model_context: context.snapshot(),
+                 messages: validation.into_history(),
+             },
+-            usage: usage.snapshot(store.session_id()),
++            usage: usage.into_snapshot(store.session_id()),
+         };
+         Ok((
+             Self {
