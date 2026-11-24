@@ -1,0 +1,25 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index b25bc18837dd00a8a00b353d050f6cdb83d7d150..de00f00f48693c5f857d321053f00f1f4f8fbd1b 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -789,13 +789,18 @@
+                     args: tool.args,
+                     effective_args: tool.effective_args,
+                 };
+-                if state.name == name {
+-                    requested = Some(state.clone());
++                let is_requested = state.name == name;
++                if is_requested {
++                    // Release the previous match before serializing its replacement.
++                    drop(requested.take());
+                 }
+                 tools.insert(
+                     state.name.clone(),
+                     write_content(store, &header.source, &state)?,
+                 );
++                if is_requested {
++                    requested = Some(state);
++                }
+             }
+             Some(())
+         },
