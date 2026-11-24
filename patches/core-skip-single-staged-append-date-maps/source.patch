@@ -1,0 +1,140 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+@@ -88,6 +88,7 @@
+     let actual = render_causal(
+         &mut |visit| staged.scan(visit),
+         Some(live),
++        false,
+         TranscriptVisibility {
+             root_threads: roots.expect("every response has a positive commit witness"),
+             certified_text_responses: true,
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -26,10 +26,11 @@
+     source: &mut JournalReadSnapshot,
+     live_turn_id: Option<TurnId>,
+ ) -> Result<Vec<AppTranscriptMessage>> {
+-    if let Some(root_threads) = source.take_staged_causal_roots() {
++    if let Some((root_threads, single_record)) = source.take_staged_causal_roots() {
+         return render_causal(
+             &mut |visit| source.scan_display(visit),
+             live_turn_id,
++            single_record,
+             TranscriptVisibility {
+                 root_threads,
+                 certified_text_responses: true,
+@@ -215,10 +216,14 @@
+ fn render_causal(
+     scan: &mut impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
+     live_turn_id: Option<TurnId>,
++    single_record: bool,
+     visibility: TranscriptVisibility,
+ ) -> Result<Vec<AppTranscriptMessage>> {
+     let mut replay = TranscriptReplay {
+-        state: TranscriptProjectionState::default(),
++        state: TranscriptProjectionState {
++            timestamps: TranscriptTimestamps::staged(single_record),
++            ..Default::default()
++        },
+         visibility,
+         final_results: Default::default(),
+         subagent_bindings: Default::default(),
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -3,7 +3,7 @@
+ use std::{collections::HashMap, hash::Hash, num::NonZeroU64};
+ 
+ use crate::{
+-    core::{JournalEntry, JournalRecord, ModelResponseOutcome},
++    core::{HistoryMutationKind, JournalEntry, JournalRecord, ModelResponseOutcome},
+     domain::{CallId, MessageId, PartId},
+     model_standard::{CanonicalMessage, ContentPart},
+ };
+@@ -24,9 +24,18 @@
+     messages: HashMap<MessageId, RecordedAt>,
+     parts: HashMap<PartId, RecordedAt>,
+     calls: HashMap<CallId, RecordedAt>,
++    single_staged_record: bool,
++    uniform_message_date: Option<i64>,
+ }
+ 
+ impl TranscriptTimestamps {
++    pub(super) fn staged(single_record: bool) -> Self {
++        Self {
++            single_staged_record: single_record,
++            ..Self::default()
++        }
++    }
++
+     #[cfg(test)]
+     pub(super) fn from_projection(projection: &JournalProjection) -> Self {
+         Self::for_records(&projection.records, 0)
+@@ -91,6 +100,23 @@
+             ),
+             timestamp_ms: record.timestamp_ms,
+         };
++        // Keep the normal sequence check above. The staged count is only a
++        // hint; scan still reads to EOF and validates the actual count.
++        self.uniform_message_date = None;
++        if std::mem::take(&mut self.single_staged_record)
++            && let JournalEntry::HistoryMutated(mutation) = &record.entry
++            && mutation.mutation == HistoryMutationKind::Append
++            && mutation.compaction.is_none()
++            && mutation.tool_results.is_empty()
++            && mutation
++                .messages
++                .iter()
++                .flat_map(|message| &message.parts)
++                .all(|part| matches!(part.payload, ContentPart::Text { .. }))
++        {
++            self.uniform_message_date = Some(at.timestamp_ms);
++            return;
++        }
+         match &record.entry {
+             JournalEntry::HistoryMutated(mutation) => {
+                 for message in &mutation.messages {
+@@ -135,6 +161,9 @@
+     }
+ 
+     pub(super) fn message(&self, message: &CanonicalMessage) -> Option<i64> {
++        if let Some(date) = self.uniform_message_date {
++            return Some(date);
++        }
+         self.messages
+             .get(&message.id)
+             .into_iter()
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+@@ -187,6 +187,10 @@
+         let mut staged = stage.finish().unwrap();
+         let roots = staged.take_causal_roots();
+         (staged, roots)
++    }
++
++    pub(super) fn is_single_record(&self) -> bool {
++        self.count == 1
+     }
+ 
+     pub(super) fn take_causal_roots(&mut self) -> Option<RootBindings> {
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -76,8 +76,12 @@
+     }
+     pub(crate) fn take_staged_causal_roots(
+         &mut self,
+-    ) -> Option<std::collections::HashMap<TurnId, crate::domain::ThreadId>> {
+-        self.display_records.as_mut()?.take_causal_roots()
++    ) -> Option<(
++        std::collections::HashMap<TurnId, crate::domain::ThreadId>,
++        bool,
++    )> {
++        let records = self.display_records.as_mut()?;
++        Some((records.take_causal_roots()?, records.is_single_record()))
+     }
+ 
+     pub(crate) fn scan_display(

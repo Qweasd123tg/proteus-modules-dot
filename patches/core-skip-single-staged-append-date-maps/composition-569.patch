@@ -1,0 +1,97 @@
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -273,8 +273,18 @@
+     let Some(text) = text_parts.take_joined() else {
+         return;
+     };
++    push_transcript_text(transcript, role, message, text, None);
++}
++
++fn push_transcript_text(
++    transcript: &mut TranscriptRows,
++    role: &str,
++    message: &CanonicalMessage,
++    text: String,
++    timestamp_ms: Option<i64>,
++) {
+     transcript.push(AppTranscriptMessage {
+-        timestamp_ms: None,
++        timestamp_ms,
+         images: Vec::new(),
+         message_id: Some(message.id),
+         phase: message.phase,
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -363,6 +363,45 @@
+ 
+     fn append_message(&mut self, message: &CanonicalMessage, hide_compactor_parts: bool) {
+         let timestamp_ms = self.timestamps.message(message);
++        self.append_message_at(message, hide_compactor_parts, timestamp_ms);
++    }
++
++    // Staged records have their own decoded payload, separate from canonical
++    // state. Only a lone plain text part can become the row without joining.
++    fn append_staged_message(&mut self, message: &mut CanonicalMessage) {
++        let timestamp_ms = self.timestamps.message(message);
++        if let [part] = message.parts.as_mut_slice()
++            && let ContentPart::Text { text } = &mut part.payload
++        {
++            if self.seen_parts.insert(part.part_id)
++                && part.scope == PartScope::Conversation
++                && !text.trim().is_empty()
++            {
++                // A row can outlive the scan. Do not retain donor spare capacity.
++                let text = if text.len() == text.capacity() {
++                    std::mem::take(text)
++                } else {
++                    text.as_str().to_owned()
++                };
++                super::push_transcript_text(
++                    &mut self.transcript,
++                    super::transcript_role(&message.role),
++                    message,
++                    text,
++                    timestamp_ms,
++                );
++            }
++        } else {
++            self.append_message_at(message, false, timestamp_ms);
++        }
++    }
++
++    fn append_message_at(
++        &mut self,
++        message: &CanonicalMessage,
++        hide_compactor_parts: bool,
++        timestamp_ms: Option<i64>,
++    ) {
+         // Keep canonical payloads borrowed: duplicate checkpoints and hidden
+         // parts must not be copied merely to discard them before rendering.
+         let mut parts = message
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -223,9 +223,19 @@
+         final_results: Default::default(),
+         subagent_bindings: Default::default(),
+     };
+-    scan(&mut |record| {
++    scan(&mut |mut record| {
+         replay.state.timestamps.collect_record::<false>(&record);
+-        replay.render_record(&record, live_turn_id);
++        if let JournalEntry::HistoryMutated(mutation) = &mut record.entry
++            && mutation.mutation == HistoryMutationKind::Append
++        {
++            if !(live_turn_id.is_some() && record.turn_id == live_turn_id) {
++                for message in &mut mutation.messages {
++                    replay.state.append_staged_message(message);
++                }
++            }
++        } else {
++            replay.render_record(&record, live_turn_id);
++        }
+         Ok(())
+     })?;
+     Ok(replay.finish())
