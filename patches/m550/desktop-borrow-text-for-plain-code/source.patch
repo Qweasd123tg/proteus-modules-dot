@@ -1,0 +1,41 @@
+diff --git a/src/ui/extensions/declarative/plain_code.rs b/src/ui/extensions/declarative/plain_code.rs
+index cfc8ac21c67474c172eca781c2385e759ae1d72b..1af91b0e05b8d1b5388c929cfdcdbef443d8a347 100644
+--- a/src/ui/extensions/declarative/plain_code.rs
++++ b/src/ui/extensions/declarative/plain_code.rs
+@@ -24,14 +24,14 @@
+ impl Plain {
+     pub(super) fn new(source: &str) -> Self {
+         Self {
+-            source: source.to_owned().into(),
++            source: SharedString::from(source),
+             open: false,
+         }
+     }
+ 
+     pub(super) fn set_source(&mut self, source: &str) {
+         if self.source.as_ref() != source {
+-            self.source = source.to_owned().into();
++            self.source = SharedString::from(source);
+         }
+     }
+ 
+diff --git a/src/ui/extensions/declarative/code_block.rs b/src/ui/extensions/declarative/code_block.rs
+index d73fa57db76f6eee96fbe56fe68f0d23e136e979..dae10e7c2247d78903cf7565c78691865f164232 100644
+--- a/src/ui/extensions/declarative/code_block.rs
++++ b/src/ui/extensions/declarative/code_block.rs
+@@ -363,13 +363,13 @@
+     pub(super) fn new(language: &str, source: &str) -> Self {
+         Self {
+             language: language.into(),
+-            source: source.to_owned().into(),
++            source: SharedString::from(source),
+         }
+     }
+ 
+     pub(super) fn set_source(&mut self, source: &str, cx: &mut Context<Self>) {
+         if self.source.as_ref() != source {
+-            self.source = source.to_owned().into();
++            self.source = SharedString::from(source);
+             cx.notify();
+         }
+     }
