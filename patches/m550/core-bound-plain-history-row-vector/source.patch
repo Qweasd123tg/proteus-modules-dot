@@ -1,0 +1,88 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 4e826724628ed5fa6a5b98eb7eb41dc2bca59722..d2768a3ab674ceb81b3df25ad0090f783721ee74 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -234,6 +234,12 @@ fn render_causal(
+             && mutation.mutation == HistoryMutationKind::Append
+         {
+             if !(live_turn_id.is_some() && record.turn_id == live_turn_id) {
++                if replay.state.timestamps.certified_text_append() {
++                    replay
++                        .state
++                        .transcript
++                        .certify_text_append(mutation.messages.len());
++                }
+                 // Only the staged record owns these decoded rows. Release each
+                 // row's unused parts and metadata as its display output grows.
+                 for mut message in std::mem::take(&mut mutation.messages) {
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+index a78f12ec6f79af54f7f6b0590037ba054f220d4b..d6d781401a7b0d9e2cf4eac16c9c0befab1ff67b 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -160,6 +160,11 @@ impl TranscriptTimestamps {
+         }
+     }
+ 
++    /// This is the single staged text-only Append proof, not just equal dates.
++    pub(super) fn certified_text_append(&self) -> bool {
++        self.uniform_message_date.is_some()
++    }
++
+     pub(super) fn message(&self, message: &CanonicalMessage) -> Option<i64> {
+         if let Some(date) = self.uniform_message_date {
+             return Some(date);
+diff --git a/crates/proteus-core/src/app_server/transcript/rows.rs b/crates/proteus-core/src/app_server/transcript/rows.rs
+index ca4b5103958880f0316db7e051a2b49b4b2f0b74..eab3c0957efda7527fb30630f85573a7e69e0589 100644
+--- a/crates/proteus-core/src/app_server/transcript/rows.rs
++++ b/crates/proteus-core/src/app_server/transcript/rows.rs
+@@ -12,14 +12,41 @@ pub(super) struct TranscriptRows {
+     latest_tools: HashMap<String, usize>,
+     reasoning_rows: HashMap<crate::domain::MessageId, usize>,
+     answer_rows: HashMap<crate::domain::MessageId, usize>,
++    // Only nonzero when the whole staged append is certified text-only.
++    text_append_ceiling: usize,
+ }
+ 
+ #[cfg(test)]
+ mod tests;
+ 
+ impl TranscriptRows {
++    /// A single text-only append produces at most one row per input message.
++    /// Do not preallocate while all decoded inputs are still owned.
++    pub(super) fn certify_text_append(&mut self, upper: usize) {
++        // Keep the ordinary writer and sizing for short and oversized histories.
++        if (4_096..=65_536).contains(&upper) {
++            debug_assert!(self.rows.is_empty());
++            self.text_append_ceiling = upper;
++        }
++    }
++
++    fn reserve_text_append_tail(&mut self) {
++        let cap = self.rows.capacity();
++        if self.rows.len() == cap
++            && self.text_append_ceiling > cap
++            && self.text_append_ceiling < cap.saturating_mul(2)
++        {
++            // The row already passed filtering; growth is inevitable now.
++            // A refused optional reserve leaves Vec's ordinary growth intact.
++            let _ = self.rows.try_reserve_exact(self.text_append_ceiling - cap);
++        }
++    }
++
+     pub(super) fn push(&mut self, row: AppTranscriptMessage) {
+-        if row.role == "assistant"
++        if self.text_append_ceiling != 0 {
++            self.reserve_text_append_tail();
++            // No reasoning row can search old answer positions in this append.
++        } else if row.role == "assistant"
+             && let Some(id) = row.message_id
+         {
+             self.answer_rows.entry(id).or_insert(self.rows.len());
+@@ -41,6 +68,7 @@ impl TranscriptRows {
+         self.latest_tools.clear();
+         self.reasoning_rows.clear();
+         self.answer_rows.clear();
++        self.text_append_ceiling = 0;
+     }
+ 
+     /// Journal part de-duplication happens before this method. Multiple readable
