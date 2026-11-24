@@ -1,0 +1,416 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index aa613166076f6cb2df47f84fb1a416ddee6070f8..65abbe105ea06679a47294fd0a9be9641251a42b 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -318,15 +318,22 @@
+         let mut context = proteus_session_semantics::ModelContextProjection::default();
+         let mut next_seq = 1;
+         source.scan(|record| {
+-            validation.apply_sequenced(store.session_id(), &record, &mut next_seq)?;
+-            usage.apply(&record);
+-            context.apply(&record);
+-            if let Some(display) = &mut display
+-                && is_display_kind(record.entry.kind())
+-            {
+-                display.push(&record);
+-            }
+-            if prefix_seq == Some(record.session_seq) {
++            let record_seq = record.session_seq;
++            validation.apply_sequenced_for_read(
++                store.session_id(),
++                record,
++                &mut next_seq,
++                |record| {
++                    usage.apply(record);
++                    context.apply(record);
++                    if let Some(display) = &mut display
++                        && is_display_kind(record.entry.kind())
++                    {
++                        display.push(record);
++                    }
++                },
++            )?;
++            if prefix_seq == Some(record_seq) {
+                 prefix_history_fingerprints = Some(
+                     validation
+                         .history()
+diff --git a/crates/proteus-session-semantics/src/journal/projection/active_ids.rs b/crates/proteus-session-semantics/src/journal/projection/active_ids.rs
+index 9ce2bf4cd39c9c22880409a7c663f29415f5ec2a..6f2d586d6bcde1d0f2579f4c8300f7823c9276e4 100644
+--- a/crates/proteus-session-semantics/src/journal/projection/active_ids.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/active_ids.rs
+@@ -29,6 +29,22 @@
+         self.check_active_ids(None)
+     }
+ 
++    /// Same row order as checking a fully materialized append. The streaming
++    /// fold may validate the borrowed tail before transferring its owners.
++    pub(super) fn check_owned_append_ids(&mut self, appended: &[CanonicalMessage]) -> Result<()> {
++        let mut ids = match self.active_ids.take() {
++            Some(ids) => ids,
++            None => {
++                let mut ids = ActiveIds::default();
++                ids.extend(&self.history)?;
++                Arc::new(ids)
++            }
++        };
++        Arc::make_mut(&mut ids).extend(appended)?;
++        self.active_ids = Some(ids);
++        Ok(())
++    }
++
+     pub(super) fn check_active_ids(&mut self, appended: Option<usize>) -> Result<()> {
+         // Take the index before checking. A rejected mutation can leave the
+         // history invalid; the next operation must then check the whole history.
+diff --git a/crates/proteus-session-semantics/src/journal/projection/facts.rs b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+index ef8c636c43e03fbea4b189420add0f29d78ea7b2..98fe44317be18de2661098cff38222efbd605173 100644
+--- a/crates/proteus-session-semantics/src/journal/projection/facts.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/facts.rs
+@@ -3,9 +3,7 @@
+ 
+ impl JournalValidationState {
+     pub fn apply(&mut self, record: &JournalRecord) -> Result<()> {
+-        if self.record_ids.insert(record.record_id).is_some() {
+-            bail!("duplicate journal record_id {}", record.record_id);
+-        }
++        self.require_new_record_id(record)?;
+ 
+         match &record.entry {
+             JournalEntry::HookInvoked(trace) => {
+@@ -77,39 +75,10 @@
+                 }
+             }
+             JournalEntry::HistoryMutated(mutation) => {
+-                reject_execution_id(record)?;
+-                if record.turn_id.is_some() {
+-                    self.require_root_turn(record)?;
+-                }
+-                if mutation.previous_revision != self.history_revision {
+-                    bail!(
+-                        "history revision mismatch: record expects {}, current revision is {}",
+-                        mutation.previous_revision,
+-                        self.history_revision
+-                    );
+-                }
+-                if mutation.new_revision != mutation.previous_revision.saturating_add(1) {
+-                    bail!(
+-                        "history revision must increment by one: {} -> {}",
+-                        mutation.previous_revision,
+-                        mutation.new_revision
+-                    );
+-                }
+-                validate_conversation_messages(&mutation.messages)?;
+-                Self::validate_part_id_stability(&mut self.known_parts, &mutation.messages)?;
+-                if mutation.mutation != HistoryMutationKind::Checkpoint
+-                    && !mutation.tool_results.is_empty()
+-                {
+-                    bail!("only a workflow checkpoint may bind tool results");
+-                }
++                self.validate_history_mutation(record, mutation)?;
+                 match mutation.mutation {
+                     HistoryMutationKind::Append => {
+-                        if mutation.messages.is_empty() {
+-                            bail!("history append must contain at least one message");
+-                        }
+-                        if mutation.compaction.is_some() {
+-                            bail!("history append cannot carry a compaction report");
+-                        }
++                        validate_history_append(mutation)?;
+                         Arc::make_mut(&mut self.history).extend(mutation.messages.iter().cloned());
+                     }
+                     HistoryMutationKind::Replace => {
+@@ -415,6 +384,45 @@
+         Ok(())
+     }
+ 
++    pub(super) fn require_new_record_id(&mut self, record: &JournalRecord) -> Result<()> {
++        if self.record_ids.insert(record.record_id).is_some() {
++            bail!("duplicate journal record_id {}", record.record_id);
++        }
++        Ok(())
++    }
++
++    pub(super) fn validate_history_mutation(
++        &mut self,
++        record: &JournalRecord,
++        mutation: &super::super::types::HistoryMutated,
++    ) -> Result<()> {
++        reject_execution_id(record)?;
++        if record.turn_id.is_some() {
++            self.require_root_turn(record)?;
++        }
++        if mutation.previous_revision != self.history_revision {
++            bail!(
++                "history revision mismatch: record expects {}, current revision is {}",
++                mutation.previous_revision,
++                self.history_revision
++            );
++        }
++        if mutation.new_revision != mutation.previous_revision.saturating_add(1) {
++            bail!(
++                "history revision must increment by one: {} -> {}",
++                mutation.previous_revision,
++                mutation.new_revision
++            );
++        }
++        validate_conversation_messages(&mutation.messages)?;
++        Self::validate_part_id_stability(&mut self.known_parts, &mutation.messages)?;
++        if mutation.mutation != HistoryMutationKind::Checkpoint && !mutation.tool_results.is_empty()
++        {
++            bail!("only a workflow checkpoint may bind tool results");
++        }
++        Ok(())
++    }
++
+     fn capture_tool_result(
+         &mut self,
+         result: &proteus_contracts::domain::ToolResult,
+@@ -428,3 +436,15 @@
+         Arc::make_mut(&mut self.capture).record_at(Arc::make_mut(&mut self.history), result)
+     }
+ }
++
++pub(super) fn validate_history_append(
++    mutation: &super::super::types::HistoryMutated,
++) -> Result<()> {
++    if mutation.messages.is_empty() {
++        bail!("history append must contain at least one message");
++    }
++    if mutation.compaction.is_some() {
++        bail!("history append cannot carry a compaction report");
++    }
++    Ok(())
++}
+diff --git a/crates/proteus-session-semantics/src/journal/projection/sequence/tests.rs b/crates/proteus-session-semantics/src/journal/projection/sequence/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..286a52611f12636395a9975e49738f4e03964fef
+--- /dev/null
++++ b/crates/proteus-session-semantics/src/journal/projection/sequence/tests.rs
+@@ -0,0 +1,123 @@
++use super::super::super::types::HistoryMutated;
++use super::*;
++use crate::{
++    domain::{new_record_id, new_session_id},
++    model_standard::{ContentPart, MessageRole},
++};
++
++fn append(session_id: SessionId, previous: u64, messages: Vec<CanonicalMessage>) -> JournalRecord {
++    JournalRecord {
++        schema_version: JOURNAL_SCHEMA_VERSION,
++        record_id: new_record_id(),
++        session_id,
++        session_seq: previous + 1,
++        timestamp_ms: previous as i64,
++        execution_id: None,
++        thread_id: None,
++        turn_id: None,
++        entry: JournalEntry::HistoryMutated(HistoryMutated {
++            previous_revision: previous,
++            new_revision: previous + 1,
++            mutation: HistoryMutationKind::Append,
++            messages,
++            compaction: None,
++            tool_results: Vec::new(),
++        }),
++    }
++}
++
++fn user(text: &str) -> CanonicalMessage {
++    CanonicalMessage::text(MessageRole::User, text)
++}
++
++#[test]
++fn read_fold_observes_the_intact_append_then_transfers_original_history() {
++    let session = new_session_id();
++    let mut fold = JournalValidationState::default();
++    let mut sequence = 1;
++    let mut observed = 0;
++    for i in 0..2 {
++        let m = user("stored 🦀 message");
++        let original_parts = m.parts.as_ptr();
++        let mut rows = Vec::with_capacity(1);
++        rows.push(m.clone());
++        let exact_outer = rows.as_ptr();
++        let moved_parts = rows[0].parts.as_ptr();
++        assert_ne!(moved_parts, original_parts);
++        let record = append(session, i, rows);
++        fold.apply_sequenced_for_read(session, record, &mut sequence, |record| {
++            let JournalEntry::HistoryMutated(appended) = &record.entry else {
++                panic!("expected an append");
++            };
++            assert_eq!(appended.messages, [m]);
++            assert_eq!(appended.messages.as_ptr(), exact_outer);
++            observed += 1;
++        })
++        .unwrap();
++        if i == 0 {
++            assert_eq!(fold.history().as_ptr(), exact_outer);
++        }
++        assert_eq!(fold.history()[i as usize].parts.as_ptr(), moved_parts);
++        assert_eq!(fold.history_revision(), i + 1);
++    }
++    assert_eq!(sequence, 3);
++    assert_eq!(observed, 2);
++    assert_eq!(fold.history().len(), 2);
++}
++
++#[test]
++fn read_fold_failure_keeps_competing_error_order_and_never_observes_rejected_rows() {
++    let session = new_session_id();
++    let existing = user("already committed");
++    let r0 = append(session, 0, vec![existing.clone()]);
++    for mode in 0..6 {
++        let duplicate = existing.clone();
++        let mut last = user("later unrelated");
++        // A duplicate message id must lose to an earlier global scope/stable
++        // part check, but win when both issues are distinct active collisions.
++        if mode == 0 {
++            last.parts[0].scope = PartScope::Trace;
++        }
++        if mode == 1 {
++            last.parts[0].part_id = existing.parts[0].part_id;
++            last.parts[0].payload = ContentPart::Text {
++                text: "changed".into(),
++            };
++        }
++        if mode == 2 {
++            last.parts[0] = existing.parts[0].clone();
++        }
++        let mut candidate = append(session, 1, vec![duplicate, last]);
++        if mode == 3 {
++            candidate.record_id = r0.record_id;
++        }
++        if mode == 4 {
++            candidate.session_seq = 3;
++        }
++        if mode == 5 {
++            candidate.schema_version += 1;
++        }
++        let mut stock = JournalValidationState::default();
++        let mut seq = 1;
++        stock.apply_sequenced(session, &r0, &mut seq).unwrap();
++        let expected = stock
++            .apply_sequenced(session, &candidate, &mut seq)
++            .unwrap_err()
++            .to_string();
++        assert_eq!(seq, 2);
++
++        let mut owned = JournalValidationState::default();
++        let mut seq = 1;
++        let mut seen = 0;
++        owned
++            .apply_sequenced_for_read(session, r0.clone(), &mut seq, |_| seen += 1)
++            .unwrap();
++        let got = owned
++            .apply_sequenced_for_read(session, candidate, &mut seq, |_| seen += 1)
++            .unwrap_err()
++            .to_string();
++        assert_eq!(got, expected);
++        assert_eq!(seq, 2);
++        assert_eq!(seen, 1);
++    }
++}
+diff --git a/crates/proteus-session-semantics/src/journal/projection/sequence.rs b/crates/proteus-session-semantics/src/journal/projection/sequence.rs
+index af6ef3de218a461ed9fb439a329457d3271c4688..d4986ca1fb08bdf67ddf0ea22e91ef6f2814dd58 100644
+--- a/crates/proteus-session-semantics/src/journal/projection/sequence.rs
++++ b/crates/proteus-session-semantics/src/journal/projection/sequence.rs
+@@ -8,31 +8,77 @@
+         record: &JournalRecord,
+         expected_seq: &mut u64,
+     ) -> Result<()> {
+-        if record.schema_version != JOURNAL_SCHEMA_VERSION {
+-            bail!(
+-                "unsupported journal schema_version {} in record {}; expected {}",
+-                record.schema_version,
+-                record.record_id,
+-                JOURNAL_SCHEMA_VERSION
+-            );
+-        }
+-        if record.session_id != session_id {
+-            bail!(
+-                "journal record {} belongs to session {}, expected {}",
+-                record.record_id,
+-                record.session_id,
+-                session_id
+-            );
+-        }
+-        if record.session_seq != *expected_seq {
+-            bail!(
+-                "journal sequence mismatch: expected {}, found {}",
+-                expected_seq,
+-                record.session_seq
+-            );
+-        }
++        check_envelope(session_id, record, *expected_seq)?;
+         self.apply(record)?;
+         *expected_seq = expected_seq.saturating_add(1);
+         Ok(())
+     }
++
++    /// Fold an owned journal record in a temporary recovery pass. The observer
++    /// receives the original record only after full validation, and before any
++    /// owned append messages are moved. Discard this state on error, just as
++    /// when building a collected projection.
++    pub fn apply_sequenced_for_read(
++        &mut self,
++        session_id: SessionId,
++        record: JournalRecord,
++        expected_seq: &mut u64,
++        observe: impl FnOnce(&JournalRecord),
++    ) -> Result<()> {
++        check_envelope(session_id, &record, *expected_seq)?;
++        if let JournalEntry::HistoryMutated(mutation) = &record.entry
++            && mutation.mutation == HistoryMutationKind::Append
++        {
++            self.require_new_record_id(&record)?;
++            self.validate_history_mutation(&record, mutation)?;
++            super::facts::validate_history_append(mutation)?;
++            self.check_owned_append_ids(&mutation.messages)?;
++            self.history_revision = mutation.new_revision;
++            self.history_turn = record.turn_id;
++            observe(&record);
++            let JournalEntry::HistoryMutated(mutation) = record.entry else {
++                unreachable!("validated append record");
++            };
++            if self.history.is_empty() {
++                self.history = Arc::new(mutation.messages);
++            } else {
++                Arc::make_mut(&mut self.history).extend(mutation.messages);
++            }
++        } else {
++            self.apply(&record)?;
++            observe(&record);
++        }
++        *expected_seq = expected_seq.saturating_add(1);
++        Ok(())
++    }
++}
++
++fn check_envelope(session_id: SessionId, record: &JournalRecord, expected_seq: u64) -> Result<()> {
++    if record.schema_version != JOURNAL_SCHEMA_VERSION {
++        bail!(
++            "unsupported journal schema_version {} in record {}; expected {}",
++            record.schema_version,
++            record.record_id,
++            JOURNAL_SCHEMA_VERSION
++        );
++    }
++    if record.session_id != session_id {
++        bail!(
++            "journal record {} belongs to session {}, expected {}",
++            record.record_id,
++            record.session_id,
++            session_id
++        );
++    }
++    if record.session_seq != expected_seq {
++        bail!(
++            "journal sequence mismatch: expected {}, found {}",
++            expected_seq,
++            record.session_seq
++        );
++    }
++    Ok(())
+ }
++
++#[cfg(test)]
++mod tests;
