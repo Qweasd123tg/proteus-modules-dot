@@ -1,0 +1,23 @@
+diff --git a/workflow/coding-workflow/src/token_accounting.rs b/workflow/coding-workflow/src/token_accounting.rs
+index 9dab84c5237c27a4f3450b7dcc7336707d13edc1..7daf355087afd06fc5ae00b7d9bfcabbc3d9dde6 100644
+--- a/workflow/coding-workflow/src/token_accounting.rs
++++ b/workflow/coding-workflow/src/token_accounting.rs
+@@ -92,9 +92,15 @@
+                         call.id.as_str().len() + call.name.len() + call.args.to_string().len();
+                 }
+                 ContentPart::ToolResult { result } => {
+-                    bytes.tool_results += result.call_id.as_str().len()
+-                        + result.text_or_status().len()
+-                        + result.metadata.to_string().len();
++                    // The report needs only the selected byte count; keep the
++                    // canonical compound and status rendering as the fallback.
++                    let text_bytes = match result.error.as_deref().filter(|s| !s.is_empty()) {
++                        Some(error) => error.len(),
++                        None if !result.output.is_empty() => result.output.len(),
++                        None => result.text_or_status().len(),
++                    };
++                    bytes.tool_results +=
++                        result.call_id.as_str().len() + text_bytes + result.metadata.to_string().len();
+                 }
+                 ContentPart::Patch { patch } => {
+                     bytes.patches += patch.content.len();
