@@ -1,0 +1,13 @@
+diff --git a/src/ui/format.rs b/src/ui/format.rs
+index c601492c839803744897377d0d4dc93466cd9856..1fa829601fd244557eb89dc359c1c128ad2f0167 100644
+--- a/src/ui/format.rs
++++ b/src/ui/format.rs
+@@ -37,6 +37,8 @@
+ /// The first lines of `text`, at most `max_chars` of it, without a mark of
+ /// what is left out: the caller fades the end out instead.
+ pub fn peek_block(text: &str, max_lines: usize, max_chars: usize) -> String {
++    let inspect = max_chars.saturating_add(max_lines).saturating_add(4);
++    let text = &text[..text.floor_char_boundary(inspect)];
+     let mut out = String::new();
+     for line in text.lines().take(max_lines) {
+         if out.len() + line.len() > max_chars {
