@@ -1,0 +1,90 @@
+diff --git a/src/ui/chat/requests.rs b/src/ui/chat/requests.rs
+index bc041533b2d972cb7b5fd7f04936d2081949b035..d03b9e328896af2897ca67b59c87dadae27c9159 100644
+--- a/src/ui/chat/requests.rs
++++ b/src/ui/chat/requests.rs
+@@ -32,7 +32,7 @@
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) -> Option<AnyElement> {
+-        let pending = self.session.pending.clone()?;
++        let pending = self.session.pending.as_ref()?;
+         match activity {
+             ActivityId::Approval(id) => pending
+                 .approvals
+@@ -43,7 +43,7 @@
+                 .user_inputs
+                 .iter()
+                 .find(|request| &request.request_id == id)
+-                .map(|request| self.render_user_input(request, window, cx)),
++                .map(|request| self.user_input.render_user_input(request, window, cx)),
+             ActivityId::Extension(_) => None,
+         }
+     }
+diff --git a/src/ui/chat/question_card.rs b/src/ui/chat/question_card.rs
+index b375c1c99c785f7a37cb62c30edc640772ad559e..6d21fb579624993c49e34b42a5dabb53cb2920c4 100644
+--- a/src/ui/chat/question_card.rs
++++ b/src/ui/chat/question_card.rs
+@@ -11,31 +11,30 @@
+ use super::Chat;
+ use super::activity_dock::ActivityId;
+ use super::requests::panel_card;
++use super::user_input::UserInputDrafts;
+ use crate::ui::kit;
+ use crate::ui::kit::Hint as _;
+ use crate::ui::kit::Pressable as _;
+ 
+-impl Chat {
++impl UserInputDrafts {
+     /// A `request_user_input` call, one question at a time: options with
+     /// their numbers, a free answer, skipping and paging.
+     pub(super) fn render_user_input(
+         &mut self,
+         request: &UserInputRequest,
+         window: &mut Window,
+-        cx: &mut Context<Self>,
++        cx: &mut Context<Chat>,
+     ) -> AnyElement {
+         let theme = cx.theme().clone();
+         let rid = request.request_id.clone();
+         let count = request.questions.len();
+-        let page = self.user_input.page(request);
++        let page = self.page(request);
+         let Some(question) = request.questions.get(page) else {
+             return div().into_any_element();
+         };
+         let last = page + 1 == count;
+-        let answered = self.user_input.is_answered(&rid, &question.id, cx);
+-        let input = self
+-            .user_input
+-            .text_input(&rid, &question.id, question.is_secret, window, cx);
++        let answered = self.is_answered(&rid, &question.id, cx);
++        let input = self.text_input(&rid, &question.id, question.is_secret, window, cx);
+         let title = request
+             .title
+             .clone()
+@@ -152,12 +151,10 @@
+         question: &UserInputQuestion,
+         ix: usize,
+         option: &proteus_contracts::contracts::UserInputQuestionOption,
+-        cx: &mut Context<Self>,
++        cx: &mut Context<Chat>,
+     ) -> AnyElement {
+         let theme = cx.theme();
+-        let selected = self
+-            .user_input
+-            .is_selected(rid, &question.id, &option.label);
++        let selected = self.is_selected(rid, &question.id, &option.label);
+         let (request, qid, label) = (rid.to_owned(), question.id.clone(), option.label.clone());
+         let multi = question.multi_select;
+         let badge = div()
+@@ -218,7 +215,9 @@
+             }))
+             .into_any_element()
+     }
+-
++}
++
++impl Chat {
+     /// "Далее": the next question, or sending after the last one. An
+     /// unanswered question stays.
+     pub(super) fn next_question(&mut self, rid: &str, window: &mut Window, cx: &mut Context<Self>) {
