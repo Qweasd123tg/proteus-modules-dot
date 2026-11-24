@@ -1,0 +1,170 @@
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -5,7 +5,8 @@
+ use proteus_contracts::{
+     app_protocol::{AppLatestToolState, AppToolState, AppTranscriptBase},
+     contracts::{
+-        SessionStorageRequest as Request, SessionStorageResponse as Response, StorageSnapshot,
++        ModelContextObservation, SessionStorageRequest as Request,
++        SessionStorageResponse as Response, StorageSnapshot,
+     },
+     model_standard::CanonicalMessage,
+ };
+@@ -251,21 +252,66 @@
+     )
+ }
+ 
++fn load_cached<T>(
++    store: &RemoteSessionStore,
++    read_conversation: impl FnOnce(&Header) -> Option<(T, usize)>,
++) -> Option<(Header, T, Vec<AppTranscriptMessage>)> {
++    let header = fresh_header(store)?;
++    let (conversation, message_count) = read_conversation(&header)?;
++    let transcript = read_section(store, &header.transcript, 0, header.transcript.rows)?;
++    (SessionReadModel::matches_parts(store, &header.summary, &header.usage, message_count)
++        && RemoteCacheSource::read(store).as_ref() == Some(&header.source))
++    .then_some((header, conversation, transcript))
++}
++
+ pub(super) fn load_model(store: &RemoteSessionStore) -> Option<SessionReadModel> {
+-    let header = fresh_header(store)?;
+-    let model = SessionReadModel {
++    let (header, conversation, transcript) = load_cached(store, |header| {
++        let messages: Vec<CanonicalMessage> =
++            read_section(store, &header.conversation, 0, header.conversation.rows)?;
++        let message_count = messages.len();
++        let model_context = read_section(store, &header.context, 0, header.context.rows)?;
++        Some((
++            ConversationSnapshot {
++                revision: header.revision,
++                messages,
++                model_context,
++            },
++            message_count,
++        ))
++    })?;
++    Some(SessionReadModel {
+         summary: header.summary,
+-        conversation: ConversationSnapshot {
+-            revision: header.revision,
+-            messages: read_section(store, &header.conversation, 0, header.conversation.rows)?,
+-            model_context: read_section(store, &header.context, 0, header.context.rows)?,
+-        },
+-        transcript: read_section(store, &header.transcript, 0, header.transcript.rows)?,
++        conversation,
++        transcript,
+         usage: header.usage,
+         prefix: None,
+-    };
+-    (model.matches(store) && RemoteCacheSource::read(store).as_ref() == Some(&header.source))
+-        .then_some(model)
++    })
++}
++
++pub(super) fn load_transcript(store: &RemoteSessionStore) -> Option<Vec<AppTranscriptMessage>> {
++    load_cached(store, |header| {
++        // Verify the same typed rows and pages, but keep neither unused output vector.
++        let mut message_count = 0usize;
++        visit_section::<CanonicalMessage>(
++            store,
++            &header.conversation,
++            0,
++            header.conversation.rows,
++            |_| {
++                message_count = message_count.checked_add(1)?;
++                Some(())
++            },
++        )?;
++        visit_section::<ModelContextObservation>(
++            store,
++            &header.context,
++            0,
++            header.context.rows,
++            |_| Some(()),
++        )?;
++        Some(((), message_count))
++    })
++    .map(|(_, _, transcript)| transcript)
+ }
+ 
+ pub(super) fn load_view(
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -75,14 +75,28 @@
+     }
+ 
+     pub(crate) fn matches(&self, store: &RemoteSessionStore) -> bool {
+-        self.summary.session_id == store.session_id()
+-            && self.summary.parent_session_id == store.parent_session_id()
+-            && self.summary.session_dir == store.session_dir()
+-            && self.usage.session_id == store.session_id()
+-            && self.summary.message_count == self.conversation.messages.len()
++        Self::matches_parts(
++            store,
++            &self.summary,
++            &self.usage,
++            self.conversation.messages.len(),
++        )
++    }
++
++    fn matches_parts(
++        store: &RemoteSessionStore,
++        summary: &AppSessionSummary,
++        usage: &SessionUsageSnapshot,
++        message_count: usize,
++    ) -> bool {
++        summary.session_id == store.session_id()
++            && summary.parent_session_id == store.parent_session_id()
++            && summary.session_dir == store.session_dir()
++            && usage.session_id == store.session_id()
++            && summary.message_count == message_count
+             && store
+                 .workspace_path()
+-                .is_ok_and(|path| path == self.summary.workspace_path)
++                .is_ok_and(|path| path == summary.workspace_path)
+     }
+ }
+ 
+@@ -129,6 +143,10 @@
+         cache::load_model(self)
+     }
+ 
++    pub(crate) fn fresh_read_transcript(&self) -> Option<Vec<AppTranscriptMessage>> {
++        cache::load_transcript(self)
++    }
++
+     pub(crate) fn project_read_model(
+         &self,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -107,6 +107,18 @@
+     match store.fresh_read_model() {
+         Some(model) => Ok(model),
+         None => store.project_read_model(|source| journal_transcript_from_source(source, None)),
++    }
++}
++
++/// Read the current full transcript without retaining unrelated cached sections.
++pub(super) fn current_transcript(
++    store: &SessionStore,
++) -> anyhow::Result<Vec<AppTranscriptMessage>> {
++    match store.fresh_read_transcript() {
++        Some(transcript) => Ok(transcript),
++        None => store
++            .project_read_model(|source| journal_transcript_from_source(source, None))
++            .map(|model| model.transcript),
+     }
+ }
+ 
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -143,7 +143,7 @@
+     let storage = state.storage_service()?;
+     tokio::task::spawn_blocking(move || {
+         let store = SessionStore::open(storage, session_dir)?;
+-        Ok(crate::app_server::read_model::current_read_model(&store)?.transcript)
++        crate::app_server::read_model::current_transcript(&store)
+     })
+     .await
+     .map_err(|error| anyhow!("cold history task failed: {error}"))?
