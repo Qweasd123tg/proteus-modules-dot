@@ -1,0 +1,281 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 581cb0ba0d0990f2118382dc3517a485f3ed178b..48be2fd4c397c4fd8c0526aa5910cd38faef34e3 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -155,7 +155,14 @@ pub(super) fn write_prefix(
+ ) -> Option<String> {
+     // Only the latest projection appends to this index. Keep one copy even
+     // when old revisions still serve their immutable display pages.
+-    let value = prefix.encode_cache()?.into_bounded_value()?;
++    write_prefix_value(store, source, prefix.encode_cache()?.into_bounded_value()?)
++}
++
++fn write_prefix_value(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    value: Value,
++) -> Option<String> {
+     let digest = hash(&value)?;
+     write_value(store, source, PREFIX, value)?;
+     Some(digest)
+@@ -410,6 +417,7 @@ pub(super) fn save_model(
+         Cow::Borrowed(&model.conversation.messages),
+         Cow::Borrowed(&model.conversation.model_context),
+         RowsRef::Full(&model.transcript),
++        model.prefix.as_ref().map(CachePrefix::Borrowed),
+     )
+ }
+ 
+@@ -422,6 +430,7 @@ pub(super) fn save_startup_model<T: CacheRows>(
+ ) -> Option<()> {
+     let messages = Cow::Owned(std::mem::take(&mut model.conversation.messages));
+     let context = Cow::Owned(std::mem::take(&mut model.conversation.model_context));
++    let prefix = model.prefix.take().map(CachePrefix::Owned);
+     save_model_sections(
+         store,
+         source,
+@@ -430,6 +439,7 @@ pub(super) fn save_startup_model<T: CacheRows>(
+         messages,
+         context,
+         model.transcript.rows_ref(),
++        prefix,
+     )
+ }
+ 
+@@ -458,6 +468,23 @@ impl CacheRows for DisplayRows {
+     }
+ }
+ 
++enum CachePrefix<'a> {
++    Borrowed(&'a PrefixIdentities),
++    Owned(PrefixIdentities),
++}
++
++impl CachePrefix<'_> {
++    fn write(self, store: &RemoteSessionStore, source: &RemoteCacheSource) -> Option<String> {
++        match self {
++            Self::Borrowed(prefix) => write_prefix(store, source, prefix),
++            Self::Owned(prefix) => {
++                let value = prefix.into_encoded_cache()?.into_bounded_value()?;
++                write_prefix_value(store, source, value)
++            }
++        }
++    }
++}
++
+ fn save_model_sections<T>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+@@ -466,6 +493,7 @@ fn save_model_sections<T>(
+     mut messages: Cow<'_, [CanonicalMessage]>,
+     observations: Cow<'_, [ModelContextObservation]>,
+     rows: RowsRef<'_>,
++    prefix: Option<CachePrefix<'_>>,
+ ) -> Option<()> {
+     if !SessionReadModel::matches_parts(store, &model.summary, &model.usage, messages.len()) {
+         return None;
+@@ -515,10 +543,7 @@ fn save_model_sections<T>(
+             cursor: cursor.cloned(),
+             base,
+             tools,
+-            prefix: model
+-                .prefix
+-                .as_ref()
+-                .and_then(|index| write_prefix(store, source, index)),
++            prefix: prefix.and_then(|index| index.write(store, source)),
+         },
+     )
+ }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+index 0f1bc3aa5da759aeae50a22033afe52c64a43c4c..23117120bf72f49e98c6b9cae36d7f5bc634afea 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+@@ -116,3 +116,43 @@ fn observations_can_become_explicit_but_never_undo_a_commit() {
+             .has_explicit_part(&id)
+     );
+ }
++
++#[test]
++fn startup_moves_original_fields_without_reordering_the_packed_value() {
++    let prefix = fixture();
++    let borrowed = prefix.encode_cache().unwrap().into_bounded_value().unwrap();
++    let owned = prefix
++        .into_encoded_cache()
++        .unwrap()
++        .into_bounded_value()
++        .unwrap();
++    assert_eq!(
++        serde_json::to_vec(&owned).unwrap(),
++        serde_json::to_vec(&borrowed).unwrap()
++    );
++    assert!(PrefixIdentities::decode_cache(owned).is_some());
++}
++
++#[test]
++fn startup_and_borrowed_reject_the_same_escaped_over_budget_prefix() {
++    let mut prefix = fixture();
++    // The lower bound fits, but the quotes and escaping make the actual
++    // serialized value too large. Never save a value accepted by only one path.
++    prefix
++        .calls
++        .insert(char::from(92u8).to_string().repeat(LIMIT / 2 + 1));
++    assert!(
++        prefix
++            .encode_cache()
++            .unwrap()
++            .into_bounded_value()
++            .is_none()
++    );
++    assert!(
++        prefix
++            .into_encoded_cache()
++            .unwrap()
++            .into_bounded_value()
++            .is_none()
++    );
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+index 42300406c16028237463a043c95c5403efd139c3..5a706e7c96bd31a2cb0d466ab7fc5eed05b06c3a 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+@@ -5,6 +5,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
+ use proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES as LIMIT;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
++use std::borrow::Cow;
+ use uuid::Uuid;
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -96,44 +97,101 @@ fn unpack<const N: usize>(s: String, mut visit: impl FnMut([u8; N]) -> Option<()
+     Some(())
+ }
+ 
+-impl PrefixIdentities {
+-    pub(in crate::core::session_store::remote::view) fn encode_cache(
+-        &self,
+-    ) -> Option<Packed<&HashSet<CallId>>> {
++// A startup projection does not retain the certificate after cache publication.
++// Lend the same exact input on ordinary/committed saves, or release the
++// startup owners progressively as each fixed-format field is encoded.
++struct PrefixFields<'a> {
++    history: Cow<'a, [[u8; 32]]>,
++    turns: Cow<'a, HashSet<TurnId>>,
++    exchanges: Cow<'a, HashSet<ExchangeId>>,
++    messages: Cow<'a, HashSet<MessageId>>,
++    parts: Cow<'a, HashMap<PartId, bool>>,
++    calls: Cow<'a, HashSet<CallId>>,
++}
++
++impl<'a> PrefixFields<'a> {
++    fn encode(self) -> Option<Packed<Cow<'a, HashSet<CallId>>>> {
++        let Self {
++            history,
++            turns,
++            exchanges,
++            messages,
++            parts,
++            calls,
++        } = self;
+         // Bound all binary allocations before creating them. The caller also
+         // checks the actual serialized JSON byte count (including escapes).
+         let mut left = LIMIT;
+         for (count, width) in [
+-            (self.history.len(), 32),
+-            (self.turns.len(), 16),
+-            (self.exchanges.len(), 16),
+-            (self.messages.len(), 16),
+-            (self.parts.len(), 17),
++            (history.len(), 32),
++            (turns.len(), 16),
++            (exchanges.len(), 16),
++            (messages.len(), 16),
++            (parts.len(), 17),
+         ] {
+             left = left.checked_sub(base64::encoded_len(count.checked_mul(width)?, true)?)?;
+         }
+-        for call in &self.calls {
++        for call in calls.iter() {
+             left = left.checked_sub(call.len().checked_add(2)?)?;
+         }
+-        let parts = pack(
+-            self.parts.iter().map(|(id, explicit)| {
++        let encoded_parts = pack(
++            parts.iter().map(|(id, explicit)| {
+                 let mut record = [0; 17];
+                 record[..16].copy_from_slice(id.as_bytes());
+                 record[16] = u8::from(*explicit);
+                 record
+             }),
+-            self.parts.len(),
++            parts.len(),
+         );
++        drop(parts);
++        let encoded_history = pack(history.iter().copied(), history.len());
++        drop(history);
++        let encoded_turns = ids(&turns);
++        drop(turns);
++        let encoded_exchanges = ids(&exchanges);
++        drop(exchanges);
++        let encoded_messages = ids(&messages);
++        drop(messages);
+         Some(Packed {
+             format: 1,
+-            history: pack(self.history.iter().copied(), self.history.len()),
+-            turns: ids(&self.turns),
+-            exchanges: ids(&self.exchanges),
+-            messages: ids(&self.messages),
+-            parts,
+-            calls: &self.calls,
++            history: encoded_history,
++            turns: encoded_turns,
++            exchanges: encoded_exchanges,
++            messages: encoded_messages,
++            parts: encoded_parts,
++            calls,
+         })
+     }
++}
++
++impl PrefixIdentities {
++    pub(in crate::core::session_store::remote::view) fn encode_cache(
++        &self,
++    ) -> Option<Packed<Cow<'_, HashSet<CallId>>>> {
++        PrefixFields {
++            history: Cow::Borrowed(&self.history),
++            turns: Cow::Borrowed(&self.turns),
++            exchanges: Cow::Borrowed(&self.exchanges),
++            messages: Cow::Borrowed(&self.messages),
++            parts: Cow::Borrowed(&self.parts),
++            calls: Cow::Borrowed(&self.calls),
++        }
++        .encode()
++    }
++
++    pub(in crate::core::session_store::remote::view) fn into_encoded_cache(
++        self,
++    ) -> Option<Packed<Cow<'static, HashSet<CallId>>>> {
++        PrefixFields {
++            history: Cow::Owned(self.history),
++            turns: Cow::Owned(self.turns),
++            exchanges: Cow::Owned(self.exchanges),
++            messages: Cow::Owned(self.messages),
++            parts: Cow::Owned(self.parts),
++            calls: Cow::Owned(self.calls),
++        }
++        .encode()
++    }
+ 
+     pub(in crate::core::session_store::remote::view) fn decode_cache(value: Value) -> Option<Self> {
+         let data: Packed<Vec<CallId>> = serde_json::from_value(value).ok()?;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 7c350b65d28617711ee77049c371716cd5e59c14..90f0e4e9f37e5a81c9d8c91bc70146fde3b22789 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -122,7 +122,6 @@ impl RemoteSessionStore {
+         let page = if paged {
+             // Keep the complete rendered transcript until the named page is
+             // actually available, even when publishing the cache failed.
+-            drop(model.prefix);
+             source
+                 .revision()
+                 .and_then(|revision| self.saved_transcript_page(None, Some(&revision)))

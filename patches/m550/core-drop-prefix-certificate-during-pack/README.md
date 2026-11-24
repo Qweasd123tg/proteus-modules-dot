@@ -1,0 +1,18 @@
+# Core: free consumed startup certificate fields during cache packing
+
+## What changes
+The startup display-only projection doesn't need its prefix certificate after packing. Move that one certificate into the existing packed-v1 writer. After checking the same caps, encode its exact fields in the original order, dropping each source field once encoded. Its calls remain until bounded Value conversion; the typed certificate is no longer alive when hashing or sending the prefix Value. Ordinary model saves and committed projection writes still borrow the certificate, using the same packing implementation.
+
+The source-addressed named revision, HEAD, page data, complete transcript fallback, strict/source guards and publication sequence are unchanged. Earlier failed saves release the doomed startup certificate when returning, and still attempt the same named read/full fallback. Prefix-write failure is still optional. The bytes of the existing packed format, 17-byte UUID/flag members, bound checks and full integrity hash are unchanged for the same certificate. UUID collections are unordered in the packed protocol and independently seeded across executions, as before.
+
+## Native evidence
+Exact M406 Core is identical to M404; all 1,101 path modes, sizes and blob identities match the canonical M406 manifest. The source patch reverses cleanly. Native A/B uses the real selected startup/strict/projected/render/cache/publish implementation with a typed in-process Storage fixture, default and preserve_order layouts. 98 paired cases in each layout match page hashes, output, cursors, decoded certificate memberships and write/read/fault traces. Includes success, optional prefix failure, named/HEAD failures, named misses with 50,000 unchanged fallback rows, strict Replace, rich/non-compact, borrowed model save and committed Checkpoint controls. The proof also checks reciprocal authenticated v1 reads and exact same-owner serialized bytes, including metadata/escaped calls; a bounded field estimate that passes but whose actual escaped Value exceeds 64 MiB still fails in both modes.
+
+On each 50,000-part projected ×4 and strict ×5 case in both map layouts, the existing certificate is 4,390,944 requested live bytes at prefix-pack entry in both arms. Immediately after packing the parts, startup ownership drops to 3,211,280 bytes. By full Value construction, actual prefix WriteCache, named-header and HEAD writes, new startup ownership is zero versus 4,390,944 B in the stock arm. The same 4,333,340 bytes of Base64 history/messages/parts still go into the packed value. Neither arm has original certificate owners at the named page read. Ordinary borrowed save holds its original certificate at the same observed points in both arms. Other tagged owners, including compact rendered rows, match.
+
+These are tracked requested allocation layouts at exact phases, not process RSS/PSS, a full app launch benchmark, or an earlier render/storage-fold peak reduction. Work and bytes published are not skipped. No service/pin/security/SDK changes.
+
+## Replay
+Use the exact M404 archive as the unchanged M406 Core snapshot, under m406, and the integration M406 inventory. Run python3 seal-source.py, python3 proof/generate.py orig, python3 proof/generate.py new, ./run-route.sh, ./run-certs.sh, python3 build-parts.py default ordered, python3 compare.py and python3 seal-proof.py in the authenticated native offline workspace. Allocation probes label actual owners by tracked allocator layouts, not estimates based on type sizes.
+
+Native proof retained separately, SHA-256: `f216f2793e405331eca7fefd9a7dcf56b0bfefda27e084f0724a4f0740a05673`.
