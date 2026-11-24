@@ -1,0 +1,7 @@
+# Git history: release layout scratch before and during drawing
+
+Finished Git graph layouts no longer carry lane-builder hash maps and lane state into row construction. Each completed line releases its pieces once drawn. The same order, colors, lane coordinates and ordered segments remain; the visible row storage is unchanged.
+
+The std-only Rust witness uses both complete versions of the real layout module. Nine tests passed, including the four shipped tests on each version, plus a scoped comparison across 35 fixtures and 140 allocator ledgers. Each comparison required exactly the same rows and segment order, all output vector capacities, and retained requested bytes. On a linear 100-commit page, peak requested bytes fell from 36,464 to 31,576 (−4,888 B, about 13%). On a 2,048-commit linear history, peak fell from 704,784 to 622,424 (−82,360 B, about 12%). Gross requested bytes and allocation calls were unchanged on the linear cases. Broad and randomized merge cases verify output parity; they are not offered as general peak guarantees.
+
+These are allocator measurements for graph layout alone on fixtures, not the whole Git panel, wall time, process memory or a cold-start result. The one-leaf patch applies and reverses on the exact source of both the Extensions owner and the packaged revision without prerequisites. The Git caller was also checked at both immutable revisions. No Core, Desktop, API or dependency changes.
