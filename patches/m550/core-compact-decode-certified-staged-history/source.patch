@@ -1,0 +1,732 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+index 2590dc35864880a60c420835a25b92a4ee6b4bb0..f6931271e4bf8cffae602aab7ab6364725169c94 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+@@ -86,16 +86,18 @@ fn staged_text_witnesses_preserve_early_rows_and_hidden_root_live_commits() {
+ 
+     let (mut staged, roots) = DisplayRecords::stage_for_test(&items);
+     let actual = render_causal(
+-        &mut |visit| staged.scan(visit),
++        &mut |visit| staged.scan(|record| visit(StagedRenderRecord::Journal(record))),
+         Some(live),
+         false,
++        false,
+         TranscriptVisibility {
+             root_threads: roots.expect("every response has a positive commit witness"),
+             certified_text_responses: true,
+             ..Default::default()
+         },
+     )
+-    .unwrap();
++    .unwrap()
++    .into_full();
+     let expected = from_records(&items, Some(live)).unwrap();
+     assert_eq!(
+         serde_json::to_value(&actual).unwrap(),
+@@ -226,16 +228,18 @@ fn staged_mixed_append_still_matches_full_order_and_dates() {
+     let items = [item];
+     let (mut staged, roots) = DisplayRecords::stage_for_test(&items);
+     let actual = render_causal(
+-        &mut |visit| staged.scan(visit),
++        &mut |visit| staged.scan(|record| visit(StagedRenderRecord::Journal(record))),
+         None,
+         true,
++        false,
+         TranscriptVisibility {
+             root_threads: roots.expect("history-only stage"),
+             certified_text_responses: true,
+             ..Default::default()
+         },
+     )
+-    .unwrap();
++    .unwrap()
++    .into_full();
+     let expected = from_records(&items, None).unwrap();
+     assert_eq!(
+         serde_json::to_vec(&actual).unwrap(),
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 67cabb6cf98ce92a2324fa9a6ae2881deb5de8bb..40908e9961eaeb79949127e2ac1139adce67dad3 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -10,7 +10,7 @@ use crate::{
+     contracts::OperationOwner,
+     core::{
+         CompactTextRow, DisplayRows, JournalEntry, JournalReadSnapshot, JournalRecord,
+-        ModelResponseOutcome, ToolCallRecordPhase,
++        ModelResponseOutcome, StagedRenderRecord, StagedTextRow, ToolCallRecordPhase,
+     },
+     domain::TurnId,
+     model_standard::ContentPart,
+@@ -47,7 +47,7 @@ fn render_source(
+                 if allow_compact && single_record && live_turn_id.is_none() {
+                     source.scan_display_capturing_prefix(visit)
+                 } else {
+-                    source.scan_display(visit)
++                    source.scan_display(|record| visit(StagedRenderRecord::Journal(record)))
+                 }
+             },
+             live_turn_id,
+@@ -236,7 +236,7 @@ pub(super) fn transcript_from_scan(
+ }
+ 
+ fn render_causal(
+-    scan: &mut impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
++    scan: &mut impl FnMut(&mut dyn FnMut(StagedRenderRecord) -> Result<()>) -> Result<()>,
+     live_turn_id: Option<TurnId>,
+     single_record: bool,
+     allow_compact: bool,
+@@ -252,7 +252,41 @@ fn render_causal(
+         subagent_bindings: Default::default(),
+     };
+     let mut compact = None;
+-    scan(&mut |mut record| {
++    scan(&mut |input| {
++        let mut record = match input {
++            StagedRenderRecord::Journal(record) => record,
++            StagedRenderRecord::Text(append) => {
++                let timestamp_ms = append.timestamp_ms;
++                replay
++                    .state
++                    .timestamps
++                    .record_staged_text_append(timestamp_ms);
++                let mut rows = Vec::new();
++                for StagedTextRow {
++                    id,
++                    role,
++                    phase,
++                    part_id,
++                    scope,
++                    mut text,
++                } in append.into_rows()
++                {
++                    if let Some(text) = replay
++                        .state
++                        .take_staged_text_value(part_id, scope, &mut text)
++                    {
++                        rows.push(CompactTextRow {
++                            message_id: id,
++                            phase,
++                            role,
++                            text,
++                        });
++                    }
++                }
++                compact = Some(DisplayRows::Text { timestamp_ms, rows });
++                return Ok(());
++            }
++        };
+         replay.state.timestamps.collect_record::<false>(&record);
+         if let JournalEntry::HistoryMutated(mutation) = &mut record.entry
+             && mutation.mutation == HistoryMutationKind::Append
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+index 1510994a7a5cb0019c98b1d3d857dcdfc5c8b700..c85ae8cd973101e0647fc26e143ec3471033b7f8 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -160,6 +160,14 @@ impl TranscriptTimestamps {
+         }
+     }
+ 
++    pub(super) fn record_staged_text_append(&mut self, timestamp_ms: i64) {
++        // The narrow record checks nonzero sequence and the single-Append
++        // shape before calling us. Consume the same single-record hint.
++        debug_assert!(self.single_staged_record);
++        self.single_staged_record = false;
++        self.uniform_message_date = Some(timestamp_ms);
++    }
++
+     /// This is the single staged text-only Append proof, not just equal dates.
+     pub(super) fn certified_text_append_date(&self) -> Option<i64> {
+         self.uniform_message_date
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+index 7fe457b49659f4e8635c90e367055878df81bce2..d3b2400ab26c1478f76c3999d3faf3058be540d4 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -423,8 +423,17 @@ impl TranscriptProjectionState {
+         let ContentPart::Text { text } = &mut part.payload else {
+             return None;
+         };
+-        if !self.seen_parts.insert(part.part_id)
+-            || part.scope != PartScope::Conversation
++        self.take_staged_text_value(part.part_id, part.scope, text)
++    }
++
++    fn take_staged_text_value(
++        &mut self,
++        part_id: PartId,
++        scope: PartScope,
++        text: &mut String,
++    ) -> Option<String> {
++        if !self.seen_parts.insert(part_id)
++            || scope != PartScope::Conversation
+             || text.trim().is_empty()
+         {
+             return None;
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 20a96dd2c975b762d454ec2c393060811beddd3f..2be8555e949f3f10774ce8f34b9bf2049936ca24 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -89,8 +89,8 @@ pub(crate) use session_store::read_cache as session_read_cache;
+ pub(crate) use session_store::subscribe_catalog_updates;
+ pub(crate) use session_store::{
+     CommittedDisplay, CompactTextRow, DisplayRecords, DisplayRows, PrefixIdentities,
+-    PreparedSession, SessionReadModel, SessionTranscriptAppend, prepare_latest_workspace_session,
+-    session_storage_binding, transcript_role,
++    PreparedSession, SessionReadModel, SessionTranscriptAppend, StagedRenderRecord, StagedTextRow,
++    prepare_latest_workspace_session, session_storage_binding, transcript_role,
+ };
+ pub use session_store::{
+     SessionStore, StorageService, canonicalize_session_dir_path, configured_session_storage,
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2dc4fd1ebbb2fc6a8594fe87fa261073a6febc85
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+@@ -0,0 +1,223 @@
++//! Private, strictly narrower wire reader for one staged text Append.
++//! This is not a storage or journal format; rejection always retries the
++//! original JournalRecord decoder on exactly the same complete staged line.
++use crate::{
++    domain::{ExecutionId, MessageId, PartId, RecordId, SessionId, ThreadId, TurnId},
++    model_standard::{MessagePhase, MessageRole, PartProvenance, PartScope},
++};
++use serde::{
++    Deserialize, Deserializer,
++    de::{Error, MapAccess, SeqAccess, Visitor},
++};
++use std::{fmt, num::NonZeroU64};
++
++pub(super) const MIN_ROWS: usize = 4_096;
++pub(super) const MAX_ROWS: usize = 65_536;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    #[serde(rename = "schema_version")]
++    _schema_version: u32,
++    #[serde(rename = "record_id")]
++    _record_id: RecordId,
++    #[serde(rename = "session_seq")]
++    _session_seq: NonZeroU64,
++    timestamp_ms: i64,
++    #[serde(rename = "session_id")]
++    _session_id: SessionId,
++    #[serde(rename = "execution_id")]
++    _execution_id: Option<ExecutionId>,
++    #[serde(rename = "thread_id")]
++    _thread_id: Option<ThreadId>,
++    turn_id: Option<TurnId>,
++    entry: Entry,
++}
++
++// Require the local serializer's tag-first object order, so Serde never
++// buffers an arbitrary payload as generic Content for this fast path. Other
++// equivalent JSON spellings still take the full authoritative decoder.
++struct Entry(Append);
++
++impl<'de> Deserialize<'de> for Entry {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct TagFirst;
++        impl<'de> Visitor<'de> for TagFirst {
++            type Value = Entry;
++
++            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++                f.write_str("a tag-first staged HistoryMutated entry")
++            }
++
++            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Entry, A::Error> {
++                if map.next_key::<&str>()? != Some("kind")
++                    || map.next_value::<&str>()? != "history_mutated"
++                    || map.next_key::<&str>()? != Some("payload")
++                {
++                    return Err(A::Error::custom("not a tag-first staged Append"));
++                }
++                let payload = map.next_value()?;
++                if map.next_key::<&str>()?.is_some() {
++                    return Err(A::Error::custom("extra staged history entry fields"));
++                }
++                Ok(Entry(payload))
++            }
++        }
++        deserializer.deserialize_map(TagFirst)
++    }
++}
++
++// Match only JSON null even if a future caller uses a deserializer whose
++// deserialize_unit accepts other shapes (Serde Content can accept an empty map).
++struct OnlyNull;
++
++impl<'de> Deserialize<'de> for OnlyNull {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct Null;
++        impl<'de> Visitor<'de> for Null {
++            type Value = OnlyNull;
++
++            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++                f.write_str("null")
++            }
++
++            fn visit_unit<E: Error>(self) -> Result<OnlyNull, E> {
++                Ok(OnlyNull)
++            }
++        }
++        deserializer.deserialize_any(Null)
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Append {
++    #[serde(rename = "previous_revision")]
++    _previous_revision: u64,
++    #[serde(rename = "new_revision")]
++    _new_revision: u64,
++    #[serde(rename = "mutation")]
++    _mutation: Mutation,
++    messages: Rows,
++    #[serde(rename = "compaction")]
++    _compaction: Option<OnlyNull>,
++    #[serde(rename = "tool_results")]
++    _tool_results: [(); 0],
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "snake_case")]
++enum Mutation {
++    Append,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Message {
++    id: MessageId,
++    role: MessageRole,
++    phase: Option<MessagePhase>,
++    parts: [Part; 1],
++    #[serde(rename = "name")]
++    _name: Option<OnlyNull>,
++    #[serde(rename = "tool_call_id")]
++    _tool_call_id: Option<OnlyNull>,
++    #[serde(rename = "metadata")]
++    _metadata: OnlyNull,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Part {
++    part_id: PartId,
++    #[serde(rename = "provenance")]
++    _provenance: PartProvenance,
++    scope: PartScope,
++    payload: Payload,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++enum Payload {
++    Text { text: String },
++}
++
++struct Rows(Vec<Message>);
++
++impl<'de> Deserialize<'de> for Rows {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct BoundedRows;
++        impl<'de> Visitor<'de> for BoundedRows {
++            type Value = Rows;
++
++            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++                write!(f, "at most {MAX_ROWS} staged text rows")
++            }
++
++            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Rows, A::Error> {
++                let mut rows = Vec::new();
++                while rows.len() < MAX_ROWS {
++                    let Some(row) = seq.next_element()? else {
++                        return Ok(Rows(rows));
++                    };
++                    rows.push(row);
++                }
++                if seq.next_element::<Message>()?.is_some() {
++                    return Err(A::Error::custom("large staged text row list"));
++                }
++                Ok(Rows(rows))
++            }
++        }
++        deserializer.deserialize_seq(BoundedRows)
++    }
++}
++
++pub(crate) struct StagedTextAppend {
++    pub(crate) timestamp_ms: i64,
++    pub(super) turn_id: Option<TurnId>,
++    messages: Vec<Message>,
++}
++
++pub(crate) struct StagedTextRow {
++    pub(crate) id: MessageId,
++    pub(crate) role: MessageRole,
++    pub(crate) phase: Option<MessagePhase>,
++    pub(crate) part_id: PartId,
++    pub(crate) scope: PartScope,
++    pub(crate) text: String,
++}
++
++impl StagedTextAppend {
++    pub(super) fn decode(line: &[u8]) -> Option<Self> {
++        let record = serde_json::from_slice::<Record>(line).ok()?;
++        let Entry(append) = record.entry;
++        let messages = append.messages.0;
++        if messages.len() < MIN_ROWS {
++            return None;
++        }
++        Some(Self {
++            timestamp_ms: record.timestamp_ms,
++            turn_id: record.turn_id,
++            messages,
++        })
++    }
++
++    pub(super) fn identities(&self) -> impl Iterator<Item = (MessageId, PartId)> + '_ {
++        self.messages.iter().map(|m| (m.id, m.parts[0].part_id))
++    }
++
++    pub(crate) fn into_rows(self) -> impl Iterator<Item = StagedTextRow> {
++        self.messages.into_iter().map(|m| {
++            let [part] = m.parts;
++            let Payload::Text { text } = part.payload;
++            StagedTextRow {
++                id: m.id,
++                role: m.role,
++                phase: m.phase,
++                part_id: part.part_id,
++                scope: part.scope,
++                text,
++            }
++        })
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+index a6b152072b6b695193ffdbdd750c4a9da883c20a..4a8ec8d99cd9e9f015a2d0ed10afc36dbf1c93ef 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+@@ -3,7 +3,7 @@
+ use super::super::view::PrefixIdentities;
+ use super::{JournalKind, JournalRecord};
+ use crate::{
+-    core::{HistoryMutationKind, JournalEntry, ModelResponseOutcome},
++    core::{HistoryMutated, HistoryMutationKind, JournalEntry, ModelResponseOutcome},
+     domain::{PartId, ThreadId, TurnId},
+     model_standard::ContentPart,
+ };
+@@ -14,6 +14,15 @@ use std::{
+     io::{self, BufRead, BufReader, BufWriter, Seek, Write},
+ };
+ 
++mod text_append;
++use text_append::{MAX_ROWS, MIN_ROWS};
++pub(crate) use text_append::{StagedTextAppend, StagedTextRow};
++
++pub(crate) enum StagedRenderRecord {
++    Journal(JournalRecord),
++    Text(StagedTextAppend),
++}
++
+ const MAX_STAGING_BYTES: u64 = 512 * 1024 * 1024;
+ const MAX_RETAINED_FINAL_SCAN_BYTES: usize = 4 * 1024 * 1024;
+ // Only seed typical large projected/strict pages. Higher outliers retain
+@@ -53,61 +62,75 @@ impl CausalStage {
+         }
+     }
+ 
+-    fn note(&mut self, record: &JournalRecord) -> bool {
++    fn note<const CHECK_COMPACT: bool>(&mut self, record: &JournalRecord) -> Option<bool> {
+         match &record.entry {
+             JournalEntry::HistoryMutated(mutation) => {
+                 if mutation.mutation == HistoryMutationKind::Replace
+                     && mutation.compaction.is_none()
+                 {
+-                    return false;
++                    return None;
+                 }
+-                for part in mutation.messages.iter().flat_map(|message| &message.parts) {
+-                    if matches!(part.payload, ContentPart::HostedToolActivity { .. }) {
+-                        return false;
++                let mut compact = CHECK_COMPACT && staged_text_shape(mutation);
++                // On the writer-proven first large line, check metadata and
++                // singleton shape during the causal walk already required.
++                // The stock plain-history bit establishes that every part is text.
++                for message in &mutation.messages {
++                    if compact {
++                        compact = message.parts.len() == 1
++                            && message.metadata.is_null()
++                            && message.name.is_none()
++                            && message.tool_call_id.is_none();
+                     }
+-                    self.plain_history &= matches!(part.payload, ContentPart::Text { .. });
+-                    if Some(part.part_id) == self.pending_text {
+-                        self.pending_text = None;
++                    for part in &message.parts {
++                        if matches!(part.payload, ContentPart::HostedToolActivity { .. }) {
++                            return None;
++                        }
++                        let text = matches!(part.payload, ContentPart::Text { .. });
++                        self.plain_history &= text;
++                        compact &= text;
++                        if Some(part.part_id) == self.pending_text {
++                            self.pending_text = None;
++                        }
+                     }
+                 }
+-                !self.saw_response || self.plain_history
++                (!self.saw_response || self.plain_history).then_some(compact && self.plain_history)
+             }
+             JournalEntry::ModelResponseRecorded(record) => {
+                 if !self.plain_history || self.pending_text.is_some() {
+-                    return false;
++                    return None;
+                 }
+                 let ModelResponseOutcome::Response { response } = &record.outcome else {
+-                    return false;
++                    return None;
+                 };
+                 let [message] = response.messages.as_slice() else {
+-                    return false;
++                    return None;
+                 };
+                 let [part] = message.parts.as_slice() else {
+-                    return false;
++                    return None;
+                 };
+                 if !response.tool_calls.is_empty()
+                     || !matches!(part.payload, ContentPart::Text { .. })
+                 {
+-                    return false;
++                    return None;
+                 }
+                 // A positive commit witness for every response proves the normal
+                 // visibility rule without keeping a global set of committed parts.
+                 self.saw_response = true;
+                 self.pending_text = Some(part.part_id);
+-                true
++                Some(false)
+             }
+             JournalEntry::TurnOpened(_) => {
+                 if let (Some(turn), Some(thread)) = (record.turn_id, record.thread_id) {
+                     if self.roots.len() == MAX_STAGED_ROOTS && !self.roots.contains_key(&turn) {
+-                        return false;
++                        return None;
+                     }
+                     // Match full discovery, which uses the final binding in journal order.
+                     self.roots.insert(turn, thread);
+                 }
+-                true
++                Some(false)
+             }
+-            JournalEntry::TurnSettled(_) => true,
+-            _ => false,
++            JournalEntry::TurnSettled(_) => Some(false),
++            _ => None,
+         }
+     }
+ 
+@@ -125,6 +148,7 @@ pub(in crate::core::session_store::remote) struct DisplayRecordWriter {
+     remaining: u64,
+     count: usize,
+     causal_stage: Option<CausalStage>,
++    compact_text: bool,
+ }
+ 
+ impl DisplayRecordWriter {
+@@ -134,6 +158,7 @@ impl DisplayRecordWriter {
+             remaining: MAX_STAGING_BYTES,
+             count: 0,
+             causal_stage: None,
++            compact_text: false,
+         })
+     }
+ 
+@@ -155,10 +180,20 @@ impl DisplayRecordWriter {
+             self.causal_stage = None;
+         } else {
+             self.count += 1;
+-            if let Some(stage) = &mut self.causal_stage
+-                && !stage.note(record)
+-            {
+-                self.causal_stage = None;
++            if let Some(stage) = &mut self.causal_stage {
++                // Never inspect compact-only properties for ordinary small
++                // or multi-record stages. This flag only permits trying the
++                // actual first line in the narrower reader.
++                let hint =
++                    if single_record_reserve(self.count, MAX_STAGING_BYTES - self.remaining) != 0 {
++                        stage.note::<true>(record)
++                    } else {
++                        stage.note::<false>(record)
++                    };
++                self.compact_text = hint.unwrap_or(false);
++                if hint.is_none() {
++                    self.causal_stage = None;
++                }
+             }
+         }
+     }
+@@ -175,6 +210,7 @@ impl DisplayRecordWriter {
+             ),
+             causal_roots: self.causal_stage.and_then(CausalStage::finish),
+             prefix_witness: None,
++            compact_text: self.compact_text,
+         })
+     }
+ }
+@@ -200,6 +236,7 @@ pub(crate) struct DisplayRecords {
+     single_record_reserve: usize,
+     causal_roots: Option<RootBindings>,
+     prefix_witness: Option<PrefixWitness>,
++    compact_text: bool,
+ }
+ 
+ // Private to this staged file, and consumed by its next prefix scan.
+@@ -242,16 +279,32 @@ impl DisplayRecords {
+ 
+     pub(super) fn scan_capturing_prefix(
+         &mut self,
+-        mut consume: impl FnMut(JournalRecord) -> Result<()>,
++        mut consume: impl FnMut(StagedRenderRecord) -> Result<()>,
+     ) -> Result<()> {
+         self.prefix_witness = None;
+         let expected_bytes = self.single_record_reserve;
+         if self.count != 1 || expected_bytes == 0 {
+-            return self.scan(consume);
++            return self.scan(|record| consume(StagedRenderRecord::Journal(record)));
+         }
+ 
++        let compact_text = self.compact_text;
+         let mut witness = None;
+         self.scan_lines(|line, last, index| {
++            if compact_text
++                && index == 0
++                && line.len() == expected_bytes
++                && let Some(append) = StagedTextAppend::decode(line)
++            {
++                let sha256 = ring::digest::digest(&ring::digest::SHA256, line);
++                release_scan_line(line, last);
++                let prefix =
++                    PrefixIdentities::from_staged_text(append.turn_id, append.identities());
++                consume(StagedRenderRecord::Text(append))?;
++                witness = Some(PrefixWitness { sha256, prefix });
++                return Ok(());
++            }
++            // The original complete slice is still intact. Propagate only the
++            // original decoder's result/error on any miss.
+             let record: JournalRecord = serde_json::from_slice(line)?;
+             let sha256 = (index == 0 && line.len() == expected_bytes && prefix_candidate(&record))
+                 .then(|| ring::digest::digest(&ring::digest::SHA256, line));
+@@ -261,7 +314,7 @@ impl DisplayRecords {
+                 prefix.visit(&record, false);
+                 witness = Some(PrefixWitness { sha256, prefix });
+             }
+-            consume(record)
++            consume(StagedRenderRecord::Journal(record))
+         })?;
+         // Only commit after the renderer and physical EOF/count checks succeed.
+         self.prefix_witness = witness;
+@@ -335,18 +388,22 @@ fn release_scan_line(line: &mut Vec<u8>, last: bool) {
+     }
+ }
+ 
++fn staged_text_shape(h: &HistoryMutated) -> bool {
++    h.mutation == HistoryMutationKind::Append
++        && h.compaction.is_none()
++        && h.tool_results.is_empty()
++        && (MIN_ROWS..=MAX_ROWS).contains(&h.messages.len())
++}
++
+ fn prefix_candidate(record: &JournalRecord) -> bool {
+     matches!(
+         &record.entry,
+         JournalEntry::HistoryMutated(h)
+-            if h.mutation == HistoryMutationKind::Append
+-                && h.compaction.is_none()
+-                && h.tool_results.is_empty()
+-                && (4_096..=65_536).contains(&h.messages.len())
+-                && h.messages.iter().all(|m| matches!(
+-                    m.parts.as_slice(),
++            if staged_text_shape(h) && h.messages.iter().all(|message|
++                matches!(message.parts.as_slice(),
+                     [part] if matches!(part.payload, ContentPart::Text { .. })
+-                ))
++                )
++            )
+     )
+ }
+ 
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index c8cb82b2091db0f923637953ce4954467d10380d..37a6f821f273280094524cb86c3a6deb061ffff3 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
+ 
+ mod display_records;
+ pub(super) use display_records::DisplayRecordWriter;
+-pub(crate) use display_records::{DisplayRecords, is_display_kind};
++pub(crate) use display_records::{
++    DisplayRecords, StagedRenderRecord, StagedTextRow, is_display_kind,
++};
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+@@ -95,11 +97,13 @@ impl RemoteJournalSnapshot {
+     }
+     pub(crate) fn scan_display_capturing_prefix(
+         &mut self,
+-        consume: impl FnMut(JournalRecord) -> Result<()>,
++        mut consume: impl FnMut(StagedRenderRecord) -> Result<()>,
+     ) -> Result<()> {
+         match &mut self.display_records {
+             Some(records) => records.scan_capturing_prefix(consume),
+-            None => self.scan_from(0, is_display_kind, consume),
++            None => self.scan_from(0, is_display_kind, |record| {
++                consume(StagedRenderRecord::Journal(record))
++            }),
+         }
+     }
+ 
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+index 8c0bc45bbfe781c2bc7a64208e2a68153664828d..5e97a96fe47962dcecaeebc2dec05d4b348cfd79 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+@@ -77,6 +77,21 @@ impl PrefixIdentities {
+         }
+     }
+ 
++    // The narrow reader has a single Text part per history message. Include
++    // all IDs, before visibility/blank filtering, as the canonical visit does.
++    pub(in crate::core::session_store::remote) fn from_staged_text(
++        turn: Option<TurnId>,
++        rows: impl Iterator<Item = (MessageId, PartId)>,
++    ) -> Self {
++        let mut prefix = Self::default();
++        prefix.visit_turn(turn, false);
++        for (message, part) in rows {
++            prefix.messages.insert(message);
++            prefix.parts.insert(part, true);
++        }
++        prefix
++    }
++
+     fn visit_turn(&mut self, turn: Option<TurnId>, suffix: bool) -> bool {
+         turn.is_none_or(|turn| identity(&mut self.turns, turn, suffix))
+     }
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index d68db85dba2770ae32ca77d71a0299ec2e935e2f..1bd44f4ff5304d6f4bf905328be78d1f720c9875 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -18,7 +18,7 @@ pub use remote::RemoteSessionStore as SessionStore;
+ pub use remote::StorageService;
+ pub(crate) use remote::{
+     prepared::{PreparedSession, prepare_latest_workspace_session},
+-    snapshot::DisplayRecords,
++    snapshot::{DisplayRecords, StagedRenderRecord, StagedTextRow},
+     view::{
+         CommittedDisplay, CompactTextRow, DisplayRows, PrefixIdentities, SessionReadModel,
+         SessionTranscriptAppend, transcript_role,
