@@ -1,0 +1,7 @@
+# Modules: move retained request context after a history acknowledgement
+
+An accepted history acknowledgement replaces the workflow's previous model-message list. The old merge deep-cloned every retained request-only message from that list just before discarding it. The new merge takes ownership and moves those messages into the same positions. The canonical messages still come from the acknowledgement, and history validation, result retirement, wire shape and rollback are not changed.
+
+The exact detached replacement assignment and merge helper passed 12 default-layout Rust tests and 40 paired observations. Serialized output and typed round trips agreed, returned capacity and retained requested bytes were unchanged, and measured live usage returned to zero after drop. With a 2 MiB context followed by a retained anchor, requested gross bytes fell from 2,098,524 to 1,203, peak requested bytes fell from 4,196,100 to 2,098,353, and allocation requests fell from nine to six. The 2 MiB no-context control was unchanged. These are scoped allocator measurements, not workflow RAM or latency. The real host acknowledgement and rollback were checked statically only.
+
+The two complete preimages match Modules main `e8e77e306092344c00833f3456acba950c851fe3` and the Core/Desktop packaged Modules pin `a271aaefcbcdd25f9b68918406f34490c6169bd7`. The indexed patch applies and reverses independently on both, with no preceding delivery requirement.
