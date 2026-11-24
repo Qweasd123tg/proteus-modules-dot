@@ -1,0 +1,7 @@
+# Core: size the live snapshot row buffer once
+
+When a session snapshot contains both completed and live rows, Core now allocates the result buffer for both at once. It still clones the completed rows and moves the live rows into the same order. With no completed rows, an already tight live buffer transfers directly. A loose live buffer does not carry its unused capacity into the snapshot. Session sampling and lock boundaries are unchanged.
+
+A detached Rust witness with the real snapshot types passed across 17 cases and 68 paired observations. Every case produced identical serialized bytes. With one live row added to a normal 50-row completed page, peak requested bytes fell from 80,300 to 54,820 and retained requested bytes from 79,784 to 54,304. Allocation requests fell from 105 to 104. The 50-row idle control was unchanged. A separate synthetic case with 2,048 live rows and no completed rows eliminated a 1,064,960-byte allocation request, with unchanged retained bytes.
+
+These measurements cover the detached snapshot assembler, including its input allocation sizes. They do not measure process memory, elapsed time, transport, or the full history. The single indexed hunk applies and reverses directly on Core main `b07ed3d4b5cfc34e8c679f7e580f810bb5872854` and the Desktop-packaged Core pin `3189126fdf6572667594e0a1ee909d244d36afe3`, with no prerequisites. A prior witness failed to compile because of an optional string in the fixture; the passing witness fixed only that fixture expression, leaving the product patch and tests' thresholds unchanged.
