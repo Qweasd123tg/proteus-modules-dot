@@ -1,0 +1,25 @@
+diff --git a/packages/analysis/src/main.rs b/packages/analysis/src/main.rs
+index 977ce584582ab6cc358111ff4f4928301a2638ff..6858bd939770ab9f62e673fe20b2de81fdb43645 100644
+--- a/packages/analysis/src/main.rs
++++ b/packages/analysis/src/main.rs
+@@ -244,11 +244,15 @@ impl Extension for Analysis {
+         }
+         let turn = self.turn.clone().filter(|turn| !turn.is_empty());
+         let query: Vec<(&str, &str)> = turn.iter().map(|turn| ("turn_id", turn.as_str())).collect();
+-        let data = self
+-            .analytics
+-            .fetch_shared(host, "/analysis", &query, false)?;
+-        let picker = self.analytics.session_picker(host)?;
+-        let root = self.page(&data, picker);
++        let root = {
++            let data = self
++                .analytics
++                .fetch_shared(host, "/analysis", &query, false)?;
++            let picker = self.analytics.session_picker(host)?;
++            self.page(&data, picker)
++        };
++        // An over-budget report has no cache owner. Release it before a
++        // slow client can block the synchronous write of the owned root.
+         host.show(view, root);
+         Ok(())
+     }
