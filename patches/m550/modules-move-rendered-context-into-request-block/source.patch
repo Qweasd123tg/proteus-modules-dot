@@ -1,0 +1,118 @@
+diff --git a/model/model-pack/src/adapters/context_render.rs b/model/model-pack/src/adapters/context_render.rs
+index 35d96c2e2377dcbe41e56b5b40c28ba6cb89c5ca..66b7f4650e1e5661a71125fa58e87aaad2d2d604 100644
+--- a/model/model-pack/src/adapters/context_render.rs
++++ b/model/model-pack/src/adapters/context_render.rs
+@@ -1,22 +1,45 @@
++use serde_json::{Map, Value};
++
+ use crate::{
+     domain::{ContextChunk, ContextRenderMode},
+     model_standard::InstructionBlock,
+ };
+ 
++/// Move the rendered context into its final block rather than copying it through json!.
++pub(super) fn context_text_block(kind: &str, chunk: &ContextChunk) -> Value {
++    let mut block = Map::with_capacity(2);
++    block.insert("type".to_owned(), Value::String(kind.to_owned()));
++    block.insert("text".to_owned(), Value::String(context_text(chunk)));
++    Value::Object(block)
++}
++
+ /// Shared model-facing formatting; provider-specific JSON shaping stays in adapters.
+ pub(super) fn context_text(chunk: &ContextChunk) -> String {
+     match chunk.render_mode {
+         ContextRenderMode::Verbatim => chunk.content.clone(),
+-        ContextRenderMode::SourceAnnotated => format!(
+-            "Context from {}{}:\n{}",
+-            chunk.source,
+-            chunk
++        ContextRenderMode::SourceAnnotated => {
++            let path = chunk
+                 .path
+                 .as_ref()
+                 .map(|path| format!(" ({})", path.display()))
+-                .unwrap_or_default(),
+-            chunk.content
+-        ),
++                .unwrap_or_default();
++            let fields = [
++                "Context from ",
++                chunk.source.as_str(),
++                path.as_str(),
++                ":\n",
++                chunk.content.as_str(),
++            ];
++            let bytes = fields
++                .iter()
++                .try_fold(0usize, |sum, field| sum.checked_add(field.len()))
++                .expect("context text capacity overflow");
++            let mut text = String::with_capacity(bytes);
++            for field in fields {
++                text.push_str(field);
++            }
++            text
++        }
+     }
+ }
+ 
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index e2ce74582f7d3a0ba1bbe572e329027c70966c2d..0aba7e994e9ec98497ef85c52dbe76b40ebba0ad 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -8,7 +8,7 @@
+ 
+ use super::{OpenAiPromptCacheConfig, model_profile::OpenAiModelProfile};
+ use crate::{
+-    adapters::context_render::{context_text, instruction_text},
++    adapters::context_render::{context_text_block, instruction_text},
+     domain::{
+         FileSearchHostedToolConfig, HostedToolConfig, ResponseFormat, ToolCall, ToolCallSurface,
+         ToolChoice, ToolContent, ToolSpec, ToolSurface, WebSearchHostedToolConfig,
+@@ -403,14 +403,14 @@
+                         input.push(openai_text_message(message, text)?);
+                     }
+                 }
+-                ContentPart::Context { chunk } => input.push(json!({
+-                    "type": "message",
+-                    "role": "user",
+-                    "content": [{
+-                        "type": "input_text",
+-                        "text": context_text(chunk)
+-                    }]
+-                })),
++                ContentPart::Context { chunk } => {
++                    let mut message = json!({ "type": "message", "role": "user", "content": [] });
++                    *message
++                        .get_mut("content")
++                        .expect("context message has a content slot") =
++                        Value::Array(vec![context_text_block("input_text", chunk)]);
++                    input.push(message);
++                }
+                 ContentPart::ToolCall { call } => {
+                     tool_call_surfaces.insert(call.id.clone(), call.surface);
+                     match call.surface {
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+index 366dc0fdd1b8cf53cdebe4987db193055099d719..f54d1063ada366142d37494d30c467aca7cbb5f7 100644
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -3,7 +3,7 @@
+ 
+ use super::AnthropicPromptCacheConfig;
+ use crate::{
+-    adapters::context_render::{context_text, instruction_text},
++    adapters::context_render::{context_text_block, instruction_text},
+     domain::{ToolCallSurface, ToolChoice, ToolContent, ToolSpec, ToolSurface},
+     model_standard::{
+         CanonicalMessage, CanonicalModelRequest, ContentPart, MessageRole, ModelOperation,
+@@ -242,10 +242,7 @@
+     for part in &message.parts {
+         match &part.payload {
+             ContentPart::Text { text } => blocks.push(json!({ "type": "text", "text": text })),
+-            ContentPart::Context { chunk } => blocks.push(json!({
+-                "type": "text",
+-                "text": context_text(chunk)
+-            })),
++            ContentPart::Context { chunk } => blocks.push(context_text_block("text", chunk)),
+             ContentPart::ToolCall { call } => match call.surface {
+                 ToolCallSurface::Function => blocks.push(json!({
+                     "type": "tool_use",

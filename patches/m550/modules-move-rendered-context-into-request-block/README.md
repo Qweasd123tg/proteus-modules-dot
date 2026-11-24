@@ -1,0 +1,7 @@
+# Move rendered context text into existing request blocks
+
+Each converted Context part in the OpenAI and Anthropic DTOs already creates an owned UTF-8 string. Move it into the JSON text value instead of materializing a second owned copy through the JSON macro. Allocate the same annotated fragments to their precise requested length and use a borrowed key lookup when filling the existing OpenAI content slot. Preserve fields, insertion order, absent/empty path distinctions, escaped/unicode bytes and every non-context branch.
+
+Actual pinned Rust formatter, DTO and serde_json in both default and preserve_order builds; 11 fixtures × 2 adapters × ABBA per build, 176 equal row outputs within layouts. For the scoped four-chunk 32,000-byte fixture under the default layout, OpenAI gross requests 69,666→37,556 bytes and Anthropic 66,882→34,772. The test's source-content budget is representative of the repo-aware defaults, not actual observed user workload. A synthetic 2MiB verbatim OpenAI context block's scoped peak was 4,195,678→2,098,525 bytes. Complete retained accounting never increased. See the receipt for both layouts and exact raw output hashes. No model request, provider runtime, checkpoint, network, RSS, timing or full application was run or measured.
+
+Three exact owner-compatible source files. Direct indexed apply and strict inverse on Modules main and the revision shared by Core/Desktop, no prerequisite patch.
