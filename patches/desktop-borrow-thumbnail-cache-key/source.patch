@@ -1,0 +1,35 @@
+diff --git a/src/ui/chat/images.rs b/src/ui/chat/images.rs
+index 3d96d0f49276cdfed2a2f64815421603207b7422..ae7614e1fd09bef397fa06744b550fbbcac7572b 100644
+--- a/src/ui/chat/images.rs
++++ b/src/ui/chat/images.rs
+@@ -109,22 +109,18 @@ impl SentImages {
+     ) -> Vec<String> {
+         let mut missing = Vec::new();
+         for image in images {
+-            let key = Key {
+-                connection,
+-                dir: dir.into(),
+-                id: image.id.clone(),
+-                edge,
+-            };
+-            if self
+-                .by_id
+-                .get(&image.id)
+-                .is_some_and(|slot| slot.key != key)
+-            {
++            if self.by_id.get(&image.id).is_some_and(|slot| {
++                let key = &slot.key;
++                key.connection != connection
++                    || key.dir.as_path() != dir
++                    || key.id.as_str() != image.id.as_str()
++                    || key.edge != edge
++            }) {
+                 self.by_id.remove(&image.id);
+             }
+             if let Some(slot) = self.by_id.get_mut(&image.id) {
+                 if let Some(image) =
+-                    SHARED.with(|shared| shared.borrow_mut().cache.get(&key, &slot.owner))
++                    SHARED.with(|shared| shared.borrow_mut().cache.get(&slot.key, &slot.owner))
+                 {
+                     slot.state = Stored::Ready(Arc::downgrade(&image));
+                     continue;
