@@ -1,0 +1,1008 @@
+diff --git a/crates/proteus-core/src/core/session_store/context_summary.rs b/crates/proteus-core/src/core/session_store/context_summary.rs
+index 1e54f93328a4ae8d0d8ec32c55c7d4fda0dab263..f3a0cb81ec2bdab504f4f3388edd53269d2d9f80 100644
+--- a/crates/proteus-core/src/core/session_store/context_summary.rs
++++ b/crates/proteus-core/src/core/session_store/context_summary.rs
+@@ -30,13 +30,7 @@ pub(crate) fn summarize_context_history(messages: &[CanonicalMessage]) -> AppCon
+     let mut bytes = 0usize;
+     for message in messages {
+         bytes += json_bytes(&message.metadata) + 4;
+-        match message.role {
+-            MessageRole::User => summary.user_messages += 1,
+-            MessageRole::Assistant => summary.assistant_messages += 1,
+-            MessageRole::System | MessageRole::Developer => summary.system_messages += 1,
+-            MessageRole::Tool => {}
+-            _ => {}
+-        }
++        note_role(&mut summary, &message.role);
+         for part in &message.parts {
+             match &part.payload {
+                 ContentPart::Text { text }
+@@ -85,6 +79,31 @@ pub(crate) fn summarize_context_history(messages: &[CanonicalMessage]) -> AppCon
+     summary
+ }
+ 
++pub(super) fn summarize_plain_history<'a>(
++    messages: impl ExactSizeIterator<Item = (&'a MessageRole, &'a str)>,
++) -> AppContextHistorySummary {
++    let mut summary = AppContextHistorySummary::default();
++    summary.messages = messages.len();
++    let fixed = json_bytes(&serde_json::Value::Null) + 4;
++    let mut bytes = 0usize;
++    for (role, text) in messages {
++        note_role(&mut summary, role);
++        bytes += fixed + text.len();
++    }
++    summary.estimated_tokens = estimate_tokens_from_bytes(bytes);
++    summary
++}
++
++fn note_role(summary: &mut AppContextHistorySummary, role: &MessageRole) {
++    match role {
++        MessageRole::User => summary.user_messages += 1,
++        MessageRole::Assistant => summary.assistant_messages += 1,
++        MessageRole::System | MessageRole::Developer => summary.system_messages += 1,
++        MessageRole::Tool => {}
++        _ => {}
++    }
++}
++
+ fn estimate_tokens_from_bytes(bytes: usize) -> u32 {
+     if bytes == 0 {
+         0
+diff --git a/crates/proteus-core/src/core/session_store/remote/mod.rs b/crates/proteus-core/src/core/session_store/remote/mod.rs
+index 65ad4f2048745aa1c056dff6d841cce21aa1970d..09765c487165eb65648e2b46a7bb0cba8a17981f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/mod.rs
++++ b/crates/proteus-core/src/core/session_store/remote/mod.rs
+@@ -14,6 +14,7 @@ use std::{
+ };
+ 
+ pub(crate) mod catalog;
++mod plain_history;
+ pub(crate) mod prepared;
+ pub(crate) mod snapshot;
+ pub(crate) mod view;
+diff --git a/crates/proteus-core/src/core/session_store/remote/plain_history.rs b/crates/proteus-core/src/core/session_store/remote/plain_history.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a7f47ac5c9a3d20538a2ccdd3fa982178847be4
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/plain_history.rs
+@@ -0,0 +1,225 @@
++//! The existing #665 plain wire row shared by two independent owners.
++//! Staged display and validated canonical history must never substitute data
++//! for one another. Canonical serializers keep all original fields/key order.
++use crate::{
++    domain::{MessageId, PartId},
++    model_standard::{
++        CanonicalMessage, ContentPart, MessagePhase, MessageRole, PartProvenance, PartScope,
++    },
++};
++use serde::{
++    Deserialize, Deserializer, Serialize, Serializer,
++    de::{Error, Visitor},
++};
++use std::fmt;
++
++// Match only JSON null even if a future caller uses a deserializer whose
++// deserialize_unit accepts other shapes (Serde Content can accept an empty map).
++pub(super) struct OnlyNull;
++
++impl<'de> Deserialize<'de> for OnlyNull {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct Null;
++        impl<'de> Visitor<'de> for Null {
++            type Value = OnlyNull;
++
++            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++                f.write_str("null")
++            }
++
++            fn visit_unit<E: Error>(self) -> Result<OnlyNull, E> {
++                Ok(OnlyNull)
++            }
++        }
++        deserializer.deserialize_any(Null)
++    }
++}
++
++impl Serialize for OnlyNull {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        serializer.serialize_unit()
++    }
++}
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct PlainHistoryMessage {
++    id: MessageId,
++    role: MessageRole,
++    phase: Option<MessagePhase>,
++    parts: [Part; 1],
++    #[serde(rename = "name")]
++    _name: Option<OnlyNull>,
++    #[serde(rename = "tool_call_id")]
++    _tool_call_id: Option<OnlyNull>,
++    #[serde(rename = "metadata")]
++    _metadata: OnlyNull,
++}
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Part {
++    part_id: PartId,
++    #[serde(rename = "provenance")]
++    _provenance: PartProvenance,
++    scope: PartScope,
++    payload: Payload,
++}
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++enum Payload {
++    Text { text: String },
++}
++
++impl PlainHistoryMessage {
++    pub(super) fn accepts(message: &CanonicalMessage) -> bool {
++        message.name.is_none()
++            && message.tool_call_id.is_none()
++            && message.metadata.is_null()
++            && matches!(message.parts.as_slice(),
++                [part] if matches!(part.payload, ContentPart::Text { .. })
++            )
++    }
++
++    // Only called after the complete immutable shape preflight. The caller
++    // drops the original shell, except for one reused typed digest scratch.
++    pub(super) fn take_from(message: &mut CanonicalMessage) -> Self {
++        debug_assert!(Self::accepts(message));
++        let part = &mut message.parts[0];
++        let ContentPart::Text { text } = &mut part.payload else {
++            unreachable!("plain canonical preflight");
++        };
++        Self {
++            id: message.id,
++            role: message.role.clone(),
++            phase: message.phase,
++            parts: [Part {
++                part_id: part.part_id,
++                _provenance: part.provenance,
++                scope: part.scope,
++                payload: Payload::Text {
++                    text: std::mem::take(text),
++                },
++            }],
++            _name: None,
++            _tool_call_id: None,
++            _metadata: OnlyNull,
++        }
++    }
++
++    pub(super) fn identities(&self) -> (MessageId, PartId) {
++        (self.id, self.parts[0].part_id)
++    }
++
++    pub(super) fn role_and_text(&self) -> (&MessageRole, &str) {
++        let Payload::Text { text } = &self.parts[0].payload;
++        (&self.role, text)
++    }
++
++    pub(super) fn into_display_fields(
++        self,
++    ) -> (
++        MessageId,
++        MessageRole,
++        Option<MessagePhase>,
++        PartId,
++        PartScope,
++        String,
++    ) {
++        let [part] = self.parts;
++        let Payload::Text { text } = part.payload;
++        (
++            self.id,
++            self.role,
++            self.phase,
++            part.part_id,
++            part.scope,
++            text,
++        )
++    }
++
++    pub(super) fn with_typed_digest_row<T>(
++        &mut self,
++        scratch: &mut CanonicalMessage,
++        hash: impl FnOnce(&CanonicalMessage) -> T,
++    ) -> T {
++        // Scratch is one of the original shells: no RNG and no per-row Vec.
++        scratch.id = self.id;
++        scratch.role = self.role.clone();
++        scratch.phase = self.phase;
++        let part = &self.parts[0];
++        scratch.parts[0].part_id = part.part_id;
++        scratch.parts[0].scope = part.scope;
++        scratch.parts[0].provenance = part._provenance;
++        self.swap_text(scratch);
++        let result = hash(scratch);
++        self.swap_text(scratch);
++        result
++    }
++
++    fn swap_text(&mut self, scratch: &mut CanonicalMessage) {
++        let ContentPart::Text { text: scratch } = &mut scratch.parts[0].payload else {
++            unreachable!("plain canonical digest scratch");
++        };
++        let Payload::Text { text } = &mut self.parts[0].payload;
++        std::mem::swap(text, scratch);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn exact_wire_fingerprint_and_pointer_sharing_with_only_typed_scratch() {
++        for (index, role) in [
++            MessageRole::System,
++            MessageRole::Developer,
++            MessageRole::User,
++            MessageRole::Assistant,
++            MessageRole::Tool,
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            for size in [1, 85, 86, 4097] {
++                let value = if size == 4097 {
++                    "x🦀\\\"\u{0}".repeat(size)
++                } else {
++                    "x".repeat(size)
++                };
++                let mut original = CanonicalMessage::text(role.clone(), value);
++                original.id = MessageId::from_u128(100 + index as u128);
++                original.phase = Some(MessagePhase::FinalAnswer);
++                original.parts[0].part_id = PartId::from_u128(200 + index as u128);
++                original.parts[0].provenance = PartProvenance::Model;
++                original.parts[0].scope = PartScope::Trace;
++                let ContentPart::Text { text } = &original.parts[0].payload else {
++                    unreachable!();
++                };
++                let pointer = text.as_ptr();
++                let bytes = serde_json::to_vec(&original).unwrap();
++                let value = serde_json::to_value(&original).unwrap();
++                let exact = crate::core::history_message_sha256(&original).unwrap();
++                let mut row = PlainHistoryMessage::take_from(&mut original);
++                assert_eq!(serde_json::to_vec(&row).unwrap(), bytes);
++                assert_eq!(serde_json::to_value(&row).unwrap(), value);
++                assert_eq!(row.role_and_text().1.as_ptr(), pointer);
++                // Deliberately start with a different typed shell. The digest
++                // adapter must change more than the text.
++                let mut scratch = CanonicalMessage::text(MessageRole::Developer, String::new());
++                scratch.id = MessageId::from_u128(9000);
++                scratch.parts[0].part_id = PartId::from_u128(9001);
++                let got = row
++                    .with_typed_digest_row(&mut scratch, crate::core::history_message_sha256)
++                    .unwrap();
++                assert_eq!(got, exact);
++                let error: Result<(), _> = row.with_typed_digest_row(&mut scratch, |_| Err("test"));
++                assert_eq!(error, Err("test"));
++                assert_eq!(row.role_and_text().1.as_ptr(), pointer);
++                assert_eq!(serde_json::to_vec(&row).unwrap(), bytes);
++            }
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/prepared.rs b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+index d8bffcf88b9a75cf8fda3de85a7c6814653b145d..9653a640055ae14d6497be99b06d7e56b5771cf4 100644
+--- a/crates/proteus-core/src/core/session_store/remote/prepared.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prepared.rs
+@@ -76,9 +76,10 @@ impl PreparedSession {
+         Option<RemoteCacheSource>,
+     )> {
+         let (view, cached_source) = match self.history {
+-            PreparedHistory::Validated(read) => {
+-                (self.store.project_startup_view(read, true, render)?, None)
+-            }
++            PreparedHistory::Validated(read) => (
++                self.store.project_startup_view(read, true, true, render)?,
++                None,
++            ),
+             PreparedHistory::Cached(source, view) => (view, Some(source)),
+         };
+         Ok((self.store, view, cached_source))
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+index 2dc4fd1ebbb2fc6a8594fe87fa261073a6febc85..0f71969a4d4e84dac08bd85b32bfb05eb4b3acf9 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+@@ -1,9 +1,10 @@
+ //! Private, strictly narrower wire reader for one staged text Append.
+ //! This is not a storage or journal format; rejection always retries the
+ //! original JournalRecord decoder on exactly the same complete staged line.
++use super::super::super::plain_history::{OnlyNull, PlainHistoryMessage};
+ use crate::{
+     domain::{ExecutionId, MessageId, PartId, RecordId, SessionId, ThreadId, TurnId},
+-    model_standard::{MessagePhase, MessageRole, PartProvenance, PartScope},
++    model_standard::{MessagePhase, MessageRole, PartScope},
+ };
+ use serde::{
+     Deserialize, Deserializer,
+@@ -67,28 +68,6 @@ impl<'de> Deserialize<'de> for Entry {
+     }
+ }
+ 
+-// Match only JSON null even if a future caller uses a deserializer whose
+-// deserialize_unit accepts other shapes (Serde Content can accept an empty map).
+-struct OnlyNull;
+-
+-impl<'de> Deserialize<'de> for OnlyNull {
+-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+-        struct Null;
+-        impl<'de> Visitor<'de> for Null {
+-            type Value = OnlyNull;
+-
+-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-                f.write_str("null")
+-            }
+-
+-            fn visit_unit<E: Error>(self) -> Result<OnlyNull, E> {
+-                Ok(OnlyNull)
+-            }
+-        }
+-        deserializer.deserialize_any(Null)
+-    }
+-}
+-
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Append {
+@@ -111,38 +90,7 @@ enum Mutation {
+     Append,
+ }
+ 
+-#[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+-struct Message {
+-    id: MessageId,
+-    role: MessageRole,
+-    phase: Option<MessagePhase>,
+-    parts: [Part; 1],
+-    #[serde(rename = "name")]
+-    _name: Option<OnlyNull>,
+-    #[serde(rename = "tool_call_id")]
+-    _tool_call_id: Option<OnlyNull>,
+-    #[serde(rename = "metadata")]
+-    _metadata: OnlyNull,
+-}
+-
+-#[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+-struct Part {
+-    part_id: PartId,
+-    #[serde(rename = "provenance")]
+-    _provenance: PartProvenance,
+-    scope: PartScope,
+-    payload: Payload,
+-}
+-
+-#[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+-enum Payload {
+-    Text { text: String },
+-}
+-
+-struct Rows(Vec<Message>);
++struct Rows(Vec<PlainHistoryMessage>);
+ 
+ impl<'de> Deserialize<'de> for Rows {
+     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+@@ -162,7 +110,7 @@ impl<'de> Deserialize<'de> for Rows {
+                     };
+                     rows.push(row);
+                 }
+-                if seq.next_element::<Message>()?.is_some() {
++                if seq.next_element::<PlainHistoryMessage>()?.is_some() {
+                     return Err(A::Error::custom("large staged text row list"));
+                 }
+                 Ok(Rows(rows))
+@@ -175,7 +123,7 @@ impl<'de> Deserialize<'de> for Rows {
+ pub(crate) struct StagedTextAppend {
+     pub(crate) timestamp_ms: i64,
+     pub(super) turn_id: Option<TurnId>,
+-    messages: Vec<Message>,
++    messages: Vec<PlainHistoryMessage>,
+ }
+ 
+ pub(crate) struct StagedTextRow {
+@@ -203,19 +151,18 @@ impl StagedTextAppend {
+     }
+ 
+     pub(super) fn identities(&self) -> impl Iterator<Item = (MessageId, PartId)> + '_ {
+-        self.messages.iter().map(|m| (m.id, m.parts[0].part_id))
++        self.messages.iter().map(PlainHistoryMessage::identities)
+     }
+ 
+     pub(crate) fn into_rows(self) -> impl Iterator<Item = StagedTextRow> {
+         self.messages.into_iter().map(|m| {
+-            let [part] = m.parts;
+-            let Payload::Text { text } = part.payload;
++            let (id, role, phase, part_id, scope, text) = m.into_display_fields();
+             StagedTextRow {
+-                id: m.id,
+-                role: m.role,
+-                phase: m.phase,
+-                part_id: part.part_id,
+-                scope: part.scope,
++                id,
++                role,
++                phase,
++                part_id,
++                scope,
+                 text,
+             }
+         })
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+index 4a8ec8d99cd9e9f015a2d0ed10afc36dbf1c93ef..fa4da5f9c84be1babc6be9e5c8c51d316ae8262c 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+@@ -262,6 +262,10 @@ impl DisplayRecords {
+         self.count == 1
+     }
+ 
++    pub(super) fn has_compact_text_hint(&self) -> bool {
++        self.count == 1 && self.compact_text && self.causal_roots.is_some()
++    }
++
+     pub(super) fn take_causal_roots(&mut self) -> Option<RootBindings> {
+         self.causal_roots.take()
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index 37a6f821f273280094524cb86c3a6deb061ffff3..d95be63560b138bbfd8b8af1715ffdabceb9d326 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -86,6 +86,12 @@ impl RemoteJournalSnapshot {
+         Some((records.take_causal_roots()?, records.is_single_record()))
+     }
+ 
++    pub(super) fn has_compact_text_stage(&self) -> bool {
++        self.display_records
++            .as_ref()
++            .is_some_and(DisplayRecords::has_compact_text_hint)
++    }
++
+     pub(crate) fn scan_display(
+         &mut self,
+         consume: impl FnMut(JournalRecord) -> Result<()>,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
+index 17dd44df4d7eec48ee636a74fb74d67395f7feda..55486d93e0de5c0b5f5e22e2dd419edab53a8cd7 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
+@@ -1,11 +1,12 @@
+ use proteus_contracts::model_standard::{CanonicalMessage, ContentPart, MessageRole};
+ 
+-pub(super) fn session_preview(messages: &[CanonicalMessage]) -> Option<String> {
+-    messages
+-        .iter()
+-        .filter(|message| message.role == MessageRole::User)
+-        .chain(messages.iter())
+-        .find_map(|message| {
++pub(in crate::core::session_store::remote::view) fn session_preview(
++    messages: &[CanonicalMessage],
++) -> Option<String> {
++    preferred_preview(
++        messages,
++        |message| &message.role,
++        |message| {
+             message.parts.iter().find_map(|part| match &part.payload {
+                 ContentPart::Text { text }
+                 | ContentPart::Reasoning { text, .. }
+@@ -13,7 +14,30 @@ pub(super) fn session_preview(messages: &[CanonicalMessage]) -> Option<String> {
+                 ContentPart::ToolResult { result } => preview_text(&result.text_or_status()),
+                 _ => None,
+             })
+-        })
++        },
++    )
++}
++
++pub(in crate::core::session_store::remote::view) fn plain_preview(
++    messages: &[crate::core::session_store::remote::plain_history::PlainHistoryMessage],
++) -> Option<String> {
++    preferred_preview(
++        messages,
++        |message| message.role_and_text().0,
++        |message| preview_text(message.role_and_text().1),
++    )
++}
++
++fn preferred_preview<T>(
++    messages: &[T],
++    role: impl Fn(&T) -> &MessageRole,
++    preview: impl FnMut(&T) -> Option<String>,
++) -> Option<String> {
++    messages
++        .iter()
++        .filter(|message| *role(message) == MessageRole::User)
++        .chain(messages.iter())
++        .find_map(preview)
+ }
+ 
+ fn preview_text(text: &str) -> Option<String> {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index ae4f209fe20c592106db8a528b2b354797e7ae29..b25bc18837dd00a8a00b353d050f6cdb83d7d150 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -13,8 +13,10 @@ use proteus_contracts::{
+ use serde::{Serialize, de::DeserializeOwned};
+ use serde_json::Value;
+ 
++use super::super::plain_history::PlainHistoryMessage;
+ use super::*;
+ use crate::core::session_store::remote::snapshot::RemoteJournalCursor;
++pub(super) use preview::{plain_preview, session_preview};
+ 
+ const FORMAT: u32 = 1;
+ pub(super) const PAGE_ROWS: usize = 50;
+@@ -427,37 +429,81 @@ pub(super) fn save_model(
+     save_model_sections(
+         store,
+         source,
+-        model,
++        ReadMetadata {
++            summary: &model.summary,
++            revision: model.conversation.revision,
++            usage: &model.usage,
++        },
+         cursor,
+-        Cow::Borrowed(&model.conversation.messages),
++        CacheConversation::Borrowed(&model.conversation.messages),
+         Cow::Borrowed(&model.conversation.model_context),
+         RowsRef::Full(&model.transcript),
+         model.prefix.as_ref().map(CachePrefix::Borrowed),
+     )
+ }
+ 
+-/// Startup returns a display-only view, never the canonical messages/context.
+-/// Keep the already rendered transcript for a potential named-page miss.
+-pub(super) fn save_startup_model<T: CacheRows>(
++/// A startup projection holds only its returned display row owner and a
++/// disposable independent canonical conversation until that section saves.
++pub(super) struct StartupProjection<'a, T> {
++    pub(super) summary: &'a AppSessionSummary,
++    pub(super) revision: u64,
++    pub(super) usage: &'a SessionUsageSnapshot,
++    pub(super) history: StartupHistory,
++    pub(super) context: Vec<ModelContextObservation>,
++    pub(super) transcript: &'a T,
++    pub(super) prefix: Option<PrefixIdentities>,
++}
++
++pub(super) fn save_startup_projection<T: CacheRows>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+-    model: &mut SessionReadModel<T>,
++    model: StartupProjection<'_, T>,
+ ) -> Option<()> {
+-    let messages = Cow::Owned(std::mem::take(&mut model.conversation.messages));
+-    let context = Cow::Owned(std::mem::take(&mut model.conversation.model_context));
+-    let prefix = model.prefix.take().map(CachePrefix::Owned);
+     save_model_sections(
+         store,
+         source,
+-        model,
++        ReadMetadata {
++            summary: model.summary,
++            revision: model.revision,
++            usage: model.usage,
++        },
+         None,
+-        messages,
+-        context,
++        CacheConversation::Owned(model.history),
++        Cow::Owned(model.context),
+         model.transcript.rows_ref(),
+-        prefix,
++        model.prefix.map(CachePrefix::Owned),
+     )
+ }
+ 
++#[cfg(test)]
++pub(super) fn save_startup_model<T: CacheRows>(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    model: &mut SessionReadModel<T>,
++) -> Option<()> {
++    save_startup_projection(
++        store,
++        source,
++        StartupProjection {
++            summary: &model.summary,
++            revision: model.conversation.revision,
++            usage: &model.usage,
++            history: StartupHistory::Full(std::mem::take(&mut model.conversation.messages)),
++            context: std::mem::take(&mut model.conversation.model_context),
++            transcript: &model.transcript,
++            prefix: model.prefix.take(),
++        },
++    )
++}
++
++pub(super) fn write_plain_conversation(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    rows: &[PlainHistoryMessage],
++) -> Option<Section> {
++    write_transcript_iter(store, source, rows.iter())
++}
++
+ #[derive(Clone, Copy)]
+ pub(super) enum RowsRef<'a> {
+     Full(&'a [AppTranscriptMessage]),
+@@ -506,28 +552,69 @@ impl CachePrefix<'_> {
+     }
+ }
+ 
+-fn save_model_sections<T>(
++struct ReadMetadata<'a> {
++    summary: &'a AppSessionSummary,
++    revision: u64,
++    usage: &'a SessionUsageSnapshot,
++}
++
++enum CacheConversation<'a> {
++    Borrowed(&'a [CanonicalMessage]),
++    Owned(StartupHistory),
++}
++
++impl CacheConversation<'_> {
++    fn len(&self) -> usize {
++        match self {
++            Self::Borrowed(rows) => rows.len(),
++            Self::Owned(history) => history.len(),
++        }
++    }
++
++    fn write(&self, store: &RemoteSessionStore, source: &RemoteCacheSource) -> Option<Section> {
++        match self {
++            Self::Borrowed(rows) => write_transcript(store, source, rows),
++            Self::Owned(history) => history.write(store, source),
++        }
++    }
++}
++
++enum SavedContextSummary<'a> {
++    Borrowed(&'a [CanonicalMessage]),
++    Computed(AppContextHistorySummary),
++}
++
++impl SavedContextSummary<'_> {
++    fn finish(self) -> AppContextHistorySummary {
++        match self {
++            Self::Borrowed(rows) => crate::core::summarize_context_history(rows),
++            Self::Computed(summary) => summary,
++        }
++    }
++}
++
++fn save_model_sections(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+-    model: &SessionReadModel<T>,
++    metadata: ReadMetadata<'_>,
+     cursor: Option<&RemoteJournalCursor>,
+-    mut messages: Cow<'_, [CanonicalMessage]>,
++    messages: CacheConversation<'_>,
+     observations: Cow<'_, [ModelContextObservation]>,
+     rows: RowsRef<'_>,
+     prefix: Option<CachePrefix<'_>>,
+ ) -> Option<()> {
+-    if !SessionReadModel::matches_parts(store, &model.summary, &model.usage, messages.len()) {
++    if !SessionReadModel::matches_parts(store, metadata.summary, metadata.usage, messages.len()) {
+         return None;
+     }
+     // Only the prior source and transcript participate in prefix comparison.
+     let previous = header(store).map(|header| (header.source, header.transcript));
+-    let conversation = write_transcript(store, source, messages.as_ref())?;
+-    let early_summary = match &mut messages {
+-        Cow::Owned(messages) => {
+-            let messages = std::mem::take(messages);
+-            Some(crate::core::summarize_context_history(&messages))
++    let conversation = messages.write(store, source)?;
++    let context_summary = match messages {
++        CacheConversation::Owned(history) => {
++            // Drop all canonical owners before allocating the display section.
++            SavedContextSummary::Computed(history.context_summary())
+         }
+-        Cow::Borrowed(_) => None,
++        CacheConversation::Borrowed(messages) => SavedContextSummary::Borrowed(messages),
+     };
+     let transcript = match rows {
+         RowsRef::Full(rows) => write_transcript(store, source, rows)?,
+@@ -563,11 +650,10 @@ fn save_model_sections<T>(
+         &Header {
+             format: FORMAT,
+             source: source.clone(),
+-            summary: model.summary.clone(),
+-            revision: model.conversation.revision,
+-            usage: model.usage.clone(),
+-            context_summary: early_summary
+-                .unwrap_or_else(|| crate::core::summarize_context_history(messages.as_ref())),
++            summary: metadata.summary.clone(),
++            revision: metadata.revision,
++            usage: metadata.usage.clone(),
++            context_summary: context_summary.finish(),
+             conversation,
+             transcript,
+             context,
+@@ -728,6 +814,14 @@ fn rebuild_tools(
+ pub(super) fn summary(
+     store: &RemoteSessionStore,
+     messages: &[CanonicalMessage],
++) -> Result<AppSessionSummary> {
++    summary_with(store, messages.len(), || session_preview(messages))
++}
++
++pub(super) fn summary_with(
++    store: &RemoteSessionStore,
++    message_count: usize,
++    make_preview: impl FnOnce() -> Option<String>,
+ ) -> Result<AppSessionSummary> {
+     let descriptor = match store.request(Request::Describe {
+         session: store.descriptor.session.clone(),
+@@ -743,9 +837,9 @@ pub(super) fn summary(
+         store.session_dir().to_owned(),
+         store.session_id(),
+         descriptor.workspace_path,
+-        messages.len(),
++        message_count,
+         u64::try_from(descriptor.updated_at_ms).ok(),
+-        preview::session_preview(messages),
++        make_preview(),
+     );
+     summary.parent_session_id = store.parent_session_id();
+     Ok(summary)
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a12598b53261d55ba891a747c9c612296afd7514
+--- /dev/null
++++ b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+@@ -0,0 +1,150 @@
++//! Startup-only owner for the independently validated canonical conversation.
++use super::super::{RemoteSessionStore, plain_history::PlainHistoryMessage};
++use super::cache::{self, RemoteCacheSource, Section};
++use crate::model_standard::CanonicalMessage;
++use anyhow::Result;
++use proteus_contracts::app_protocol::AppContextHistorySummary;
++
++pub(super) enum StartupHistory {
++    Full(Vec<CanonicalMessage>),
++    Plain {
++        rows: Vec<PlainHistoryMessage>,
++        scratch: CanonicalMessage,
++    },
++}
++
++impl StartupHistory {
++    pub(super) fn prepare(history: Vec<CanonicalMessage>, try_plain: bool) -> Self {
++        // This checks authoritative bytes independently of the hint about
++        // staged display. Check everything before moving any owner.
++        if !try_plain
++            || !(4_096..=65_536).contains(&history.len())
++            || !history.iter().all(PlainHistoryMessage::accepts)
++        {
++            return Self::Full(history);
++        }
++        let mut rows = Vec::new();
++        if rows.try_reserve_exact(history.len()).is_err() {
++            return Self::Full(history);
++        }
++        let mut donor = history.into_iter();
++        let mut scratch = donor.next().expect("nonempty plain canonical history");
++        rows.push(PlainHistoryMessage::take_from(&mut scratch));
++        for mut message in donor {
++            rows.push(PlainHistoryMessage::take_from(&mut message));
++        }
++        Self::Plain { rows, scratch }
++    }
++
++    pub(super) fn len(&self) -> usize {
++        match self {
++            Self::Full(rows) => rows.len(),
++            Self::Plain { rows, .. } => rows.len(),
++        }
++    }
++
++    pub(super) fn fingerprints(&mut self) -> Result<Vec<[u8; 32]>> {
++        let hash = crate::core::history_message_sha256;
++        match self {
++            Self::Full(rows) => rows.iter().map(hash).collect(),
++            Self::Plain { rows, scratch } => rows
++                .iter_mut()
++                .map(|row| row.with_typed_digest_row(scratch, hash))
++                .collect(),
++        }
++    }
++
++    pub(super) fn preview(&self) -> Option<String> {
++        match self {
++            Self::Full(rows) => cache::session_preview(rows),
++            Self::Plain { rows, .. } => cache::plain_preview(rows),
++        }
++    }
++
++    pub(super) fn context_summary(&self) -> AppContextHistorySummary {
++        match self {
++            Self::Full(rows) => crate::core::summarize_context_history(rows),
++            Self::Plain { rows, .. } => {
++                super::super::super::context_summary::summarize_plain_history(
++                    rows.iter().map(PlainHistoryMessage::role_and_text),
++                )
++            }
++        }
++    }
++
++    pub(super) fn write(
++        &self,
++        store: &RemoteSessionStore,
++        source: &RemoteCacheSource,
++    ) -> Option<Section> {
++        match self {
++            Self::Full(rows) => cache::write_transcript(store, source, rows),
++            Self::Plain { rows, .. } => cache::write_plain_conversation(store, source, rows),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::model_standard::{ContentPart, MessageRole};
++
++    fn fixture() -> Vec<CanonicalMessage> {
++        (0..4_096)
++            .map(|i| {
++                let role = if i < 20 {
++                    MessageRole::Assistant
++                } else {
++                    MessageRole::User
++                };
++                CanonicalMessage::text(role, format!("  {i} é🦀 \\ \n"))
++            })
++            .collect()
++    }
++
++    #[test]
++    fn compact_preflight_keeps_same_text_owners_and_exact_summaries() {
++        let rows = fixture();
++        let ids: Vec<_> = rows
++            .iter()
++            .map(|row| {
++                let ContentPart::Text { text } = &row.parts[0].payload else {
++                    unreachable!();
++                };
++                text.as_ptr()
++            })
++            .collect();
++        let preview = cache::session_preview(&rows);
++        let context = crate::core::summarize_context_history(&rows);
++        let ordered = rows
++            .iter()
++            .map(crate::core::history_message_sha256)
++            .collect::<Result<Vec<_>>>()
++            .unwrap();
++        let mut holder = StartupHistory::prepare(rows, true);
++        assert_eq!(holder.len(), ids.len());
++        assert_eq!(holder.preview(), preview);
++        assert_eq!(holder.context_summary(), context);
++        assert_eq!(holder.fingerprints().unwrap(), ordered);
++        let StartupHistory::Plain { rows, .. } = holder else {
++            panic!("fixture should use compact authoritative storage");
++        };
++        assert!(
++            rows.iter()
++                .zip(ids)
++                .all(|(row, ptr)| row.role_and_text().1.as_ptr() == ptr)
++        );
++    }
++
++    #[test]
++    fn late_present_empty_name_does_not_convert_any_earlier_donor() {
++        let mut rows = fixture();
++        rows.last_mut().unwrap().name = Some(String::new());
++        let original = rows.as_ptr();
++        let StartupHistory::Full(rows) = StartupHistory::prepare(rows, true) else {
++            panic!("present name is not canonical plain history");
++        };
++        assert_eq!(rows.as_ptr(), original);
++        assert_eq!(rows.last().unwrap().name.as_deref(), Some(""));
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index db371882d0446cb20470b49be3907f284867f5d5..6a09808fe4aa55ce55d5493fedbda9a85db5a905 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -20,9 +20,11 @@ mod committed;
+ mod incremental;
+ pub(crate) use committed::CommittedDisplay;
+ mod prefix;
++mod startup_history;
+ mod text_rows;
+ pub(crate) use cache::RemoteCacheSource;
+ pub(crate) use prefix::PrefixIdentities;
++use startup_history::StartupHistory;
+ pub(crate) use text_rows::{CompactTextRow, DisplayRows, transcript_role};
+ 
+ #[cfg(test)]
+@@ -102,7 +104,7 @@ impl RemoteSessionStore {
+         paged: bool,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<Vec<AppTranscriptMessage>>,
+     ) -> Result<SessionReadView> {
+-        self.project_startup_view(read, paged, |snapshot| {
++        self.project_startup_view(read, paged, false, |snapshot| {
+             render(snapshot).map(DisplayRows::Full)
+         })
+     }
+@@ -111,12 +113,45 @@ impl RemoteSessionStore {
+         &self,
+         read: RemoteValidatedRead,
+         paged: bool,
++        allow_compact_history: bool,
+         render: impl FnOnce(&mut RemoteJournalSnapshot) -> Result<DisplayRows>,
+     ) -> Result<SessionReadView> {
+         let source = RemoteCacheSource::from_cursor(&read.cursor());
+-        let mut model = SessionReadModel::from_validated(self, read, render)?;
+-        let _ = cache::save_startup_model(self, &source, &mut model);
+-        let revision = model.conversation.revision;
++        let (history, transcript, prefix, summary, revision, context, usage) = {
++            let (mut snapshot, state) = read.into_parts();
++            let mut history = StartupHistory::prepare(
++                state.history,
++                allow_compact_history && paged && snapshot.has_compact_text_stage(),
++            );
++            let transcript = render(&mut snapshot)?;
++            let mut prefix = snapshot.scan_display_prefix()?;
++            prefix.history = history.fingerprints()?;
++            let summary = cache::summary_with(self, history.len(), || history.preview())?;
++            let context = state.model_context.snapshot();
++            (
++                history,
++                transcript,
++                prefix,
++                summary,
++                state.history_revision,
++                context,
++                state.usage,
++            )
++            // Preserve snapshot drop/release after Describe and before saving.
++        };
++        let _ = cache::save_startup_projection(
++            self,
++            &source,
++            cache::StartupProjection {
++                summary: &summary,
++                revision,
++                usage: &usage,
++                history,
++                context,
++                transcript: &transcript,
++                prefix: Some(prefix),
++            },
++        );
+         // A concurrent projection may have advanced HEAD. Only this immutable
+         // revision can provide a page for the model's summary, revision and usage.
+         let page = if paged {
+@@ -137,12 +172,12 @@ impl RemoteSessionStore {
+                     base: page.base,
+                 }),
+             ),
+-            None => (model.transcript.into_full(), None),
++            None => (transcript.into_full(), None),
+         };
+         Ok(SessionReadView {
+-            summary: model.summary,
++            summary,
+             revision,
+-            usage: model.usage,
++            usage,
+             transcript,
+             cursor,
+         })
