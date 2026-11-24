@@ -1,0 +1,60 @@
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index cd578af057e066e4e1620d2f014ebc52fdaa934c..4e91d5fd6badfc7377a6d5ad3fff6b14127cb0fa 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -87,7 +87,7 @@
+                 previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+             }
+             while let Some(record) = source.next()? {
+-                state.apply(session.session_id, &record)?;
++                state.apply_validated(session.session_id, &record)?;
+                 if cut == Some(record.session_seq) {
+                     source.remember_page_boundary(record.session_seq);
+                     previous_boundary = Some((state.revision(), source.consumed_fingerprint()));
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index ecf417d4ebc712d2c5f724ced3fb676363f39fa6..6f42ed3b0ac96b47df314f5e42736e4433480a6d 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -12,10 +12,15 @@
+ }
+ impl Fold {
+     pub fn apply(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
+-        self.apply_projected::<true>(id, record)
+-    }
+-
+-    fn apply_projected<const MODEL_CONTEXT: bool>(
++        self.apply_projected::<true, true>(id, record)
++    }
++
++    /// Validate every journal fact without constructing unused query projections.
++    pub fn apply_validated(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
++        self.apply_projected::<false, false>(id, record)
++    }
++
++    fn apply_projected<const MODEL_CONTEXT: bool, const USAGE: bool>(
+         &mut self,
+         id: SessionId,
+         record: &JournalRecord,
+@@ -28,7 +33,9 @@
+         if MODEL_CONTEXT {
+             self.model_context.apply(record);
+         }
+-        self.usage.apply(record);
++        if USAGE {
++            self.usage.apply(record);
++        }
+         self.session_seq = record.session_seq;
+         Ok(())
+     }
+@@ -172,7 +179,10 @@
+         let mut state = Fold::default();
+         let mut terminal = None;
+         while let Some(record) = self.source.next()? {
+-            state.apply_projected::<MODEL_CONTEXT>(self.identity.session.session_id, &record)?;
++            state.apply_projected::<MODEL_CONTEXT, true>(
++                self.identity.session.session_id,
++                &record,
++            )?;
+             if capture && record.session_seq == self.identity.revision.session_seq {
+                 terminal = Some(record);
+             }
