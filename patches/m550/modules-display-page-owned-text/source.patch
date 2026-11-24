@@ -1,0 +1,99 @@
+diff --git a/components/session-storage-module/src/main.rs b/components/session-storage-module/src/main.rs
+index 35ba53cd8ebcc46ded8247d58a7dcc5cc0e69c2b..bcc0fa8d0c4ead3708d72607c2e4eabd331dcb73 100644
+--- a/components/session-storage-module/src/main.rs
++++ b/components/session-storage-module/src/main.rs
+@@ -43,7 +43,10 @@
+         // other request, including unnegotiated display requests.
+         if !self.projection_negotiated
+             || method != PROCESS_SESSION_STORAGE_EXECUTE_METHOD
+-            || params.get("operation").and_then(Value::as_str) != Some("open_display_snapshot")
++            || !matches!(
++                params.get("operation").and_then(Value::as_str),
++                Some("open_display_snapshot" | "read_display_records")
++            )
+         {
+             return self.standard.invoke(method, params, host);
+         }
+diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs
+index abf5a477c8a0574112ad549a56b96d7c62ce111d..843e20549b56a4982e1210b2442c61ea92f6e833 100644
+--- a/components/session-storage-module/src/display_reply.rs
++++ b/components/session-storage-module/src/display_reply.rs
+@@ -1,19 +1,49 @@
+ //! Preserve the SDK's Value wire shape while moving owned display text into it.
+ use anyhow::{Context, Result, ensure};
+ use proteus_module_sdk::contracts::{
+-    contracts::SessionStorageResponse, model_standard::ContentPart,
++    contracts::SessionStorageResponse,
++    model_standard::{CanonicalMessage, ContentPart},
++    storage::journal::JournalEntry,
+ };
+ use serde_json::Value;
+ use std::mem;
+ 
+ pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value> {
+-    let SessionStorageResponse::DisplaySnapshot {
+-        projection: Some(projection),
+-    } = &mut response
+-    else {
+-        return Ok(serde_json::to_value(response)?);
++    let messages = match &mut response {
++        SessionStorageResponse::DisplaySnapshot {
++            projection: Some(projection),
++        } => mem::take(&mut projection.state.conversation.messages),
++        SessionStorageResponse::Records { page } => {
++            let records = mem::take(&mut page.records);
++            let mut result = serde_json::to_value(response)?;
++            let output = result
++                .get_mut("page")
++                .and_then(|value| value.get_mut("records"))
++                .and_then(Value::as_array_mut)
++                .context("serialized display page omitted its records array")?;
++            output.reserve_exact(records.len());
++            for mut record in records {
++                if let JournalEntry::HistoryMutated(mutation) = &mut record.entry {
++                    let messages = mem::take(&mut mutation.messages);
++                    let mut value = serde_json::to_value(record)?;
++                    let output_messages = value
++                        .get_mut("entry")
++                        .and_then(|value| value.get_mut("payload"))
++                        .and_then(|value| value.get_mut("messages"))
++                        .and_then(Value::as_array_mut)
++                        .context(
++                            "serialized display history mutation omitted its messages array",
++                        )?;
++                    move_messages(output_messages, messages)?;
++                    output.push(value);
++                } else {
++                    output.push(serde_json::to_value(record)?);
++                }
++            }
++            return Ok(result);
++        }
++        _ => return Ok(serde_json::to_value(response)?),
+     };
+-    let messages = mem::take(&mut projection.state.conversation.messages);
+     let mut result = serde_json::to_value(response)?;
+     let serialized_messages = result
+         .get_mut("projection")
+@@ -22,6 +52,14 @@
+         .and_then(|value| value.get_mut("messages"))
+         .and_then(Value::as_array_mut)
+         .context("serialized display snapshot omitted its messages array")?;
++    move_messages(serialized_messages, messages)?;
++    Ok(result)
++}
++
++fn move_messages(
++    serialized_messages: &mut Vec<Value>,
++    messages: Vec<CanonicalMessage>,
++) -> Result<()> {
+     serialized_messages.reserve_exact(messages.len());
+ 
+     // Use the pinned DTO serializer to emit every key and its position. Only
+@@ -57,5 +95,5 @@
+         serialized_messages.push(value);
+     }
+ 
+-    Ok(result)
++    Ok(())
+ }
