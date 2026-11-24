@@ -1,0 +1,63 @@
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -158,12 +158,21 @@
+         if inserted == 0 {
+             return Change::None;
+         }
+-        let mut prefix: Vec<_> = messages
+-            .into_iter()
+-            .map(|message| self.entry_from(message))
+-            .collect();
+-        prefix.append(&mut self.entries);
+-        self.entries = prefix;
++        let next_key = &self.next_key;
++        let incoming = messages.into_iter().map(|message| {
++            let role = role_of(&message.role);
++            let key = next_key.fetch_add(1, Ordering::Relaxed) + 1;
++            Entry::from_wire(key, message, role, None)
++        });
++        // Eviction leaves reusable storage in a full paging window. Only
++        // reuse an exact fit; a much larger former window must still be freed.
++        if self.entries.capacity() - self.entries.len() == inserted {
++            drop(self.entries.splice(..0, incoming));
++        } else {
++            let mut prefix: Vec<_> = incoming.collect();
++            prefix.append(&mut self.entries);
++            self.entries = prefix;
++        }
+         Change::Spliced {
+             start: 0,
+             removed: 0,
+@@ -542,19 +551,25 @@
+         self.next_key.fetch_add(1, Ordering::Relaxed) + 1
+     }
+ 
+-    fn entry_from(&mut self, message: AppTranscriptMessage) -> Entry {
+-        let role = role_of(&message.role);
+-        self.entry_from_with_text(message, role, None)
+-    }
+-
+     fn entry_from_with_text(
+         &mut self,
+         message: AppTranscriptMessage,
+         role: Role,
+         shared_text: Option<Arc<str>>,
+     ) -> Entry {
+-        Entry {
+-            key: self.allocate_key(),
++        Entry::from_wire(self.allocate_key(), message, role, shared_text)
++    }
++}
++
++impl Entry {
++    fn from_wire(
++        key: u64,
++        message: AppTranscriptMessage,
++        role: Role,
++        shared_text: Option<Arc<str>>,
++    ) -> Self {
++        Self {
++            key,
+             message_id: message.message_id,
+             role,
+             text: shared_text.unwrap_or_else(|| message.text.into()),
