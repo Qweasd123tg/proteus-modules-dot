@@ -1,0 +1,57 @@
+--- a/packages/analysis/src/nodes.rs
++++ b/packages/analysis/src/nodes.rs
+@@ -3,6 +3,7 @@
+ use std::borrow::Cow;
+ 
+ use proteus_extension::ui::Node;
++pub use proteus_extension::ui::{row, stack as column};
+ use proteus_extension::{Map, Value, json};
+ 
+ /// Disclosures with these suffixes start revealed.
+@@ -29,16 +30,8 @@
+     label(value, "default").with("size", "large")
+ }
+ 
+-pub fn row(children: Vec<Value>) -> Value {
+-    json!({"type": "stack", "direction": "row", "children": children})
+-}
+-
+-pub fn column(children: Vec<Value>) -> Value {
+-    json!({"type": "stack", "direction": "column", "children": children})
+-}
+-
+ pub fn card(title: impl ToString, children: Vec<Value>) -> Value {
+-    json!({"type": "card", "title": title.to_string(), "children": children})
++    json!({"type": "card", "title": title.to_string()}).with("children", Value::Array(children))
+ }
+ 
+ pub fn badge(value: impl ToString, tone: &str) -> Value {
+--- a/packages/analysis/src/main.rs
++++ b/packages/analysis/src/main.rs
+@@ -8,7 +8,7 @@
+ 
+ use std::{collections::HashSet, time::Duration};
+ 
+-use proteus_extension::ui::{Node, button};
++use proteus_extension::ui::{Node, button, fill};
+ use proteus_extension::{
+     Analytics, Extension, Host, Result, Surface, Value, ValueExt, bail, json, run,
+ };
+@@ -102,12 +102,14 @@
+             self.all_turns,
+         ));
+         // Turns, steps and details side by side, each column scrolling on its own.
+-        let split = json!({"type": "split", "widths": [260, 320, null], "children": [
++        let columns = vec![
+             column(body).with("gap", "medium"),
+             self.step_list(steps),
+             column(details).with("gap", "medium"),
+-        ]});
+-        json!({"type": "fill", "children": [split]})
++        ];
++        let split = json!({"type": "split", "widths": [260, 320, null]})
++            .with("children", Value::Array(columns));
++        fill(vec![split])
+     }
+ 
+     fn step_list(&self, steps: &[Value]) -> Value {
