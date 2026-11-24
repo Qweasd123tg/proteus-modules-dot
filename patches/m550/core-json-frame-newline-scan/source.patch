@@ -1,0 +1,62 @@
+diff --git a/crates/proteus-process-host/src/framing.rs b/crates/proteus-process-host/src/framing.rs
+index 91ffabab085cf83707604933a33608229bb6a61d..95922b31e1968e2b16f950bdc8bb8ba83481e09f 100644
+--- a/crates/proteus-process-host/src/framing.rs
++++ b/crates/proteus-process-host/src/framing.rs
+@@ -54,10 +54,18 @@
+                 break;
+             }
+ 
+-            let bytes_to_take = buffer
+-                .iter()
+-                .position(|byte| *byte == b'\n')
+-                .map_or(buffer.len(), |position| position + 1);
++            // Long continuations usually contain no newline. The byte-slice
++            // predicate skips them without a scalar position search; only
++            // a positive match still requires the exact delimiter position.
++            let bytes_to_take =
++                if !line.is_empty() && buffer.len() >= 1024 && !buffer.contains(&b'\n') {
++                    buffer.len()
++                } else {
++                    buffer
++                        .iter()
++                        .position(|byte| *byte == b'\n')
++                        .map_or(buffer.len(), |position| position + 1)
++                };
+             if line.len().saturating_add(bytes_to_take) > self.max_frame_bytes {
+                 bail!(
+                     "newline JSON frame exceeded {} bytes before newline",
+diff --git a/crates/proteus-process-host/src/framing/newline_tests.rs b/crates/proteus-process-host/src/framing/newline_tests.rs
+index ab050d4876e4a45594bdd84a48aab5fe0373416b..d5974df7f88a204bafeb4141e1fb3d6f7fc6080a 100644
+--- a/crates/proteus-process-host/src/framing/newline_tests.rs
++++ b/crates/proteus-process-host/src/framing/newline_tests.rs
+@@ -145,3 +145,30 @@
+     );
+     assert_eq!(reader.position(), 6);
+ }
++
++#[test]
++fn long_fragment_search_preserves_limit_errors_and_next_frame() {
++    let frame = format!("{{\"text\":\"{}\"}}\r\n", "Привет 🦀\\n".repeat(4096));
++    let mut bytes = frame.as_bytes().to_vec();
++    bytes.extend_from_slice(b"[]\n");
++    for capacity in [1023, 1024, 1025, 8192, 8193] {
++        for limit in [frame.len() - 1, frame.len()] {
++            for malformed in [false, true] {
++                let mut data = bytes.clone();
++                if malformed {
++                    data[frame.len() - 6] = 0xff;
++                }
++                let mut reference = BufReader::with_capacity(capacity, Cursor::new(&data[..]));
++                let mut current = BufReader::with_capacity(capacity, Cursor::new(&data[..]));
++                let framing = NewlineJsonFraming::new(limit);
++                for _ in 0..2 {
++                    assert_eq!(
++                        framing.read_frame(&mut current).map_err(|e| e.to_string()),
++                        read_reference(&mut reference, limit).map_err(|e| e.to_string())
++                    );
++                    assert_eq!(consumed(&current), consumed(&reference));
++                }
++            }
++        }
++    }
++}
