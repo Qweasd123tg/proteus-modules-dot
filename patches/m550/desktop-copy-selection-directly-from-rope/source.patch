@@ -1,0 +1,69 @@
+diff --git a/vendor/gpui-base/src/input/base/state.rs b/vendor/gpui-base/src/input/base/state.rs
+index f14602c5fffb2c0003b10ce13d091d1d685eb059..43027c71fe94efa8630ec04c143c9b759309f064 100644
+--- a/vendor/gpui-base/src/input/base/state.rs
++++ b/vendor/gpui-base/src/input/base/state.rs
+@@ -3191,8 +3191,12 @@
+         window.show_character_palette();
+     }
+ 
+-    /// The text of every non-empty selection, in document order.
+-    fn selected_texts(&self) -> Vec<String> {
++    /// Build the final clipboard string directly from the selected byte ranges.
++    fn selected_text(&self) -> String {
++        if self.selections.is_single() {
++            return String::from(self.text.slice(*self.selections.active()));
++        }
++
+         let mut selections: Vec<CursorSelection> = self
+             .selections
+             .iter()
+@@ -3200,10 +3204,23 @@
+             .filter(|sel| !sel.is_empty())
+             .collect();
+         selections.sort_by_key(|sel| sel.start);
+-        selections
+-            .iter()
+-            .map(|sel| self.text.slice(*sel).to_string())
+-            .collect()
++
++        let bytes = selections.iter().fold(selections.len().saturating_sub(1), |n, sel| {
++            n.checked_add(sel.len()).expect("clipboard text too large")
++        });
++        let mut text = String::with_capacity(bytes);
++        for (i, sel) in selections.into_iter().enumerate() {
++            if i != 0 {
++                text.push('\n');
++            }
++            let slice = self.text.slice(sel);
++            if let Some(chunk) = slice.as_str() {
++                text.push_str(chunk);
++            } else {
++                text.extend(slice.chunks());
++            }
++        }
++        text
+     }
+ 
+     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+@@ -3211,9 +3228,7 @@
+             return;
+         }
+ 
+-        let texts = self.selected_texts();
+-
+-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
++        cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
+     }
+ 
+     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+@@ -3221,9 +3236,7 @@
+             return;
+         }
+ 
+-        let texts = self.selected_texts();
+-
+-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
++        cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
+ 
+         self.undo_manager.set_pending_intent(EditIntent::Atomic);
+         self.replace_text_in_range_silent(None, "", window, cx);
