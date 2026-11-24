@@ -1,0 +1,58 @@
+--- a/src/transcript/mod.rs
++++ b/src/transcript/mod.rs
+@@ -4,2 +4,3 @@
+ 
++use std::cell::Cell;
+ use std::collections::HashMap;
+@@ -89,5 +90,7 @@
+         let old = std::mem::take(&mut self.entries);
+-        let mut previous: HashMap<Identity, &Entry> = old
++        // The index borrows old row IDs. Consume each winner exactly once,
++        // including when the incoming snapshot contains duplicate identities.
++        let previous: HashMap<_, _> = old
+             .iter()
+-            .filter_map(|entry| Some((identity_of(entry)?, entry)))
++            .filter_map(|entry| Some((identity_of(entry)?, Cell::new(Some(entry)))))
+             .collect();
+@@ -102,3 +105,3 @@
+             ) {
+-                Some(id) => previous.remove(&id).map(|before| {
++                Some(id) => previous.get(&id).and_then(Cell::take).map(|before| {
+                     // Compare with the owned wire text before allocating another Arc.
+@@ -554,6 +557,6 @@
+ #[derive(Clone, PartialEq, Eq, Hash)]
+-enum Identity {
++enum Identity<'a> {
+     Message(MessageId, Role),
+-    Tool(String),
+-    Subagent(String),
++    Tool(&'a str),
++    Subagent(&'a str),
+ }
+@@ -569,3 +572,3 @@
+ 
+-fn identity_of(entry: &Entry) -> Option<Identity> {
++fn identity_of(entry: &Entry) -> Option<Identity<'_>> {
+     identity(
+@@ -578,8 +581,8 @@
+ 
+-fn identity(
++fn identity<'a>(
+     message_id: Option<MessageId>,
+     role: Role,
+-    tool: Option<&AppTranscriptTool>,
+-    subagent: Option<&AppTranscriptSubagent>,
+-) -> Option<Identity> {
++    tool: Option<&'a AppTranscriptTool>,
++    subagent: Option<&'a AppTranscriptSubagent>,
++) -> Option<Identity<'a>> {
+     if let Some(id) = message_id {
+@@ -588,5 +591,5 @@
+     if let Some(tool) = tool {
+-        return Some(Identity::Tool(tool.call_id.clone()));
+-    }
+-    subagent.map(|subagent| Identity::Subagent(subagent.child_thread_id.clone()))
++        return Some(Identity::Tool(&tool.call_id));
++    }
++    subagent.map(|subagent| Identity::Subagent(&subagent.child_thread_id))
+ }
