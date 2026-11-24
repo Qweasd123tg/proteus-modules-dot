@@ -1,0 +1,155 @@
+diff --git a/components/session-storage-module/src/main.rs b/components/session-storage-module/src/main.rs
+index cedd103d53b43b3ca6dc6e629b25e33ceb938928..35ba53cd8ebcc46ded8247d58a7dcc5cc0e69c2b 100644
+--- a/components/session-storage-module/src/main.rs
++++ b/components/session-storage-module/src/main.rs
+@@ -1,13 +1,23 @@
++use std::sync::Arc;
++
+ use anyhow::{Result, bail};
+ use proteus_module_sdk::{
++    Export,
+     contracts::contracts::{
+-        ProcessComponentExportInitialize, SessionStorageRequest, SessionStorageResponse,
++        PROCESS_SESSION_STORAGE_EXECUTE_METHOD, ProcessComponentExportInitialize,
++        ProcessComponentExportManifest, SESSION_STORAGE_DISPLAY_PROJECTION_FEATURE,
++        SessionStorageRequest, SessionStorageResponse,
+     },
++    hosts::HostBridge,
+     session_storage::{SessionStorageExport, SessionStorageModule},
+ };
++use serde_json::Value;
+ use session_storage::{BackendKind, StorageService};
+ 
+-struct Backend(StorageService);
++mod display_reply;
++
++#[derive(Clone)]
++struct Backend(Arc<StorageService>);
+ impl SessionStorageModule for Backend {
+     fn supports_display_projection(&self) -> bool {
+         true
+@@ -17,7 +27,33 @@
+         self.0.execute(request)
+     }
+ }
+-fn load(binding: ProcessComponentExportInitialize) -> Result<Box<dyn proteus_module_sdk::Export>> {
++struct DisplayExport {
++    standard: SessionStorageExport<Backend>,
++    backend: Backend,
++    projection_negotiated: bool,
++}
++
++impl Export for DisplayExport {
++    fn manifest(&self) -> ProcessComponentExportManifest {
++        self.standard.manifest()
++    }
++
++    fn invoke(&self, method: &str, params: Value, host: &HostBridge) -> Result<Value> {
++        // Leave the existing SDK contract and errors in charge for every
++        // other request, including unnegotiated display requests.
++        if !self.projection_negotiated
++            || method != PROCESS_SESSION_STORAGE_EXECUTE_METHOD
++            || params.get("operation").and_then(Value::as_str) != Some("open_display_snapshot")
++        {
++            return self.standard.invoke(method, params, host);
++        }
++        let request: SessionStorageRequest = serde_json::from_value(params)?;
++        request.validate()?;
++        display_reply::into_value(self.backend.execute(request)?)
++    }
++}
++
++fn load(binding: ProcessComponentExportInitialize) -> Result<Box<dyn Export>> {
+     if binding.slot != "session_storage" {
+         bail!("unsupported storage slot {}", binding.slot);
+     }
+@@ -39,10 +75,18 @@
+     if config.is_some_and(|config| !config.is_empty()) {
+         bail!("unknown session storage configuration fields");
+     }
+-    Ok(Box::new(SessionStorageExport::new(
+-        binding,
+-        Backend(StorageService::new(kind)),
+-    )?))
++    let backend = Backend(Arc::new(StorageService::new(kind)));
++    let standard = SessionStorageExport::new(binding, backend.clone())?;
++    let projection_negotiated = standard
++        .manifest()
++        .module_features
++        .iter()
++        .any(|feature| feature == SESSION_STORAGE_DISPLAY_PROJECTION_FEATURE);
++    Ok(Box::new(DisplayExport {
++        standard,
++        backend,
++        projection_negotiated,
++    }))
+ }
+ fn main() {
+     let arguments: Vec<_> = std::env::args_os().collect();
+diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..abf5a477c8a0574112ad549a56b96d7c62ce111d
+--- /dev/null
++++ b/components/session-storage-module/src/display_reply.rs
+@@ -0,0 +1,61 @@
++//! Preserve the SDK's Value wire shape while moving owned display text into it.
++use anyhow::{Context, Result, ensure};
++use proteus_module_sdk::contracts::{
++    contracts::SessionStorageResponse, model_standard::ContentPart,
++};
++use serde_json::Value;
++use std::mem;
++
++pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value> {
++    let SessionStorageResponse::DisplaySnapshot {
++        projection: Some(projection),
++    } = &mut response
++    else {
++        return Ok(serde_json::to_value(response)?);
++    };
++    let messages = mem::take(&mut projection.state.conversation.messages);
++    let mut result = serde_json::to_value(response)?;
++    let serialized_messages = result
++        .get_mut("projection")
++        .and_then(|value| value.get_mut("state"))
++        .and_then(|value| value.get_mut("conversation"))
++        .and_then(|value| value.get_mut("messages"))
++        .and_then(Value::as_array_mut)
++        .context("serialized display snapshot omitted its messages array")?;
++    serialized_messages.reserve_exact(messages.len());
++
++    // Use the pinned DTO serializer to emit every key and its position. Only
++    // replace existing content slots; insertion could change preserve_order.
++    for mut message in messages {
++        let parts = mem::take(&mut message.parts);
++        let mut value = serde_json::to_value(message)?;
++        let serialized_parts = value
++            .get_mut("parts")
++            .and_then(Value::as_array_mut)
++            .context("serialized display message omitted its parts array")?;
++        serialized_parts.reserve_exact(parts.len());
++        for mut part in parts {
++            let owned_text = match &mut part.payload {
++                ContentPart::Text { text } => Some(mem::take(text)),
++                _ => None,
++            };
++            let mut value = serde_json::to_value(part)?;
++            if let Some(text) = owned_text {
++                let slot = value
++                    .get_mut("payload")
++                    .and_then(|value| value.get_mut("Text"))
++                    .and_then(|value| value.get_mut("text"))
++                    .context("serialized display text omitted its string slot")?;
++                ensure!(
++                    slot.as_str() == Some(""),
++                    "serialized display text slot changed"
++                );
++                *slot = Value::String(text);
++            }
++            serialized_parts.push(value);
++        }
++        serialized_messages.push(value);
++    }
++
++    Ok(result)
++}
