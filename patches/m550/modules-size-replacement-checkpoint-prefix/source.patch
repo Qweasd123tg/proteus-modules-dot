@@ -1,0 +1,17 @@
+diff --git a/workflow/coding-workflow/src/scaffold.rs b/workflow/coding-workflow/src/scaffold.rs
+index 5c26a37270d38e282a31f168d6a49de6f415ad78..1e6d25528e0ad4d062b4f74981c8b10ae64ff64e 100644
+--- a/workflow/coding-workflow/src/scaffold.rs
++++ b/workflow/coding-workflow/src/scaffold.rs
+@@ -320,9 +320,9 @@
+                         "workflow history replacement boundary is beyond persistent history",
+                     ));
+                 }
+-                let mut history_prefix = self.persistent_messages.clone();
+-                let new_messages = history_prefix.split_off(replacement_len);
+-                (Some(history_prefix), new_messages)
++                // Allocate the returned prefix for just the messages it keeps.
++                let (prefix, suffix) = self.persistent_messages.split_at(replacement_len);
++                (Some(prefix.to_vec()), suffix.to_vec())
+             }
+             None => {
+                 let current_user_position =

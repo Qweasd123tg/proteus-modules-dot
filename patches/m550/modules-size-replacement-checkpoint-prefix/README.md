@@ -1,0 +1,7 @@
+# Modules: copy checkpoint history from two slices
+
+For a replacement checkpoint, the old code cloned the entire persistent message vector and then moved the suffix into a separate vector. The returned prefix still held space for all messages. Split the borrowed input first and clone each slice into its final vector. The same messages and nested payloads are cloned in the same order. Normal checkpoints, boundary checks, and DTO shape are unchanged.
+
+The exact detached constructor passed five Linux Rust default-layout tests, including the original two in each arm. Across 15 scenarios and 60 ABBA measurements, expected DTO bytes and typed round trips matched; retained measured bytes returned to zero after dropping each result. For 2,048 descriptors with 16 in the replacement prefix, requested peak and retained output allocation during the operation both fell from 523,152 to 263,056 bytes. Seven allocation requests in both arms. This is requested allocator traffic around the constructor only, not whole-process memory or latency. Neither the full workflow nor preserve-order was run.
+
+The indexed patch uses the composed M458 source. Its single context hunk also applies independently and reverses on Modules main `e8e77e306092344c00833f3456acba950c851fe3` and packaged pin `a271aaefcbcdd25f9b68918406f34490c6169bd7`; on either owner revision use `git apply --check source.patch` and then `git apply source.patch` without `--index`. #698 is needed only to recreate the complete measured leaf; either hunk can be applied first.
