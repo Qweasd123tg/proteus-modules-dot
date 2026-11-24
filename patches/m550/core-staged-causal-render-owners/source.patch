@@ -1,0 +1,84 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 527049c641426a50c76a87e48bb5ab4b6cd860d4..4e826724628ed5fa6a5b98eb7eb41dc2bca59722 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -234,8 +234,10 @@
+             && mutation.mutation == HistoryMutationKind::Append
+         {
+             if !(live_turn_id.is_some() && record.turn_id == live_turn_id) {
+-                for message in &mut mutation.messages {
+-                    replay.state.append_staged_message(message);
++                // Only the staged record owns these decoded rows. Release each
++                // row's unused parts and metadata as its display output grows.
++                for mut message in std::mem::take(&mut mutation.messages) {
++                    replay.state.append_staged_message(&mut message);
+                 }
+             }
+         } else {
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+index 54dc136a5f458417695de5a85761d18c5affbe14..2590dc35864880a60c420835a25b92a4ee6b4bb0 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source/tests/staged_text.rs
+@@ -188,3 +188,62 @@
+         assert!(DisplayRecords::stage_for_test(&items).1.is_none());
+     }
+ }
++
++#[test]
++fn staged_mixed_append_still_matches_full_order_and_dates() {
++    use crate::model_standard::{CanonicalPart, MessagePhase, PartProvenance, PartScope};
++
++    let mut assistant = CanonicalMessage::new(
++        MessageRole::Assistant,
++        vec![
++            ContentPart::Text {
++                text: "first 🦀\n".into(),
++            },
++            ContentPart::ReasoningSummary {
++                text: "a separate thought".into(),
++            },
++            ContentPart::Text {
++                text: "second".into(),
++            },
++        ],
++    )
++    .with_phase(MessagePhase::FinalAnswer);
++    assistant.parts.push(CanonicalPart::new(
++        PartProvenance::Runtime,
++        PartScope::Trace,
++        ContentPart::Text {
++            text: "not part of the display".into(),
++        },
++    ));
++    let item = history(
++        HistoryMutationKind::Append,
++        vec![
++            CanonicalMessage::text(MessageRole::User, "  \t\n"),
++            assistant,
++            CanonicalMessage::text(MessageRole::User, "another user"),
++        ],
++    );
++    let items = [item];
++    let (mut staged, roots) = DisplayRecords::stage_for_test(&items);
++    let actual = render_causal(
++        &mut |visit| staged.scan(visit),
++        None,
++        true,
++        TranscriptVisibility {
++            root_threads: roots.expect("history-only stage"),
++            certified_text_responses: true,
++            ..Default::default()
++        },
++    )
++    .unwrap();
++    let expected = from_records(&items, None).unwrap();
++    assert_eq!(
++        serde_json::to_vec(&actual).unwrap(),
++        serde_json::to_vec(&expected).unwrap()
++    );
++    assert_eq!(
++        actual.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(),
++        ["reasoning", "assistant", "user"]
++    );
++    assert!(actual.iter().all(|row| row.timestamp_ms == Some(42)));
++}
