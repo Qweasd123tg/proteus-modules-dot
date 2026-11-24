@@ -1,0 +1,139 @@
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -289,6 +289,30 @@
+ fn append_transcript_tool_result(transcript: &mut TranscriptRows, result: &ToolResult) {
+     let status = if result.ok { "done" } else { "failed" }.to_owned();
+     let result_text = result.text_or_status();
++    apply_transcript_tool_result(transcript, result, status, result_text);
++}
++
++fn append_owned_transcript_tool_result(transcript: &mut TranscriptRows, result: &mut ToolResult) {
++    let status = if result.ok { "done" } else { "failed" }.to_owned();
++    let selected = match &mut result.error {
++        Some(error) if !error.is_empty() => Some(error),
++        _ if !result.output.is_empty() => Some(&mut result.output),
++        _ => None,
++    };
++    // Match the borrowed result's capacity as well as its contents.
++    let result_text = match selected {
++        Some(text) if text.len() == text.capacity() => std::mem::take(text),
++        _ => result.text_or_status(),
++    };
++    apply_transcript_tool_result(transcript, result, status, result_text);
++}
++
++fn apply_transcript_tool_result(
++    transcript: &mut TranscriptRows,
++    result: &ToolResult,
++    status: String,
++    result_text: String,
++) {
+     let terminal = result
+         .metadata
+         .get("tool_terminal")
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -27,8 +27,9 @@
+ };
+ 
+ use super::{
+-    AppTranscriptMessage, TranscriptRows, append_transcript_parts, append_transcript_tool_call,
+-    append_transcript_tool_result, finalize_interrupted_tools,
++    AppTranscriptMessage, TranscriptRows, append_owned_transcript_tool_result,
++    append_transcript_parts, append_transcript_tool_call, append_transcript_tool_result,
++    finalize_interrupted_tools,
+ };
+ 
+ /// Строит завершённый web transcript из canonical journal. Active streaming
+@@ -188,9 +189,12 @@
+                 }
+             }
+             JournalEntry::ToolResultRecorded(tool)
+-                if record.turn_id != live_turn_id
+-                    && visibility.is_root_record(record.thread_id, record.turn_id)
+-                    && visibility.displays_tool(record.turn_id, &tool.result.call_id) =>
++                if visibility.displays_final_result(
++                    record.thread_id,
++                    record.turn_id,
++                    live_turn_id,
++                    &tool.result.call_id,
++                ) =>
+             {
+                 if state.seen_results.insert(tool.result.call_id.clone()) {
+                     state.append_tool_result(&tool.result);
+@@ -213,6 +217,22 @@
+                 state.append_turn_failure(settled, record.timestamp_ms);
+             }
+             _ => {}
++        }
++    }
++
++    fn render_final_record(&mut self, record: &mut JournalRecord, live_turn_id: Option<TurnId>) {
++        let JournalEntry::ToolResultRecorded(tool) = &mut record.entry else {
++            self.render_record(record, live_turn_id);
++            return;
++        };
++        if self.visibility.displays_final_result(
++            record.thread_id,
++            record.turn_id,
++            live_turn_id,
++            &tool.result.call_id,
++        ) && self.state.seen_results.insert(tool.result.call_id.clone())
++        {
++            self.state.append_owned_tool_result(&mut tool.result);
+         }
+     }
+ 
+@@ -326,6 +346,18 @@
+         is_root_record(&self.root_threads, thread_id, turn_id)
+     }
+ 
++    fn displays_final_result(
++        &self,
++        thread_id: Option<ThreadId>,
++        turn_id: Option<TurnId>,
++        live_turn_id: Option<TurnId>,
++        call_id: &str,
++    ) -> bool {
++        turn_id != live_turn_id
++            && self.is_root_record(thread_id, turn_id)
++            && self.displays_tool(turn_id, call_id)
++    }
++
+     fn displays_tool(&self, turn_id: Option<TurnId>, call_id: &str) -> bool {
+         turn_id
+             .and_then(|turn| self.display_tool_calls.get(&turn))
+@@ -411,8 +443,18 @@
+     fn append_tool_result(&mut self, result: &crate::domain::ToolResult) {
+         let start = self.transcript.rows.len();
+         append_transcript_tool_result(&mut self.transcript, result);
++        self.timestamp_appended_tool_result(start, &result.call_id);
++    }
++
++    fn append_owned_tool_result(&mut self, result: &mut crate::domain::ToolResult) {
++        let start = self.transcript.rows.len();
++        append_owned_transcript_tool_result(&mut self.transcript, result);
++        self.timestamp_appended_tool_result(start, &result.call_id);
++    }
++
++    fn timestamp_appended_tool_result(&mut self, start: usize, call_id: &str) {
+         if self.transcript.rows.len() > start {
+-            self.transcript.rows[start].timestamp_ms = self.timestamps.call(&result.call_id);
++            self.transcript.rows[start].timestamp_ms = self.timestamps.call(call_id);
+         }
+     }
+ 
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -203,9 +203,9 @@
+         final_results,
+         subagent_bindings,
+     };
+-    scan(&mut |record| {
++    scan(&mut |mut record| {
+         if record.session_seq >= start {
+-            replay.render_record(&record, live_turn_id);
++            replay.render_final_record(&mut record, live_turn_id);
+         }
+         Ok(())
+     })?;
