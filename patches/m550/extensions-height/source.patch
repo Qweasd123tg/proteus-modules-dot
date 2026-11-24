@@ -1,0 +1,16 @@
+--- a/packages/analysis/src/nodes.rs
++++ b/packages/analysis/src/nodes.rs
+@@ -56,6 +56,13 @@
+ 
+ /// Keep Python's splitlines behavior without storing every line just to size the block.
+ fn height(body: &str, wrap: bool) -> usize {
++    // At most 19 wrapped rows fit below the height cap. Each row has at
++    // most 110 four-byte scalars, plus at most one three-byte line ending
++    // (CRLF is two bytes). Longer wrapped text cannot fit, whatever its lines.
++    const MAX_UNSATURATED_BYTES: usize = 19 * (110 * 4 + 3);
++    if wrap && body.len() > MAX_UNSATURATED_BYTES {
++        return 360;
++    }
+     let breaks = [
+         '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+     ];
