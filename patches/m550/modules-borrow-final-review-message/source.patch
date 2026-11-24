@@ -1,0 +1,21 @@
+diff --git a/workflow/coding-workflow/src/plan_execute_review.rs b/workflow/coding-workflow/src/plan_execute_review.rs
+index 322dd9c16ebfee5ad71f5a038972fb951df9ed20..dbe4e0e8209687cc3463877336738388427b52bd 100644
+--- a/workflow/coding-workflow/src/plan_execute_review.rs
++++ b/workflow/coding-workflow/src/plan_execute_review.rs
+@@ -165,14 +165,14 @@
+         },
+     )?;
+ 
+-    let final_message = response_output_message("review", &final_response)?.clone();
++    let final_message = response_output_message("review", &final_response)?;
+     turn.model_messages
+         .extend(final_response.messages.iter().cloned());
+     turn.persistent_messages
+         .extend(final_response.messages.iter().cloned());
+     turn.checkpoint(host, &[])?;
+     let text = output_text(
+-        &final_message,
++        final_message,
+         &turn.model_messages[turn.current_turn_messages_start..],
+     );
+     let metadata = output_metadata_with_extra(
