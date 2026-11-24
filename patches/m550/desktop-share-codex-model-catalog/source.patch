@@ -1,0 +1,126 @@
+diff --git a/src/agents/codex/mod.rs b/src/agents/codex/mod.rs
+index f85a869738b1ee251267794dfe380232a1b8655c..5a9ea0d75ca07106db309d263d7fa53d208d1a47 100644
+--- a/src/agents/codex/mod.rs
++++ b/src/agents/codex/mod.rs
+@@ -25,7 +25,7 @@
+     client: Arc<Client>,
+     router: Arc<Mutex<Router>>,
+     subscriptions: Arc<Subscriptions>,
+-    models: Arc<Mutex<Option<Vec<Model>>>>,
++    models: Arc<Mutex<Option<Arc<[Model]>>>>,
+     catalog_events: Arc<Mutex<Option<async_channel::Receiver<CatalogEvent>>>>,
+ }
+ 
+@@ -175,7 +175,7 @@
+             next_cursor: cursor_of(&response),
+         })
+     }
+-    pub fn models(&self) -> Result<Vec<Model>, Error> {
++    pub fn models(&self) -> Result<Arc<[Model]>, Error> {
+         // Catalogs belong to this app-server's configuration. Reopening a chat
+         // must not repeat a potentially remote model discovery. Keep concurrent
+         // first reads single-flight, and retry failures without caching them.
+@@ -184,6 +184,11 @@
+             return Ok(models.clone());
+         }
+         let models = self.load_models()?;
++        let models: Arc<[Model]> = if models.is_empty() {
++            Arc::default()
++        } else {
++            Arc::from(models)
++        };
+         *cached = Some(models.clone());
+         Ok(models)
+     }
+diff --git a/src/agents/codex/tests.rs b/src/agents/codex/tests.rs
+index 72028d128f56a9417d917f299281a8bb4c952e4a..24fe0ae2d794f8ef4fa111a8dedfb9d3d64686a6 100644
+--- a/src/agents/codex/tests.rs
++++ b/src/agents/codex/tests.rs
+@@ -235,8 +235,12 @@
+                 scope.spawn(move || service.models().unwrap())
+             })
+             .collect();
++        let mut jobs = jobs.into_iter();
++        let first = jobs.next().unwrap().join().unwrap();
++        assert_eq!(first[0].model, "execution-model");
+         for job in jobs {
+-            assert_eq!(job.join().unwrap()[0].model, "execution-model");
++            let models = job.join().unwrap();
++            assert!(Arc::ptr_eq(&models, &first));
+         }
+     });
+     assert_eq!(
+diff --git a/src/ui/chats/codex.rs b/src/ui/chats/codex.rs
+index 625958cb8f584ca03fc0d56af2f2cf1429947074..e261c881f5d3ce2f9cf81539630b7ae5956cb994 100644
+--- a/src/ui/chats/codex.rs
++++ b/src/ui/chats/codex.rs
+@@ -1,4 +1,6 @@
+ //! Codex lifecycle uses native opaque thread IDs; the Chat view is shared.
++use std::sync::Arc;
++
+ use super::*;
+ use crate::agents::codex::{Model, Opened};
+ 
+@@ -105,12 +107,8 @@
+         .detach();
+     }
+ 
+-    pub(in crate::ui) fn replace_codex_models(&mut self, models: Vec<Model>) {
+-        self.codex_models = if models.is_empty() {
+-            Default::default()
+-        } else {
+-            models.into()
+-        };
++    pub(in crate::ui) fn replace_codex_models(&mut self, models: Arc<[Model]>) {
++        self.codex_models = models;
+     }
+ 
+     pub(in crate::ui) fn insert_codex_chat(
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+index 077f402c61ecf7382d96b379bf8aa94ccecc0b9c..03e942c00b0494e656ab426badaa6035b78543dc 100644
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -2,6 +2,7 @@
+ //! belong to startup. Inactive chat areas resume lazily on selection.
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
++use std::sync::Arc;
+ 
+ use anyhow::{Context as _, Result};
+ use proteus_client_common::session_selection::select_startup_session;
+@@ -89,7 +90,7 @@
+     pub streams: HashMap<PathBuf, async_channel::Receiver<connection::PumpItem>>,
+     pub codex: Option<CodexService>,
+     pub codex_opened: Vec<Opened>,
+-    pub codex_models: Vec<Model>,
++    pub codex_models: Arc<[Model]>,
+     pub codex_failed: Vec<(String, String)>,
+ }
+ 
+@@ -231,7 +232,7 @@
+             streams: HashMap::new(),
+             codex: None,
+             codex_opened: Vec::new(),
+-            codex_models: Vec::new(),
++            codex_models: Default::default(),
+             codex_failed: Vec::new(),
+         }
+     };
+@@ -297,7 +298,7 @@
+         streams: HashMap::new(),
+         codex: None,
+         codex_opened: Vec::new(),
+-        codex_models: Vec::new(),
++        codex_models: Default::default(),
+         codex_failed: Vec::new(),
+     })
+ }
+@@ -368,7 +369,7 @@
+         streams: HashMap::new(),
+         codex: None,
+         codex_opened: Vec::new(),
+-        codex_models: Vec::new(),
++        codex_models: Default::default(),
+         codex_failed: Vec::new(),
+     })
+ }
