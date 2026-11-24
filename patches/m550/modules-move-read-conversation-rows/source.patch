@@ -1,0 +1,39 @@
+diff --git a/components/session-storage-module/src/main.rs b/components/session-storage-module/src/main.rs
+index f0256ecee16dd12663b0eee60a886edb8e116a1a..5a0cf47bf905fac46e631b17bcb08f4558e4d3f2 100644
+--- a/components/session-storage-module/src/main.rs
++++ b/components/session-storage-module/src/main.rs
+@@ -43,9 +43,9 @@ impl Export for StorageExport {
+             return self.standard.invoke(method, params, host);
+         }
+         match params.get("operation").and_then(Value::as_str) {
+-            // Canonical records and disposable caches do not require
+-            // projection negotiation.
+-            Some("read_records" | "read_cache") => {}
++            // Canonical records, conversation and disposable caches do not
++            // require projection negotiation.
++            Some("read_records" | "read_conversation" | "read_cache") => {}
+             Some("open_display_snapshot" | "read_display_records")
+                 if self.projection_negotiated => {}
+             // Leave the SDK in charge of all other operations and errors,
+diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs
+index f6f7222e01b587ef5e0341992c6470838f73b258..0f72fe44b30d512cd2ca505bca403410ac4e5385 100644
+--- a/components/session-storage-module/src/display_reply.rs
++++ b/components/session-storage-module/src/display_reply.rs
+@@ -25,6 +25,17 @@ pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value>
+             *slot = payload;
+             return Ok(result);
+         }
++        SessionStorageResponse::Conversation { conversation } => {
++            let messages = mem::take(&mut conversation.messages);
++            let mut result = serde_json::to_value(response)?;
++            let output = result
++                .get_mut("conversation")
++                .and_then(|value| value.get_mut("messages"))
++                .and_then(Value::as_array_mut)
++                .context("serialized storage conversation omitted its messages array")?;
++            move_messages(output, messages)?;
++            return Ok(result);
++        }
+         SessionStorageResponse::DisplaySnapshot {
+             projection: Some(projection),
+         } => mem::take(&mut projection.state.conversation.messages),
