@@ -1,0 +1,459 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 309de8940b02b355e7a2bf5a66b515d1c1d2f294..cc4a2b10767ba6bb6d355809417ddbb5345162a9 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -253,7 +253,7 @@ fn render_causal(
+         {
+             if !(live_turn_id.is_some() && record.turn_id == live_turn_id) {
+                 if allow_compact
+-                    && replay.state.timestamps.certified_text_append()
++                    && let Some(timestamp_ms) = replay.state.timestamps.certified_text_append_date()
+                     && (4_096..=65_536).contains(&mutation.messages.len())
+                     && mutation
+                         .messages
+@@ -262,20 +262,23 @@ fn render_causal(
+                 {
+                     let mut rows = Vec::new();
+                     for mut message in std::mem::take(&mut mutation.messages) {
+-                        let timestamp_ms = replay.state.timestamps.message(&message);
+                         if let Some(text) = replay.state.take_staged_text(&mut message.parts[0]) {
+                             rows.push(CompactTextRow {
+                                 message_id: message.id,
+-                                timestamp_ms,
+                                 phase: message.phase,
+-                                role: super::super::transcript_role(&message.role),
++                                role: message.role,
+                                 text,
+                             });
+                         }
+                     }
+-                    compact = Some(rows);
++                    compact = Some(DisplayRows::Text { timestamp_ms, rows });
+                 } else {
+-                    if replay.state.timestamps.certified_text_append() {
++                    if replay
++                        .state
++                        .timestamps
++                        .certified_text_append_date()
++                        .is_some()
++                    {
+                         replay
+                             .state
+                             .transcript
+@@ -296,7 +299,7 @@ fn render_causal(
+     // A compact row owner is eligible only on a certified one-record scan;
+     // an extra or truncated staged record failed before reaching here.
+     Ok(match compact {
+-        Some(rows) => DisplayRows::Text(rows),
++        Some(rows) => rows,
+         None => DisplayRows::Full(replay.finish()),
+     })
+ }
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+index d6d781401a7b0d9e2cf4eac16c9c0befab1ff67b..1510994a7a5cb0019c98b1d3d857dcdfc5c8b700 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/timestamps.rs
+@@ -161,8 +161,8 @@ impl TranscriptTimestamps {
+     }
+ 
+     /// This is the single staged text-only Append proof, not just equal dates.
+-    pub(super) fn certified_text_append(&self) -> bool {
+-        self.uniform_message_date.is_some()
++    pub(super) fn certified_text_append_date(&self) -> Option<i64> {
++        self.uniform_message_date
+     }
+ 
+     pub(super) fn message(&self, message: &CanonicalMessage) -> Option<i64> {
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+index d1b3ee8ec56a9a153867ed887c1aabd09bfa00ac..c399da3189e08cb465ef17e37d85362210c77d1e 100644
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -1,3 +1,5 @@
++use crate::core::transcript_role;
++
+ use serde_json::Value;
+ 
+ use crate::{
+@@ -357,16 +359,6 @@ fn apply_transcript_tool_result(
+     });
+ }
+ 
+-fn transcript_role(role: &MessageRole) -> &'static str {
+-    match role {
+-        MessageRole::System | MessageRole::Developer => "system",
+-        MessageRole::User => "user",
+-        MessageRole::Assistant => "assistant",
+-        MessageRole::Tool => "system",
+-        _ => "system",
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     #[test]
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 564d681b285610c45fa879177613a083d9cf3918..20a96dd2c975b762d454ec2c393060811beddd3f 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -90,7 +90,7 @@ pub(crate) use session_store::subscribe_catalog_updates;
+ pub(crate) use session_store::{
+     CommittedDisplay, CompactTextRow, DisplayRecords, DisplayRows, PrefixIdentities,
+     PreparedSession, SessionReadModel, SessionTranscriptAppend, prepare_latest_workspace_session,
+-    session_storage_binding,
++    session_storage_binding, transcript_role,
+ };
+ pub use session_store::{
+     SessionStore, StorageService, canonicalize_session_dir_path, configured_session_storage,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index ee93cf3130375ccaab8e268eaa983cc8870fdb2d..fe12c54fefd343588e8411712b94c1c42fd30680 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -28,10 +28,10 @@ pub(in crate::core::session_store::remote::view) struct Section {
+     packs: Vec<PackRef>,
+ }
+ 
+-fn write_pages<'a, T: Serialize + 'a>(
++fn write_pages<T: Serialize>(
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+-    rows: impl Iterator<Item = &'a T>,
++    rows: impl Iterator<Item = T>,
+     section: &mut Section,
+     pack_before: usize,
+ ) -> Option<()> {
+@@ -39,7 +39,7 @@ fn write_pages<'a, T: Serialize + 'a>(
+     let mut scratch = LeafScratch::default();
+     let mut page = Vec::with_capacity(PAGE_ROWS);
+     let mut bytes = 2usize;
+-    let mut submit = |page: &[&T], bytes: usize| {
++    let mut submit = |page: &[T], bytes: usize| {
+         if section.pages.len() >= MAX_PAGES {
+             return None;
+         }
+@@ -61,7 +61,7 @@ fn write_pages<'a, T: Serialize + 'a>(
+         )
+     };
+     for row in rows {
+-        let row_bytes = encoded_len(row, SESSION_STORAGE_MAX_CACHE_BYTES)?;
++        let row_bytes = encoded_len(&row, SESSION_STORAGE_MAX_CACHE_BYTES)?;
+         if !page.is_empty()
+             && (page.len() == PAGE_ROWS
+                 || bytes.saturating_add(row_bytes).saturating_add(1) > NORMAL_PAGE_BYTES)
+@@ -99,15 +99,18 @@ pub(in crate::core::session_store::remote::view) fn write_transcript<T: Serializ
+     store: &RemoteSessionStore,
+     source: &RemoteCacheSource,
+     rows: &[T],
++) -> Option<Section> {
++    write_transcript_iter(store, source, rows.iter())
++}
++
++pub(super) fn write_transcript_iter<T: Serialize>(
++    store: &RemoteSessionStore,
++    source: &RemoteCacheSource,
++    rows: impl ExactSizeIterator<Item = T>,
+ ) -> Option<Section> {
+     let mut section = Section::default();
+-    write_pages(
+-        store,
+-        source,
+-        rows.iter(),
+-        &mut section,
+-        rows.len().saturating_sub(PAGE_ROWS),
+-    )?;
++    let pack_before = rows.len().saturating_sub(PAGE_ROWS);
++    write_pages(store, source, rows, &mut section, pack_before)?;
+     Some(section)
+ }
+ 
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 48be2fd4c397c4fd8c0526aa5910cd38faef34e3..110137024391f9d38bd934e5eb8b62604cff3350 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -23,11 +23,11 @@ const PREFIX: &str = "display-view-v1-prefix";
+ 
+ mod pages;
+ mod preview;
+-use pages::valid_section;
+ pub(super) use pages::{
+     Section, append_section, extend_known_section, read_section, visit_section, write_section,
+     write_transcript,
+ };
++use pages::{valid_section, write_transcript_iter};
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -446,7 +446,10 @@ pub(super) fn save_startup_model<T: CacheRows>(
+ #[derive(Clone, Copy)]
+ pub(super) enum RowsRef<'a> {
+     Full(&'a [AppTranscriptMessage]),
+-    Text(&'a [CompactTextRow]),
++    Text {
++        timestamp_ms: i64,
++        rows: &'a [CompactTextRow],
++    },
+ }
+ 
+ pub(super) trait CacheRows {
+@@ -463,7 +466,10 @@ impl CacheRows for DisplayRows {
+     fn rows_ref(&self) -> RowsRef<'_> {
+         match self {
+             DisplayRows::Full(rows) => RowsRef::Full(rows),
+-            DisplayRows::Text(rows) => RowsRef::Text(rows),
++            DisplayRows::Text { timestamp_ms, rows } => RowsRef::Text {
++                timestamp_ms: *timestamp_ms,
++                rows,
++            },
+         }
+     }
+ }
+@@ -510,7 +516,9 @@ fn save_model_sections<T>(
+     };
+     let transcript = match rows {
+         RowsRef::Full(rows) => write_transcript(store, source, rows)?,
+-        RowsRef::Text(rows) => write_transcript(store, source, rows)?,
++        RowsRef::Text { timestamp_ms, rows } => {
++            write_transcript_iter(store, source, rows.iter().map(|row| row.wire(timestamp_ms)))?
++        }
+     };
+     let context = write_section(store, source, observations.as_ref())?;
+     drop(observations);
+@@ -518,8 +526,16 @@ fn save_model_sections<T>(
+         Some(AppTranscriptBase {
+             revision: old_source.revision()?,
+             common_prefix: match rows {
+-                RowsRef::Full(rows) => common_prefix(store, &old_transcript, &transcript, rows)?,
+-                RowsRef::Text(rows) => common_prefix(store, &old_transcript, &transcript, rows)?,
++                RowsRef::Full(rows) => {
++                    common_prefix(store, &old_transcript, &transcript, rows.len(), |i| {
++                        rows.get(i)
++                    })?
++                }
++                RowsRef::Text { timestamp_ms, rows } => {
++                    common_prefix(store, &old_transcript, &transcript, rows.len(), |i| {
++                        rows.get(i).map(|row| row.wire(timestamp_ms))
++                    })?
++                }
+             },
+         })
+     });
+@@ -552,7 +568,8 @@ fn common_prefix<T: Serialize>(
+     store: &RemoteSessionStore,
+     old: &Section,
+     new: &Section,
+-    rows: &[T],
++    len: usize,
++    row: impl Fn(usize) -> Option<T>,
+ ) -> Option<usize> {
+     let mut common = 0;
+     for (before, after) in old.pages.iter().zip(&new.pages) {
+@@ -563,7 +580,7 @@ fn common_prefix<T: Serialize>(
+         let old_rows: Vec<Value> =
+             read_section(store, old, common, common.checked_add(before.rows)?)?;
+         for old_row in &old_rows {
+-            let Some(new_row) = rows.get(common) else {
++            let Some(new_row) = row(common) else {
+                 return Some(common);
+             };
+             if hash(old_row)? != hash(&serde_json::to_value(new_row).ok()?)? {
+@@ -571,9 +588,9 @@ fn common_prefix<T: Serialize>(
+             }
+             common += 1;
+         }
+-        return Some(common.min(old.rows).min(rows.len()));
++        return Some(common.min(old.rows).min(len));
+     }
+-    Some(common.min(old.rows).min(rows.len()))
++    Some(common.min(old.rows).min(len))
+ }
+ 
+ pub(super) fn update_tools(
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs b/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs
+index 1d36e3f891738ca47f0419f7641b8a3a92564556..4f248c74354e8b2abaf29845149ebfa0699586ff 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/text_rows.rs
+@@ -1,22 +1,28 @@
+ //! Private cold-start row owner for one certified text-only append.
+ //! Do not change AppTranscriptMessage or the persisted page wire format.
+ use proteus_contracts::{
+-    app_protocol::AppTranscriptMessage, domain::MessageId, model_standard::MessagePhase,
++    app_protocol::AppTranscriptMessage,
++    domain::MessageId,
++    model_standard::{MessagePhase, MessageRole},
+ };
+ use serde::{Serialize, Serializer};
+ 
+ pub(crate) enum DisplayRows {
+     Full(Vec<AppTranscriptMessage>),
+-    Text(Vec<CompactTextRow>),
++    Text {
++        // The only producer proves one physical all-text Append.
++        timestamp_ms: i64,
++        rows: Vec<CompactTextRow>,
++    },
+ }
+ 
+ impl DisplayRows {
+     pub(crate) fn into_full(self) -> Vec<AppTranscriptMessage> {
+         match self {
+             Self::Full(rows) => rows,
+-            Self::Text(rows) => {
++            Self::Text { timestamp_ms, rows } => {
+                 let mut full = Vec::with_capacity(rows.len());
+-                full.extend(rows.into_iter().map(CompactTextRow::into_full));
++                full.extend(rows.into_iter().map(|row| row.into_full(timestamp_ms)));
+                 full
+             }
+         }
+@@ -25,19 +31,25 @@ impl DisplayRows {
+ 
+ pub(crate) struct CompactTextRow {
+     pub(crate) message_id: MessageId,
+-    pub(crate) timestamp_ms: Option<i64>,
+     pub(crate) phase: Option<MessagePhase>,
+-    pub(crate) role: &'static str,
++    pub(crate) role: MessageRole,
+     pub(crate) text: String,
+ }
+ 
+ impl CompactTextRow {
+-    fn into_full(self) -> AppTranscriptMessage {
++    pub(super) fn wire(&self, timestamp_ms: i64) -> impl Serialize + '_ {
++        TextRowWithDate {
++            row: self,
++            timestamp_ms,
++        }
++    }
++
++    fn into_full(self, timestamp_ms: i64) -> AppTranscriptMessage {
+         AppTranscriptMessage {
+             message_id: Some(self.message_id),
+-            timestamp_ms: self.timestamp_ms,
++            timestamp_ms: Some(timestamp_ms),
+             phase: self.phase,
+-            role: self.role.to_owned(),
++            role: transcript_role(&self.role).to_owned(),
+             text: self.text,
+             images: Vec::new(),
+             tool: None,
+@@ -47,6 +59,16 @@ impl CompactTextRow {
+     }
+ }
+ 
++pub(crate) fn transcript_role(role: &MessageRole) -> &'static str {
++    match role {
++        MessageRole::System | MessageRole::Developer => "system",
++        MessageRole::User => "user",
++        MessageRole::Assistant => "assistant",
++        MessageRole::Tool => "system",
++        _ => "system",
++    }
++}
++
+ // Match AppTranscriptMessage's declaration order even in preserve_order.
+ #[derive(Serialize)]
+ struct TextWire<'a> {
+@@ -61,14 +83,20 @@ struct TextWire<'a> {
+     streaming: bool,
+ }
+ 
+-impl Serialize for CompactTextRow {
++// Borrowed two-word item; only a page of these is retained by the writer.
++struct TextRowWithDate<'a> {
++    row: &'a CompactTextRow,
++    timestamp_ms: i64,
++}
++
++impl Serialize for TextRowWithDate<'_> {
+     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+         TextWire {
+-            message_id: Some(self.message_id),
+-            timestamp_ms: self.timestamp_ms,
+-            phase: self.phase,
+-            role: self.role,
+-            text: &self.text,
++            message_id: Some(self.row.message_id),
++            timestamp_ms: Some(self.timestamp_ms),
++            phase: self.row.phase,
++            role: transcript_role(&self.row.role),
++            text: &self.row.text,
+             images: [],
+             tool: None,
+             subagent: None,
+@@ -83,23 +111,41 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn compact_wire_and_owned_fallback_match_the_public_row() {
+-        for (role, phase, timestamp_ms) in [
+-            ("user", None, None),
+-            ("assistant", Some(MessagePhase::FinalAnswer), Some(-8)),
+-            ("system", Some(MessagePhase::Commentary), Some(234)),
++    fn dense_text_keeps_role_phase_signed_date_and_fallback_wire() {
++        for (role, expected_role, phase, timestamp_ms) in [
++            (MessageRole::User, "user", None, i64::MIN),
++            (
++                MessageRole::Assistant,
++                "assistant",
++                Some(MessagePhase::FinalAnswer),
++                i64::MAX,
++            ),
++            (
++                MessageRole::System,
++                "system",
++                Some(MessagePhase::Commentary),
++                -8,
++            ),
++            (MessageRole::Developer, "system", None, 0),
++            (MessageRole::Tool, "system", None, 234),
+         ] {
+             let row = CompactTextRow {
+                 message_id: MessageId::nil(),
+-                timestamp_ms,
+                 phase,
+                 role,
+                 text: "line\\n𝄞🦀\\u{0}\\\\".repeat(97),
+             };
+-            let owner = row.text.as_ptr();
+-            let compact = serde_json::to_vec(&row).unwrap();
+-            let full = DisplayRows::Text(vec![row]).into_full();
+-            assert_eq!(full[0].text.as_ptr(), owner);
++            let text_owner = row.text.as_ptr();
++            let compact = serde_json::to_vec(&row.wire(timestamp_ms)).unwrap();
++            let full = DisplayRows::Text {
++                timestamp_ms,
++                rows: vec![row],
++            }
++            .into_full();
++            assert_eq!(full[0].text.as_ptr(), text_owner);
++            assert_eq!(full[0].role, expected_role);
++            assert_eq!(full[0].timestamp_ms, Some(timestamp_ms));
++            assert_eq!(full[0].phase, phase);
+             assert_eq!(compact, serde_json::to_vec(&full[0]).unwrap());
+         }
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 90f0e4e9f37e5a81c9d8c91bc70146fde3b22789..c0f4d4d2420003db1f7fac084a0043fd2d118ca1 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -23,7 +23,7 @@ mod prefix;
+ mod text_rows;
+ pub(crate) use cache::RemoteCacheSource;
+ pub(crate) use prefix::PrefixIdentities;
+-pub(crate) use text_rows::{CompactTextRow, DisplayRows};
++pub(crate) use text_rows::{CompactTextRow, DisplayRows, transcript_role};
+ 
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index d7ff38969f39d2cfad72da8dfa44a491a11869e3..d68db85dba2770ae32ca77d71a0299ec2e935e2f 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -21,7 +21,7 @@ pub(crate) use remote::{
+     snapshot::DisplayRecords,
+     view::{
+         CommittedDisplay, CompactTextRow, DisplayRows, PrefixIdentities, SessionReadModel,
+-        SessionTranscriptAppend,
++        SessionTranscriptAppend, transcript_role,
+     },
+ };
+ pub use workspace_dir::{decode_workspace_path, encode_workspace_path};
