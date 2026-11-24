@@ -1,0 +1,18 @@
+diff --git a/src/ui/chat/history.rs b/src/ui/chat/history.rs
+index 297ba38..7208302 100644
+--- a/src/ui/chat/history.rs
++++ b/src/ui/chat/history.rs
+@@ -482,6 +482,13 @@ impl Chat {
+     }
+ 
+     fn disclosed_height_rows(&self) -> Vec<Range<usize>> {
++        if self.expanded.is_empty()
++            && self.full_blocks.is_empty()
++            && self.open_chains.is_empty()
++            && self.tool_diffs.is_empty()
++        {
++            return Vec::new();
++        }
+         let entries = self.display_transcript().entries();
+         let mut excluded: Vec<Range<usize>> = Vec::new();
+         for (row, entry) in entries.iter().enumerate() {
