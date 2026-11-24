@@ -1,0 +1,125 @@
+diff --git a/crates/proteus-core/src/core/runtime/history.rs b/crates/proteus-core/src/core/runtime/history.rs
+index 3b11d3a261fcbb382bc5f59435bf30ab4a3217e8..4a8377bb82fdcb657a2e09a1484e0916464a66d3 100644
+--- a/crates/proteus-core/src/core/runtime/history.rs
++++ b/crates/proteus-core/src/core/runtime/history.rs
+@@ -1,4 +1,4 @@
+-use std::collections::HashSet;
++use std::{borrow::Cow, collections::HashSet};
+ 
+ mod compacted_user;
+ 
+@@ -17,6 +17,42 @@
+ 
+ pub(crate) fn prepare_history_update(
+     current_history: &[CanonicalMessage],
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    prepare_successful_update(
++        Cow::Borrowed(current_history),
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++pub(super) fn prepare_owned_history_update(
++    current_history: Vec<CanonicalMessage>,
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    prepare_successful_update(
++        Cow::Owned(current_history),
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++fn prepare_successful_update(
++    current_history: Cow<'_, [CanonicalMessage]>,
+     persisted_user_message: &CanonicalMessage,
+     new_messages: &[CanonicalMessage],
+     history_replacement: Option<&[CanonicalMessage]>,
+@@ -51,7 +87,7 @@
+         "workflow failure returned an empty history update"
+     );
+     prepare_update(
+-        current_history,
++        Cow::Borrowed(current_history),
+         persisted_user_message,
+         new_messages,
+         history_replacement,
+@@ -61,7 +97,7 @@
+ }
+ 
+ fn prepare_update(
+-    current_history: &[CanonicalMessage],
++    current_history: Cow<'_, [CanonicalMessage]>,
+     persisted_user_message: &CanonicalMessage,
+     new_messages: &[CanonicalMessage],
+     history_replacement: Option<&[CanonicalMessage]>,
+@@ -94,7 +130,7 @@
+         }
+         (true, Some(replacement)) => {
+             compacted_user::validate_current_user(
+-                current_history,
++                current_history.as_ref(),
+                 persisted_user_message,
+                 replacement,
+                 compactions,
+@@ -108,8 +144,17 @@
+             })
+         }
+         (false, None) => {
+-            let mut final_messages = Vec::with_capacity(current_history.len() + new_messages.len());
+-            final_messages.extend_from_slice(current_history);
++            let mut final_messages = match current_history {
++                Cow::Borrowed(prefix) => {
++                    let mut messages = Vec::with_capacity(prefix.len() + new_messages.len());
++                    messages.extend_from_slice(prefix);
++                    messages
++                }
++                Cow::Owned(mut prefix) => {
++                    prefix.reserve_exact(new_messages.len());
++                    prefix
++                }
++            };
+             final_messages.extend_from_slice(new_messages);
+             Ok(PreparedHistoryUpdate {
+                 final_messages,
+diff --git a/crates/proteus-core/src/core/runtime/turn.rs b/crates/proteus-core/src/core/runtime/turn.rs
+index dd7288193c18f49d52c425614196c2e6d584d5d5..767ec412be019d6df0a696c8d86e34a992091f3f 100644
+--- a/crates/proteus-core/src/core/runtime/turn.rs
++++ b/crates/proteus-core/src/core/runtime/turn.rs
+@@ -11,7 +11,8 @@
+ };
+ 
+ use super::{
+-    AgentRuntime, ExecutionAdmissionSnapshot, ReservedRunCompletion, prepare_history_update,
++    AgentRuntime, ExecutionAdmissionSnapshot, ReservedRunCompletion,
++    history::prepare_owned_history_update,
+     steering::{
+         ReservedUserMessage, RootTurnSettlement, SteeringModel, UserMessageReservation,
+         weave_deliveries_into_output,
+@@ -473,8 +474,8 @@
+                         .await;
+                 }
+             };
+-        let history_update = match prepare_history_update(
+-            &history,
++        let history_update = match prepare_owned_history_update(
++            history,
+             &user_message,
+             &workflow_output.new_messages,
+             workflow_output.history_replacement.as_deref(),
