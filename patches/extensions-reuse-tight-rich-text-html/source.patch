@@ -1,0 +1,22 @@
+diff --git a/sdk/src/ui.rs b/sdk/src/ui.rs
+index 2587517432bf..48a6c21016e2 100644
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -34,7 +34,16 @@
+ /// Native selectable rich text. HTML is interpreted by the native text widget,
+ /// without a browser; Markdown conversion belongs to the extension.
+ pub fn rich_text(id: &str, html: impl Into<String>) -> Value {
+-    json!({"type":"rich_text", "id":id, "html":html.into()})
++    let mut node = json!({"type":"rich_text", "id":id, "html":null});
++    let html = html.into();
++    // Do not retain spare capacity from caller buffers in the widget.
++    let html = if html.capacity() == html.len() {
++        html
++    } else {
++        html.as_str().to_owned()
++    };
++    *node.get_mut("html").expect("rich_text has an html field") = Value::String(html);
++    node
+ }
+ 
+ /// Retained child surface routed through enabled content language registrations.
