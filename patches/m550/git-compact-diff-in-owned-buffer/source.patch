@@ -1,0 +1,18 @@
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index 8f7ee03584001d0fb75999b0b6b7b9f44b82c5c4..23ab04f0947a962b2093cfa8121000438f8425f7 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -87,10 +87,9 @@ fn patch_view(id: &str, data: &Value, entry: Option<&Value>) -> Value {
+ }
+ 
+ fn aggregate_patch(patch: String) -> Value {
+-    // Preserve the old tight allocation when the join has spare capacity.
+-    if patch.capacity() != patch.len() {
+-        return diff("changes", &patch);
+-    }
++    // Tighten the already-owned join before moving it into the widget.
++    // A borrowed replacement would keep both full strings live at once.
++    let patch = String::from(patch.into_boxed_str());
+     let mut widget = diff("changes", "");
+     *widget
+         .get_mut("patch")
