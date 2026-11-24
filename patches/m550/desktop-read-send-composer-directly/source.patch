@@ -1,0 +1,17 @@
+diff --git a/src/ui/chat/actions.rs b/src/ui/chat/actions.rs
+index 3951f36fa60264d5fdbf954da49ce810abbf65fb..4150e633ed91de8b9ca9ce89468d97ec27661991 100644
+--- a/src/ui/chat/actions.rs
++++ b/src/ui/chat/actions.rs
+@@ -95,7 +95,11 @@
+             self.send_codex(window, cx);
+             return;
+         }
+-        let draft_text = self.composer.read(cx).value().to_string();
++        let draft_source = self.composer.read(cx).text();
++        let draft_text = match draft_source.as_str() {
++            Some(text) => text.to_owned(),
++            None => String::from(draft_source),
++        };
+         let text = draft_text.trim().to_owned();
+         if (text.is_empty() && self.attachments.is_empty())
+             || !self.session.connected
