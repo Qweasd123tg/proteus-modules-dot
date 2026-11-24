@@ -1,0 +1,31 @@
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -526,7 +526,7 @@
+             .filter(|value| !value.is_null())
+     }
+ 
+-    fn failed(&self, view: &str, error: &str) {
++    fn failed(&mut self, view: &str, error: &str) {
+         if self.surface(view) == Some(Surface::Content) {
+             self.send(json!({"type":"content_error", "session_dir":self.session,
+                 "view":view, "error":error, "sequence":self.sequence(view),"source_revision":self.content(view).and_then(|content| content.source_revision)}));
+@@ -538,9 +538,16 @@
+             ui::button("Повторить", "refresh").with("icon", "refresh-cw"),
+         ]);
+         let mut children = vec![notice];
+-        children.extend(self.shown.get(view).cloned());
+-        self.send(json!({"type": "view", "session_dir": self.session, "view": view, "sequence": self.sequence(view),
+-                         "keys": {}, "root": {"type": "fill", "children": children}}));
++        children.extend(self.shown.get_mut(view).map(Value::take));
++        let mut message = json!({"type": "view", "session_dir": self.session, "view": view, "sequence": self.sequence(view),
++                                 "keys": {}, "root": null})
++        .with("root", ui::fill(children));
++        // Send synchronously while the original tree is in the envelope,
++        // then restore that exact allocation for the next retry.
++        self.send_ref(&message);
++        if let Some(previous) = self.shown.get_mut(view) {
++            *previous = message["root"]["children"][1].take();
++        }
+     }
+ 
+     /// Render only the requested surface. A retained heavy document must
