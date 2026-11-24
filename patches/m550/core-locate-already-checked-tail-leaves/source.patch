@@ -1,0 +1,196 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index fe12c54fefd343588e8411712b94c1c42fd30680..ca35509cc407e645881b73add42292b839f1b6ff 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -187,9 +187,30 @@ pub(in crate::core::session_store::remote::view) fn read_section<T: DeserializeO
+     section: &Section,
+     start: usize,
+     end: usize,
++) -> Option<Vec<T>> {
++    collect_section(store, section, start, end, false)
++}
++
++// Only for an immutable section of the already checked header. The
++// same decoder still validates bounds, object/leaf hashes and typed rows.
++pub(super) fn read_checked_transcript<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    checked: &super::CheckedHeader,
++    start: usize,
++    end: usize,
++) -> Option<Vec<T>> {
++    collect_section(store, &checked.0.transcript, start, end, true)
++}
++
++fn collect_section<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    section: &Section,
++    start: usize,
++    end: usize,
++    checked: bool,
+ ) -> Option<Vec<T>> {
+     let mut result = None;
+-    visit_section(store, section, start, end, |row| {
++    visit_section_impl(store, section, start, end, checked, |row| {
+         result
+             .get_or_insert_with(|| Vec::with_capacity(end - start))
+             .push(row);
+@@ -205,16 +226,39 @@ pub(in crate::core::session_store::remote::view) fn visit_section<T: Deserialize
+     section: &Section,
+     start: usize,
+     end: usize,
++    visit: impl FnMut(T) -> Option<()>,
++) -> Option<()> {
++    visit_section_impl(store, section, start, end, false, visit)
++}
++
++fn visit_section_impl<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    section: &Section,
++    start: usize,
++    end: usize,
++    checked: bool,
+     mut visit: impl FnMut(T) -> Option<()>,
+ ) -> Option<()> {
+-    if start > end || end > section.rows || !valid_section(section) {
++    if start > end || end > section.rows || (!checked && !valid_section(section)) {
+         return None;
+     }
+     if start == end {
+         return Some(());
+     }
+-    let mut packs = section.packs.iter().peekable();
+-    let (mut index, mut offset) = (0, 0);
++    let (mut index, mut offset, spans) =
++        if checked && start >= section.rows.saturating_sub(PAGE_ROWS) {
++            // Validated pack spans cannot cover any leaf intersecting the latest
++            // PAGE_ROWS. Walk backward only to the first overlapping leaf.
++            let mut offset = section.rows;
++            let index = section.pages.iter().rposition(|page| {
++                offset -= page.rows;
++                offset <= start
++            })?;
++            (index, offset, &[][..])
++        } else {
++            (0, 0, section.packs.as_slice())
++        };
++    let mut packs = spans.iter().peekable();
+     while offset < end {
+         let pack = packs.next_if(|pack| pack.first == index);
+         let count = pack.map_or(1, |p| p.count);
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index 110137024391f9d38bd934e5eb8b62604cff3350..ae4f209fe20c592106db8a528b2b354797e7ae29 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -27,7 +27,7 @@ pub(super) use pages::{
+     Section, append_section, extend_known_section, read_section, visit_section, write_section,
+     write_transcript,
+ };
+-use pages::{valid_section, write_transcript_iter};
++use pages::{read_checked_transcript, valid_section, write_transcript_iter};
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -219,19 +219,31 @@ fn matches(store: &RemoteSessionStore, header: &Header) -> bool {
+         && header.tools.len() <= 16_384
+ }
+ 
++// Paging may use a section without rescanning it, but only after the
++// complete source and section checks on this owned, immutable header.
++struct CheckedHeader(Header);
++
++impl CheckedHeader {
++    fn read(store: &RemoteSessionStore, key: &str) -> Option<Self> {
++        let header = serde_json::from_value(read_value(store, key)?).ok()?;
++        matches(store, &header).then_some(Self(header))
++    }
++}
++
+ pub(super) fn header(store: &RemoteSessionStore) -> Option<Header> {
+-    let header = serde_json::from_value(read_value(store, HEAD)?).ok()?;
+-    matches(store, &header).then_some(header)
++    CheckedHeader::read(store, HEAD).map(|checked| checked.0)
+ }
+ 
+ pub(super) fn header_at_revision(store: &RemoteSessionStore, revision: &str) -> Option<Header> {
++    checked_header_at_revision(store, revision).map(|checked| checked.0)
++}
++
++fn checked_header_at_revision(store: &RemoteSessionStore, revision: &str) -> Option<CheckedHeader> {
+     if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+         return None;
+     }
+-    let header =
+-        serde_json::from_value(read_value(store, &format!("display-revision-{revision}"))?).ok()?;
+-    (matches(store, &header) && header.source.revision().as_deref() == Some(revision))
+-        .then_some(header)
++    let header = CheckedHeader::read(store, &format!("display-revision-{revision}"))?;
++    (header.0.source.revision().as_deref() == Some(revision)).then_some(header)
+ }
+ 
+ pub(super) fn fresh_header(store: &RemoteSessionStore) -> Option<Header> {
+@@ -332,9 +344,11 @@ pub(super) fn load_view(
+ pub(super) fn load_saved_view(
+     store: &RemoteSessionStore,
+ ) -> Option<(RemoteCacheSource, SessionReadView)> {
+-    let header = header(store)?;
+-    let start = header.transcript.rows.saturating_sub(PAGE_ROWS);
+-    let transcript = read_section(store, &header.transcript, start, header.transcript.rows)?;
++    let checked = CheckedHeader::read(store, HEAD)?;
++    let end = checked.0.transcript.rows;
++    let start = end.saturating_sub(PAGE_ROWS);
++    let transcript = read_checked_transcript(store, &checked, start, end)?;
++    let CheckedHeader(header) = checked;
+     let view = SessionReadView {
+         summary: header.summary,
+         revision: header.revision,
+@@ -357,15 +371,15 @@ pub(super) fn transcript_page(
+ ) -> Option<AppTranscriptPage> {
+     if let Some(revision) = expected {
+         // A retained, explicitly named revision can be older than the journal.
+-        return page_from_header(store, header_at_revision(store, revision)?, before);
++        return page_from_header(store, checked_header_at_revision(store, revision)?, before);
+     }
+-    let head = header(store)?;
++    let head = CheckedHeader::read(store, HEAD)?;
+     if stale_display {
+         return page_from_header(store, head, before);
+     }
+     // All page content is addressed by hash. Check the complete source identity
+     // AFTER the read: an earlier probe adds no proof to a successful final check.
+-    let source = head.source.clone();
++    let source = head.0.source.clone();
+     let page = page_from_header(store, head, before);
+     let current = RemoteCacheSource::read(store)?;
+     if source == current {
+@@ -375,8 +389,8 @@ pub(super) fn transcript_page(
+     // A publisher stores the named index before HEAD. If the last write failed,
+     // a complete index for the current source may survive behind an older HEAD.
+     // This remains a latest-page request; recheck after reading that index too.
+-    let saved = header_at_revision(store, &current.revision()?)?;
+-    if saved.source != current {
++    let saved = checked_header_at_revision(store, &current.revision()?)?;
++    if saved.0.source != current {
+         return None;
+     }
+     let page = page_from_header(store, saved, before)?;
+@@ -385,15 +399,16 @@ pub(super) fn transcript_page(
+ 
+ fn page_from_header(
+     store: &RemoteSessionStore,
+-    header: Header,
++    checked: CheckedHeader,
+     before: Option<usize>,
+ ) -> Option<AppTranscriptPage> {
+-    let end = before.unwrap_or(header.transcript.rows);
+-    if end > header.transcript.rows {
++    let end = before.unwrap_or(checked.0.transcript.rows);
++    if end > checked.0.transcript.rows {
+         return None;
+     }
+     let start = end.saturating_sub(PAGE_ROWS);
+-    let messages = read_section(store, &header.transcript, start, end)?;
++    let messages = read_checked_transcript(store, &checked, start, end)?;
++    let CheckedHeader(header) = checked;
+     Some(AppTranscriptPage {
+         revision: header.source.revision()?,
+         start,
