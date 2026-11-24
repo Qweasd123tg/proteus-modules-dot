@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index 2850cbf..7df9584 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -162,7 +162,8 @@ impl SnapshotState {
+             if record.session_seq > prefix.revision.session_seq {
+                 continue;
+             }
+-            state.apply(self.identity.session.session_id, &record)?;
++            // The comparison needs the verified revision, not model context or usage.
++            state.apply_validated(self.identity.session.session_id, &record)?;
+         }
+         Ok(state.revision() == prefix.revision)
+     }
