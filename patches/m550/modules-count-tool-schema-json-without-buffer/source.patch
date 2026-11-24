@@ -1,0 +1,49 @@
+diff --git a/workflow/coding-workflow/src/token_accounting.rs b/workflow/coding-workflow/src/token_accounting.rs
+index 9e730256b1d00a2653805c0f722445e592652cc4..9dab84c5237c27a4f3450b7dcc7336707d13edc1 100644
+--- a/workflow/coding-workflow/src/token_accounting.rs
++++ b/workflow/coding-workflow/src/token_accounting.rs
+@@ -117,11 +117,7 @@
+     bytes.tool_schemas = request
+         .tools
+         .iter()
+-        .map(|tool| {
+-            serde_json::to_string(tool)
+-                .map(|json| json.len())
+-                .unwrap_or(0)
+-        })
++        .map(|tool| serialized_json_len(tool).unwrap_or(0))
+         .sum::<usize>();
+ 
+     [
+@@ -147,6 +143,31 @@
+     .collect()
+ }
+ 
++fn serialized_json_len(value: &impl serde::Serialize) -> serde_json::Result<usize> {
++    let mut counter = JsonByteCounter(0);
++    serde_json::to_writer(&mut counter, value)?;
++    Ok(counter.0)
++}
++
++struct JsonByteCounter(usize);
++
++impl std::io::Write for JsonByteCounter {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        // Match the representable length of to_string's Vec<u8>, not a
++        // saturating estimate or a serialization error that would be skipped.
++        self.0 = self
++            .0
++            .checked_add(bytes.len())
++            .filter(|length| *length <= isize::MAX as usize)
++            .expect("capacity overflow");
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
+ #[derive(Default)]
+ struct RequestCategoryBytes {
+     instructions: usize,
