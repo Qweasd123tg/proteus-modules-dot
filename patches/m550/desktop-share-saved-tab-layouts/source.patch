@@ -1,0 +1,217 @@
+--- a/crates/tabs/Cargo.toml
++++ b/crates/tabs/Cargo.toml
+@@ -7,7 +7,7 @@
+ description = "Headless tab, pane and split-layout state for Proteus Desktop"
+ 
+ [dependencies]
+-serde = { version = "1", features = ["derive"] }
++serde = { version = "1", features = ["derive", "rc"] }
+ 
+ [dev-dependencies]
+ serde_json = "1"
+--- a/crates/tabs/src/retarget.rs
++++ b/crates/tabs/src/retarget.rs
+@@ -55,7 +55,7 @@
+ 
+ impl ChatSpaces {
+     pub fn retarget_document_to_existing(&mut self, root: &str, from: &str, to: &str) -> bool {
+-        let Some(layout) = self.roots.get_mut(root) else {
++        let Some(layout) = self.root_layout_mut(root) else {
+             return false;
+         };
+         layout.retarget_document_to_existing(from, to);
+@@ -65,7 +65,7 @@
+     /// Exact retained session area only; another session with identical
+     /// document arguments is independent.
+     pub fn retarget_document(&mut self, root: &str, from: &str, to: &str) -> bool {
+-        let Some(layout) = self.roots.get_mut(root) else {
++        let Some(layout) = self.root_layout_mut(root) else {
+             return false;
+         };
+         layout.retarget_document(from, to);
+--- a/crates/tabs/src/spaces.rs
++++ b/crates/tabs/src/spaces.rs
+@@ -2,6 +2,7 @@
+ //! A root owns its pane tree; a focused child chat never changes that owner.
+ 
+ use std::collections::{BTreeMap, HashSet};
++use std::sync::Arc;
+ 
+ use serde::{Deserialize, Serialize};
+ 
+@@ -11,7 +12,9 @@
+ #[serde(default, deny_unknown_fields)]
+ pub struct ChatSpaces {
+     active: Option<String>,
+-    pub(super) roots: BTreeMap<String, TabLayout>,
++    // Preferences, window registration, and persistence can retain the
++    // same inactive areas without copying their pane trees and tab history.
++    roots: BTreeMap<String, Arc<TabLayout>>,
+     loose: TabLayout,
+ }
+ 
+@@ -33,6 +36,7 @@
+         self.active
+             .as_ref()
+             .and_then(|root| self.roots.get(root))
++            .map(Arc::as_ref)
+             .unwrap_or(&self.loose)
+     }
+ 
+@@ -41,7 +45,7 @@
+     pub fn save_active(&mut self, layout: TabLayout) {
+         match &self.active {
+             Some(root) => {
+-                self.roots.insert(root.clone(), layout);
++                self.roots.insert(root.clone(), Arc::new(layout));
+             }
+             None => self.loose = layout,
+         }
+@@ -56,7 +60,7 @@
+         self.roots.entry(root.to_owned()).or_insert_with(|| {
+             let mut layout = TabLayout::default();
+             layout.open(root, |_| false);
+-            layout
++            Arc::new(layout)
+         });
+         self.active = Some(root.to_owned());
+         true
+@@ -85,7 +89,7 @@
+     pub fn root_layouts(&self) -> impl Iterator<Item = (&str, &TabLayout)> {
+         self.roots
+             .iter()
+-            .map(|(root, layout)| (root.as_str(), layout))
++            .map(|(root, layout)| (root.as_str(), layout.as_ref()))
+     }
+ 
+     /// Whether there are no actual tabs, including the unowned area.
+@@ -111,6 +115,9 @@
+     /// that chat from every area. Recently closed entries cannot resurrect it.
+     pub fn remove_chats<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+         let ids: HashSet<_> = ids.into_iter().filter(|id| is_chat(id)).collect();
++        if ids.is_empty() {
++            return;
++        }
+         self.roots.retain(|root, _| !ids.contains(root.as_str()));
+         if self
+             .active
+@@ -119,7 +126,7 @@
+         {
+             self.active = None;
+         }
+-        for layout in std::iter::once(&mut self.loose).chain(self.roots.values_mut()) {
++        for layout in self.layouts_mut() {
+             for id in &ids {
+                 layout.extract(id);
+             }
+@@ -133,7 +140,7 @@
+         if !is_chat(id) {
+             return;
+         }
+-        for layout in std::iter::once(&mut self.loose).chain(self.roots.values_mut()) {
++        for layout in self.layouts_mut() {
+             extract_chat(layout, id);
+         }
+     }
+@@ -147,7 +154,7 @@
+         extract_chat(&mut self.loose, id);
+         for (owner, layout) in &mut self.roots {
+             if owner != root {
+-                extract_chat(layout, id);
++                extract_chat(Arc::make_mut(layout), id);
+             }
+         }
+     }
+@@ -158,7 +165,7 @@
+         self.loose.include_window(&other.loose);
+         for (root, layout) in &other.roots {
+             match self.roots.get_mut(root) {
+-                Some(existing) => existing.include_window(layout),
++                Some(existing) => Arc::make_mut(existing).include_window(layout),
+                 None => {
+                     self.roots.insert(root.clone(), layout.clone());
+                 }
+@@ -167,7 +174,7 @@
+     }
+ 
+     pub fn all_layouts(&self) -> impl Iterator<Item = &TabLayout> {
+-        std::iter::once(&self.loose).chain(self.roots.values())
++        std::iter::once(&self.loose).chain(self.roots.values().map(Arc::as_ref))
+     }
+ 
+     /// Actual tabs, excluding root identities whose tabs were detached.
+@@ -183,12 +190,20 @@
+     /// Remove invalid documents from every retained area, including its closed
+     /// tab history. Root ownership is unaffected by document cleanup.
+     pub fn retain_documents(&mut self, keep: impl Fn(&str) -> bool) {
+-        for layout in std::iter::once(&mut self.loose).chain(self.roots.values_mut()) {
++        for layout in self.layouts_mut() {
+             layout.retain(|id| is_chat(id) || keep(id));
+             layout
+                 .closed
+                 .retain(|tab| is_chat(&tab.id) || keep(&tab.id));
+         }
++    }
++
++    fn layouts_mut(&mut self) -> impl Iterator<Item = &mut TabLayout> {
++        std::iter::once(&mut self.loose).chain(self.roots.values_mut().map(Arc::make_mut))
++    }
++
++    pub(super) fn root_layout_mut(&mut self, root: &str) -> Option<&mut TabLayout> {
++        self.roots.get_mut(root).map(Arc::make_mut)
+     }
+ 
+     pub fn validate(&self) -> Result<(), String> {
+--- a/crates/tabs/src/spaces/tests.rs
++++ b/crates/tabs/src/spaces/tests.rs
+@@ -266,3 +266,50 @@
+     assert_eq!(spaces.active_root(), Some(SECOND));
+     assert!(spaces.owner_of_chat(FIRST).is_some());
+ }
++
++#[test]
++fn cloned_workspace_remains_a_frozen_value_across_shared_window_edits() {
++    let mut spaces = populated();
++    let mut first = spaces.active_layout().clone();
++    first.open("files:closed.rs", |_| false);
++    first.close("files:closed.rs");
++    spaces.save_active(first);
++    spaces.select(SECOND);
++    let mut second = spaces.active_layout().clone();
++    second.open("files:second.rs", |_| false);
++    spaces.save_active(second);
++
++    let original = spaces.clone();
++    let preferences = serde_json::to_vec(&original).unwrap();
++    let mut moved = ChatSpaces::default();
++    let mut fragment = TabLayout::default();
++    fragment.open("terminal:from-other-window", |_| false);
++    moved.set_active(Some(FIRST), fragment);
++    spaces.include_window(&moved);
++    spaces.select(FIRST);
++    assert!(
++        spaces
++            .active_layout()
++            .contains("terminal:from-other-window")
++    );
++    spaces.remove_chats([CHILD]);
++    assert!(spaces.retarget_document(FIRST, "files:first.rs", "files:renamed.rs"));
++    spaces.retain_documents(|id| id != "files:second.rs");
++    assert!(!spaces.contains(CHILD));
++    assert!(!spaces.contains("files:second.rs"));
++
++    assert_eq!(original.active_root(), Some(SECOND));
++    assert!(original.contains(CHILD));
++    assert!(original.contains("files:second.rs"));
++    assert!(!original.contains("terminal:from-other-window"));
++    assert_eq!(serde_json::to_vec(&original).unwrap(), preferences);
++    let first = original
++        .root_layouts()
++        .find(|(key, _)| *key == FIRST)
++        .unwrap()
++        .1;
++    assert!(first.is_pinned("files:first.rs"));
++    assert_eq!(first.closed_ids().collect::<Vec<_>>(), ["files:closed.rs"]);
++    assert_eq!(original.validate(), Ok(()));
++    assert_eq!(spaces.validate(), Ok(()));
++}
