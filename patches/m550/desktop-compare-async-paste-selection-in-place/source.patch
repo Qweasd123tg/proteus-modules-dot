@@ -1,0 +1,60 @@
+diff --git a/vendor/gpui-base/src/input/base/state.rs b/vendor/gpui-base/src/input/base/state.rs
+index 43027c71fe94efa8630ec04c143c9b759309f064..8c4732ebd5017bc5d6edab4db575989d6e712bac 100644
+--- a/vendor/gpui-base/src/input/base/state.rs
++++ b/vendor/gpui-base/src/input/base/state.rs
+@@ -3267,7 +3267,7 @@
+                     // input too.
+                     if this.is_editable()
+                         && this.focus_handle.is_focused(window)
+-                        && this.paste_target() == target
++                        && this.matches_paste_target(&target)
+                     {
+                         this.insert_clipboard(clipboard, window, cx);
+                     }
+@@ -3288,6 +3288,16 @@
+             document_revision: self.document_revision,
+             selections: self.selections.iter().copied().collect(),
+         }
++    }
++
++    fn matches_paste_target(&self, target: &PasteTarget) -> bool {
++        let PasteTarget {
++            document_revision,
++            selections,
++        } = target;
++        self.document_revision == *document_revision
++            && self.selections.len() == selections.len()
++            && self.selections.iter().eq(selections)
+     }
+ 
+     /// Inserts the clipboard text the way `Paste` does: one atomic edit,
+@@ -12018,10 +12028,7 @@
+         setup_cursors(&mut cx, &input, "ab|c");
+         let target = input.read_with(&cx, |state, _| state.paste_target());
+         // Nothing happened: a paste asked for then still applies.
+-        assert_eq!(
+-            input.read_with(&cx, |state, _| state.paste_target()),
+-            target
+-        );
++        assert!(input.read_with(&cx, |state, _| state.matches_paste_target(&target)));
+ 
+         // Moving the caret changes where the paste would go.
+         cx.update(|_, cx| {
+@@ -12034,7 +12041,7 @@
+             });
+         });
+         let moved = input.read_with(&cx, |state, _| state.paste_target());
+-        assert_ne!(moved, target);
++        assert!(!input.read_with(&cx, |state, _| state.matches_paste_target(&target)));
+ 
+         // Editing the text changes it too, even with the caret put back.
+         cx.update(|window, cx| {
+@@ -12046,7 +12053,7 @@
+                     .replace_all(vec![CursorSelection::new(id, 1, 1)]);
+             });
+         });
+-        assert_ne!(input.read_with(&cx, |state, _| state.paste_target()), moved);
++        assert!(!input.read_with(&cx, |state, _| state.matches_paste_target(&moved)));
+     }
+ 
+     #[gpui::test]
