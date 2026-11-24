@@ -1,0 +1,49 @@
+diff --git a/components/session-storage-module/src/main.rs b/components/session-storage-module/src/main.rs
+index 126aa4e..f0256ec 100644
+--- a/components/session-storage-module/src/main.rs
++++ b/components/session-storage-module/src/main.rs
+@@ -43,9 +43,9 @@ impl Export for StorageExport {
+             return self.standard.invoke(method, params, host);
+         }
+         match params.get("operation").and_then(Value::as_str) {
+-            // Canonical reads remain available to legacy hosts and to hosts
+-            // that negotiated projection but fell back to the strict lane.
+-            Some("read_records") => {}
++            // Canonical records and disposable caches do not require
++            // projection negotiation.
++            Some("read_records" | "read_cache") => {}
+             Some("open_display_snapshot" | "read_display_records")
+                 if self.projection_negotiated => {}
+             // Leave the SDK in charge of all other operations and errors,
+diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs
+index 843e205..f6f7222 100644
+--- a/components/session-storage-module/src/display_reply.rs
++++ b/components/session-storage-module/src/display_reply.rs
+@@ -1,4 +1,4 @@
+-//! Preserve the SDK's Value wire shape while moving owned display text into it.
++//! Move owned storage payloads into the SDK's existing Value wire shape.
+ use anyhow::{Context, Result, ensure};
+ use proteus_module_sdk::contracts::{
+     contracts::SessionStorageResponse,
+@@ -10,6 +10,21 @@ use std::mem;
+ 
+ pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value> {
+     let messages = match &mut response {
++        SessionStorageResponse::Metadata {
++            document: Some(document),
++        } => {
++            // ReadCache already hydrated this Value and checked its source.
++            // Serialize the small envelope, not a second copy of the tree.
++            let payload = mem::take(&mut document.value);
++            let mut result = serde_json::to_value(response)?;
++            let slot = result
++                .get_mut("document")
++                .and_then(|value| value.get_mut("value"))
++                .context("serialized cache document omitted its value slot")?;
++            ensure!(slot.is_null(), "serialized cache value slot changed");
++            *slot = payload;
++            return Ok(result);
++        }
+         SessionStorageResponse::DisplaySnapshot {
+             projection: Some(projection),
+         } => mem::take(&mut projection.state.conversation.messages),
