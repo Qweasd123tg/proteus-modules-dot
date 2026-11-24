@@ -1,0 +1,20 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/rows.rs b/crates/proteus-core/src/app_server/transcript/rows.rs
+index eab3c0957efda7527fb30630f85573a7e69e0589..65c335e64f29495a8b4b1190250fede6398b43af 100644
+--- a/crates/proteus-core/src/app_server/transcript/rows.rs
++++ b/crates/proteus-core/src/app_server/transcript/rows.rs
+@@ -79,6 +79,15 @@
+         }
+         if let Some(index) = self.reasoning_rows.get(&message_id) {
+             let row = &mut self.rows[*index];
++            let capacity = row.text.capacity();
++            if capacity >= 8
++                && row.text.len() == capacity
++                && text.len() >= capacity.saturating_mul(3)
++            {
++                // Both pushes would grow this row. The final size dominates
++                // both growth steps; keep that capacity and request it once.
++                let _ = row.text.try_reserve(text.len() + 1);
++            }
+             row.text.push('\n');
+             row.text.push_str(text);
+             return;
