@@ -1,0 +1,28 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -359,19 +359,15 @@
+     if !model.matches(store) {
+         return None;
+     }
+-    let previous = header(store);
++    // Only the prior source and transcript participate in prefix comparison.
++    let previous = header(store).map(|header| (header.source, header.transcript));
+     let conversation = write_transcript(store, source, &model.conversation.messages)?;
+     let transcript = write_transcript(store, source, &model.transcript)?;
+     let context = write_section(store, source, &model.conversation.model_context)?;
+-    let base = previous.as_ref().and_then(|previous| {
++    let base = previous.and_then(|(old_source, old_transcript)| {
+         Some(AppTranscriptBase {
+-            revision: previous.source.revision()?,
+-            common_prefix: common_prefix(
+-                store,
+-                &previous.transcript,
+-                &transcript,
+-                &model.transcript,
+-            )?,
++            revision: old_source.revision()?,
++            common_prefix: common_prefix(store, &old_transcript, &transcript, &model.transcript)?,
+         })
+     });
+     let mut tools = BTreeMap::new();
