@@ -1,0 +1,266 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/append.rs b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+index 1d4dae70b504e80cd5bd28af0ade39a1f0d7d77c..986530a47f469747497adc93ea669fb3df0b8395 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/append.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+@@ -146,7 +146,7 @@ fn inspect_suffix(
+                         independent &= message
+                             .parts
+                             .iter()
+-                            .all(|part| prefix.explicit_committed_parts.contains(&part.part_id));
++                            .all(|part| prefix.has_explicit_part(&part.part_id));
+                     }
+                     // Only an exact retained canonical prefix may
+                     // repeat old identities. Inspect all new parts.
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+index 698615c32fbda3ee5a41a7c03e208850e3401620..0f1bc3aa5da759aeae50a22033afe52c64a43c4c 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+@@ -8,8 +8,7 @@ fn fixture() -> PrefixIdentities {
+         turns: HashSet::from([Uuid::from_u128(9), known]),
+         exchanges: HashSet::from([known]),
+         messages: HashSet::from([Uuid::from_u128(2), known]),
+-        parts: HashSet::from([known, Uuid::from_u128(4)]),
+-        explicit_committed_parts: HashSet::from([known]),
++        parts: HashMap::from([(known, true), (Uuid::from_u128(4), false)]),
+         calls: HashSet::from([String::new(), "not/UUID: э\n✨".into()]),
+     }
+ }
+@@ -22,9 +21,6 @@ fn value(prefix: &PrefixIdentities) -> Value {
+ fn tagged_certificate_preserves_all_exact_sets_and_hash_order() {
+     let original = fixture();
+     let new = value(&original);
+-    assert!(serde_json::from_value::<PrefixIdentities>(new.clone()).is_err());
+-    let old = serde_json::to_value(&original).unwrap();
+-    assert!(PrefixIdentities::decode_cache(old).is_none());
+     for v in [new] {
+         let mut read = PrefixIdentities::decode_cache(v).unwrap();
+         assert_eq!(read.history, original.history);
+@@ -32,17 +28,16 @@ fn tagged_certificate_preserves_all_exact_sets_and_hash_order() {
+         assert_eq!(read.exchanges, original.exchanges);
+         assert_eq!(read.messages, original.messages);
+         assert_eq!(read.parts, original.parts);
+-        assert_eq!(
+-            read.explicit_committed_parts,
+-            original.explicit_committed_parts
+-        );
++        assert!(read.has_explicit_part(&Uuid::from_u128(100)));
++        assert!(!read.has_explicit_part(&Uuid::from_u128(4)));
++        assert!(!read.has_explicit_part(&Uuid::from_u128(101)));
+         assert_eq!(read.calls, original.calls);
+         let mut message =
+             CanonicalMessage::text(crate::model_standard::MessageRole::User, "suffix");
+-        assert!(read.message(&message, true));
++        assert!(read.message(&message, true, false));
+         message.parts[0].part_id = Uuid::from_u128(4);
+         assert!(
+-            !read.message(&message, true),
++            !read.message(&message, true, false),
+             "non-explicit known part still fences append"
+         );
+     }
+@@ -53,7 +48,6 @@ fn tagged_certificate_preserves_all_exact_sets_and_hash_order() {
+ 
+ #[test]
+ fn invalid_tag_encoding_membership_or_duplicate_is_a_cache_miss() {
+-    let original = fixture();
+     let empty = value(&PrefixIdentities::default());
+     for (field, bad) in [
+         ("format", json!(2)),
+@@ -65,6 +59,15 @@ fn invalid_tag_encoding_membership_or_duplicate_is_a_cache_miss() {
+         ("calls", json!(["same", "same"])),
+         ("parts", json!(STANDARD.encode([2; 17]))),
+         ("parts", json!(STANDARD.encode([0; 34]))),
++        // Same UUID with opposing flag still fails the whole certificate.
++        (
++            "parts",
++            json!(STANDARD.encode({
++                let mut rows = [0; 34];
++                rows[33] = 1;
++                rows
++            })),
++        ),
+         ("surprise", json!(true)),
+     ] {
+         let mut v = empty.clone();
+@@ -74,20 +77,42 @@ fn invalid_tag_encoding_membership_or_duplicate_is_a_cache_miss() {
+     let mut no_messages = empty.clone();
+     no_messages.as_object_mut().unwrap().remove("messages");
+     assert!(PrefixIdentities::decode_cache(no_messages).is_none());
+-    let mut hybrid = serde_json::to_value(original).unwrap();
++    let old = json!({
++        "history": [], "turns": [], "exchanges": [], "messages": [],
++        "parts": [Uuid::from_u128(4)], "explicit_committed_parts": [], "calls": [],
++    });
++    assert!(PrefixIdentities::decode_cache(old.clone()).is_none());
++    let mut hybrid = old;
+     hybrid["format"] = json!(0);
+     assert!(PrefixIdentities::decode_cache(hybrid).is_none());
+ }
+ 
+ #[test]
+-fn invalid_subset_and_over_budget_fields_are_not_published_or_used() {
+-    let mut original = fixture();
+-    original
+-        .explicit_committed_parts
+-        .insert(Uuid::from_u128(999));
+-    assert!(original.encode_cache().is_none());
+-
++fn over_budget_fields_are_not_used() {
+     let mut v = value(&PrefixIdentities::default());
+     v["history"] = Value::String("A".repeat(LIMIT + 1));
+     assert!(PrefixIdentities::decode_cache(v).is_none());
+ }
++
++#[test]
++fn observations_can_become_explicit_but_never_undo_a_commit() {
++    let mut prefix = PrefixIdentities::default();
++    let message = CanonicalMessage::text(crate::model_standard::MessageRole::User, "suffix");
++    let id = message.parts[0].part_id;
++    assert!(prefix.message(&message, false, false));
++    assert!(!prefix.has_explicit_part(&id));
++    assert!(!prefix.visit_history_message(&message, true));
++    assert!(
++        !prefix.has_explicit_part(&id),
++        "suffix checking is read only"
++    );
++    assert!(prefix.visit_history_message(&message, false));
++    assert!(prefix.has_explicit_part(&id));
++    assert!(prefix.message(&message, false, false));
++    assert!(prefix.has_explicit_part(&id));
++    assert!(
++        PrefixIdentities::decode_cache(value(&prefix))
++            .unwrap()
++            .has_explicit_part(&id)
++    );
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+index ed00f6c11bf63113d59188da370c4a1dde8d11ba..42300406c16028237463a043c95c5403efd139c3 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+@@ -3,6 +3,7 @@
+ use super::*;
+ use base64::{Engine as _, engine::general_purpose::STANDARD};
+ use proteus_contracts::contracts::SESSION_STORAGE_MAX_CACHE_BYTES as LIMIT;
++use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ use uuid::Uuid;
+ 
+@@ -114,14 +115,11 @@ impl PrefixIdentities {
+         for call in &self.calls {
+             left = left.checked_sub(call.len().checked_add(2)?)?;
+         }
+-        if !self.explicit_committed_parts.is_subset(&self.parts) {
+-            return None;
+-        }
+         let parts = pack(
+-            self.parts.iter().map(|id| {
++            self.parts.iter().map(|(id, explicit)| {
+                 let mut record = [0; 17];
+                 record[..16].copy_from_slice(id.as_bytes());
+-                record[16] = u8::from(self.explicit_committed_parts.contains(id));
++                record[16] = u8::from(*explicit);
+                 record
+             }),
+             self.parts.len(),
+@@ -170,12 +168,12 @@ impl PrefixIdentities {
+         }
+         unpack(data.parts, |record: [u8; 17]| {
+             let id = Uuid::from_slice(&record[..16]).ok()?;
+-            result.parts.insert(id).then_some(())?;
+-            match record[16] {
+-                0 => Some(()),
+-                1 => result.explicit_committed_parts.insert(id).then_some(()),
+-                _ => None,
+-            }
++            let explicit = match record[16] {
++                0 => false,
++                1 => true,
++                _ => return None,
++            };
++            result.parts.insert(id, explicit).is_none().then_some(())
+         })?;
+         Some(result)
+     }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+index df9232b9686926c03492d4a4423156dba3825390..24d4725380537aaddd0b1ab8b545a0e6afc1f953 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+@@ -4,23 +4,21 @@ use crate::{
+     domain::{CallId, ExchangeId, MessageId, PartId, TurnId},
+     model_standard::{CanonicalMessage, ContentPart},
+ };
+-use serde::{Deserialize, Serialize};
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ 
+ mod packed;
+ 
+ /// Prefix-only identities. New identities are deliberately not inserted during
+ /// suffix inspection: repeats and forward references within one new turn need
+ /// the complete suffix renderer, but cannot affect previously cached rows.
+-#[derive(Debug, Default, Serialize, Deserialize)]
+-#[serde(deny_unknown_fields)]
++#[derive(Debug, Default)]
+ pub(crate) struct PrefixIdentities {
+     pub(super) history: Vec<[u8; 32]>,
+     turns: HashSet<TurnId>,
+     exchanges: HashSet<ExchangeId>,
+     messages: HashSet<MessageId>,
+-    parts: HashSet<PartId>,
+-    pub(crate) explicit_committed_parts: HashSet<PartId>,
++    // Keep all observed parts; the bit records whether history ever committed one.
++    parts: HashMap<PartId, bool>,
+     calls: HashSet<CallId>,
+ }
+ 
+@@ -37,13 +35,13 @@ impl PrefixIdentities {
+             // dates and may become visible when a later record commits a part.
+             JournalEntry::ModelMessageRecorded(item) => {
+                 independent &= identity(&mut self.exchanges, item.exchange_id, suffix);
+-                independent &= self.message(&item.message, suffix);
++                independent &= self.message(&item.message, suffix, false);
+             }
+             JournalEntry::ModelResponseRecorded(item) => {
+                 independent &= identity(&mut self.exchanges, item.exchange_id, suffix);
+                 if let ModelResponseOutcome::Response { response } = &item.outcome {
+                     for message in &response.messages {
+-                        independent &= self.message(message, suffix);
++                        independent &= self.message(message, suffix, false);
+                     }
+                     for call in &response.tool_calls {
+                         independent &= identity(&mut self.calls, call.id.clone(), suffix);
+@@ -80,20 +78,27 @@ impl PrefixIdentities {
+         turn.is_none_or(|turn| identity(&mut self.turns, turn, suffix))
+     }
+ 
++    pub(crate) fn has_explicit_part(&self, id: &PartId) -> bool {
++        self.parts.get(id).copied().unwrap_or(false)
++    }
++
+     fn visit_history_message(&mut self, message: &CanonicalMessage, suffix: bool) -> bool {
+-        if !suffix {
+-            self.explicit_committed_parts
+-                .extend(message.parts.iter().map(|part| part.part_id));
+-        }
+-        self.message(message, suffix)
++        self.message(message, suffix, true)
+     }
+ 
+-    fn message(&mut self, message: &CanonicalMessage, suffix: bool) -> bool {
++    fn message(&mut self, message: &CanonicalMessage, suffix: bool, explicit: bool) -> bool {
+         let mut independent = identity(&mut self.messages, message.id, suffix);
+         // Include every part, regardless of scope or provenance. Hidden parts
+         // can be rehosted and still determine the first durable occurrence.
+         for part in &message.parts {
+-            independent &= identity(&mut self.parts, part.part_id, suffix);
++            if suffix {
++                independent &= !self.parts.contains_key(&part.part_id);
++            } else if explicit {
++                self.parts.insert(part.part_id, true);
++            } else {
++                // A later model observation must not undo an earlier commit.
++                self.parts.entry(part.part_id).or_insert(false);
++            }
+             match &part.payload {
+                 ContentPart::ToolCall { call } => {
+                     independent &= identity(&mut self.calls, call.id.clone(), suffix);
