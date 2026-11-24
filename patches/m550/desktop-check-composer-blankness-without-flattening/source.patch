@@ -1,0 +1,81 @@
+diff --git a/vendor/gpui-base/src/input/base/state.rs b/vendor/gpui-base/src/input/base/state.rs
+index eaae30dc5977168bb8f74d9a10707001af94e925..f14602c5fffb2c0003b10ce13d091d1d685eb059 100644
+--- a/vendor/gpui-base/src/input/base/state.rs
++++ b/vendor/gpui-base/src/input/base/state.rs
+@@ -1675,6 +1675,15 @@
+         SharedString::new(self.text.to_string())
+     }
+ 
++    /// Whether the value is empty or contains only Unicode whitespace.
++    /// Check borrowed chunks instead of materializing the whole editor buffer.
++    pub fn is_blank(&self) -> bool {
++        match self.text.as_str() {
++            Some(text) => text.trim().is_empty(),
++            None => self.text.chunks().all(|chunk| chunk.trim().is_empty()),
++        }
++    }
++
+     /// Return the portion of the value within the input field that
+     /// is selected by the user, as an owned string.
+     ///
+diff --git a/src/ui/chat/mod.rs b/src/ui/chat/mod.rs
+index 07bc0bc226edd787a56718eb1f1f5de2198be1a2..4fbcc4f44e10a48b385bf37df95d63619e4c7ea1 100644
+--- a/src/ui/chat/mod.rs
++++ b/src/ui/chat/mod.rs
+@@ -455,7 +455,7 @@
+                     return;
+                 }
+                 let empty =
+-                    this.composer.read(cx).value().trim().is_empty() && this.attachments.is_empty();
++                    this.composer.read(cx).is_blank() && this.attachments.is_empty();
+                 if !(empty && this.confirm_pending(window, cx)) {
+                     this.send(window, cx);
+                 }
+@@ -479,7 +479,7 @@
+         self.session.transcript.entries().is_empty()
+             && self.session.feedback.visible_sends().next().is_none()
+             && !self.session.running()
+-            && self.composer.read(cx).value().trim().is_empty()
++            && self.composer.read(cx).is_blank()
+             && self.attachments.is_empty()
+             && !self.attachments_loading
+             && self.saved_drafts.is_empty()
+diff --git a/src/ui/chat/draft.rs b/src/ui/chat/draft.rs
+index e1eeefcc650c458f258f1344e7f8bb83b1b29490..5d1e7e81ae42a040646f0e1805b5ab1b978a9e08 100644
+--- a/src/ui/chat/draft.rs
++++ b/src/ui/chat/draft.rs
+@@ -24,7 +24,7 @@
+ 
+ impl Chat {
+     pub(super) fn has_draft(&self, cx: &App) -> bool {
+-        !self.composer.read(cx).value().trim().is_empty()
++        !self.composer.read(cx).is_blank()
+             || !self.attachments.is_empty()
+             || self.attachments_loading
+     }
+diff --git a/src/ui/chat/codex/requests.rs b/src/ui/chat/codex/requests.rs
+index ca4a6d295816a1275d37cefce6515f8c725764b3..80aab371cf6433738ec0b2a3562beefe3523d5e6 100644
+--- a/src/ui/chat/codex/requests.rs
++++ b/src/ui/chat/codex/requests.rs
+@@ -224,7 +224,7 @@
+                             })
+                             .clone();
+                         let selected = self.codex.as_ref().unwrap().selected.get(&key).cloned();
+-                        answered &= !input.read(cx).value().trim().is_empty() || selected.is_some();
++                        answered &= !input.read(cx).is_blank() || selected.is_some();
+                         let mut body = v_flex().gap_1().child(
+                             div().text_sm().child(
+                                 question
+diff --git a/vendor/gpui-base/src/questionnaire/state.rs b/vendor/gpui-base/src/questionnaire/state.rs
+index 7342147738412def2f03410ae2ac53f01dcdb417..25f545a94f1331df05c996bf5e82123c0af52122 100644
+--- a/vendor/gpui-base/src/questionnaire/state.rs
++++ b/vendor/gpui-base/src/questionnaire/state.rs
+@@ -328,7 +328,7 @@
+         };
+         self.items[item_ix]
+             .input()
+-            .is_some_and(|input| !input.state().read(cx).value().trim().is_empty())
++            .is_some_and(|input| !input.state().read(cx).is_blank())
+     }
+ 
+     pub fn focused_current_choice(&self, window: &Window) -> Option<&SharedString> {
