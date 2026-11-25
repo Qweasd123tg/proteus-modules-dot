@@ -1,0 +1,21 @@
+diff --git a/scripts/cargo_binary.py b/scripts/cargo_binary.py
+index c04cceb22c6f483249baa8d06d9f3ae38ff8773e..56da0e15997ab86fcb0f63971e17415a8e1fa907 100644
+--- a/scripts/cargo_binary.py
++++ b/scripts/cargo_binary.py
+@@ -117,12 +117,15 @@
+         artifact_manifest = message.get("manifest_path")
+         if not isinstance(artifact_manifest, str):
+             continue
++        target_name = target.get("name")
++        if isinstance(target_name, str) and target_name and target_name != binary:
++            continue
+         artifact_manifest = Path(artifact_manifest)
+         if not artifact_manifest.is_absolute():
+             artifact_manifest = cwd / artifact_manifest
+         if (
+             artifact_manifest.resolve() != manifest
+-            or target.get("name") != binary
++            or target_name != binary
+             or target.get("kind") != ["bin"]
+             or profile.get("test", False)
+         ):
