@@ -1,0 +1,20 @@
+diff --git a/workflow/opencode-runtime/compaction.mjs b/workflow/opencode-runtime/compaction.mjs
+index 55724336a0a127fe794faa82b28cb2d8ebfe48d9..2560f88deb07267ff388b1bc36512f3661ddbb88 100644
+--- a/workflow/opencode-runtime/compaction.mjs
++++ b/workflow/opencode-runtime/compaction.mjs
+@@ -177,8 +177,13 @@
+         throw new Error(`Unsupported upstream compaction prompt content ${part.type}`);
+     });
+     const canonicalMessage = canonical(({ user: "User", assistant: "Assistant", tool: "Tool", system: "System" })[message.role], parts[0] ?? { Text: { text: "" } }, "runtime");
+-    canonicalMessage.parts = parts.map((payload, index) => index === 0 ? canonicalMessage.parts[0]
+-        : { part_id: randomUUID(), provenance: "runtime", scope: "conversation", payload });
++    // Reuse the private vector only after every payload has been validated.
++    for (let index = 0; index < parts.length; index++) {
++        if (!(index in parts)) continue;
++        parts[index] = index === 0 ? canonicalMessage.parts[0]
++            : { part_id: randomUUID(), provenance: "runtime", scope: "conversation", payload: parts[index] };
++    }
++    canonicalMessage.parts = parts;
+     return canonicalMessage;
+ }
+ 
