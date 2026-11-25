@@ -1,0 +1,19 @@
+diff --git a/experiments/performance/session-projection/bench.py b/experiments/performance/session-projection/bench.py
+index 2013aee4249b0cf58940294e3a5839b02bbdd24c..580c4d2d814855d813ebfa71ea673e6afce75305 100644
+--- a/experiments/performance/session-projection/bench.py
++++ b/experiments/performance/session-projection/bench.py
+@@ -33,8 +33,12 @@
+ 
+ def entries(count, payload_bytes):
+     # Deliberately large tool output, not the assistant's text projection.
+-    return [dict(role="assistant", tool=dict(name="synthetic", args={}, result="x" * payload_bytes), subagent=None)
+-            for _ in range(count)]
++    indices = range(count)
++    if not indices:
++        return []
++    payload = "x" * payload_bytes
++    return [dict(role="assistant", tool=dict(name="synthetic", args={}, result=payload), subagent=None)
++            for _ in indices]
+ 
+ 
+ def wait_badge(process, view):
