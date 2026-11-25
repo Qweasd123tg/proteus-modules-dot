@@ -1,0 +1,14 @@
+diff --git a/examples/performance/native-history/run.py b/examples/performance/native-history/run.py
+index eac7fbbb77f7acea61e1ca1014ab2c2c12d349bd..6ff96c23c54a6b95af072ba767b4f82d3e57d887 100644
+--- a/examples/performance/native-history/run.py
++++ b/examples/performance/native-history/run.py
+@@ -229,6 +229,9 @@
+                     if ready_at is not None and time.monotonic()-ready_at >= args.settle:
+                         if recorder.phase != 'idle':
+                             recorder.mark('idle')
++                    # Raw samples are flushed; only the last supplies snapshot process details.
++                    if samples:
++                        samples[-1].pop('processes', None)
+                     row = recorder.sample()
+                     samples.append(row)
+                     assert not row['memory_incomplete_pids'], row['memory_incomplete_pids']
