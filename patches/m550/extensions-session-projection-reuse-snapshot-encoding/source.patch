@@ -1,0 +1,43 @@
+diff --git a/experiments/native-renderers/bench.py b/experiments/native-renderers/bench.py
+index b2e4fcaba1b4745c64dea0312f5d362fcfc4ab82..a6a424bb17a4c9205a90d0ae43dab813e2e942dc 100644
+--- a/experiments/native-renderers/bench.py
++++ b/experiments/native-renderers/bench.py
+@@ -125,11 +125,21 @@
+                                         monotonic=time.monotonic()), ensure_ascii=False) + "\n")
+         self.trace.flush()
+ 
+-    def send(self, message):
++    @staticmethod
++    def _wire_payload(message):
++        return memoryview((json.dumps(message, ensure_ascii=False) + "\n").encode())
++
++    def send(self, message, *, on_encoded_bytes=None):
++        payload = None
++        if on_encoded_bytes is not None:
++            # Some reports record the planned frame length even if the peer exits.
++            payload = self._wire_payload(message)
++            on_encoded_bytes(len(payload) - 1)  # Exclude the framing LF.
+         if self.child.poll() is not None:
+             raise RuntimeError(f"renderer exited: {self.child.returncode}")
+         self.event("send", message)
+-        payload = memoryview((json.dumps(message, ensure_ascii=False) + "\n").encode())
++        if payload is None:
++            payload = self._wire_payload(message)
+         deadline = time.monotonic() + self.timeout
+         while payload:
+             remaining = deadline - time.monotonic()
+diff --git a/experiments/performance/session-projection/bench.py b/experiments/performance/session-projection/bench.py
+index 2013aee4249b0cf58940294e3a5839b02bbdd24c..85c5768845b3ffeae964946547a201498d5aed2b 100644
+--- a/experiments/performance/session-projection/bench.py
++++ b/experiments/performance/session-projection/bench.py
+@@ -83,8 +83,8 @@
+                 full = args.full or manifest.get("session_entries", True)
+                 message = dict(type="session_snapshot", context="synthetic", session_dir="/synthetic/projection",
+                                state=state(), entries=entries(args.entries, args.payload_kib * 1024) if full else [])
+-                row["snapshot_encoded_bytes"] = len(json.dumps(message).encode())
+-                process.send(message)
++                # This fixture's printable ASCII gives the same bytes as the legacy count.
++                process.send(message, on_encoded_bytes=lambda size: row.update(snapshot_encoded_bytes=size))
+                 del message
+                 process.send(dict(type="render", context="synthetic", session_dir="/synthetic/projection", view="badge", surface="badge"))
+                 first = wait_badge(process, "badge")
