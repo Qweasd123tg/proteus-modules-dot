@@ -1,0 +1,114 @@
+diff --git a/tool/pi-tools/worker.mjs b/tool/pi-tools/worker.mjs
+index c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65..32d34b43ecacc6055f6f5332d13b960c5f699018 100644
+--- a/tool/pi-tools/worker.mjs
++++ b/tool/pi-tools/worker.mjs
+@@ -8,6 +8,6 @@
+         return modelExport(binding);
+     }
+     if (binding.slot === "tool") return createPiToolsExport(binding);
+-    const { createExport } = await import("../../workflow/pi-runtime/exports.mjs");
+-    return createExport(binding);
++    const { createJsonLineExport } = await import("../../workflow/pi-runtime/exports.mjs");
++    return createJsonLineExport(binding);
+ });
+diff --git a/workflow/pi-runtime/compaction.mjs b/workflow/pi-runtime/compaction.mjs
+index 0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c..721d198a31dfe37b44988c406b4342add6825e0d 100644
+--- a/workflow/pi-runtime/compaction.mjs
++++ b/workflow/pi-runtime/compaction.mjs
+@@ -1,5 +1,5 @@
+ import { canonical } from "../../components/module-runtime-js/canonical.mjs";
+-import { piMessages, assistant, finishedStream } from "../../components/pi-runtime-js/messages.mjs";
++import { piMessage, piMessages, assistant, finishedStream } from "../../components/pi-runtime-js/messages.mjs";
+ import {
+     prepareCompaction,
+     compact,
+@@ -11,16 +11,40 @@
+     resolveModel,
+ } from "./upstream.mjs";
+ 
+-export async function preparation(params, { hostCall, signal, catalogProvider }) {
++export function preparation(params, invocation) {
++    return prepare(params, invocation, false);
++}
++
++export function preparationFromJsonLine(params, invocation) {
++    return prepare(params, invocation, true);
++}
++
++async function prepare(params, { hostCall, signal, catalogProvider }, jsonLineInputs) {
+     const { event } = params;
+     const unchanged = { result: { action: "continue" } };
+     if (event.event !== "before_context" || !event.input.request) return unchanged;
+     const request = event.input.request;
+     const model = resolveModel(request.model, catalogProvider);
+     const messages = event.output.messages;
++    const hint = jsonLineInputs ? event.input.token_estimate : undefined;
++    // Only the worker's parsed JSON-line requests can take this path. The
++    // pinned Pi predicate uses scalar settings and does not inspect the rows.
++    const decision = jsonLineInputs && event.input.reason === "pi_before_sampling"
++        && event.output.changed === false && Array.isArray(messages)
++        && Number.isInteger(hint) && hint >= 0 && hint <= 0xffff_ffff
++        && Number.isFinite(model.contextWindow)
++        ? shouldCompact(hint, model.contextWindow, DEFAULT_COMPACTION_SETTINGS)
++        : undefined;
++    if (decision === false) {
++        const names = new Map();
++        // Keep the same chronological conversion, including its validation
++        // errors and cross-row tool names, without retaining the results.
++        messages.forEach(message => { piMessage(message, model, names); });
++        return unchanged;
++    }
+     const pi = piMessages(messages, model);
+-    const tokens = event.input.token_estimate ?? estimateContextTokens(pi).tokens;
+-    if (!shouldCompact(tokens, model.contextWindow, DEFAULT_COMPACTION_SETTINGS)) return unchanged;
++    const tokens = (jsonLineInputs ? hint : event.input.token_estimate) ?? estimateContextTokens(pi).tokens;
++    if (!(decision ?? shouldCompact(tokens, model.contextWindow, DEFAULT_COMPACTION_SETTINGS))) return unchanged;
+     const entries = messages.map((m, i) => {
+         const common = {
+             id: m.id,
+diff --git a/workflow/pi-runtime/exports.mjs b/workflow/pi-runtime/exports.mjs
+index d0f5a2c7c261140ae52edaf3e7434550681e4b9b..1a57c5c94577d6c8b041930b6e114107650a1d99 100644
+--- a/workflow/pi-runtime/exports.mjs
++++ b/workflow/pi-runtime/exports.mjs
+@@ -1,14 +1,22 @@
+ import { workflow } from "./loop.mjs";
+-import { preparation } from "./compaction.mjs";
++import { preparation, preparationFromJsonLine } from "./compaction.mjs";
+ import { context } from "./context.mjs";
+ 
+ const slots = {
+     workflow: { id: "pi_loop", version: "v22", method: "run", handle: workflow },
+-    hook: { id: "pi_compact", version: "v8", method: "hook.invoke", handle: preparation },
++    hook: { id: "pi_compact", version: "v8", method: "hook.invoke" },
+     context: { id: "pi_context", version: "v3", method: "build", handle: context },
+ };
+ 
+ export function createExport(binding) {
++    return createBoundExport(binding, preparation);
++}
++
++export function createJsonLineExport(binding) {
++    return createBoundExport(binding, preparationFromJsonLine);
++}
++
++function createBoundExport(binding, prepare) {
+     const contract = slots[binding.slot];
+     if (
+         !contract ||
+@@ -19,6 +27,7 @@
+             !["openai-codex", "opencode-go"].includes(binding.module_config.catalog_provider))
+     )
+         throw new Error("Invalid Pi export binding");
++    const handle = contract.handle ?? prepare;
+     return {
+         manifest: {
+             slot: binding.slot,
+@@ -30,7 +39,7 @@
+         },
+         invoke(method, params, invocation) {
+             if (method !== contract.method) throw new Error("Unsupported Pi invocation " + method);
+-            return contract.handle(params, {
++            return handle(params, {
+                 ...invocation,
+                 catalogProvider: binding.module_config.catalog_provider ?? "openai-codex",
+             });
