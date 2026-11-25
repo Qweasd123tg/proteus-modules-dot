@@ -1,0 +1,30 @@
+diff --git a/workflow/opencode-runtime/workflow.mjs b/workflow/opencode-runtime/workflow.mjs
+index ee2a744b936bf36a7eb45f28ea4adb65ca43c94c..92f80becd37e8aec47ebb98af35a014d6a3552b1 100644
+--- a/workflow/opencode-runtime/workflow.mjs
++++ b/workflow/opencode-runtime/workflow.mjs
+@@ -88,6 +88,14 @@
+         { type: "finish" },
+     );
+     return events;
++}
++
++function replyText(reply) {
++    const fragments = [];
++    for (const message of reply.messages)
++        for (const part of message.parts)
++            if (part.payload.Text) fragments.push(part.payload.Text.text);
++    return fragments.join("\n");
+ }
+ 
+ export async function workflow({ task, history, runtime }, { hostCall, signal }) {
+@@ -240,9 +248,7 @@
+             messages.push(...reply.messages);
+             progress.new_messages.push(...reply.messages);
+             await checkpoint([...bindings.values()]);
+-            text = reply.messages
+-                .flatMap((m) => m.parts.flatMap((p) => (p.payload.Text ? [p.payload.Text.text] : [])))
+-                .join("\n");
++            text = replyText(reply);
+             lastUsage = reply.usage ? reply.usage.input_tokens + reply.usage.output_tokens : null;
+             const results = new Map();
+             const dispatch = toolBarrier(selection.tools, signal);
