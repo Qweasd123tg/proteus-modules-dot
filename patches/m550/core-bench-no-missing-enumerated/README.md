@@ -1,0 +1,5 @@
+# Benchmarks: report a known gap in the sampled process tree
+
+When the sampler discovers a process but cannot observe the same identity by the end of the sweep, mark that sample incomplete. Do not count the missing process as zero or attribute memory to a recycled PID. The existing Desktop check sees that status. Core history-scale keeps the raw row but does not admit incomplete subject samples to its summary. It exempts only an omitted identity proven to be the configured controller root, which belongs outside the Core subject, not outside the full tree.
+
+Exact Core main, Desktop-pinned Core revision and M481. Apply and reverse match. Four existing synthetic sampler tests passed on each arm, and 12 paired cases used the real sampler, Recorder and Core summary gate with synthetic process data. Numeric sums of the actually observed rows and the safety-cap and missing-field diagnostics were unchanged. This cannot detect children missed before enumeration or retroactively classify old reports.

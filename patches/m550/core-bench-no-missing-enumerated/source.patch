@@ -1,0 +1,60 @@
+diff --git a/examples/performance/common/proc_sampler.py b/examples/performance/common/proc_sampler.py
+index 08738374e8abaf0a255dca6e946e823543111e0c..f36b23d8efe1a40b4f90a609329fabf8d74a0e89 100644
+--- a/examples/performance/common/proc_sampler.py
++++ b/examples/performance/common/proc_sampler.py
+@@ -148,10 +148,12 @@
+         deltas = {field: 0 for field in COUNTERS}
+         cpu_missing_baselines = []
+         alive = set()
++        unobserved_owned = []
+         elapsed = None if self.previous_ns is None else (started_ns - self.previous_ns) / 1e9
+         for pid in sorted(roots):
+             row = self._observe(pid, current[pid]["start_ticks"])
+             if row is None:
++                unobserved_owned.append(dict(pid=pid, start_ticks=current[pid]["start_ticks"]))
+                 continue
+             identity = (pid, row["start_ticks"])
+             lifetime_prior = self.last.get(identity)
+@@ -210,6 +212,12 @@
+                                            for pid, start in sorted(self.previous_alive - alive)],
+             "scan_duration_seconds": (time.monotonic_ns() - started_ns) / 1e9,
+         }
++        # Save the census identity, not the replacement PID generation. These
++        # members have no trustworthy memory row or observed per-role group.
++        result["memory_unobserved_owned"] = unobserved_owned
++        if unobserved_owned:
++            result["memory_incomplete_pids"].extend(item["pid"] for item in unobserved_owned)
++            result["memory_incomplete_pids"].sort()
+         for key in self.peaks:
+             if result[key] >= self.peaks[key]:
+                 self.peaks[key] = result[key]
+diff --git a/examples/performance/history-scale/measurement.py b/examples/performance/history-scale/measurement.py
+index 60a5acaea4674134133c8865e8b873c9fdd4d7ea..1c9fc171562d64a62f97002c4100a39104d49da7 100644
+--- a/examples/performance/history-scale/measurement.py
++++ b/examples/performance/history-scale/measurement.py
+@@ -43,13 +43,22 @@
+                                         for field in ("cpu_ticks", "read_bytes", "write_bytes", "rchar", "wchar")}
+         event["subject"] = subject
+         self.log.write(event)
+-        self.small.append(dict(phase=event["phase"], monotonic_ns=event["monotonic_ns"],
+-                               interval_seconds=event["interval_seconds"],
+-                               phase_interval_eligible=event["phase_interval_eligible"], **subject))
++        # Only the exact configured controller root has a known exclusion
++        # without an observed row. A non-root can have exec'd into the subject.
++        controller = ((event["root_pid"], event["root_start_ticks"])
++                      if self.tree.root_group == "controller" else None)
++        unobserved = [item for item in event["memory_unobserved_owned"]
++                      if (item["pid"], item["start_ticks"]) != controller]
++        if not unobserved:
++            self.small.append(dict(phase=event["phase"], monotonic_ns=event["monotonic_ns"],
++                                   interval_seconds=event["interval_seconds"],
++                                   phase_interval_eligible=event["phase_interval_eligible"], **subject))
+         if subject["pss_swap_kib"] > self.args.max_pss_mib * 1024:
+             raise MemoryError(f"subject PSS+SwapPss exceeded {self.args.max_pss_mib} MiB")
+         if subject["memory_incomplete_pids"]:
+             raise RuntimeError(f"incomplete subject memory sample: {subject['memory_incomplete_pids']}")
++        if unobserved:
++            raise RuntimeError(f"unobserved owned processes: {unobserved}")
+         if time.monotonic() - self.started > self.args.timeout:
+             raise TimeoutError(f"case exceeded {self.args.timeout} seconds")
+         return subject
