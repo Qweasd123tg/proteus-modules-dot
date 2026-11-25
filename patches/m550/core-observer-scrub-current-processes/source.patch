@@ -1,0 +1,35 @@
+diff --git a/examples/performance/history-scale/clone_read.py b/examples/performance/history-scale/clone_read.py
+index 993176c01d383776b6c1ed4e41da5ae82b6bc5b8..51c309baf8fbb50cab6eea327faddaacdd6304d2 100644
+--- a/examples/performance/history-scale/clone_read.py
++++ b/examples/performance/history-scale/clone_read.py
+@@ -74,16 +74,25 @@
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.sampled_backend_identities = set()
++        self._redaction_pending = False
+ 
+     def sample(self, phase=None):
++        # A failed sample can leave partially updated retained rows behind.
++        recover = getattr(self, "_redaction_pending", True)
++        self._redaction_pending = True
+         event = super().sample(phase)
++        observed = event["processes"]
+         self.sampled_backend_identities.update(
+-            (row["pid"], row["start_ticks"]) for row in event["processes"]
++            (row["pid"], row["start_ticks"]) for row in observed
+             if row["group"] == "backend")
+-        for row in [*event["processes"], *self.last.values()]:
+-            row["argv"] = []
+-            row["argv_redacted"] = True
+-            row["errors"] = {key: "unavailable" for key in row.get("errors", {})}
++        retained = self.last.values() if recover else (
++            self.last[(row["pid"], row["start_ticks"])] for row in observed)
++        for rows in (observed, retained):
++            for row in rows:
++                row["argv"] = []
++                row["argv_redacted"] = True
++                row["errors"] = {key: "unavailable" for key in row.get("errors", {})}
++        self._redaction_pending = False
+         return event
+ 
+ 
