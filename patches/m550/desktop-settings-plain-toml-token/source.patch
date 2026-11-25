@@ -1,0 +1,18 @@
+diff --git a/scripts/settings-migration.py b/scripts/settings-migration.py
+index 102395fec955121dd9cf2949e9aa3a1877e0b7b5..b037f26c92454ac1b8755e66c566bf9995998cb9 100755
+--- a/scripts/settings-migration.py
++++ b/scripts/settings-migration.py
+@@ -235,7 +235,12 @@ def relocate(data, suffix, mappings, *, preferences_at=None):
+         token = match.group()
+         if token.startswith('#'):
+             return token
+-        original = tomllib.loads('value = ' + token)['value']
++        # Simple printable ASCII strings need no TOML escape decoding.
++        if (not token.startswith(('"""', "'''"))
++                and token.isascii() and token.isprintable() and '\\' not in token):
++            original = token[1:-1]
++        else:
++            original = tomllib.loads('value = ' + token)['value']
+         moved = path_value(original)
+         return json.dumps(moved, ensure_ascii=False) if moved != original else token
+ 
