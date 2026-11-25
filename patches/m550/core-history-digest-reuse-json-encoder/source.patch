@@ -1,0 +1,16 @@
+diff --git a/examples/performance/history-scale/journal.py b/examples/performance/history-scale/journal.py
+index 68566f63d951239e50ba69fa5e596fe51b96c405..fcf6dcb0bafad9832a8bf3a510d953ad6134a8bb 100644
+--- a/examples/performance/history-scale/journal.py
++++ b/examples/performance/history-scale/journal.py
+@@ -48,9 +48,10 @@ def text(message):
+ def message_digest(messages):
+     value = hashlib.sha256()
+     count = 0
++    encode = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode
+     for message in messages:
+         # IDs, part IDs, roles, metadata and text must all survive unchanged.
+-        encoded = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
++        encoded = encode(message).encode()
+         value.update(len(encoded).to_bytes(8, "little"))
+         value.update(encoded)
+         count += 1
