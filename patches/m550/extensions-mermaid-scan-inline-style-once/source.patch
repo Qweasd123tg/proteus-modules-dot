@@ -1,0 +1,26 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b..86f43221640fbbbfb7547678001402b2ed1cedd0 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -140,15 +140,18 @@
+     }
+     const style = declarations(attributes.find(([key]) => key === 'style')?.[1] ?? '');
+     let variables = parent.variables;
++    let declaredColor;
+     for (const [key, value] of style) {
+-      if (!key.startsWith('--')) continue;
++      if (!key.startsWith('--')) {
++        if (key === 'color') declaredColor ??= value;
++        continue;
++      }
+       // Inherited values are read-only until this element introduces its own.
+       if (variables === parent.variables) variables = new Map(variables);
+       variables.set(key, value);
+     }
+     let color = parent.color;
+-    const declaredColor = style.find(([key]) => key === 'color')?.[1]
+-      ?? attributes.find(([key]) => key === 'color')?.[1];
++    declaredColor ??= attributes.find(([key]) => key === 'color')?.[1];
+     if (declaredColor && declaredColor.toLowerCase() !== 'currentcolor') {
+       color = resolveVariables(declaredColor, variables);
+     }

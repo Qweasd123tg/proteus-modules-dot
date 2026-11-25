@@ -1,0 +1,196 @@
+{
+  "repo": "Proteus-harness/Proteus-desktop-extensions",
+  "owner_base": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+  "source_gate_sha256": "cfa6acff2adb6485fa8e78a8bc5376353a8dc3ef6a9d835bc29485ee07fe0ed3",
+  "source_patch_sha256": "b63df03fdbcf16e89f2bec6a826c85f55b68e4004abd00cea3588ff7b2b2db22",
+  "selection": "Use source.patch only on the exact owner preimage or use the scoped alternate after the recorded same-file predecessor changes, not both.",
+  "alternate_scoped_patch": "diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs\nindex 1eecae1506bc0151767aa2bdc616d7b85c53c07e..b38487ffee9e4dc100072ea17eec6a3a125b3196 100644\n--- a/packages/mermaid-render/svg-theme.mjs\n+++ b/packages/mermaid-render/svg-theme.mjs\n@@ -166,14 +166,18 @@\n     }\n     const style = declarations(inlineStyle ?? '');\n     let variables = parent.variables;\n+    let declaredColor;\n     for (const [key, value] of style) {\n-      if (!key.startsWith('--')) continue;\n+      if (!key.startsWith('--')) {\n+        if (key === 'color') declaredColor ??= value;\n+        continue;\n+      }\n       // Inherited values are read-only until this element introduces its own.\n       if (variables === parent.variables) variables = new Map(variables);\n       variables.set(key, value);\n     }\n     let color = parent.color;\n-    const declaredColor = style.find(([key]) => key === 'color')?.[1] ?? inlineColor;\n+    declaredColor ??= inlineColor;\n     if (declaredColor && declaredColor.toLowerCase() !== 'currentcolor') {\n       color = resolveVariables(declaredColor, variables);\n     }\n",
+  "alternate_scoped_patch_sha256": "d6e719283128a8567114640644f6195ebd7d142e49310b11e290a55855c64af0",
+  "alternate": {
+    "after": {
+      "packages/mermaid-render/svg-theme.mjs": {
+        "bytes": 8698,
+        "git": "b38487ffee9e4dc100072ea17eec6a3a125b3196",
+        "sha256": "19660969f73e218e11a198f4be289a1fcc2c035e8cb2d01d73ceb99047af9bae"
+      }
+    },
+    "before": {
+      "packages/mermaid-render/svg-theme.mjs": {
+        "bytes": 8654,
+        "git": "1eecae1506bc0151767aa2bdc616d7b85c53c07e",
+        "sha256": "b46192c78ac96402f2304299c6db2de7218471064cd64b74e96b1b62519e9152"
+      }
+    },
+    "chronological_scope": {
+      "736": {
+        "path": "packages/mermaid-render/svg-theme.mjs",
+        "result": "66234f215e855fcd63a5b7ed5928e47b973f13ae",
+        "source_on_this_scope": {
+          "bytes": 1516,
+          "git": "b4eba415c0cf8d519a330c24135ad86ce1d3ff03",
+          "sha256": "901b872090d3591025c32e9d2ead927fd79e9322b67e4c1bbbe4505a7e5f6556"
+        }
+      },
+      "754": {
+        "path": "packages/mermaid-render/svg-theme.mjs",
+        "result": "385fd333e05b1dd1ef8ada5dd756f90ec0550ca2",
+        "source_on_this_scope": {
+          "bytes": 1529,
+          "git": "907c44743bc95ab42642c9e772c443a22182deee",
+          "sha256": "1a0241e26278ad56783b9b2470cccfa090420fdb62d0a69c58ba63517b6c1f2b"
+        }
+      },
+      "758": {
+        "path": "packages/mermaid-render/worker.mjs",
+        "result": "4d750203f9dc38bbc03e479e111127d3aca41c58",
+        "source_on_this_scope": {
+          "bytes": 2639,
+          "git": "305c9a39b6121a772ce0c1347433b5c7bf407d1f",
+          "sha256": "ae805c38508987a6d102585504d0bf2a12da6a4fcc171fba18223d3eeaacf6c2"
+        }
+      },
+      "769": {
+        "path": "packages/mermaid-render/svg-theme.mjs",
+        "result": "424597dd7cf0d25d1520c86201534b60c3f83b0e",
+        "source_on_this_scope": {
+          "bytes": 817,
+          "git": "388c5d65fc09cee51298d74bad61af50daf8eaae",
+          "sha256": "2e77c559aaf7a9ca1a87e3c0b08833a13741477b771a83fd0f3d3f2ee64015f9"
+        }
+      },
+      "778": {
+        "path": "packages/mermaid-render/svg-theme.mjs",
+        "result": "1eecae1506bc0151767aa2bdc616d7b85c53c07e",
+        "source_on_this_scope": {
+          "bytes": 1385,
+          "git": "169c65958a9843a59fa64599e507b9b6f9652422",
+          "sha256": "6a9820696b46d688ccf2e8ae7b46052acf8884e945bbda21ab92413d44c95624"
+        }
+      }
+    },
+    "earlier_728_exactly_in_owner": true,
+    "patch": {
+      "bytes": 1115,
+      "git": "93c0cb78607277896dd63e53d82dfd05a1938b41",
+      "sha256": "d6e719283128a8567114640644f6195ebd7d142e49310b11e290a55855c64af0"
+    },
+    "raw_owner_on_scoped_rejected": true,
+    "reversed_all_prior_chain_to_owner": true,
+    "scoped_worker_758": {
+      "bytes": 4171,
+      "git": "4d750203f9dc38bbc03e479e111127d3aca41c58",
+      "sha256": "f1ffd2798605ebd6469bc2cc974f31396a16dcf568ab4cc131bae576884be315"
+    },
+    "strict_forward_reverse_exact": true
+  },
+  "contract": {
+    "added_inloop_plain_key_comparisons": 104,
+    "attribute_color_fallback_policies_owner_and_scoped_unchanged": true,
+    "collects_all_local_aliases_before_resolving_color": true,
+    "eliminated_separate_find_calls": 270,
+    "first_style_color_in_existing_loop": true,
+    "healthy_charts_per_basis": 8,
+    "includes_no_elapsed_time_or_heap_claim": true,
+    "keeps_blank_first_color_and_case_and_fallback": true,
+    "replaced_callback_visits": 120,
+    "same_rendered_bytes_controls_and_errors": true,
+    "worker_limits_unchanged": true
+  },
+  "desktop_manifest": {
+    "git": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+    "pins": {
+      "extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+      "harness": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+      "modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1"
+    }
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+    "Proteus-harness/Proteus-desktop": "c7840cf1edac1c6b6930a09dd3a64e2296a6ec1c",
+    "Proteus-harness/Proteus-desktop-extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+    "Proteus-harness/Proteus-modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "independent_proof": {
+    "cross_request_isolation": true,
+    "direct_controls_each_basis": 19,
+    "paired_wire_each_basis": 13,
+    "proof_sha256": "78f91281f459b0cb7c4f7f1868075404eb093e53f30d99053113b863d1f87ebd",
+    "seal_sha256": "303358f7f81fd4d66d25de8c430db204a318a34b7b35d02a736ffbf070564caa"
+  },
+  "preflight_sha256": "020d8ac7dd01aa3f4f8c5ed914460bf3a62d47d96c0ab3f7f94f14c3a67c7897",
+  "producer_proof": {
+    "healthy_wire_sha256": "39713807fc737ce18bbced8d79d89c48f9af9e359e03d89d89c80aad5ba630e0",
+    "proof_sha256": "836afb3b9362ffb750e8b38823e74b15f34ce13f9b23202ec64d8149e393c4a0",
+    "reauthentication_sha256": "fe8a74dce73c4f3892e6236efb0f4a4ae91d0566a3c93bc49df32837edb96024",
+    "seal_sha256": "e4652ac90d674c439019a34b6e4e8aa2f81ba745be0024d173aa385c50a23948",
+    "stock_positive_9_each_basis_arm": true
+  },
+  "scope": "Mermaid worker JavaScript subsystem backed by sealed local Pele 1.12.0, real eligible healthy render requests and direct controls; no app GUI/CPU/PSS, allocation timing, broad speedup or cache-hit claim.",
+  "selector_roster": {
+    "collision_scope": {
+      "packages/mermaid-render/svg-theme.mjs": [
+        728,
+        736,
+        754,
+        769,
+        778
+      ],
+      "packages/mermaid-render/worker.mjs": [
+        758
+      ]
+    },
+    "count": 96,
+    "digest": "bd1f14196024646d5b030869c87e73a2299bf7c90789b14e9442140f65069f6d",
+    "prior_verified_digest": "b3157d66cd194f4fe8840f368971d6d12663849657e386f6a0c68b17afb3be61",
+    "range": [
+      693,
+      788
+    ],
+    "raw_metadata_sha256": "5753b2681e665b7bc2d6ea14a74dd5e7ab1146d3c1a4509aa0f801d63003fde3"
+  },
+  "source": {
+    "after": {
+      "packages/mermaid-render/svg-theme.mjs": {
+        "bytes": 7761,
+        "git": "86f43221640fbbbfb7547678001402b2ed1cedd0",
+        "sha256": "cbc2cd7d2bcb6f4a1a597d7f0bedd1933f91e4093f92c7daa54321e5cbd9e4b1"
+      }
+    },
+    "before": {
+      "packages/mermaid-render/svg-theme.mjs": {
+        "bytes": 7723,
+        "git": "247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b",
+        "sha256": "e9c48fe77b53891e9b5ded05ed623b7ca47e75cc811608309916b32a88beb77d"
+      }
+    },
+    "closure": {
+      "packages/mermaid-render/tests/worker.test.mjs": {
+        "bytes": 6485,
+        "git": "c5c28a6e7676b62f15822ee604890b6ca40d2f76",
+        "sha256": "45dc31c157235b05d744879a7fd0d3b6ffec4fa9a73b4ff8cc5bcde9cac5154d"
+      },
+      "packages/mermaid-render/vendor/pele/UPSTREAM.json": {
+        "bytes": 985,
+        "git": "bca68e90c080e0f740af9e5bcea7e80bb55ff9cf",
+        "sha256": "73bfe73f83727f83cfc55f4266a280be1b4b91230a1908ee883358b751d70703"
+      },
+      "packages/mermaid-render/vendor/pele/pele.mjs": {
+        "bytes": 726089,
+        "git": "649899765d79ef44723b58e645ee00c87aa93b6e",
+        "sha256": "a87cc1dc5b2334ccfe32fd0aa5c66f2bb1006b035642976031f589d70c6bf9c7"
+      },
+      "packages/mermaid-render/worker.mjs": {
+        "bytes": 3537,
+        "git": "42b82b47243751823edadc3f6fad08e6ff33dc4b",
+        "sha256": "af673b5887877558a6be57610fcc8e03a04b387f061ad3f968b36c4a2ec8f0e7"
+      }
+    },
+    "patch": {
+      "bytes": 1233,
+      "git": "e339d7d703122e559d9e44a2983aba89e96526d7",
+      "sha256": "b63df03fdbcf16e89f2bec6a826c85f55b68e4004abd00cea3588ff7b2b2db22"
+    },
+    "strict_forward_reverse_exact": true
+  }
+}
