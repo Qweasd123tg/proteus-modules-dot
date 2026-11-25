@@ -1,0 +1,80 @@
+{
+  "sources": {
+    "owner-stock": {
+      "git": "a502b920da48787407d7780743b2356b1d96afa0",
+      "sha256": "e25ba99a2553c40b0489a8a99dafe6c56a7cccbd75419978ad1dbb3aa98c79fc",
+      "bytes": 16480
+    },
+    "owner-candidate": {
+      "git": "3a13fe8dde6747574707635ba3f4226d8bc474f7",
+      "sha256": "e57330733f3e24dcc7e7bf64bf38f6d5df6d15a6b1719cc25da6ec4abd1891b7",
+      "bytes": 16739
+    },
+    "scope-stock": {
+      "git": "949ba7174b58de005777835ab9e63b39c34dde90",
+      "sha256": "301f287cce1c29c25279db68f696f968b365842f22aa8a94f93153146e7fc73c",
+      "bytes": 16529
+    },
+    "scope-candidate": {
+      "git": "5613f72f120b3cc09c84949ee4e870a2e419c6fa",
+      "sha256": "e2adcf02ffc8e2175ab5b53c443e841cd6a95f5518d469c90b2c8fe1ab72f32d",
+      "bytes": 16788
+    }
+  },
+  "samplers": {
+    "owner-stock": {
+      "git": "f36b23d8efe1a40b4f90a609329fabf8d74a0e89",
+      "sha256": "6749eac299d835dea1a616a299841a6e3638cf3412e3750373a222bee58a7d82",
+      "bytes": 15999
+    },
+    "owner-candidate": {
+      "git": "f36b23d8efe1a40b4f90a609329fabf8d74a0e89",
+      "sha256": "6749eac299d835dea1a616a299841a6e3638cf3412e3750373a222bee58a7d82",
+      "bytes": 15999
+    },
+    "scope-stock": {
+      "git": "d6ac9a729f91ebf892cc8a4301c6379bd58cadf4",
+      "sha256": "75d4db13bb4efaec1f31c0e48983a0c2291a8bd6a2d260e453c459225b4a1c78",
+      "bytes": 16320
+    },
+    "scope-candidate": {
+      "git": "d6ac9a729f91ebf892cc8a4301c6379bd58cadf4",
+      "sha256": "75d4db13bb4efaec1f31c0e48983a0c2291a8bd6a2d260e453c459225b4a1c78",
+      "bytes": 16320
+    }
+  },
+  "case_count": 13,
+  "direct_cli_count": 52,
+  "strict_patch_orders_and_inverses": true,
+  "python": "3.12.14",
+  "boundary": "Exact offline Python summary CLI over ordinary synthetic report/sample files, separate sys.settrace at aggregation entry counts references retained within samples only. No live sampling, actual app/native, PSS, or time claim; raw splitlines retained.",
+  "source_patch_sha256": "d9bf3b2e74b5b09a068b1c954ece7c5dffe6f61a04e5aef140ab8a86864ad397",
+  "proof_sha256": "eed45fa54476eb26fb7fe523c9ea468e3e8027d3758e16c65e7bca7839a7df2a",
+  "preflight_sha256": "155efdabbe00afc96c9be1be4f4de01a78564b672a144e839e694fb799f1bc39",
+  "desktop_manifest": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+  "prior_selectors": {
+    "count": 79,
+    "digest": "e23e9ee6ee9e5ed3629856b2f91d4c5851c2d251aab91eafb8d4ef44552daea3"
+  },
+  "retained_accumulator_witness": {
+    "accepted_samples": 48,
+    "mappings_per_sample_input": 25,
+    "interval_eligible": 47,
+    "top_level_fields": [
+      1008,
+      336
+    ],
+    "nested_process_rows": [
+      1200,
+      0
+    ],
+    "nested_group_maps": [
+      48,
+      0
+    ]
+  },
+  "alternate_scoped_patch_sha256": "836a4e20f4469cae0697ff12afcf43d8a1a5b0c026b7d5c6fea0c338a59df6de",
+  "alternate_scoped_patch": "diff --git a/examples/performance/summarize.py b/examples/performance/summarize.py\nindex 949ba7174b58de005777835ab9e63b39c34dde90..5613f72f120b3cc09c84949ee4e870a2e419c6fa 100644\n--- a/examples/performance/summarize.py\n+++ b/examples/performance/summarize.py\n@@ -149,16 +149,19 @@\n                     samples_path = Path(row.get('path', path.parent)) / 'samples.jsonl'\n                     if samples_path.is_file():\n                         phase_intervals = PhaseIntervals()\n+                        memory_keys = ('rss_kib', 'pss_kib', 'swap_pss_kib', 'pss_swap_kib')\n+                        sample_keys = memory_keys + ('interval_cpu_percent_one_core', 'interval_seconds')\n                         samples = []\n                         for line in samples_path.read_text().splitlines():\n                             item = json.loads(line)\n                             eligible = phase_intervals.observe(item)\n                             if item.get('type') == 'sample' and item.get('phase') == 'resident_idle':\n-                                item['phase_interval_eligible'] = eligible\n-                                samples.append(item)\n+                                sample = {key: item[key] for key in sample_keys if key in item}\n+                                sample['phase_interval_eligible'] = eligible\n+                                samples.append(sample)\n                         if samples:\n                             values = {key: statistics.median(item[key] for item in samples)\n-                                      for key in ('rss_kib','pss_kib','swap_pss_kib','pss_swap_kib')}\n+                                      for key in memory_keys}\n                             intervals = [item for item in samples if item['phase_interval_eligible']]\n                             values.update(peak_rss=max(item['rss_kib'] for item in samples),\n                                           peak_pss_swap=max(item['pss_swap_kib'] for item in samples),\n",
+  "independent_source_gate_sha256": "8d8a07eb0dcfb1786d06b0c0361056fb01ee86e7c5a02ff2534c78c121452495",
+  "producer_seal_sha256": "2b239a8a5c76d15a4f9bc7df5a0d70aed10871f704f22ab53d8b80d3d01b3d70"
+}
