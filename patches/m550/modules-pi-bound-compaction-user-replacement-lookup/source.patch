@@ -1,0 +1,17 @@
+diff --git a/workflow/pi-runtime/compaction.mjs b/workflow/pi-runtime/compaction.mjs
+index 0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c..e7b6d63fa3949bbb29b965776007dd26851dace3 100644
+--- a/workflow/pi-runtime/compaction.mjs
++++ b/workflow/pi-runtime/compaction.mjs
+@@ -73,9 +73,10 @@
+     compacted.metadata = { pi_compaction: summary };
+     const cut = messages.findIndex((m) => m.id === summary.firstKeptEntryId);
+     if (cut < 0) throw new Error("Pi compaction retained an unknown entry");
+-    const currentUser = messages.findLast((m) => m.role === "User");
++    const userIndex = messages.findLastIndex((m) => m.role === "User");
++    const currentUser = userIndex === -1 ? undefined : messages[userIndex];
+     const replacements =
+-        currentUser && messages.indexOf(currentUser) < cut
++        currentUser && (userIndex < cut || (cut > 0 && messages.lastIndexOf(currentUser, cut - 1) !== -1))
+             ? [{ source_message_id: currentUser.id, replacement_message_id: compacted.id }]
+             : [];
+     return {
