@@ -1,0 +1,22 @@
+diff --git a/model/opencode-provider/messages.mjs b/model/opencode-provider/messages.mjs
+index 285ed3698367013b6be2abbb27081201051663ef..48ba3fd9bd438b105a1fa1b89764a1cc529e2a1c 100644
+--- a/model/opencode-provider/messages.mjs
++++ b/model/opencode-provider/messages.mjs
+@@ -3,6 +3,8 @@
+ import { readFile } from 'node:fs/promises';
+ import { contextText } from '../../components/model-runtime-js/context.mjs';
+ import { LLM, Media } from '../../workflow/opencode-runtime/node_modules/@opencode/ai/dist/index.js';
++
++const NATIVE_ROLES = { System: 'system', Developer: 'system', User: 'user', Assistant: 'assistant', Tool: 'tool' };
+ 
+ function unsupported(message) {
+     const error = new Error(message);
+@@ -95,7 +97,7 @@
+     for (const message of request.messages) {
+         signal?.throwIfAborted();
+         if (!Array.isArray(message.parts)) unsupported('Invalid canonical message parts');
+-        const role = { System: 'system', Developer: 'system', User: 'user', Assistant: 'assistant', Tool: 'tool' }[message.role];
++        const role = NATIVE_ROLES[message.role];
+         if (!role) unsupported('Unsupported canonical message role');
+         const content = [];
+         for (let index = 0; index < message.parts.length; index++) {
