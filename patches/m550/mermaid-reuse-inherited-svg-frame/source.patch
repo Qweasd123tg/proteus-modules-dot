@@ -1,0 +1,16 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 6b163b3d08c0d1fd72c1a063de870dc4c5ed276f..247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -180,7 +180,10 @@
+     }
+     const name = tag.match(/^<([\w:-]+)/)?.[1];
+     if (!name) throw new Error('invalid Pele SVG tag');
+-    if (!tag.endsWith('/>')) stack.push({ variables, color });
++    if (!tag.endsWith('/>')) {
++      // An unchanged inherited scope still gets a stack slot, not a new frame.
++      stack.push(variables === parent.variables && color === parent.color ? parent : { variables, color });
++    }
+     return `<${name}${output.join('')}${tag.endsWith('/>') ? '/>' : '>'}`;
+   });
+ }
