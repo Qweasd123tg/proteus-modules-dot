@@ -1,0 +1,41 @@
+diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs
+index 6dfac8c5fb240435d39c6d02fef4edcadd1893e3..3c351014cbd6dee8d1491f4a3efecfcbde596ee2 100644
+--- a/workflow/pi-runtime/loop.mjs
++++ b/workflow/pi-runtime/loop.mjs
+@@ -5,6 +5,27 @@
+ import { assistant, finishedStream, piContent, piMessage, piMessages } from "../../components/pi-runtime-js/messages.mjs";
+ 
+ import { receiveModelResponse } from "../../components/module-runtime-js/model-stream.mjs";
++
++function convertWorkflowMessages(messages) {
++    if (!Array.isArray(messages) || Object.getPrototypeOf(messages) !== Array.prototype)
++        return convertToLlm(messages);
++    const converted = [];
++    // Pi 1.5.2 passes these roles through unchanged; preserve its full fallback.
++    for (let i = 0, length = messages.length; i < length; i++) {
++        const message = messages[i];
++        switch (message?.role) {
++            case "system":
++            case "user":
++            case "assistant":
++            case "toolResult":
++                converted.push(message);
++                break;
++            default:
++                return convertToLlm(messages);
++        }
++    }
++    return converted;
++}
+ 
+ function piRetryDelay(failure, attempt) {
+     const policy = SETTINGS_DEFAULTS.retry;
+@@ -221,7 +242,7 @@
+             {
+                 model,
+                 reasoning: runtime.reasoning.effort,
+-                convertToLlm,
++                convertToLlm: convertWorkflowMessages,
+                 finishTurn: async () => {
+                     await checkpoint();
+                 },
