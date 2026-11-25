@@ -1,0 +1,19 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b..4abab5528574ffeb63acf2aac30e8a1f169ac648 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -68,7 +68,13 @@
+     if (seen !== undefined && seen.has(name)) throw new Error('cyclic SVG variable');
+     const raw = variables.get(name) ?? (comma < 0 ? undefined : value.slice(comma + 1, end - 1));
+     if (raw === undefined) throw new Error(`unresolved SVG variable ${name}`);
+-    result += resolveVariables(raw.trim(), variables, new Set(seen === undefined ? [name] : [...seen, name]));
++    const text = raw.trim();
++    // A top-level scalar has no nested reference to track.
++    if (seen === undefined && typeof text === 'string' && text.indexOf('var(') < 0) {
++      result += text;
++    } else {
++      result += resolveVariables(text, variables, new Set(seen === undefined ? [name] : [...seen, name]));
++    }
+     position = end;
+   }
+ }

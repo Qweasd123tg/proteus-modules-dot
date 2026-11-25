@@ -1,0 +1,60 @@
+{
+  "vendor": {
+    "bytes": 726089,
+    "git": "649899765d79ef44723b58e645ee00c87aa93b6e",
+    "sha256": "a87cc1dc5b2334ccfe32fd0aa5c66f2bb1006b035642976031f589d70c6bf9c7"
+  },
+  "pinned": {
+    "worker.mjs": "42b82b47243751823edadc3f6fad08e6ff33dc4b",
+    "svg-theme.mjs": "247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b",
+    "tests/worker.test.mjs": "c5c28a6e7676b62f15822ee604890b6ca40d2f76",
+    "vendor/pele/UPSTREAM.json": "bca68e90c080e0f740af9e5bcea7e80bb55ff9cf",
+    "vendor/pele/pele.mjs": "649899765d79ef44723b58e645ee00c87aa93b6e"
+  },
+  "terminal_top_level_sum": 65,
+  "natural_top_level_sum": 188,
+  "source_control": "Normal first expansion only; prior syntax/name/cycle/lookup/trim and limits unchanged; explicit seen and recursive expansion retain original branch, no guards removed.",
+  "scope": "Node real exact bundled Pele 1.12 and worker incl same eight natural charts, byte-for-byte output. Separate source-level count of construction sites, not physical V8 allocation/heap, latency, native app or Rust.",
+  "variants": {
+    "owner": {
+      "before": {
+        "bytes": 7723,
+        "git": "247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b",
+        "sha256": "e9c48fe77b53891e9b5ded05ed623b7ca47e75cc811608309916b32a88beb77d"
+      },
+      "after": {
+        "bytes": 7935,
+        "git": "4abab5528574ffeb63acf2aac30e8a1f169ac648",
+        "sha256": "ec4232015addca329d4c07e91c6c4cd692f6effe439413c9cb5e1f469fb7d55d"
+      }
+    },
+    "scoped": {
+      "before": {
+        "bytes": 8451,
+        "git": "424597dd7cf0d25d1520c86201534b60c3f83b0e",
+        "sha256": "0b66a6fd86ed41f0b00e42a5299dd9108bc73f77a77cb33160a7a22e1cb7ad64"
+      },
+      "after": {
+        "bytes": 8654,
+        "git": "1eecae1506bc0151767aa2bdc616d7b85c53c07e",
+        "sha256": "b46192c78ac96402f2304299c6db2de7218471064cd64b74e96b1b62519e9152"
+      }
+    }
+  },
+  "producer_proof_sha256": "d3d3d74ef4db46b19dd166b9eb709471e2142cd76845b4955e9d2ff79b9db721",
+  "natural_proof_sha256": "f12bcce78ea25540aad1e7aec31357204d913de55c804e5bae9055b67b1ae2b1",
+  "natural_seal_sha256": "8d0ba9f88b81a820a2f2fec434a06492ea47e3e2d05bce3e3e76c101a0fec412",
+  "independent_observer_seal_sha256": "4f11cdd30693170cb554a0272a5406579dbbda6a35d601ef7b4c5c7867c96195",
+  "source_patch_sha256": "83116c240747ca2aa0070fdcd58c0d98c4b840ae1b34a934cf8c46b47d106c67",
+  "alternate_scoped_patch": "diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs\nindex 424597dd7cf0d25d1520c86201534b60c3f83b0e..1eecae1506bc0151767aa2bdc616d7b85c53c07e 100644\n--- a/packages/mermaid-render/svg-theme.mjs\n+++ b/packages/mermaid-render/svg-theme.mjs\n@@ -74,13 +74,18 @@\n     const raw = variables.get(name) ?? (comma < 0 ? undefined : value.slice(comma + 1, end - 1));\n     if (raw === undefined) throw new Error(`unresolved SVG variable ${name}`);\n     const text = raw.trim();\n-    const reuse = privateHistory && seen !== undefined;\n-    const trail = reuse ? seen : new Set(seen === undefined ? [name] : [...seen, name]);\n-    if (reuse) trail.add(name);\n-    try {\n-      result += expandVariables(text, variables, trail, privateHistory);\n-    } finally {\n-      if (reuse) trail.delete(name);\n+    // A top-level scalar has no nested reference to track.\n+    if (seen === undefined && typeof text === 'string' && text.indexOf('var(') < 0) {\n+      result += text;\n+    } else {\n+      const reuse = privateHistory && seen !== undefined;\n+      const trail = reuse ? seen : new Set(seen === undefined ? [name] : [...seen, name]);\n+      if (reuse) trail.add(name);\n+      try {\n+        result += expandVariables(text, variables, trail, privateHistory);\n+      } finally {\n+        if (reuse) trail.delete(name);\n+      }\n     }\n     position = end;\n   }\n",
+  "alternate_scoped_patch_sha256": "6a9820696b46d688ccf2e8ae7b46052acf8884e945bbda21ab92413d44c95624",
+  "producer_seal_sha256": "868c8957aaebb1ada837d8e183eb4b8af0c6dafd34ddbcd02278997c55713b5f",
+  "preflight_sha256": "26bd0c85205d66d2942ac30e4c3378a0fde9761df9cf3f2f9a1143d19faeb2a1",
+  "independent_source_gate_sha256": "39b32daa3a40026f709bc96a30db481dd0405c773e9f73d820e8aef3d7ee3dd7",
+  "desktop_manifest": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+  "prior_selectors": {
+    "count": 85,
+    "digest": "f89fa10107424383516f0382e1e8cd57bcf93d57673ead492130dc2a357c7f77"
+  },
+  "selection": "Apply the pinned Extensions patch OR the exact alternate after #736/#754/#769, not both. #758 affects the companion worker only."
+}
