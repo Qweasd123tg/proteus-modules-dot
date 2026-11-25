@@ -1,0 +1,33 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b..7221bd5ad0247fcd5d8091e13dc417709d270f68 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -135,10 +135,16 @@
+     if (/^<[!?]/.test(tag)) return tag;
+     const parent = stack.at(-1);
+     const attributes = [];
++    let inlineStyle;
++    let inlineColor;
+     for (const match of tag.matchAll(/([\w:-]+)="([^"]*)"/g)) {
+-      attributes.push([match[1], unescapeAttribute(match[2])]);
++      const key = match[1];
++      const value = unescapeAttribute(match[2]);
++      attributes.push([key, value]);
++      if (key === 'style') inlineStyle ??= value;
++      else if (key === 'color') inlineColor ??= value;
+     }
+-    const style = declarations(attributes.find(([key]) => key === 'style')?.[1] ?? '');
++    const style = declarations(inlineStyle ?? '');
+     let variables = parent.variables;
+     for (const [key, value] of style) {
+       if (!key.startsWith('--')) continue;
+@@ -147,8 +153,7 @@
+       variables.set(key, value);
+     }
+     let color = parent.color;
+-    const declaredColor = style.find(([key]) => key === 'color')?.[1]
+-      ?? attributes.find(([key]) => key === 'color')?.[1];
++    const declaredColor = style.find(([key]) => key === 'color')?.[1] ?? inlineColor;
+     if (declaredColor && declaredColor.toLowerCase() !== 'currentcolor') {
+       color = resolveVariables(declaredColor, variables);
+     }
