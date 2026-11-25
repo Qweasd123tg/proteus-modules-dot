@@ -1,0 +1,33 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 6b163b3d08c0d1fd72c1a063de870dc4c5ed276f..6b9ce3fefdca9b7d89bf028295cb3eaa00704d29 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -47,6 +47,11 @@
+ }
+ 
+ export function resolveVariables(value, variables, seen = undefined) {
++  // A caller-provided history keeps the original immutable copying semantics.
++  return expandVariables(value, variables, seen, seen === undefined);
++}
++
++function expandVariables(value, variables, seen, privateHistory) {
+   if (seen !== undefined && seen.size > 32) throw new Error('SVG variable nesting exceeds 32');
+   let result = '';
+   let position = 0;
+@@ -68,7 +73,15 @@
+     if (seen !== undefined && seen.has(name)) throw new Error('cyclic SVG variable');
+     const raw = variables.get(name) ?? (comma < 0 ? undefined : value.slice(comma + 1, end - 1));
+     if (raw === undefined) throw new Error(`unresolved SVG variable ${name}`);
+-    result += resolveVariables(raw.trim(), variables, new Set(seen === undefined ? [name] : [...seen, name]));
++    const text = raw.trim();
++    const reuse = privateHistory && seen !== undefined;
++    const trail = reuse ? seen : new Set(seen === undefined ? [name] : [...seen, name]);
++    if (reuse) trail.add(name);
++    try {
++      result += expandVariables(text, variables, trail, privateHistory);
++    } finally {
++      if (reuse) trail.delete(name);
++    }
+     position = end;
+   }
+ }
