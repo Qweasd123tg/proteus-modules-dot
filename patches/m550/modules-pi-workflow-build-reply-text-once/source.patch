@@ -1,0 +1,21 @@
+diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs
+index 6dfac8c5fb240435d39c6d02fef4edcadd1893e3..f96727538f09672a8ca1ed381541735cb401946a 100644
+--- a/workflow/pi-runtime/loop.mjs
++++ b/workflow/pi-runtime/loop.mjs
+@@ -177,10 +177,12 @@
+             if (answer.stopReason === "error")
+                 throw new Error("Pi model stopped with " + reply.finish_reason);
+             usageAnchor = { id: reply.messages.at(-1)?.id, tokens: answer.usage.totalTokens };
+-            finalText = answer.content
+-                .filter((c) => c.type === "text")
+-                .map((c) => c.text)
+-                .join("\n");
++            {
++                const fragments = [];
++                for (const part of answer.content)
++                    if (part.type === "text") fragments.push(part.text);
++                finalText = fragments.join("\n");
++            }
+             messages.push(...reply.messages);
+             progress.new_messages.push(...reply.messages);
+             for (const call of reply.tool_calls)
