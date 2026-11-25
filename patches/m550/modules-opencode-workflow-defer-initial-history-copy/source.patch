@@ -1,0 +1,86 @@
+diff --git a/workflow/opencode-runtime/workflow.mjs b/workflow/opencode-runtime/workflow.mjs
+index ee2a744b936bf36a7eb45f28ea4adb65ca43c94c..b05a887b61289e0b6f1ffa27d4cfc3f40914a96b 100644
+--- a/workflow/opencode-runtime/workflow.mjs
++++ b/workflow/opencode-runtime/workflow.mjs
+@@ -90,8 +90,11 @@
+     return events;
+ }
+ 
+-export async function workflow({ task, history, runtime }, { hostCall, signal }) {
+-    let messages = [...history];
++const BROKER_HISTORY = Symbol();
++
++export async function workflow({ task, history, runtime }, { hostCall, signal }, ownership = undefined) {
++    let borrowed = ownership === BROKER_HISTORY && Array.isArray(history);
++    let messages = borrowed ? history : [...history];
+     let progress = runtime.continuation?.history ?? {
+         new_messages: [],
+         history_replacement: null,
+@@ -107,6 +110,7 @@
+         if (ack.revision != null) {
+             progress = ack.history;
+             messages = ack.messages;
++            borrowed = false;
+         }
+         return ack;
+     }
+@@ -140,6 +144,7 @@
+             if (durable) throw new Error("OpenCode overflow compaction requires a durable checkpoint acknowledgement");
+             progress = candidate;
+             messages = p.messages;
++            borrowed = false;
+         }
+         signal.throwIfAborted();
+         return true;
+@@ -237,6 +242,11 @@
+                     },
+                 ])),
+             );
++            // The broker input can stay read-only until the first append.
++            if (borrowed) {
++                messages = [...messages];
++                borrowed = false;
++            }
+             messages.push(...reply.messages);
+             progress.new_messages.push(...reply.messages);
+             await checkpoint([...bindings.values()]);
+@@ -328,6 +338,15 @@
+ }
+ 
+ export function createWorkflowExport(binding) {
++    return createExport(binding);
++}
++
++// Only the installed component broker supplies freshly decoded JSON.
++export function createBrokerWorkflowExport(binding) {
++    return createExport(binding, BROKER_HISTORY);
++}
++
++function createExport(binding, ownership) {
+     if (
+         binding.module_id !== "opencode_loop" ||
+         binding.slot !== "workflow" ||
+@@ -347,7 +366,7 @@
+         },
+         invoke(method, params, invocation) {
+             if (method !== "run") throw new Error("Unsupported workflow method " + method);
+-            return workflow(params, invocation);
++            return workflow(params, invocation, ownership);
+         },
+     };
+ }
+diff --git a/workflow/opencode-runtime/worker.mjs b/workflow/opencode-runtime/worker.mjs
+index b491175e37427a121b24f8d783273359880737f0..a90927cea0954e6e963b87a1e8db788319c1056c 100644
+--- a/workflow/opencode-runtime/worker.mjs
++++ b/workflow/opencode-runtime/worker.mjs
+@@ -23,8 +23,8 @@
+         return createContextExport(binding);
+     }
+     if (binding.slot === "workflow" && binding.module_id === "opencode_loop") {
+-        const { createWorkflowExport } = await import("./workflow.mjs");
+-        return createWorkflowExport(binding);
++        const { createBrokerWorkflowExport } = await import("./workflow.mjs");
++        return createBrokerWorkflowExport(binding);
+     }
+     throw new Error(`OpenCode ${binding.slot}/${binding.module_id} adapter is unavailable`);
+ });
