@@ -1,0 +1,7 @@
+# Modules: reuse the fresh descriptor on a resident catalog hit
+
+The session catalog already owns the descriptor it just opened. When the resident summary passes the same stamp and prefix checks, move that descriptor into the result instead of cloning the session key and paths. The cached message count and preview are unchanged. The durable fallback still borrows the fresh descriptor, and a miss returns it to the same cold replay. Audit continues to bypass the cached summary path.
+
+A detached Rust test ran the stock and patched typed List paths against deterministic storage substitutes. Normal and audit runs preserved result order, returned summaries or errors, and the control-flow trace. The resident result contains the newly opened descriptor, not the older cached descriptor. Five separate response-construction fixtures used stock/candidate/candidate/stock order. With a normal three-path descriptor and a nonempty preview, new allocation requests fell from 5 to 1 and bytes requested from 142 to 11. With the preview absent they fell from 4 to 0 and from 131 to 0 bytes. These measurements start after the input descriptor already exists. Physical JSONL/SQLite service runs, cold-start time and app memory were not measured.
+
+Applies directly to Modules main and Desktop's packaged Modules revision listed in the receipt. No prerequisite patch. The independently checked M473 replay contains the same source leaf.
