@@ -1,0 +1,57 @@
+diff --git a/scripts/settings-migration.py b/scripts/settings-migration.py
+index b0a56a293029ba1e5aaa058033bbbc5b32efbdf0..cccb279c8e8ff9075edffef87ebb971093f50abc 100755
+--- a/scripts/settings-migration.py
++++ b/scripts/settings-migration.py
+@@ -6,9 +6,7 @@
+ import os
+ from pathlib import Path, PurePosixPath
+ import re
+-import shutil
+ import sys
+-import tempfile
+ import tomllib
+ 
+ SCHEMA = 1
+@@ -117,6 +115,7 @@
+     import hashlib
+     import io
+     import tarfile
++    import tempfile
+ 
+     home, locations = roots(args)
+     files = {}
+@@ -408,9 +407,17 @@
+     if dry_run:
+         print(f'Would {action} {len(prepared)} settings files')
+         return
++    past = 'Restored' if action == 'restore' else 'Updated'
++    if not prepared:
++        print(f'{past} 0 settings files')
++        return
++
++    # The startup migration usually finds no files to write.
++    import shutil
++    import tempfile
++
+     backup = state_dir / 'Proteus-settings-backups' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+-    if prepared:
+-        backup.mkdir(parents=True, mode=0o700)
++    backup.mkdir(parents=True, mode=0o700)
+     written = []
+     try:
+         for index, (destination, data) in enumerate(prepared):
+@@ -435,12 +442,9 @@
+             else:
+                 destination.unlink()
+         raise
+-    if prepared:
+-        (backup / 'manifest.json').write_text(json.dumps({str(saved): str(path) for path, saved in written if saved}, indent=2) + '\n')
+-    past = 'Restored' if action == 'restore' else 'Updated'
++    (backup / 'manifest.json').write_text(json.dumps({str(saved): str(path) for path, saved in written if saved}, indent=2) + '\n')
+     print(f'{past} {len(prepared)} settings files')
+-    if prepared:
+-        print(f'Previous files backed up at {backup}')
++    print(f'Previous files backed up at {backup}')
+ 
+ 
+ def main():
