@@ -1,0 +1,17 @@
+diff --git a/workflow/opencode-runtime/instructions.mjs b/workflow/opencode-runtime/instructions.mjs
+index 126a51bded68854839c502b23e3c9cc0f928cb06..6672c7eeab8c8075eb57c92601c4e077faa894b5 100644
+--- a/workflow/opencode-runtime/instructions.mjs
++++ b/workflow/opencode-runtime/instructions.mjs
+@@ -29,10 +29,8 @@
+ }
+ 
+ function identity(value) {
+-    const hex = createHash("sha256").update(value).digest("hex").slice(0, 32).split("");
+-    hex[12] = "5";
+-    hex[16] = "8";
+-    return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20).join("")}`;
++    const hex = createHash("sha256").update(value).digest("hex");
++    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+ }
+ 
+ export function projectInstructions(messages, model) {
