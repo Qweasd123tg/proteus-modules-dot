@@ -1,0 +1,29 @@
+diff --git a/tool/pi-tools/adapter.mjs b/tool/pi-tools/adapter.mjs
+index be5910c17cb36d75736dd1bb8fc4a1f4acfe98d7..42952f63ea7414bb8720a52ae4a851fa76d3f24e 100644
+--- a/tool/pi-tools/adapter.mjs
++++ b/tool/pi-tools/adapter.mjs
+@@ -35,15 +35,18 @@
+     if (failure) {
+         return { call_id: callId, ok: false, output: "", content: [], error: String(failure.message ?? failure), metadata: null };
+     }
+-    const content = value.content.map(block => {
+-        if (block.type === "text") return { type: "text", text: block.text };
+-        if (block.type === "image") return { type: "image", mime_type: block.mimeType, data: block.data };
+-        throw new Error(`Unsupported Pi tool content type ${block.type}`);
++    const texts = [];
++    const content = [];
++    value.content.forEach(block => {
++        const type = block.type;
++        if (type === "text") texts.push(block.text);
++        else if (type === "image") content.push({ type: "image", mime_type: block.mimeType, data: block.data });
++        else throw new Error(`Unsupported Pi tool content type ${type}`);
+     });
+-    const output = value.content.filter(block => block.type === "text").map(block => block.text).join("\n");
++    const output = texts.join("\n");
+     return {
+         call_id: callId, ok: value.isError !== true, output,
+-        content: content.filter(block => block.type !== "text"), error: value.isError ? output : null,
++        content, error: value.isError ? output : null,
+         metadata: { "pi/details": value.details ?? null, "pi/structured_content": value.structuredContent ?? null },
+     };
+ }
