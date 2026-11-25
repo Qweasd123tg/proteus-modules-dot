@@ -1,0 +1,30 @@
+diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs
+index 6dfac8c5fb240435d39c6d02fef4edcadd1893e3..8af5f3a545d0ed1652d2b9a33c886e5fe3135d24 100644
+--- a/workflow/pi-runtime/loop.mjs
++++ b/workflow/pi-runtime/loop.mjs
+@@ -24,6 +24,13 @@
+         initial[index + 1] = piMessage(history[index], model, names);
+     const tail = history.length ? [piMessage(history[prefixLength], model, names)] : [];
+     return { initial, tail };
++}
++
++function estimateHistoryTokens(messages, model, usageAnchor) {
++    const projected = piMessages(messages, model);
++    const anchor = usageAnchor ? messages.findIndex((m) => m.id === usageAnchor.id) : -1;
++    if (anchor >= 0) projected[anchor].usage.totalTokens = usageAnchor.tokens;
++    return estimateContextTokens(projected).tokens;
+ }
+ 
+ export async function workflow({ task, runtime, history }, { hostCall, signal, catalogProvider }) {
+@@ -133,10 +140,7 @@
+                 client_metadata: {},
+                 metadata: null,
+             };
+-            const projected = piMessages(messages, model);
+-            const anchor = usageAnchor ? messages.findIndex((m) => m.id === usageAnchor.id) : -1;
+-            if (anchor >= 0) projected[anchor].usage.totalTokens = usageAnchor.tokens;
+-            const tokenEstimate = estimateContextTokens(projected).tokens;
++            const tokenEstimate = estimateHistoryTokens(messages, model, usageAnchor);
+             const prepared = await hostCall("host.context.prepare", {
+                 input: {
+                     messages,
