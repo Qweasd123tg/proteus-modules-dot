@@ -1,0 +1,29 @@
+diff --git a/workflow/opencode-runtime/compaction.mjs b/workflow/opencode-runtime/compaction.mjs
+index 55724336a0a127fe794faa82b28cb2d8ebfe48d9..f5ee920b2c527473d9dba89cbc1cf3859563ec4c 100644
+--- a/workflow/opencode-runtime/compaction.mjs
++++ b/workflow/opencode-runtime/compaction.mjs
+@@ -51,14 +51,18 @@
+ }
+ 
+ function nativeResultContent(result) {
+-    return [{ type: "text", text: result.output }, ...(result.content ?? []).map(item => {
+-        if (item.type === "text") return { type: "text", text: item.text };
+-        if (item.type === "image" && typeof item.mime_type === "string" && /^image\//i.test(item.mime_type)
++    const content = [{ type: "text", text: result.output }];
++    (result.content ?? []).forEach(item => {
++        if (item.type === "text") {
++            content.push({ type: "text", text: item.text });
++        } else if (item.type === "image" && typeof item.mime_type === "string" && /^image\//i.test(item.mime_type)
+             && typeof item.data === "string") {
+-            return { type: "file", mime: item.mime_type, uri: `data:${item.mime_type};base64,${item.data}` };
++            content.push({ type: "file", mime: item.mime_type, uri: `data:${item.mime_type};base64,${item.data}` });
++        } else {
++            throw new Error("Unsupported canonical OpenCode tool-result content; only text and inline images are bridged");
+         }
+-        throw new Error("Unsupported canonical OpenCode tool-result content; only text and inline images are bridged");
+-    })];
++    });
++    return content;
+ }
+ 
+ function canonicalToolResult(part) {
