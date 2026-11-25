@@ -1,0 +1,23 @@
+diff --git a/workflow/pi-runtime/compaction.mjs b/workflow/pi-runtime/compaction.mjs
+index 0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c..67a13c89abd76dfe96693fbc8ea3b6579769d8ac 100644
+--- a/workflow/pi-runtime/compaction.mjs
++++ b/workflow/pi-runtime/compaction.mjs
+@@ -21,14 +21,16 @@
+     const pi = piMessages(messages, model);
+     const tokens = event.input.token_estimate ?? estimateContextTokens(pi).tokens;
+     if (!shouldCompact(tokens, model.contextWindow, DEFAULT_COMPACTION_SETTINGS)) return unchanged;
+-    const entries = messages.map((m, i) => {
++    // Reuse the private projection now that no estimator reads it.
++    const entries = pi;
++    messages.forEach((m, i) => {
+         const common = {
+             id: m.id,
+             parentId: i ? messages[i - 1].id : null,
+             timestamp: "1970-01-01T00:00:00.000Z",
+         };
+         const prior = m.metadata?.pi_compaction;
+-        return prior
++        entries[i] = prior
+             ? { ...common, ...prior, type: "compaction" }
+             : { ...common, type: "message", message: pi[i] };
+     });
