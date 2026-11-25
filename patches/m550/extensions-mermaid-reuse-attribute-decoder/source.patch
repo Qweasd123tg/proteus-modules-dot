@@ -1,0 +1,20 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 247dca9c7f2b9f52e089e8632f5aa6ec0ff8e39b..0c600e59c12b98be49294d33daae2b2271b71a0c 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -73,10 +73,12 @@
+   }
+ }
+ 
++const ATTRIBUTE_ENCODED = /&(quot|apos|amp|lt|gt);/g;
++const DECODED_ATTRIBUTE_ENTITIES = { quot: '"', apos: "'", amp: '&', lt: '<', gt: '>' };
++const decodedAttributeEntity = (_, name) => DECODED_ATTRIBUTE_ENTITIES[name];
++
+ function unescapeAttribute(value) {
+-  return value.replace(/&(quot|apos|amp|lt|gt);/g, (_, name) => ({
+-    quot: '"', apos: "'", amp: '&', lt: '<', gt: '>',
+-  })[name]);
++  return value.replace(ATTRIBUTE_ENCODED, decodedAttributeEntity);
+ }
+ 
+ const ATTRIBUTE_SPECIALS = /[&"<>]/g;
