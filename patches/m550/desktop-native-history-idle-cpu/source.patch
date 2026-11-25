@@ -1,0 +1,143 @@
+diff --git a/examples/performance/native-history/README.md b/examples/performance/native-history/README.md
+index 6a4d993c1929800962c8810f2007da13f07df7c3..e676107cd73238812eed32b819a0eadb30a3f8a9 100644
+--- a/examples/performance/native-history/README.md
++++ b/examples/performance/native-history/README.md
+@@ -82,8 +82,10 @@
+ `chat.snapshot.applied`, `chat.transcript.render`. Последняя отметка означает
+ первый render непустой истории, а не подтверждение presented frame GPU.
+ Внешнее время наблюдения readiness ограничено сверху интервалом опроса.
+-Память после settle считается медианой idle samples; CPU — по сумме тиков
+-за интервал. Peak является нижней оценкой по выборкам. Сумма RSS дважды
++Память после settle считается медианой всех idle samples. Обе оценки idle CPU
++используют только интервалы, целиком относящиеся к idle; переходный интервал
++не учитывается. Если таких интервалов нет, показатели idle CPU равны null,
++а idle_cpu_interval_count равен 0. Peak является нижней оценкой по выборкам. Сумма RSS дважды
+ считает shared pages; основной показатель — PSS вместе с отдельно показанным
+ SwapPss. Ошибка readiness, неполный `/proc`, превышение RAM-порога или
+ изменение journal завершают запуск ошибкой с сохранением частичных samples.
+diff --git a/examples/performance/native-history/run.py b/examples/performance/native-history/run.py
+index eac7fbbb77f7acea61e1ca1014ab2c2c12d349bd..898d1c60378f61accbc2747a2ecd322ee4e0805c 100644
+--- a/examples/performance/native-history/run.py
++++ b/examples/performance/native-history/run.py
+@@ -3,6 +3,7 @@
+ import argparse
+ import hashlib
+ import json
++import math
+ import os
+ from pathlib import Path
+ import signal
+@@ -179,6 +180,32 @@
+     current = table()
+     assert not any(pid in current and current[pid]['start_ticks'] == start
+                    and current[pid]['state'] != 'Z' for pid, start in tree.owned.items()), 'surviving descendants'
++
++
++def idle_cpu(samples, clock_ticks):
++    """Use the same wholly idle intervals for both CPU summaries."""
++    intervals = []
++    previous_idle = False
++    legacy = not any('phase_interval_eligible' in row for row in samples)
++    for row in samples:
++        idle = row['phase'] == 'idle'
++        # Older Core samplers label only the interval's end sample. Since the
++        # runner marks idle once, two successive idle samples bound an idle interval.
++        # Do not use the fallback for a missing flag in a modern stream.
++        if idle and row.get('phase_interval_eligible', legacy and previous_idle) is True:
++            elapsed = row.get('interval_seconds')
++            ticks = (row.get('interval_counters') or {}).get('cpu_ticks')
++            if (type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed > 0
++                    and type(ticks) is int and ticks >= 0):
++                intervals.append((ticks, elapsed))
++        previous_idle = idle
++    if not intervals:
++        return None, None, 0
++    median = statistics.median(100 * ticks / clock_ticks / elapsed
++                               for ticks, elapsed in intervals)
++    weighted = (100 * sum(ticks for ticks, _ in intervals) / clock_ticks
++                / math.fsum(elapsed for _, elapsed in intervals))
++    return median, weighted, len(intervals)
+ 
+ 
+ def run_case(args, case, workspace, config, restart, expected):
+@@ -260,20 +287,22 @@
+     validate_canonical(journal.parent, canonical)
+     idle = [row for row in samples if row['phase'] == 'idle']
+     assert len(idle) >= 2, 'insufficient steady samples'
++    median_cpu, weighted_cpu, cpu_intervals = idle_cpu(samples, tree.clock_ticks)
++    median = {key: statistics.median(row[key] for row in idle)
++              for key in ('rss_kib', 'pss_kib', 'swap_pss_kib', 'pss_swap_kib', 'private_kib')}
++    median['interval_cpu_percent_one_core'] = median_cpu
+     stages, history = traces(log)
+     result = dict(status='passed', cache='restart' if restart else 'first-app-cache',
+                   stages=stages, external_readiness_observed_s=ready_at-started,
+-                  median={key: statistics.median(row[key] for row in idle)
+-                          for key in ('rss_kib', 'pss_kib', 'swap_pss_kib', 'pss_swap_kib',
+-                                      'private_kib', 'interval_cpu_percent_one_core')},
++                  median=median,
+                   groups={group: {key: statistics.median(row['groups'][group][key] for row in idle)
+                                   for key in ('rss_kib', 'pss_kib', 'pss_swap_kib', 'process_count')}
+                           for group in idle[-1]['groups']},
+                   counters=tree.totals(), journal=dict(bytes=journal.stat().st_size, sha256=before, unchanged=True),
+                   measured_peak_kib={key:max(row[key] for row in samples)
+                                      for key in ('rss_kib','pss_kib','pss_swap_kib')},
+-                  idle_cpu_percent_one_core=100 * sum(row['interval_counters']['cpu_ticks'] for row in idle)
+-                  / tree.clock_ticks / sum(row['interval_seconds'] for row in idle),
++                  idle_cpu_percent_one_core=weighted_cpu,
++                  idle_cpu_interval_count=cpu_intervals,
+                   startup_peak_kib={key:max((row[key] for row in samples if row['phase'] == 'startup'), default=None)
+                                     for key in ('rss_kib','pss_kib','pss_swap_kib')},
+                   history_windows=history, snapshot_validation=validation, canonical_files=canonical,
+diff --git a/examples/performance/native-history/test_runner.py b/examples/performance/native-history/test_runner.py
+index e29ac888f0e66675ed75af365106e37517e90ce1..097bd0c4aacb650b2881e02cea064c7bede9b6b7 100644
+--- a/examples/performance/native-history/test_runner.py
++++ b/examples/performance/native-history/test_runner.py
+@@ -4,7 +4,7 @@
+ import unittest
+ import tomllib
+ 
+-from run import process_group, canonical_files, validate_canonical, profile, storage_binary
++from run import process_group, canonical_files, validate_canonical, profile, storage_binary, idle_cpu
+ 
+ 
+ class ProcessGroups(unittest.TestCase):
+@@ -57,5 +57,39 @@
+         self.assertEqual(process_group({'exe': '/portable/bin/proteus-session-storage-module'}, root), 'modules')
+ 
+ 
++class IdleCpu(unittest.TestCase):
++    def test_crossing_sample_is_not_idle_cpu_in_either_sampler(self):
++        for modern in (False, True):
++            with self.subTest(modern=modern):
++                samples = [
++                    dict(phase='settle'),
++                    dict(phase='idle', interval_seconds=.30, interval_counters={'cpu_ticks': 30}),
++                    dict(phase='idle', interval_seconds=.15, interval_counters={'cpu_ticks': 0}),
++                ]
++                if modern:
++                    samples[1]['phase_interval_eligible'] = False
++                    samples[2]['phase_interval_eligible'] = True
++                self.assertEqual(idle_cpu(samples, 100), (0, 0, 1))
++
++    def test_both_cpu_summaries_use_the_same_intervals(self):
++        samples = [
++            dict(phase='idle', interval_seconds=.25, interval_counters={'cpu_ticks': 25},
++                 phase_interval_eligible=True),
++            dict(phase='idle', interval_seconds=.75, interval_counters={'cpu_ticks': 0},
++                 phase_interval_eligible=True),
++            dict(phase='idle', interval_seconds=2, interval_counters={'cpu_ticks': 2000},
++                 phase_interval_eligible=False),
++            dict(phase='idle', interval_seconds=5, interval_counters={'cpu_ticks': 5000}),
++        ]
++        self.assertEqual(idle_cpu(samples, 100), (50, 25, 2))
++
++    def test_absent_or_invalid_intervals_do_not_mean_zero_cpu(self):
++        samples = [
++            dict(phase='idle', interval_seconds=None, interval_counters=None),
++            dict(phase='idle', interval_seconds=float('inf'), interval_counters={'cpu_ticks': 2}),
++        ]
++        self.assertEqual(idle_cpu(samples, 100), (None, None, 0))
++
++
+ if __name__ == '__main__':
+     unittest.main()
