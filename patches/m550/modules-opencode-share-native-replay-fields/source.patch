@@ -1,0 +1,22 @@
+diff --git a/model/opencode-provider/messages.mjs b/model/opencode-provider/messages.mjs
+index 285ed3698367013b6be2abbb27081201051663ef..09f053ff0a653e9cd3333fc80c3ac0f549967481 100644
+--- a/model/opencode-provider/messages.mjs
++++ b/model/opencode-provider/messages.mjs
+@@ -10,6 +10,8 @@
+     throw error;
+ }
+ 
++const NATIVE_EXTRA_FIELDS = ['providerMetadata', 'metadata', 'cache', 'encrypted', 'namespace', 'providerExecuted'];
++
+ function nativeExtras(message, index, type) {
+     const extra = message.metadata?.opencode_native?.parts?.[index];
+     if (!extra) return undefined;
+@@ -17,7 +19,7 @@
+     // Only restore schema fields, never spread an arbitrary provider blob into
+     // a canonical block. Text and tool arguments have one authoritative copy.
+     let result;
+-    for (const key of ['providerMetadata', 'metadata', 'cache', 'encrypted', 'namespace', 'providerExecuted'])
++    for (const key of NATIVE_EXTRA_FIELDS)
+         if (extra[key] !== undefined) (result ??= {})[key] = extra[key];
+     return result;
+ }
