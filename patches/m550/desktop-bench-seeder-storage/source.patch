@@ -1,0 +1,23 @@
+diff --git a/examples/performance/native-history/run.py b/examples/performance/native-history/run.py
+index c2f6aded1cfe78cca0426af17274bd583a5c6d5e..10406265e215eb26269f40fd80fa1b359041cece 100644
+--- a/examples/performance/native-history/run.py
++++ b/examples/performance/native-history/run.py
+@@ -359,6 +359,8 @@
+     workspace = args.output / 'workspace'
+     workspace.mkdir()
+     (workspace / 'AGENTS.md').write_text('Synthetic memory/startup benchmark. No model calls.\n')
++    seed_env = os.environ.copy()
++    seed_env['PROTEUS_TEST_SESSION_STORAGE_MODULE'] = str(args.storage)
+     results = []
+     for count in args.messages:
+         for repeat in range(args.repeats):
+@@ -368,7 +370,8 @@
+             config = configs / 'bench.toml'
+             config.write_text(profile(args.module, args.storage))
+             seed = subprocess.run([str(args.seeder), str(case/'config'), str(workspace),
+-                                   str(count), str(args.text_repeats)], capture_output=True, text=True, check=True)
++                                   str(count), str(args.text_repeats)],
++                                  env=seed_env, capture_output=True, text=True, check=True)
+             save(case / 'seed.json', json.loads(seed.stdout))
+             subprocess.run([sys.executable, str(args.core_source/'examples/performance/history-scale/verify.py'),
+                             'seed', json.loads(seed.stdout)['session_dir'], str(count), str(args.text_repeats),
