@@ -1,0 +1,14 @@
+diff --git a/workflow/opencode-runtime/workflow.mjs b/workflow/opencode-runtime/workflow.mjs
+index ee2a744b936bf36a7eb45f28ea4adb65ca43c94c..673a97532eb9c52391e78218791754e71e3d3c8f 100644
+--- a/workflow/opencode-runtime/workflow.mjs
++++ b/workflow/opencode-runtime/workflow.mjs
+@@ -199,8 +199,7 @@
+             };
+             // Reuse the native estimator for unmeasured content; a provider
+             // usage observation is an anchor for the next preparation.
+-            const projected = await nativeContext(input, messages);
+-            const estimate = estimateContext(projected);
++            const estimate = estimateContext(await nativeContext(input, messages));
+             input.token_estimate = lastUsage == null ? estimate : Math.max(estimate, lastUsage);
+             await prepare(input);
+             request.messages = withContext(messages, context.chunks);
