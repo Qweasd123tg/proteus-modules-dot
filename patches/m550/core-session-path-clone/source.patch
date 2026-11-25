@@ -1,0 +1,18 @@
+diff --git a/crates/proteus-core/src/app_server/http/sessions.rs b/crates/proteus-core/src/app_server/http/sessions.rs
+index 3259d16a154b96981435013a5d600302278f7243..4e730ddf1932308febf4716291a9872730389abe 100644
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -36,12 +36,11 @@
+     let activity_by_dir = state.activity_by_session_dir().await;
+     let mut seen = HashSet::new();
+     let mut summaries = Vec::new();
+ 
+     for mut summary in stored_summaries {
+-        let session_dir = summary.session_dir.clone();
+-        let session_key = canonical_session_key(session_dir.clone());
++        let session_key = canonical_session_key(summary.session_dir.clone());
+         seen.insert(session_key.clone());
+         if let Some(activity) = activity_by_dir.get(&session_key) {
+             summary = summary.with_activity(activity.clone());
+         }
+         summaries.push(summary);
