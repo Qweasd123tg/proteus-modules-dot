@@ -1,0 +1,19 @@
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+index 077f402c61ecf7382d96b379bf8aa94ccecc0b9c..181748383d7e8d66aea3502374a2dfe0aaa2a150 100644
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -346,11 +346,9 @@
+         }
+         let opened = match select_startup_session(None, bootstrap.session_dir, &sessions) {
+             Some(dir) => api.resume(Path::new(&dir))?,
+-            None => {
+-                let opened = api.new_session(None, None)?;
+-                sessions = api.sessions()?;
+-                opened
+-            }
++            // The first catalog is provisional. Ready workspaces refresh it
++            // independently; a successful creation must not wait for that list.
++            None => api.new_session(None, None)?,
+         };
+         projects.insert(opened.session_dir.clone(), opened.workspace_path);
+         Some(opened.session_dir)
