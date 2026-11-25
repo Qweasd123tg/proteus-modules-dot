@@ -1,0 +1,17 @@
+diff --git a/crates/proteus-core/src/app_server/http/sessions.rs b/crates/proteus-core/src/app_server/http/sessions.rs
+index 3259d16a154b96981435013a5d600302278f7243..63094284a9cc5646de5812619b14c0ae4b41f996 100644
+--- a/crates/proteus-core/src/app_server/http/sessions.rs
++++ b/crates/proteus-core/src/app_server/http/sessions.rs
+@@ -66,10 +66,12 @@
+             seen.insert(session_key);
+             summaries.push(summary);
+         }
+     }
+ 
++    // Canonical keys are only needed while merging live sessions.
++    drop(seen);
+     summaries.sort_by(|left, right| {
+         right
+             .updated_at_ms
+             .cmp(&left.updated_at_ms)
+             .then_with(|| right.session_dir.cmp(&left.session_dir))
