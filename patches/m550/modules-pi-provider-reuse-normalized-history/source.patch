@@ -1,0 +1,29 @@
+diff --git a/model/pi-provider/adapter.mjs b/model/pi-provider/adapter.mjs
+index 4d054bd596b2e5d3106874988c3a3ae9a4e16c0d..5f9a9480415bebd39f589c86729f5f7a5e9a3034 100644
+--- a/model/pi-provider/adapter.mjs
++++ b/model/pi-provider/adapter.mjs
+@@ -4,6 +4,7 @@
+ import { readFile } from "node:fs/promises";
+ import { ModelRuntime } from "../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/model-runtime.js";
+ import {
++    createInitialSystemMessage,
+     normalizeContext,
+     isRetryableAssistantError,
+ } from "../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/index.js";
+@@ -74,11 +75,11 @@
+             strict: t.surface.strict ? "require" : "prefer",
+         },
+     }));
+-    return normalizeContext({
+-        systemPrompt: request.instructions.map((i) => i.text).join("\n\n"),
+-        tools,
+-        messages: history,
+-    });
++    const systemPrompt = request.instructions.map((i) => i.text).join("\n\n");
++    const initial = createInitialSystemMessage(systemPrompt, tools);
++    // The projected history is private; reuse it for Pi's optional leading message.
++    if (initial) history.unshift(initial);
++    return normalizeContext({ messages: history });
+ }
+ 
+ export function canonicalAnswer(message, id) {
