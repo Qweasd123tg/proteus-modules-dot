@@ -1,0 +1,147 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/append.rs b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+index 986530a47f469747497adc93ea669fb3df0b8395..fe9cba45d03e01f420c39944092ca0dad0195699 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/append.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/append.rs
+@@ -90,30 +90,50 @@
+     baseline: &[[u8; 32]],
+     final_history_len: usize,
+ ) -> Result<Option<SessionTranscriptAppend>> {
++    append_committed_from_scan(
++        |visit| records.scan(visit),
++        prefix,
++        baseline,
++        final_history_len,
++    )
++}
++
++fn append_committed_from_scan(
++    mut scan: impl FnMut(&mut dyn FnMut(JournalRecord) -> Result<()>) -> Result<()>,
++    prefix: &mut PrefixIdentities,
++    baseline: &[[u8; 32]],
++    final_history_len: usize,
++) -> Result<Option<SessionTranscriptAppend>> {
+     let Some(conversation_appended) = final_history_len.checked_sub(baseline.len()) else {
+         return Ok(None);
+     };
+     let mut independent = true;
+-    records.scan(|mut record| {
++    scan(&mut |mut record| {
+         independent &= inspect_suffix(prefix, baseline, &mut record)?;
+         Ok(())
+     })?;
+     if !independent {
+         return Ok(None);
+     }
++    // Independence above must see only the old identities; repeats within
++    // this new turn are allowed. Now capture the next prefix in the renderer's
++    // first full scan of the same finished, privately owned stage. Index the
++    // original facts before stripping checkpoints for display only. The
++    // publisher drops this unshared index on any render or publication failure.
++    let mut index_next_scan = true;
+     let transcript = transcript_from_scan(
+         |visit| {
+-            records.scan(|mut record| {
++            let index_original = std::mem::take(&mut index_next_scan);
++            scan(&mut |mut record| {
++                if index_original {
++                    prefix.visit(&record, false);
++                }
+                 strip_checkpoint_baseline(&mut record, baseline.len())?;
+                 visit(record)
+             })
+         },
+         None,
+     )?;
+-    records.scan(|record| {
+-        prefix.visit(&record, false);
+-        Ok(())
+-    })?;
+     Ok(Some(SessionTranscriptAppend {
+         transcript,
+         conversation_appended,
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/append/tests/checkpoints.rs b/crates/proteus-core/src/app_server/transcript/journal/append/tests/checkpoints.rs
+index a58954884887865eff4ce2bd3060d69ca4acd887..43a3a78427ce6411ed2cef7856f4dc8f450a33b7 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/append/tests/checkpoints.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/append/tests/checkpoints.rs
+@@ -96,6 +96,81 @@
+ }
+ 
+ #[test]
++fn committed_checkpoints_index_original_facts_in_the_render_scan() {
++    let records = checkpoint_fixture();
++    let previous = validated_history(&records[..1]).unwrap();
++    let final_history = validated_history(&records).unwrap();
++    let baseline = previous
++        .iter()
++        .map(history_message_sha256)
++        .collect::<Result<Vec<_>>>()
++        .unwrap();
++    let mut prefix = PrefixIdentities::default();
++    prefix.visit(&records[0], false);
++    let (mut staged, _) = crate::core::DisplayRecords::stage_for_test(&records[1..]);
++    let mut scans = 0;
++    let mut decodes = 0;
++    let appended = append_committed_from_scan(
++        |visit| {
++            scans += 1;
++            staged.scan(|record| {
++                decodes += 1;
++                visit(record)
++            })
++        },
++        &mut prefix,
++        &baseline,
++        final_history.len(),
++    )
++    .unwrap()
++    .expect("repeated new IDs in the same turn are independent of the old prefix");
++    // Closed causal fixture: independence + renderer discovery + renderer rows.
++    // The old separate index pass was a fourth decode of all five records.
++    assert_eq!((scans, decodes), (3, 15));
++    assert_eq!(appended.conversation_appended, 3);
++    let mut actual = super::super::super::source::from_records(&records[..1], None).unwrap();
++    actual.extend(appended.transcript);
++    let expected = super::super::super::source::from_records(&records, None).unwrap();
++    assert_eq!(
++        serde_json::to_value(actual).unwrap(),
++        serde_json::to_value(expected).unwrap()
++    );
++    for part in final_history.iter().flat_map(|message| &message.parts) {
++        assert!(prefix.has_explicit_part(&part.part_id));
++    }
++}
++
++#[test]
++fn committed_scan_error_after_overlap_still_precedes_fallback() {
++    let records = checkpoint_fixture();
++    let old = &records[0];
++    let baseline = validated_history(&records[..1])
++        .unwrap()
++        .iter()
++        .map(history_message_sha256)
++        .collect::<Result<Vec<_>>>()
++        .unwrap();
++    let mut prefix = PrefixIdentities::default();
++    prefix.visit(old, false);
++    let mut overlap = old.clone();
++    overlap.session_seq = records[1].session_seq;
++    let mut scans = 0;
++    let error = append_committed_from_scan(
++        |visit| {
++            scans += 1;
++            visit(overlap.clone())?;
++            anyhow::bail!("transcript staging record count changed")
++        },
++        &mut prefix,
++        &baseline,
++        4,
++    )
++    .unwrap_err();
++    assert_eq!(error.to_string(), "transcript staging record count changed");
++    assert_eq!(scans, 1);
++}
++
++#[test]
+ fn a_checkpoint_must_retain_the_exact_canonical_prefix_including_metadata() {
+     let records = checkpoint_fixture();
+     let baseline = validated_history(&records[..1])
