@@ -1,0 +1,86 @@
+{
+  "status": "paired_exact_export_and_actual_local_worker_bridge",
+  "owner_pre_post": {
+    "workflow/opencode-runtime/workflow.mjs": [
+      {
+        "bytes": 15495,
+        "git": "ee2a744b936bf36a7eb45f28ea4adb65ca43c94c",
+        "sha256": "18212a94dcc6e4a24afbeacb8b998a5b69169411402fe107c05f311145a2ee6c"
+      },
+      {
+        "bytes": 16170,
+        "git": "b05a887b61289e0b6f1ffa27d4cfc3f40914a96b",
+        "sha256": "26334b3258d2cb91b714791b55757fc98ea821060250152d1c9ea491ef00f0eb"
+      }
+    ],
+    "workflow/opencode-runtime/worker.mjs": [
+      {
+        "bytes": 1330,
+        "git": "b491175e37427a121b24f8d783273359880737f0",
+        "sha256": "d3e4ff1e4fff71ccdf5b6dbd8c7ac075c4e4843882c4d562a76ffe1bcbf47e88"
+      },
+      {
+        "bytes": 1342,
+        "git": "a90927cea0954e6e963b87a1e8db788319c1056c",
+        "sha256": "d88f66a47b166e453ff1dab74b7ed85325cf65e51ca50c0c4929e4daad037f84"
+      }
+    ]
+  },
+  "scoped_pre_post": {
+    "workflow/opencode-runtime/workflow.mjs": [
+      {
+        "bytes": 15696,
+        "git": "a33d1bf82f287da4c11e1a8b6f1e748ff6a0bc18",
+        "sha256": "5502b8bea9e9bdb7e0ce7ae8a04bf6556f55a711985d9c2f8c5fb92d26942ffc"
+      },
+      {
+        "bytes": 16371,
+        "git": "d5053f11cc5bc4bb2721c213bc22ca60641c13e0",
+        "sha256": "223ae441ed6c1d4198a862e39ce69f137089171be43df8bc1c2461c54693e512"
+      }
+    ],
+    "workflow/opencode-runtime/worker.mjs": [
+      {
+        "bytes": 1330,
+        "git": "b491175e37427a121b24f8d783273359880737f0",
+        "sha256": "d3e4ff1e4fff71ccdf5b6dbd8c7ac075c4e4843882c4d562a76ffe1bcbf47e88"
+      },
+      {
+        "bytes": 1342,
+        "git": "a90927cea0954e6e963b87a1e8db788319c1056c",
+        "sha256": "d88f66a47b166e453ff1dab74b7ed85325cf65e51ca50c0c4929e4daad037f84"
+      }
+    ]
+  },
+  "patches": {
+    "owner": {
+      "bytes": 3318,
+      "git": "3636307613a0caf41963ef17e81cb118eb4b8594",
+      "sha256": "3e878ae32bcd009ee272a9bd3379ba01c96067e98c5a0aaac14acd9c83290cdf"
+    },
+    "canonical": {
+      "bytes": 3332,
+      "git": "48692a878e2026058705d8186481a5a069f5baa7",
+      "sha256": "517ae2996fcd9719c7ad52a2327876bb7c86d0036dfa1391735f6dcfcb06a74c"
+    }
+  },
+  "strict_apply_inverse_both_files_both_bases": true,
+  "desktop_manifest": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+  "prior_selectors": {
+    "count": 75,
+    "digest": "2538128ea0c9b09ff2ba81e69b92a2b05e88264c9495710fcca830b01452fc0f",
+    "range": "#693–767"
+  },
+  "preflight_sha256": "5f05e507d2574b21c9b5731675c7a8a982472d21318f4b38c02856b6c29c35d1",
+  "proof_sha256": "034e5c86dbd3082349860acce1ee96b4efe9cb2e0b4c1afb8086b35c8ade8b10",
+  "proof_file_seal_sha256": "d98954cd26e47fe2434cb690cbb1221398cfd0fdb55d339fbd440b3017bf42aa",
+  "node": "v24.22.3",
+  "paired_controls": 20,
+  "extra_shape_error_controls": 3,
+  "actual_synthetic_broker_cases": 3,
+  "held_rows": 8192,
+  "largest_invoke_bytes": 2240060,
+  "largest_callback_bytes": 4479434,
+  "alternate_scoped_patch": "diff --git a/workflow/opencode-runtime/workflow.mjs b/workflow/opencode-runtime/workflow.mjs\nindex a33d1bf82f287da4c11e1a8b6f1e748ff6a0bc18..d5053f11cc5bc4bb2721c213bc22ca60641c13e0 100644\n--- a/workflow/opencode-runtime/workflow.mjs\n+++ b/workflow/opencode-runtime/workflow.mjs\n@@ -98,8 +98,11 @@\n     return fragments.join(\"\\n\");\n }\n \n-export async function workflow({ task, history, runtime }, { hostCall, signal }) {\n-    let messages = [...history];\n+const BROKER_HISTORY = Symbol();\n+\n+export async function workflow({ task, history, runtime }, { hostCall, signal }, ownership = undefined) {\n+    let borrowed = ownership === BROKER_HISTORY && Array.isArray(history);\n+    let messages = borrowed ? history : [...history];\n     let progress = runtime.continuation?.history ?? {\n         new_messages: [],\n         history_replacement: null,\n@@ -115,6 +118,7 @@\n         if (ack.revision != null) {\n             progress = ack.history;\n             messages = ack.messages;\n+            borrowed = false;\n         }\n         return ack;\n     }\n@@ -148,6 +152,7 @@\n             if (durable) throw new Error(\"OpenCode overflow compaction requires a durable checkpoint acknowledgement\");\n             progress = candidate;\n             messages = p.messages;\n+            borrowed = false;\n         }\n         signal.throwIfAborted();\n         return true;\n@@ -246,6 +251,11 @@\n                     },\n                 ])),\n             );\n+            // The broker input can stay read-only until the first append.\n+            if (borrowed) {\n+                messages = [...messages];\n+                borrowed = false;\n+            }\n             messages.push(...reply.messages);\n             progress.new_messages.push(...reply.messages);\n             await checkpoint([...bindings.values()]);\n@@ -335,6 +345,15 @@\n }\n \n export function createWorkflowExport(binding) {\n+    return createExport(binding);\n+}\n+\n+// Only the installed component broker supplies freshly decoded JSON.\n+export function createBrokerWorkflowExport(binding) {\n+    return createExport(binding, BROKER_HISTORY);\n+}\n+\n+function createExport(binding, ownership) {\n     if (\n         binding.module_id !== \"opencode_loop\" ||\n         binding.slot !== \"workflow\" ||\n@@ -354,7 +373,7 @@\n         },\n         invoke(method, params, invocation) {\n             if (method !== \"run\") throw new Error(\"Unsupported workflow method \" + method);\n-            return workflow(params, invocation);\n+            return workflow(params, invocation, ownership);\n         },\n     };\n }\ndiff --git a/workflow/opencode-runtime/worker.mjs b/workflow/opencode-runtime/worker.mjs\nindex b491175e37427a121b24f8d783273359880737f0..a90927cea0954e6e963b87a1e8db788319c1056c 100644\n--- a/workflow/opencode-runtime/worker.mjs\n+++ b/workflow/opencode-runtime/worker.mjs\n@@ -23,8 +23,8 @@\n         return createContextExport(binding);\n     }\n     if (binding.slot === \"workflow\" && binding.module_id === \"opencode_loop\") {\n-        const { createWorkflowExport } = await import(\"./workflow.mjs\");\n-        return createWorkflowExport(binding);\n+        const { createBrokerWorkflowExport } = await import(\"./workflow.mjs\");\n+        return createBrokerWorkflowExport(binding);\n     }\n     throw new Error(`OpenCode ${binding.slot}/${binding.module_id} adapter is unavailable`);\n });\n",
+  "independent_source_gate_sha256": "81aa431c07144169b2ff364b2b7e4ad75d2a9ca3cf023fea35ffc2a99dca6e47"
+}
