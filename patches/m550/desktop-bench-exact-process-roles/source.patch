@@ -1,0 +1,93 @@
+diff --git a/examples/performance/native-history/run.py b/examples/performance/native-history/run.py
+index c2f6aded1cfe78cca0426af17274bd583a5c6d5e..e7f009814cadacef19ddc45b5bfd12e9486e4a86 100644
+--- a/examples/performance/native-history/run.py
++++ b/examples/performance/native-history/run.py
+@@ -105,13 +105,14 @@
+     return result, windows
+ 
+ 
+-def process_group(row, extensions):
+-    path = Path(row.get('exe', ''))
+-    executable = path.name
+-    if executable == 'proteus':
++def process_group(row, extensions, *, core, module, storage):
++    exe = row.get('exe') or ''
++    if exe == str(core):
+         return 'backend'
+-    if executable in ('proteus-reference-module', 'proteus-session-storage-module'):
++    if exe in (str(module), str(storage)):
+         return 'modules'
++    path = Path(exe)
++    executable = path.name
+     if path.is_relative_to(extensions) or executable.startswith('python') or executable == 'node' or row.get('name') == 'node':
+         return 'extensions'
+     return 'other'
+@@ -224,7 +225,7 @@
+                        XDG_DATA_HOME=str(case / 'xdg-data'), XDG_CACHE_HOME=str(case / 'xdg-cache'))
+ 
+     def classify(row):
+-        return process_group(row, args.extensions)
++        return process_group(row, args.extensions, core=args.core, module=args.module, storage=args.storage)
+ 
+     samples = []
+     started = time.monotonic()
+@@ -338,6 +339,8 @@
+     for name in ('native', 'core', 'module', 'seeder', 'extensions', 'core_source', 'output', 'bgui'):
+         setattr(args, name, getattr(args, name).resolve())
+     args.storage = storage_binary(args.core, args.storage)
++    if args.core in (args.module, args.storage):
++        parser.error('--core must resolve to a different executable path than --module and --storage')
+     assert args.repeats >= 1 and all(n > 0 for n in args.messages)
+     assert args.interval >= .05 and args.idle >= 1 and args.settle >= 0
+     assert os.environ.get('WAYLAND_DISPLAY'), 'launch through background-gui exec/run'
+diff --git a/examples/performance/native-history/test_runner.py b/examples/performance/native-history/test_runner.py
+index 097bd0c4aacb650b2881e02cea064c7bede9b6b7..bc733faa729d24bbb3205426342ebd894ef273ce 100644
+--- a/examples/performance/native-history/test_runner.py
++++ b/examples/performance/native-history/test_runner.py
+@@ -46,15 +46,40 @@
+ 
+     def test_rust_packages_and_workers_are_counted_as_extensions(self):
+         root = Path('/portable/share/extensions')
++        core = Path('/portable/bin/proteus')
++        module = Path('/portable/bin/proteus-reference-module')
++        storage = Path('/portable/bin/proteus-session-storage-module')
++
++        def group(row):
++            return process_group(row, root, core=core, module=module, storage=storage)
++
+         for executable in (root / 'markdown-render/bin/markdown-render',
+                            root / 'files/bin/files', Path('/usr/bin/node'),
+                            Path('/usr/bin/python3')):
+-            self.assertEqual(process_group({'exe': str(executable)}, root), 'extensions')
+-        self.assertEqual(process_group({'exe': '/usr/bin/node-22', 'name': 'node'}, root), 'extensions')
+-        self.assertEqual(process_group({'exe': '/portable/share/extensions-old/bin/files'}, root), 'other')
+-        self.assertEqual(process_group({'exe': '/portable/bin/proteus'}, root), 'backend')
+-        self.assertEqual(process_group({'exe': '/portable/bin/proteus-reference-module'}, root), 'modules')
+-        self.assertEqual(process_group({'exe': '/portable/bin/proteus-session-storage-module'}, root), 'modules')
++            self.assertEqual(group({'exe': str(executable)}), 'extensions')
++        self.assertEqual(group({'exe': '/usr/bin/node-22', 'name': 'node'}), 'extensions')
++        self.assertEqual(group({'exe': '/portable/share/extensions-old/bin/files'}), 'other')
++        self.assertEqual(group({'exe': str(core)}), 'backend')
++        self.assertEqual(group({'exe': str(module)}), 'modules')
++        self.assertEqual(group({'exe': str(storage)}), 'modules')
++
++    def test_exact_selected_paths_win_without_basename_or_argv_fallback(self):
++        extensions = Path('/portable/share/extensions')
++        core = Path('/alternate/core debug')
++        module = Path('/alternate/reference debug')
++        storage = extensions / 'nested/storage release'
++
++        def group(row):
++            return process_group(row, extensions, core=core, module=module, storage=storage)
++
++        for exe, expected in ((core, 'backend'), (module, 'modules'), (storage, 'modules')):
++            self.assertEqual(group({'exe': str(exe), 'argv': ['/unrelated/proteus']}), expected)
++        for unknown in ('/unrelated/proteus', '/unrelated/proteus-reference-module',
++                        '/unrelated/proteus-session-storage-module', str(core) + ' (deleted)',
++                        str(storage.name), '', None):
++            self.assertEqual(group({'exe': unknown, 'argv': [str(core)], 'name': 'proteus'}), 'other')
++        self.assertEqual(group({'name': 'node'}), 'extensions')
++        self.assertEqual(group({'exe': str(extensions / 'deep/old/proteus')}), 'extensions')
+ 
+ 
+ class IdleCpu(unittest.TestCase):
