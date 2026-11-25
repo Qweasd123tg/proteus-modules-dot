@@ -1,0 +1,23 @@
+diff --git a/model/opencode-provider/adapter.mjs b/model/opencode-provider/adapter.mjs
+index 8f6fded6134dba2cc87a06e916739f8b056ab54b..6e856ce41469175ab629e81edb01190a2a601d00 100644
+--- a/model/opencode-provider/adapter.mjs
++++ b/model/opencode-provider/adapter.mjs
+@@ -6,6 +6,8 @@
+ import { createCredentialReader } from './credentials.mjs';
+ import { configSchema } from './config-schema.mjs';
+ import { createGoQuotaReader } from '../../components/model-runtime-js/opencode-go-quota.mjs';
++
++const STREAM_START_EVENTS = ['text-start', 'text-delta', 'reasoning-start', 'reasoning-delta', 'tool-input-start', 'tool-call'];
+ 
+ let streamParts, loadingStreamParts;
+ function loadStreamParts() {
+@@ -104,7 +106,8 @@
+                 const resolved = await runtime.resolve(r.model.model, r.reasoning.effort, await credential(signal, r.model.model), signal);
+                 const request = await toNativeRequest(r, resolved.model, { signal, modelInfo: resolved.modelInfo });
+                 await stream(request, signal, async event => {
+-                    if (['text-start', 'text-delta', 'reasoning-start', 'reasoning-delta', 'tool-input-start', 'tool-call'].includes(event.type)) started = true;
++                    const eventType = event.type;
++                    if (!started && STREAM_START_EVENTS.includes(eventType)) started = true;
+                     const events = collector.push(event);
+                     for (const event of events) if (event.MessageCompleted) {
+                         started = true;
