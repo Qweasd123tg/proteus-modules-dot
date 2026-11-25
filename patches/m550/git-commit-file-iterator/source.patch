@@ -1,0 +1,40 @@
+--- a/packages/git/src/details.rs
++++ b/packages/git/src/details.rs
+@@ -16,8 +16,8 @@
+     Many(Vec<&'a Value>),
+ }
+ 
+-fn files_in(
+-    files: &[&Value],
++fn files_in<'a>(
++    files: impl IntoIterator<Item = &'a Value>,
+     prefix: &str,
+     depth: usize,
+     hash: &str,
+@@ -26,7 +26,7 @@
+     rows: &mut Vec<Value>,
+ ) {
+     let mut groups = BTreeMap::<&str, FileGroup<'_>>::new();
+-    for &file in files {
++    for file in files {
+         let relative = file.str("path").strip_prefix(prefix).unwrap_or("");
+         match groups.entry(relative.split('/').next().unwrap_or("")) {
+             Entry::Vacant(entry) => {
+@@ -54,7 +54,7 @@
+             rows.push(json!({"id":format!("dir:{path}"),"label":name,"depth":depth,"expanded":expanded,"icon":"folder"}));
+             if expanded {
+                 files_in(
+-                    items,
++                    items.iter().copied(),
+                     &format!("{path}/"),
+                     depth + 1,
+                     hash,
+@@ -143,7 +143,7 @@
+         let mut rows = Vec::new();
+         let short = self.short_of(hash);
+         files_in(
+-            &files.iter().collect::<Vec<_>>(),
++            files,
+             "",
+             0,
+             hash,
