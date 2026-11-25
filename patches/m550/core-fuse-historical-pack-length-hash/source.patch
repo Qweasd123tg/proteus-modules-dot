@@ -1,0 +1,177 @@
+diff --git a/crates/proteus-contracts/src/contracts/session_storage.rs b/crates/proteus-contracts/src/contracts/session_storage.rs
+index 80c1edfa149658f504a9501a7c8edb3d2b5e171d..2a96d4735bceba72a0658e9fccfede903e11e59d 100644
+--- a/crates/proteus-contracts/src/contracts/session_storage.rs
++++ b/crates/proteus-contracts/src/contracts/session_storage.rs
+@@ -50,7 +50,7 @@
+ mod tests;
+ mod validation;
+ mod value_hash;
+-pub use value_hash::storage_value_etag;
++pub use value_hash::{storage_value_etag, storage_value_etag_with_len};
+ 
+ /// The key is interpreted only by the selected storage implementation.
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+diff --git a/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs b/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
+index 4f5bbcb93090a89d32f41afaa10e1f7d4321cbcf..376eb6d3059fc7ebc76530a4451b73b9f8fcb1fb 100644
+--- a/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
++++ b/crates/proteus-contracts/src/contracts/session_storage/value_hash.rs
+@@ -1,4 +1,6 @@
+ //! Stable content fingerprints without a serialized copy of a cached value.
++use std::io;
++
+ use anyhow::{Context, Result};
+ use ring::digest::{Context as DigestContext, SHA256};
+ use serde::{
+@@ -10,17 +12,30 @@
+ /// SHA-256 of compact JSON with lexicographically ordered object keys. Ordering
+ /// is explicit so independent worker builds agree even with `preserve_order`.
+ pub fn storage_value_etag(value: &Value) -> Result<String> {
+-    let mut writer = DigestWriter(DigestContext::new(&SHA256));
++    fingerprint::<false>(value, 0).map(|(etag, _)| etag)
++}
++
++/// The same canonical etag and compact JSON byte count, with an inclusive
++/// serialized byte limit. No partial etag is returned on overflow.
++pub fn storage_value_etag_with_len(value: &Value, max_bytes: usize) -> Result<(String, usize)> {
++    fingerprint::<true>(value, max_bytes)
++}
++
++fn fingerprint<const BOUNDED: bool>(value: &Value, limit: usize) -> Result<(String, usize)> {
++    let mut writer = DigestWriter::<BOUNDED> {
++        digest: DigestContext::new(&SHA256),
++        remaining: limit,
++    };
+     serde_json::to_writer(&mut writer, &OrderedValue(value))
+         .context("failed to fingerprint storage value")?;
+-    let digest = writer.0.finish();
++    let digest = writer.digest.finish();
+     let mut etag = String::with_capacity(digest.as_ref().len() * 2);
+     const HEX: &[u8; 16] = b"0123456789abcdef";
+     for &byte in digest.as_ref() {
+         etag.push(char::from(HEX[usize::from(byte >> 4)]));
+         etag.push(char::from(HEX[usize::from(byte & 0x0f)]));
+     }
+-    Ok(etag)
++    Ok((etag, limit - writer.remaining))
+ }
+ 
+ struct OrderedValue<'a>(&'a Value);
+@@ -75,13 +90,56 @@
+     true
+ }
+ 
+-struct DigestWriter(DigestContext);
+-impl std::io::Write for DigestWriter {
+-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-        self.0.update(bytes);
++struct DigestWriter<const BOUNDED: bool> {
++    digest: DigestContext,
++    remaining: usize,
++}
++
++impl<const BOUNDED: bool> io::Write for DigestWriter<BOUNDED> {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        if BOUNDED {
++            self.remaining = self
++                .remaining
++                .checked_sub(bytes.len())
++                .ok_or_else(|| io::Error::other("encoded JSON exceeds byte budget"))?;
++        }
++        self.digest.update(bytes);
+         Ok(bytes.len())
+     }
+-    fn flush(&mut self) -> std::io::Result<()> {
++    fn flush(&mut self) -> io::Result<()> {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::{Map, json};
++
++    #[test]
++    fn bounded_storage_fingerprint_matches_canonical_with_exact_json_cap() {
++        let nested = Map::from_iter([
++            ("z".into(), json!(["\n\t\\\0", "ключ🦀", -1.5, null])),
++            ("a".into(), json!({"second": 2, "first": true})),
++        ]);
++        for value in [
++            json!(null),
++            json!(""),
++            json!([Value::Object(nested), false]),
++            json!({"deflate_v1": ["AA==", "BB==", "CC=="]}),
++        ] {
++            let bytes = serde_json::to_vec(&value).unwrap().len();
++            let expected = storage_value_etag(&value).unwrap();
++            assert_eq!(
++                storage_value_etag_with_len(&value, bytes).unwrap(),
++                (expected.clone(), bytes)
++            );
++            assert_eq!(
++                storage_value_etag_with_len(&value, bytes + 1).unwrap(),
++                (expected, bytes)
++            );
++            assert!(storage_value_etag_with_len(&value, bytes - 1).is_err());
++            assert!(storage_value_etag_with_len(&value, 0).is_err());
++        }
++    }
++}
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+index 771addf980c0afc6249ef0774e8727991c667c39..73b5932e6f44819aec40694e3dce499a70f29439 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages/packs.rs
+@@ -10,6 +10,7 @@
+     },
+     inflate::decompress_to_vec_with_limit,
+ };
++use proteus_contracts::contracts::storage_value_etag_with_len;
+ use serde_json::{Map, Value};
+ 
+ // Compact JSON of {"deflate_v1":[]} plus quoted base64 strings and commas.
+@@ -56,26 +57,27 @@
+         store: &RemoteSessionStore,
+         pages: &[PageRef],
+     ) -> Option<(Encoding, Vec<Value>)> {
+-        let value = read_value(store, &format!("display-data-{}", self.hash))?;
+-        // A disposable header's byte counts are not authority for a returned
+-        // object's size. Reject an oversized body before hashing its contents.
+-        let size = encoded_len(&value, MAX_BYTES)?;
+-        if hash(&value).as_deref() != Some(&self.hash) {
++        let mut value = read_value(store, &format!("display-data-{}", self.hash))?;
++        let object = value.as_object()?;
++        if object.len() != 1 {
+             return None;
+         }
+-        match value {
+-            Value::Object(mut object) if object.len() == 1 => {
+-                let Value::Array(leaves) = object.remove("deflate_v1")? else {
+-                    return None;
+-                };
+-                let smallest = pages.iter().map(|page| page.bytes).min()?;
+-                (size <= 2 * smallest
+-                    && leaves.len() == self.count
+-                    && leaves.iter().all(Value::is_string))
+-                .then_some((Encoding::DeflateV1, leaves))
+-            }
+-            _ => None,
++        let leaves = object.get("deflate_v1")?.as_array()?;
++        if leaves.len() != self.count || !leaves.iter().all(Value::is_string) {
++            return None;
+         }
++        // This shape cannot require sorting a large object before writing
++        // any bytes. Count the actual physical value as its canonical hash
++        // is computed, independently of the header's claimed sizes.
++        let (digest, size) = storage_value_etag_with_len(&value, MAX_BYTES).ok()?;
++        let smallest = pages.iter().map(|page| page.bytes).min()?;
++        if digest != self.hash || size > 2 * smallest {
++            return None;
++        }
++        let Value::Array(leaves) = value.as_object_mut()?.remove("deflate_v1")? else {
++            return None;
++        };
++        Some((Encoding::DeflateV1, leaves))
+     }
+ }
+ 
