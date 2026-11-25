@@ -1,0 +1,14 @@
+diff --git a/workflow/opencode-runtime/compaction.mjs b/workflow/opencode-runtime/compaction.mjs
+index 55724336a0a127fe794faa82b28cb2d8ebfe48d9..a5e0e1aab622b4c33f3333af3ba3be19a5e21b5f 100644
+--- a/workflow/opencode-runtime/compaction.mjs
++++ b/workflow/opencode-runtime/compaction.mjs
+@@ -38,6 +38,9 @@
+ }
+ 
+ function textParts(message) {
++    const parts = message.parts;
++    const single = Array.isArray(parts) && parts.length === 1 ? parts[0]?.payload?.Text?.text : undefined;
++    if (typeof single === "string") return single;
+     const fragments = [];
+     message.parts.forEach(({ payload }) => {
+         if (payload.Text) fragments.push(payload.Text.text);
