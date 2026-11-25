@@ -1,0 +1,75 @@
+--- a/packages/model/src/popup.rs
++++ b/packages/model/src/popup.rs
+@@ -4,7 +4,7 @@
+ use std::collections::{BTreeMap, BTreeSet, HashMap};
+ 
+ use proteus_extension::ui::{
+-    Node, button, disclosure, divider, muted, note, picker, row, select, stack, text,
++    Node, button, disclosure, divider, muted, note, picker_from, row, select, stack, text,
+ };
+ use proteus_extension::{Host, Value, ValueExt, json};
+ 
+@@ -172,20 +172,17 @@
+                 .or_insert_with(|| item.str("provider"));
+         }
+     }
+-    let choices: Vec<_> = options
+-        .iter()
+-        .map(|option| {
+-            let value = option.at("value");
+-            let name = option.str("name");
+-            let label = match providers.get(value) {
+-                Some(provider) => format!("{provider}/{name}"),
+-                None => name.to_owned(),
+-            };
+-            (value.clone(), label)
+-        })
+-        .collect();
++    let choices = options.iter().map(|option| {
++        let value = option.at("value");
++        let name = option.str("name");
++        let label = match providers.get(value) {
++            Some(provider) => std::borrow::Cow::Owned(format!("{provider}/{name}")),
++            None => std::borrow::Cow::Borrowed(name),
++        };
++        (value, label)
++    });
+     vec![picker_header(
+-        picker("models", &choices, &json!(name), "model"),
++        picker_from("models", choices, &json!(name), "model"),
+         &title,
+         back,
+     )]
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -300,6 +300,30 @@
+         .iter()
+         .map(|(value, label)| json!({"value":value,"label":label,"selected":value==selected}))
+         .collect();
++    picker_options(id, options, action)
++}
++
++/// Build a native picker directly from borrowed choice values and their labels.
++pub fn picker_from<'a, L: Into<String>>(
++    id: &str,
++    options: impl IntoIterator<Item = (&'a Value, L)>,
++    selected: &Value,
++    action: &str,
++) -> Value {
++    let options: Vec<_> = options
++        .into_iter()
++        .map(|(value, label)| {
++            with_source(
++                json!({"value":value,"label":null,"selected":value==selected}),
++                "label",
++                label,
++            )
++        })
++        .collect();
++    picker_options(id, options, action)
++}
++
++fn picker_options(id: &str, options: Vec<Value>, action: &str) -> Value {
+     json!({"type":"picker","id":id})
+         .with("options", Value::Array(options))
+         .with("action", action)
