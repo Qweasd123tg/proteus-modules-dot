@@ -1,0 +1,199 @@
+{
+  "repo": "Proteus-harness/Proteus-modules",
+  "owner_base": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+  "source_gate_sha256": "462a298190ab6d8392d09999ca15eb5440f2b99febb6d7442b4eab57d9f64208",
+  "source_patch_sha256": "eb3dee9e31971a69c0a0060e31c06fcb2717a88f5bb886d8fc5fffe7153b637c",
+  "selection": "Use source.patch only on the exact owner preimage or use the scoped alternate after #737, not both.",
+  "alternate_scoped_patch": "diff --git a/tool/pi-tools/adapter.mjs b/tool/pi-tools/adapter.mjs\nindex 42952f63ea7414bb8720a52ae4a851fa76d3f24e..af7c6659afc7caaaefefaf089679220e58541b2b 100644\n--- a/tool/pi-tools/adapter.mjs\n+++ b/tool/pi-tools/adapter.mjs\n@@ -4,7 +4,10 @@\n const packageInfo = JSON.parse(readFileSync(new URL(\"../package.json\", packageEntry), \"utf8\"));\n if (packageInfo.version !== \"1.5.2\") throw new Error(`Pi runtime requires 1.5.2, found ${packageInfo.version}`);\n export const importPi = relative => import(new URL(relative, packageEntry));\n-const { createCodingToolDefinitions } = await importPi(\"./core/tools/index.js\");\n+const { createCodingToolDefinitions, createToolDefinition } = await importPi(\"./core/tools/index.js\");\n+// Match the four tools in Pi 1.5.2's createCodingToolDefinitions, not the\n+// wider set supported by createToolDefinition.\n+const codingToolNames = [\"read\", \"bash\", \"edit\", \"write\"];\n \n export const loadPi = () => pi;\n \n@@ -52,8 +55,10 @@\n }\n \n export async function executePiTool(input, signal) {\n-    const definition = createPiDefinitions(input.cwd).find(tool => tool.name === input.call.name);\n-    if (!definition) throw new Error(`Unknown Pi tool ${input.call.name}`);\n+    const cwd = input.cwd;\n+    const name = codingToolNames.find(name => name === input.call.name);\n+    if (name === undefined) throw new Error(`Unknown Pi tool ${input.call.name}`);\n+    const definition = createToolDefinition(name, cwd);\n     const args = input.call.raw_arguments == null ? input.call.args : JSON.parse(input.call.raw_arguments);\n     const prepared = definition.prepareArguments ? definition.prepareArguments(args) : args;\n     try {\n",
+  "alternate_scoped_patch_sha256": "b56537fe5b34d4c4d92b6dc49a242e94daf12b794c777bd8acafbc2c090cab47",
+  "alternate": {
+    "after": {
+      "tool/pi-tools/adapter.mjs": {
+        "bytes": 4389,
+        "git": "af7c6659afc7caaaefefaf089679220e58541b2b",
+        "sha256": "8ca8017de9286d7352d54d7531e9397d606b051c33e81b039c0b6cee12f4e083"
+      }
+    },
+    "before": {
+      "tool/pi-tools/adapter.mjs": {
+        "bytes": 4121,
+        "git": "42952f63ea7414bb8720a52ae4a851fa76d3f24e",
+        "sha256": "9bf470e45f06585c584a725e384f471e4d857454da2fe7fb1e28e2940a7e7d87"
+      }
+    },
+    "historical_787_worker_companion_separate_source": {
+      "bytes": 5374,
+      "git": "8c48f45b5e9ef4c43564dd0a7ac6904b819e69a4",
+      "sha256": "a0f9ac7c0ff83ef17da04b4323abf9a150baea316bed51660d68f4a9a6f02574"
+    },
+    "patch": {
+      "bytes": 1653,
+      "git": "ec29164e13ab36e982dcb10df1acae3fee778d23",
+      "sha256": "b56537fe5b34d4c4d92b6dc49a242e94daf12b794c777bd8acafbc2c090cab47"
+    },
+    "prior_737_exact_patch": {
+      "bytes": 1604,
+      "git": "804a93e3d9bd161cf9114c77e9beede9865ca9e6",
+      "sha256": "624f7994b51ca9314abbca3b83383e61a33040c8852d55f053636b19ea640758"
+    },
+    "raw_737_after_new_owner_strictly_applies": true,
+    "strict_forward_reverse_exact": true
+  },
+  "contract": {
+    "actual_tool_effect_count_measured": false,
+    "existing_four_exact_case_sensitive_names": [
+      "read",
+      "bash",
+      "edit",
+      "write"
+    ],
+    "inert_selected_execute_same": true,
+    "native_generic_extra_tool_names_remain_rejected": true,
+    "no_new_public_parameters_or_methods": true,
+    "preserves_model_tool_contract_and_core_authorization": true,
+    "retains_separate_unchanged_list_creation": true,
+    "same_working_directory_options_and_raw_precedence": true,
+    "single_same_edit_preparation_error_cancel_result": true,
+    "supported_invocation_private_definitions_before_after": [
+      4,
+      1
+    ]
+  },
+  "desktop_manifest": {
+    "git": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+    "pins": {
+      "extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+      "harness": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+      "modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1"
+    }
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+    "Proteus-harness/Proteus-desktop": "c7840cf1edac1c6b6930a09dd3a64e2296a6ec1c",
+    "Proteus-harness/Proteus-desktop-extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+    "Proteus-harness/Proteus-modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "independent_proof": {
+    "alternate_proof_sha256": "f7f2c4cee37a1c3de9558346dd1490a24d4a13be24addcfc7d3b6e19662875a3",
+    "alternate_with_787_worker_proof_sha256": "56293578d2f470c13efea028af6c8bdf58c3579822774e4034f6b41538985778",
+    "initialization_rejections": 4,
+    "owner_proof_sha256": "a36def360a8a481064e3d002e5c94f6892546999dc08ce4a763bb2d287f62d70",
+    "paired_cases_per_basis": 25,
+    "seal_sha256": "fe41f2df60fe2d8e05fb46f848b09a93cb6f37e48408c204de83262ec56d48a1",
+    "wire_sha256": "b4df6b55ced1266a89662a91ece1fa2a7a0d30456d1396d9f605ae9438cb49f9"
+  },
+  "preflight_sha256": "c334c93ce727e9ad6d1694759228dce8d5f0a3b1ceb2974e0fbc2f87f45e02b3",
+  "producer_proof": {
+    "paired_direct_each_basis": 3,
+    "paired_wire_each_basis": 28,
+    "proof_sha256": "705170ee891e62e471c8ddf5f1722dc78bbbe1c3e09543ea6080d2c7529585e5",
+    "seal_sha256": "d8650eec14b83b6ca6baf23d4cca284008487c7c32d479fbeb03b78ac53e6ac4"
+  },
+  "scope": "Actual Pi Modules adapter, worker and broker JSONL. Authenticated released Pi factory-dispatch source backed by owned inert constructors/execution; no installed dependency or native tool effects, runtime speed, physical heap/PSS or policy expansion.",
+  "scoped_closure_selectors": {
+    "broker_723_exact_prior_reversal_and_reapply_verified": true,
+    "broker_723_patch_sha256": "b4a2f6bac354100a7b983fb5ecfab60f816ebc93e41e59992e8e2dc86f423cbf",
+    "broker_owner_and_inert_worker_proof_git": "2dfd4c97f08f60b48ef9a3acf28f17924da29634",
+    "companion_787_worker_inert_wire_verified": true,
+    "local_scope_proof_sha256": "bff2b68ce8a5e91100113ddfc0aa1c8ee2c4d2213d2dfc14b9ecd78f69aa7f52",
+    "worker_787_does_not_modify_existing_tool_handler_route": true,
+    "worker_787_patch_sha256": "a0f9ac7c0ff83ef17da04b4323abf9a150baea316bed51660d68f4a9a6f02574",
+    "worker_proof_scope": "exact owner worker; #787 static source compatibility only"
+  },
+  "selector_roster": {
+    "collision_scope": {
+      "components/module-runtime-js/component.mjs": [
+        723
+      ],
+      "tool/pi-tools/adapter.mjs": [
+        737
+      ],
+      "tool/pi-tools/worker.mjs": [
+        787
+      ]
+    },
+    "count": 97,
+    "digest": "8a243b2ba885a7bec32421c708292b4e2d20df06be5dd5af3f7de63aee968843",
+    "prior_verified_digest": "bd1f14196024646d5b030869c87e73a2299bf7c90789b14e9442140f65069f6d",
+    "range": [
+      693,
+      789
+    ],
+    "raw_metadata_sha256": "628b654ed6df9e48efb477959c5c5f068c46252a3dfe2ca266c7a57fcbdad2f8"
+  },
+  "source": {
+    "after": {
+      "tool/pi-tools/adapter.mjs": {
+        "bytes": 4462,
+        "git": "2b091d9e780fe763103fa441e7083b65d0d21d53",
+        "sha256": "4a68682f66bc890d5904179ecf5d0fb8959adba28d4d613909a85dce2a4a78c8"
+      }
+    },
+    "before": {
+      "tool/pi-tools/adapter.mjs": {
+        "bytes": 4194,
+        "git": "be5910c17cb36d75736dd1bb8fc4a1f4acfe98d7",
+        "sha256": "0ad56083fdfa8c7e3e9c4155f26b5046bd305f56c707bb1b310de658f4f9fa8f"
+      }
+    },
+    "closure": {
+      "components/module-runtime-js/component.mjs": {
+        "bytes": 7629,
+        "git": "2dfd4c97f08f60b48ef9a3acf28f17924da29634",
+        "sha256": "1de13fe3827212428b3af17f0a6e578c84efe0333ce819920e22f9d10b6c99ed"
+      },
+      "configs/pi.config.toml": {
+        "bytes": 2053,
+        "git": "aed2dbe9e723e90104915ca97b4ef7e701a2050b",
+        "sha256": "2ae316c8c9ebb0023ec211b9fa8d2ec5af0a819b864889bf66e4a42c80a1b8a2"
+      },
+      "packages/coding-agent/src/core/tools/bash.ts": {
+        "bytes": 17418,
+        "git": "92de2d09bff6a8e7542535867bf01d585033eae3",
+        "sha256": "dc97c3fa2a23e13981920bea85e6b135fc627610682bfadcdae6888b4ef1778e"
+      },
+      "packages/coding-agent/src/core/tools/edit.ts": {
+        "bytes": 8413,
+        "git": "1223ebc1c1d4f8415af4934b27038b3c5fb37fda",
+        "sha256": "8c40365f7c50b60ba27084f028ae7734b5ddba18a91b8aa29d939ed6d2aad7f2"
+      },
+      "packages/coding-agent/src/core/tools/index.ts": {
+        "bytes": 6784,
+        "git": "5e8fd5b36912371c1e54878356bf40356d619aeb",
+        "sha256": "3c66ea1e03530fb85436ee639f35add8bf72718ac6e76b738a1f41be58a2b472"
+      },
+      "packages/coding-agent/src/core/tools/read.ts": {
+        "bytes": 16320,
+        "git": "dd123cb4eb0373e4b97647a5a8b560d0f48b17cc",
+        "sha256": "46b9312a3d69b3a82e716abe6211788dbd02f0dc55fb092a3c8390acde45fa5f"
+      },
+      "packages/coding-agent/src/core/tools/write.ts": {
+        "bytes": 3520,
+        "git": "9e6b296dc08d1d09391cc002ebf45b529761964f",
+        "sha256": "b93b6a83eaee6959ae713934bbcdba834a39b023694a3ca986c73b331f771a3d"
+      },
+      "tool/pi-tools/NOTICE": {
+        "bytes": 468,
+        "git": "71f7ca25530e2194e6ecf7a3f97f8386a073f1ff",
+        "sha256": "68dc15148b12e74a833d13f174919fda7dcb8570737defb0dc2bce1b250b84ab"
+      },
+      "tool/pi-tools/package-lock.json": {
+        "bytes": 58399,
+        "git": "2cc04d44da9f3f3416e5cd90cb21dbc8de4d1c0e",
+        "sha256": "b4c2e6b27417648918b621b3516e5e5b26bb8f4a1c32b6aa7822479c7a5c18cb"
+      },
+      "tool/pi-tools/worker.mjs": {
+        "bytes": 547,
+        "git": "c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65",
+        "sha256": "e05f05f31d0ea4e9992366e904979811a89870511c4cc3bd78a3bc52528e593b"
+      }
+    },
+    "patch": {
+      "bytes": 1653,
+      "git": "94e2f70ff46678a27d5dbd64686b74361a3a9304",
+      "sha256": "eb3dee9e31971a69c0a0060e31c06fcb2717a88f5bb886d8fc5fffe7153b637c"
+    },
+    "strict_forward_reverse_exact": true
+  }
+}
