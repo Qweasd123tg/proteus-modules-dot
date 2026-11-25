@@ -1,0 +1,247 @@
+{
+  "repo": "Proteus-harness/Proteus-modules",
+  "owner_base": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+  "source_gate_sha256": "9f8af78805764a29c84a1fd1bbbcec0456c000958b93a1ab3087107dd4c139c5",
+  "source_patch_sha256": "9ff26571a7b471ef9e5ff6364d6052d8f9cc395d7f2d83832c59e8147f8109fa",
+  "selection": "Use source.patch only on the exact owner preimage or the exact scoped alternate after #742/#744/#761/#763, not both.",
+  "alternate_scoped_patch": "diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs\nindex c37e44c301521a59418fc3a2a1028f4184fea557..97c8f9dfefbf77985ecf645b248d68960ac429ca 100644\n--- a/workflow/pi-runtime/loop.mjs\n+++ b/workflow/pi-runtime/loop.mjs\n@@ -1,5 +1,5 @@\n import { randomUUID } from \"node:crypto\";\n-import { runAgentLoop, convertToLlm, buildSystemPrompt, estimateContextTokens, resolveModel, createCodingToolDefinitions, SETTINGS_DEFAULTS, retryDelayMs } from \"./upstream.mjs\";\n+import { runAgentLoop, convertToLlm, buildSystemPrompt, estimateContextTokens, resolveModel, createToolDefinition, SETTINGS_DEFAULTS, retryDelayMs } from \"./upstream.mjs\";\n import { executionCall } from \"./tool-arguments.mjs\";\n import { canonical } from \"../../components/module-runtime-js/canonical.mjs\";\n import { assistant, finishedStream, piContent, piMessage, piMessages } from \"../../components/pi-runtime-js/messages.mjs\";\n@@ -116,15 +116,19 @@\n             contextFiles,\n             skills: [],\n         });\n-        const definitions = new Map(createCodingToolDefinitions(task.cwd).map(t => [t.name, t]));\n+        const definitionCwd = task.cwd;\n+        // Of Pi 1.5.2's four coding tools, only edit has an argument preparer.\n+        let prepareEdit;\n         const tools = specs.map((spec) => ({\n             name: spec.name,\n             label: spec.name,\n             description: spec.description,\n             parameters: spec.input_schema,\n             executionMode: spec.metadata?.[\"pi/execution_mode\"] ?? undefined,\n-            prepareArguments: spec.metadata?.[\"pi/package\"] === \"@earendil-works/pi-coding-agent@1.5.2\"\n-                ? definitions.get(spec.name)?.prepareArguments : undefined,\n+            prepareArguments:\n+                spec.metadata?.[\"pi/package\"] === \"@earendil-works/pi-coding-agent@1.5.2\" && spec.name === \"edit\"\n+                    ? (prepareEdit ??= createToolDefinition(\"edit\", definitionCwd).prepareArguments)\n+                    : undefined,\n             execute: async (id, args) => {\n                 const binding = pending.get(id);\n                 if (!binding) throw new Error(\"Unbound Pi invocation \" + id);\ndiff --git a/workflow/pi-runtime/upstream.mjs b/workflow/pi-runtime/upstream.mjs\nindex 55f1b556eaf7b8353d7c9abddaa46dd32e2f389c..07bbd62fd28633f997b7431edf15f2dc6356e4b4 100644\n--- a/workflow/pi-runtime/upstream.mjs\n+++ b/workflow/pi-runtime/upstream.mjs\n@@ -28,7 +28,7 @@\n }\n \n export { validateToolArguments } from \"../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/index.js\";\n-export { createCodingToolDefinitions } from \"../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js\";\n+export { createCodingToolDefinitions, createToolDefinition } from \"../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js\";\n \n export { SETTINGS_DEFAULTS } from \"../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/settings-defaults.js\";\n export { retryDelayMs } from \"../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/utils/retry.js\";\n",
+  "alternate_scoped_patch_sha256": "702bb05420cf593cf3b4458622470c1a907b519427a48897cc0377eaf4e0726a",
+  "alternate": {
+    "after": {
+      "workflow/pi-runtime/loop.mjs": {
+        "bytes": 12542,
+        "git": "97c8f9dfefbf77985ecf645b248d68960ac429ca",
+        "sha256": "9e093194c698690e881b4fa002ce2f218fa869a83fb007a6bb6bed37dc3d07e1"
+      },
+      "workflow/pi-runtime/upstream.mjs": {
+        "bytes": 2291,
+        "git": "07bbd62fd28633f997b7431edf15f2dc6356e4b4",
+        "sha256": "e0b07b8f6b270f706b0359270021a007b25a8b2d854accc6243c7d2d5836d663"
+      }
+    },
+    "already_present_735_verified_reverse_and_forward": true,
+    "before": {
+      "workflow/pi-runtime/loop.mjs": {
+        "bytes": 12404,
+        "git": "c37e44c301521a59418fc3a2a1028f4184fea557",
+        "sha256": "68082e495ae53b7210c4d4fb6b0a51d5e475b2085e70d59a7e6d20c0ffbf033f"
+      },
+      "workflow/pi-runtime/upstream.mjs": {
+        "bytes": 2269,
+        "git": "55f1b556eaf7b8353d7c9abddaa46dd32e2f389c",
+        "sha256": "23975e1a606a199a0f7ec41f8d4bf68900abd27adc87d47331a016e673feff11"
+      }
+    },
+    "candidate_first_raw_chain_rejected_at": 761,
+    "chronology": [
+      {
+        "pr": 742,
+        "scope_patch": {
+          "bytes": 1048,
+          "git": "53853c5068de213f78c0b96991efcc9cdeb898b1",
+          "sha256": "61bb3c82afe216c4c3632e68d2a9c5e19c02c3a59b0cbaaeb7b3af0b2a889680"
+        },
+        "target_git": "f96727538f09672a8ca1ed381541735cb401946a"
+      },
+      {
+        "pr": 744,
+        "scope_patch": {
+          "bytes": 1548,
+          "git": "688d5d29eb7d8ae57b9c806964aa6b97366d7724",
+          "sha256": "59847baeb3aaaaec8c3dbc67d44141d89b29bcef917c3cbe04c1337960c6b413"
+        },
+        "target_git": "0786d852763cda3004c8a2aa1e002c25d7ad3565"
+      },
+      {
+        "pr": 761,
+        "scope_patch": {
+          "bytes": 1921,
+          "git": "2341d44b3c881e18cc189d7759df0f0c867a7490",
+          "sha256": "fcc9e4cf52365fa3391adb36abbfefc250f4a35a61d663a6ad36067e7b20330a"
+        },
+        "target_git": "929aee0ba8a35bd178c6ac962fc5ea9846d02e5c"
+      },
+      {
+        "pr": 763,
+        "scope_patch": {
+          "bytes": 1592,
+          "git": "836d9957baa5b47b3c3c67d35019ba815a0deca3",
+          "sha256": "5483bc1f39166bb1e35c3ac458713dbef015dad778e2cf1e0d50e2123c8b439f"
+        },
+        "target_git": "c37e44c301521a59418fc3a2a1028f4184fea557"
+      }
+    ],
+    "patch": {
+      "bytes": 3085,
+      "git": "04e63ef304e0d215a9302d35f252b96e10f1740f",
+      "sha256": "702bb05420cf593cf3b4458622470c1a907b519427a48897cc0377eaf4e0726a"
+    },
+    "raw_owner_on_scoped_rejected": true,
+    "reversed_all_to_owner": true,
+    "strict_forward_reverse_exact": true
+  },
+  "contract": {
+    "no_authority_protocol_or_real_tool_execution_change": true,
+    "no_qualifying_edit_wrapper_constructions_before_after": [
+      4,
+      0
+    ],
+    "one_per_turn_native_preparer_function_no_cross_turn_cache": true,
+    "only_pinned_exact_package_tag_and_case_sensitive_edit_qualify": true,
+    "ordinary_tagged_edit_wrapper_constructions_before_after": [
+      4,
+      1
+    ],
+    "tool_descriptor_list_and_existing_preparer_identity_preserved": true,
+    "validator_inputs_cwd_raw_args_cancellation_and_errors_preserved": true
+  },
+  "desktop_manifest": {
+    "git": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+    "pins": {
+      "extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+      "harness": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+      "modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1"
+    }
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+    "Proteus-harness/Proteus-desktop": "c7840cf1edac1c6b6930a09dd3a64e2296a6ec1c",
+    "Proteus-harness/Proteus-desktop-extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+    "Proteus-harness/Proteus-modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "independent_proof": {
+    "expected_host_rejection_and_pre_stream_cancellation": true,
+    "paired_actual_wire_per_basis": 17,
+    "proof_sha256": "d5ab53e1c8b43d1066e87054bd06ad90388fd020d37beae0de0d7ff0d51a7f56",
+    "seal_sha256": "d3d4532d9fa439b651b6c55b40565297d72fdb335631a3b6164d5b01754a6353"
+  },
+  "owner_dependency_closure": {
+    "modules": {
+      "components/model-runtime-js/context.mjs": "4c09b46beae5fc3765328469f85c8bd38adbb69a",
+      "components/module-runtime-js/canonical.mjs": "65c4299272e41ddf14cb7a9db72120a41b02d2a2",
+      "components/module-runtime-js/component.mjs": "2dfd4c97f08f60b48ef9a3acf28f17924da29634",
+      "components/module-runtime-js/model-stream.mjs": "c195af0a5c92b086337fff5fba4a698a3f50681e",
+      "components/pi-runtime-js/messages.mjs": "43c0372fcfd6b17337d7fd042e25e4b23ee6fa2c",
+      "tool/pi-tools/adapter.mjs": "be5910c17cb36d75736dd1bb8fc4a1f4acfe98d7",
+      "tool/pi-tools/worker.mjs": "c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65",
+      "workflow/pi-runtime/compaction.mjs": "0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c",
+      "workflow/pi-runtime/context.mjs": "f6f9ee0680aab67f7d322ed92ae1da3b8890416f",
+      "workflow/pi-runtime/exports.mjs": "d0f5a2c7c261140ae52edaf3e7434550681e4b9b",
+      "workflow/pi-runtime/tool-arguments.mjs": "16f16ff8bfea7db098fbd987f42745b072fecd98"
+    },
+    "sdk": {
+      "packages/coding-agent/src/core/tools/edit.ts": "1223ebc1c1d4f8415af4934b27038b3c5fb37fda",
+      "packages/coding-agent/src/core/tools/index.ts": "5e8fd5b36912371c1e54878356bf40356d619aeb"
+    }
+  },
+  "preflight_sha256": "41d25f7460cfe61849fbeef7b6118817a93d8f5230f32f0d2bf70145fc880e4a",
+  "producer_proof": {
+    "direct_per_basis": 5,
+    "paired_wire_per_basis": 13,
+    "proof_sha256": "7d93aafcd0f2b6d59f3f250d3718c61ef46e4ee0d35734172c3b31b3ec3631d8",
+    "real_version_gate_negative_per_arm": true,
+    "seal_sha256": "1d2d0b6cfec528da246a0a128f4908b6bef72f990ba2488056400160a30d9c71"
+  },
+  "scope": "Actual local Pi workflow/worker/JSONL broker and pinned Pi factory-dispatch/edit normalization source with inert scheduler/model/host/TypeBox and no tool effects. No packaged native/GUI/system benchmark or physical RSS/PSS/time claim.",
+  "scoped_companions": {
+    "exact_test_import_closure": {
+      "components/model-runtime-js/context.mjs": "4c09b46beae5fc3765328469f85c8bd38adbb69a",
+      "components/module-runtime-js/canonical.mjs": "65c4299272e41ddf14cb7a9db72120a41b02d2a2",
+      "components/module-runtime-js/component.mjs": "2dfd4c97f08f60b48ef9a3acf28f17924da29634",
+      "components/module-runtime-js/model-stream.mjs": "c195af0a5c92b086337fff5fba4a698a3f50681e",
+      "components/pi-runtime-js/messages.mjs": "3d2abb2c496f64ab04b5dcbf55dc4e4272d7b237",
+      "tool/pi-tools/adapter.mjs": "af7c6659afc7caaaefefaf089679220e58541b2b",
+      "tool/pi-tools/worker.mjs": "32d34b43ecacc6055f6f5332d13b960c5f699018",
+      "workflow/pi-runtime/compaction.mjs": "5ec22a8853e781d7e5976db6a7088e947939503b",
+      "workflow/pi-runtime/context.mjs": "f6f9ee0680aab67f7d322ed92ae1da3b8890416f",
+      "workflow/pi-runtime/exports.mjs": "1a57c5c94577d6c8b041930b6e114107650a1d99",
+      "workflow/pi-runtime/tool-arguments.mjs": "16f16ff8bfea7db098fbd987f42745b072fecd98"
+    },
+    "source_selector_gits": {
+      "743": "9c59693a0173746e037a201492bb3eda1429f9f0",
+      "787": "8c48f45b5e9ef4c43564dd0a7ac6904b819e69a4",
+      "790": "94e2f70ff46678a27d5dbd64686b74361a3a9304"
+    }
+  },
+  "selector_roster": {
+    "collision_scope": {
+      "components/pi-runtime-js/messages.mjs": [
+        743
+      ],
+      "tool/pi-tools/NOTICE": [],
+      "tool/pi-tools/package-lock.json": [],
+      "workflow/pi-runtime/loop.mjs": [
+        735,
+        742,
+        744,
+        761,
+        763
+      ],
+      "workflow/pi-runtime/tool-arguments.mjs": [],
+      "workflow/pi-runtime/upstream.mjs": []
+    },
+    "count": 99,
+    "digest": "22675f9415f447082b78caa4992ea1732644a23934eab2a2a90b6379703ab227",
+    "prior_verified_digest": "74691453adc862b2b042f3335a3daa80f2fde1abadb7a286d876ae184021c083",
+    "range": [
+      693,
+      791
+    ],
+    "raw_metadata_sha256": "11d971b18407b80fee5c659ea8013e52a028f5f69a28889bc770786f2b7aa9f1"
+  },
+  "source": {
+    "after": {
+      "workflow/pi-runtime/loop.mjs": {
+        "bytes": 11484,
+        "git": "e18215b3a14c46fcbe220e78892fb23a3fb2cde1",
+        "sha256": "8fa742af4c3ae0183eb914d141d3341aabc87cfd444f36726e8ee1b3930b9804"
+      },
+      "workflow/pi-runtime/upstream.mjs": {
+        "bytes": 2291,
+        "git": "07bbd62fd28633f997b7431edf15f2dc6356e4b4",
+        "sha256": "e0b07b8f6b270f706b0359270021a007b25a8b2d854accc6243c7d2d5836d663"
+      }
+    },
+    "before": {
+      "workflow/pi-runtime/loop.mjs": {
+        "bytes": 11346,
+        "git": "6dfac8c5fb240435d39c6d02fef4edcadd1893e3",
+        "sha256": "f32e5aa3a7f7b66180bbffbbfe507cb7b79420f29040ea2a0b21e92c60da51e3"
+      },
+      "workflow/pi-runtime/upstream.mjs": {
+        "bytes": 2269,
+        "git": "55f1b556eaf7b8353d7c9abddaa46dd32e2f389c",
+        "sha256": "23975e1a606a199a0f7ec41f8d4bf68900abd27adc87d47331a016e673feff11"
+      }
+    },
+    "closure": {
+      "components/pi-runtime-js/messages.mjs": {
+        "bytes": 5824,
+        "git": "43c0372fcfd6b17337d7fd042e25e4b23ee6fa2c",
+        "sha256": "49dc568d367992e0d932b987ad1dbd3bfa85616f03eda51ff213c16c6172bbe0"
+      },
+      "tool/pi-tools/NOTICE": {
+        "bytes": 468,
+        "git": "71f7ca25530e2194e6ecf7a3f97f8386a073f1ff",
+        "sha256": "68dc15148b12e74a833d13f174919fda7dcb8570737defb0dc2bce1b250b84ab"
+      },
+      "tool/pi-tools/package-lock.json": {
+        "bytes": 58399,
+        "git": "2cc04d44da9f3f3416e5cd90cb21dbc8de4d1c0e",
+        "sha256": "b4c2e6b27417648918b621b3516e5e5b26bb8f4a1c32b6aa7822479c7a5c18cb"
+      },
+      "workflow/pi-runtime/tool-arguments.mjs": {
+        "bytes": 758,
+        "git": "16f16ff8bfea7db098fbd987f42745b072fecd98",
+        "sha256": "98c4e24bd948986fad6c81d537252b92a6d20b73e02827ee33db710a5cc52d89"
+      }
+    },
+    "patch": {
+      "bytes": 3126,
+      "git": "11c11a319cfeb172e9e512beea0d13803d8b1e24",
+      "sha256": "9ff26571a7b471ef9e5ff6364d6052d8f9cc395d7f2d83832c59e8147f8109fa"
+    },
+    "strict_forward_reverse_exact": true
+  }
+}

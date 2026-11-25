@@ -1,0 +1,47 @@
+diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs
+index 6dfac8c5fb240435d39c6d02fef4edcadd1893e3..e18215b3a14c46fcbe220e78892fb23a3fb2cde1 100644
+--- a/workflow/pi-runtime/loop.mjs
++++ b/workflow/pi-runtime/loop.mjs
+@@ -1,5 +1,5 @@
+ import { randomUUID } from "node:crypto";
+-import { runAgentLoop, convertToLlm, buildSystemPrompt, estimateContextTokens, resolveModel, createCodingToolDefinitions, SETTINGS_DEFAULTS, retryDelayMs } from "./upstream.mjs";
++import { runAgentLoop, convertToLlm, buildSystemPrompt, estimateContextTokens, resolveModel, createToolDefinition, SETTINGS_DEFAULTS, retryDelayMs } from "./upstream.mjs";
+ import { executionCall } from "./tool-arguments.mjs";
+ import { canonical } from "../../components/module-runtime-js/canonical.mjs";
+ import { assistant, finishedStream, piContent, piMessage, piMessages } from "../../components/pi-runtime-js/messages.mjs";
+@@ -81,15 +81,19 @@
+                 .map((c) => ({ path: c.path, content: c.content })),
+             skills: [],
+         });
+-        const definitions = new Map(createCodingToolDefinitions(task.cwd).map(t => [t.name, t]));
++        const definitionCwd = task.cwd;
++        // Of Pi 1.5.2's four coding tools, only edit has an argument preparer.
++        let prepareEdit;
+         const tools = specs.map((spec) => ({
+             name: spec.name,
+             label: spec.name,
+             description: spec.description,
+             parameters: spec.input_schema,
+             executionMode: spec.metadata?.["pi/execution_mode"] ?? undefined,
+-            prepareArguments: spec.metadata?.["pi/package"] === "@earendil-works/pi-coding-agent@1.5.2"
+-                ? definitions.get(spec.name)?.prepareArguments : undefined,
++            prepareArguments:
++                spec.metadata?.["pi/package"] === "@earendil-works/pi-coding-agent@1.5.2" && spec.name === "edit"
++                    ? (prepareEdit ??= createToolDefinition("edit", definitionCwd).prepareArguments)
++                    : undefined,
+             execute: async (id, args) => {
+                 const binding = pending.get(id);
+                 if (!binding) throw new Error("Unbound Pi invocation " + id);
+diff --git a/workflow/pi-runtime/upstream.mjs b/workflow/pi-runtime/upstream.mjs
+index 55f1b556eaf7b8353d7c9abddaa46dd32e2f389c..07bbd62fd28633f997b7431edf15f2dc6356e4b4 100644
+--- a/workflow/pi-runtime/upstream.mjs
++++ b/workflow/pi-runtime/upstream.mjs
+@@ -28,7 +28,7 @@
+ }
+ 
+ export { validateToolArguments } from "../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/index.js";
+-export { createCodingToolDefinitions } from "../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
++export { createCodingToolDefinitions, createToolDefinition } from "../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/tools/index.js";
+ 
+ export { SETTINGS_DEFAULTS } from "../../tool/pi-tools/node_modules/@earendil-works/pi-coding-agent/dist/core/settings-defaults.js";
+ export { retryDelayMs } from "../../tool/pi-tools/node_modules/@earendil-works/pi-ai/dist/utils/retry.js";
