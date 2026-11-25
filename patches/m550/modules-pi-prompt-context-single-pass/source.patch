@@ -1,0 +1,35 @@
+diff --git a/workflow/pi-runtime/loop.mjs b/workflow/pi-runtime/loop.mjs
+index 6dfac8c5fb240435d39c6d02fef4edcadd1893e3..0e25ef75f7119b24710fdd290e2748584367d534 100644
+--- a/workflow/pi-runtime/loop.mjs
++++ b/workflow/pi-runtime/loop.mjs
+@@ -67,18 +67,25 @@
+         });
+         const order = ["read", "bash", "edit", "write"];
+         const specs = selection.tools.toSorted((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
++        let systemChunk;
++        const appendParts = [];
++        const contextFiles = [];
++        context.chunks.forEach(c => {
++            const marker = c.metadata?.["pi/prompt"];
++            if (marker === "system") systemChunk ??= c;
++            else if (marker === "append") appendParts.push(c.content);
++            else if (!marker) contextFiles.push({ path: c.path, content: c.content });
++        });
+         const prompt = buildSystemPrompt({
+             cwd: task.cwd,
+-            customPrompt: context.chunks.find(c => c.metadata?.["pi/prompt"] === "system")?.content,
+-            appendSystemPrompt: context.chunks.filter(c => c.metadata?.["pi/prompt"] === "append")
+-                .map(c => c.content).join("\n\n"),
++            customPrompt: systemChunk?.content,
++            appendSystemPrompt: appendParts.join("\n\n"),
+             selectedTools: specs.map((t) => t.name),
+             toolSnippets: Object.fromEntries(specs.map((t) => [t.name, t.metadata?.["pi/prompt_snippet"]])),
+             toolGuidelines: Object.fromEntries(
+                 specs.map((t) => [t.name, t.metadata?.["pi/prompt_guidelines"] ?? []]),
+             ),
+-            contextFiles: context.chunks.filter(c => !c.metadata?.["pi/prompt"])
+-                .map((c) => ({ path: c.path, content: c.content })),
++            contextFiles,
+             skills: [],
+         });
+         const definitions = new Map(createCodingToolDefinitions(task.cwd).map(t => [t.name, t]));
