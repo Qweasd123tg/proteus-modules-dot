@@ -1,0 +1,262 @@
+{
+  "repo": "Proteus-harness/Proteus-modules",
+  "owner_base": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+  "source_patch_sha256": "a0f9ac7c0ff83ef17da04b4323abf9a150baea316bed51660d68f4a9a6f02574",
+  "selection": "Use only source.patch on the exact owner base, or the exact alternative after #740 and the #756 scoped variant, not both.",
+  "alternate_scoped_patch": "diff --git a/tool/pi-tools/worker.mjs b/tool/pi-tools/worker.mjs\nindex c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65..32d34b43ecacc6055f6f5332d13b960c5f699018 100644\n--- a/tool/pi-tools/worker.mjs\n+++ b/tool/pi-tools/worker.mjs\n@@ -8,6 +8,6 @@\n         return modelExport(binding);\n     }\n     if (binding.slot === \"tool\") return createPiToolsExport(binding);\n-    const { createExport } = await import(\"../../workflow/pi-runtime/exports.mjs\");\n-    return createExport(binding);\n+    const { createJsonLineExport } = await import(\"../../workflow/pi-runtime/exports.mjs\");\n+    return createJsonLineExport(binding);\n });\ndiff --git a/workflow/pi-runtime/compaction.mjs b/workflow/pi-runtime/compaction.mjs\nindex 029bceb31221275b3f816a2fd7b929a038e6ef1f..5ec22a8853e781d7e5976db6a7088e947939503b 100644\n--- a/workflow/pi-runtime/compaction.mjs\n+++ b/workflow/pi-runtime/compaction.mjs\n@@ -1,5 +1,5 @@\n import { canonical } from \"../../components/module-runtime-js/canonical.mjs\";\n-import { piMessages, assistant, finishedStream } from \"../../components/pi-runtime-js/messages.mjs\";\n+import { piMessage, piMessages, assistant, finishedStream } from \"../../components/pi-runtime-js/messages.mjs\";\n import {\n     prepareCompaction,\n     compact,\n@@ -11,16 +11,40 @@\n     resolveModel,\n } from \"./upstream.mjs\";\n \n-export async function preparation(params, { hostCall, signal, catalogProvider }) {\n+export function preparation(params, invocation) {\n+    return prepare(params, invocation, false);\n+}\n+\n+export function preparationFromJsonLine(params, invocation) {\n+    return prepare(params, invocation, true);\n+}\n+\n+async function prepare(params, { hostCall, signal, catalogProvider }, jsonLineInputs) {\n     const { event } = params;\n     const unchanged = { result: { action: \"continue\" } };\n     if (event.event !== \"before_context\" || !event.input.request) return unchanged;\n     const request = event.input.request;\n     const model = resolveModel(request.model, catalogProvider);\n     const messages = event.output.messages;\n+    const hint = jsonLineInputs ? event.input.token_estimate : undefined;\n+    // Only the worker's parsed JSON-line requests can take this path. The\n+    // pinned Pi predicate uses scalar settings and does not inspect the rows.\n+    const decision = jsonLineInputs && event.input.reason === \"pi_before_sampling\"\n+        && event.output.changed === false && Array.isArray(messages)\n+        && Number.isInteger(hint) && hint >= 0 && hint <= 0xffff_ffff\n+        && Number.isFinite(model.contextWindow)\n+        ? shouldCompact(hint, model.contextWindow, DEFAULT_COMPACTION_SETTINGS)\n+        : undefined;\n+    if (decision === false) {\n+        const names = new Map();\n+        // Keep the same chronological conversion, including its validation\n+        // errors and cross-row tool names, without retaining the results.\n+        messages.forEach(message => { piMessage(message, model, names); });\n+        return unchanged;\n+    }\n     const pi = piMessages(messages, model);\n-    const tokens = event.input.token_estimate ?? estimateContextTokens(pi).tokens;\n-    if (!shouldCompact(tokens, model.contextWindow, DEFAULT_COMPACTION_SETTINGS)) return unchanged;\n+    const tokens = (jsonLineInputs ? hint : event.input.token_estimate) ?? estimateContextTokens(pi).tokens;\n+    if (!(decision ?? shouldCompact(tokens, model.contextWindow, DEFAULT_COMPACTION_SETTINGS))) return unchanged;\n     // Reuse the private projection now that no estimator reads it.\n     const entries = pi;\n     messages.forEach((m, i) => {\ndiff --git a/workflow/pi-runtime/exports.mjs b/workflow/pi-runtime/exports.mjs\nindex d0f5a2c7c261140ae52edaf3e7434550681e4b9b..1a57c5c94577d6c8b041930b6e114107650a1d99 100644\n--- a/workflow/pi-runtime/exports.mjs\n+++ b/workflow/pi-runtime/exports.mjs\n@@ -1,14 +1,22 @@\n import { workflow } from \"./loop.mjs\";\n-import { preparation } from \"./compaction.mjs\";\n+import { preparation, preparationFromJsonLine } from \"./compaction.mjs\";\n import { context } from \"./context.mjs\";\n \n const slots = {\n     workflow: { id: \"pi_loop\", version: \"v22\", method: \"run\", handle: workflow },\n-    hook: { id: \"pi_compact\", version: \"v8\", method: \"hook.invoke\", handle: preparation },\n+    hook: { id: \"pi_compact\", version: \"v8\", method: \"hook.invoke\" },\n     context: { id: \"pi_context\", version: \"v3\", method: \"build\", handle: context },\n };\n \n export function createExport(binding) {\n+    return createBoundExport(binding, preparation);\n+}\n+\n+export function createJsonLineExport(binding) {\n+    return createBoundExport(binding, preparationFromJsonLine);\n+}\n+\n+function createBoundExport(binding, prepare) {\n     const contract = slots[binding.slot];\n     if (\n         !contract ||\n@@ -19,6 +27,7 @@\n             ![\"openai-codex\", \"opencode-go\"].includes(binding.module_config.catalog_provider))\n     )\n         throw new Error(\"Invalid Pi export binding\");\n+    const handle = contract.handle ?? prepare;\n     return {\n         manifest: {\n             slot: binding.slot,\n@@ -30,7 +39,7 @@\n         },\n         invoke(method, params, invocation) {\n             if (method !== contract.method) throw new Error(\"Unsupported Pi invocation \" + method);\n-            return contract.handle(params, {\n+            return handle(params, {\n                 ...invocation,\n                 catalogProvider: binding.module_config.catalog_provider ?? \"openai-codex\",\n             });\n",
+  "alternate_scoped_patch_sha256": "28961d72a522de7fff0f045bb6c251ed9549aaf18628de9659b38e438e32e986",
+  "cumulative_with_743_proof_sha256": "718cf1ab027c7017210953c26d13b895aeffbb8aa1d1018b740cd48f7d201b01",
+  "source_gate_sha256": "27fddb34b84a7e61f0caf800908620103406ac03ca2ec4a03fc327a2c7fc43bf",
+  "alternate": {
+    "after": {
+      "tool/pi-tools/worker.mjs": {
+        "bytes": 563,
+        "git": "32d34b43ecacc6055f6f5332d13b960c5f699018",
+        "sha256": "6ab01728c705713465913e840893d616e3ae53bb696e65723a1b64c2ea770ba4"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 5530,
+        "git": "5ec22a8853e781d7e5976db6a7088e947939503b",
+        "sha256": "5738e9085021db19902fdd30a86beef42c394aa8ee34365debf0c001f590ccd5"
+      },
+      "workflow/pi-runtime/exports.mjs": {
+        "bytes": 1871,
+        "git": "1a57c5c94577d6c8b041930b6e114107650a1d99",
+        "sha256": "2db679416de3c48f5f01a6ec4a2da85e0e657fb2baa5b217f49b198809aab746"
+      }
+    },
+    "before": {
+      "tool/pi-tools/worker.mjs": {
+        "bytes": 547,
+        "git": "c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65",
+        "sha256": "e05f05f31d0ea4e9992366e904979811a89870511c4cc3bd78a3bc52528e593b"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 4342,
+        "git": "029bceb31221275b3f816a2fd7b929a038e6ef1f",
+        "sha256": "58a6cc03108e6f0116c405cdab7572ee21fa838dc45944917d6495fdf844624b"
+      },
+      "workflow/pi-runtime/exports.mjs": {
+        "bytes": 1612,
+        "git": "d0f5a2c7c261140ae52edaf3e7434550681e4b9b",
+        "sha256": "19ee3e9ae38f3935cd8702e51d08a7b10947ffcadd536df7f68887939ff256d9"
+      }
+    },
+    "combined_order": "Apply #740 then #756 (historical exact scoped variant), then this scoped alternate; #743 separately touches the companion messages source.",
+    "patch": {
+      "bytes": 5407,
+      "git": "06d1278b2454933b9275d735f8a7529c67affd71",
+      "sha256": "28961d72a522de7fff0f045bb6c251ed9549aaf18628de9659b38e438e32e986"
+    },
+    "raw_756_after_new_owner_rejected_at_overlap_context": true,
+    "strict_forward_reverse_exact": true
+  },
+  "candidate_basis": {
+    "cumulative": {
+      "components/pi-runtime-js/messages.mjs": {
+        "bytes": 6193,
+        "git": "3d2abb2c496f64ab04b5dcbf55dc4e4272d7b237",
+        "sha256": "915a86edce7c0c973c5333dc98cf92d18ff5941a52b7f57cae9732845f06f9cb"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 4342,
+        "git": "029bceb31221275b3f816a2fd7b929a038e6ef1f",
+        "sha256": "58a6cc03108e6f0116c405cdab7572ee21fa838dc45944917d6495fdf844624b"
+      }
+    },
+    "owner": {
+      "components/pi-runtime-js/messages.mjs": {
+        "bytes": 5824,
+        "git": "43c0372fcfd6b17337d7fd042e25e4b23ee6fa2c",
+        "sha256": "49dc568d367992e0d932b987ad1dbd3bfa85616f03eda51ff213c16c6172bbe0"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 4129,
+        "git": "0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c",
+        "sha256": "3c14939e0330592e1e387e69113cf4039c255281241cff44b49204407a6d3171"
+      }
+    },
+    "pub756_scoped_reconstruction": {
+      "bytes": 1085,
+      "git": "799d04b7afcb3359a70d08f50d1fec6790347dcd",
+      "sha256": "04c3a30eae18f3cb395c3d6dfd323204f4fd6ae95cdc891c7b7160f6c4bd59aa"
+    },
+    "source_selectors": {
+      "740": {
+        "bytes": 1033,
+        "git": "633cee4c672b772e18564307032674ab17d18dd2",
+        "sha256": "69b30a082a74f6c28c4952b0c57e4969d16bb2a77bec54405d667b90573c5438"
+      },
+      "743": {
+        "bytes": 1410,
+        "git": "9c59693a0173746e037a201492bb3eda1429f9f0",
+        "sha256": "cf32908f467363231769ec68a2e63ae88e1e57d559a3da7807cf9776008ad23f"
+      },
+      "756": {
+        "bytes": 1085,
+        "git": "014838200f69be6ca34319d703c179dcc8b545cd",
+        "sha256": "83c9c16408111a5c50e308d20c26683a60acb7337e1c0c11ece56ccc3a5bc93d"
+      }
+    },
+    "verified_both_order_and_inverse": true
+  },
+  "contract": {
+    "declined_hook_conversions_each_arm": 8192,
+    "declined_hook_full_vector_slots_before_after": [
+      8192,
+      0
+    ],
+    "direct_export_uses_original_conversion_and_custom_shape_handling": true,
+    "no_handoff_policy_model_descriptor_or_host_capability_change": true,
+    "only_worker_json_line_factory_routes_plain_json_eligible_hook": true,
+    "positive_preparation_and_historical_positive_vector_reuse_unchanged": true,
+    "same_typed_hint_and_pure_pinned_predicate": true,
+    "validates_every_row_in_exact_order_and_preserves_tool_name_map": true,
+    "wrapper_preserves_captured_handler_and_does_not_add_async_assimilation": true
+  },
+  "cumulative_dependency_proof": {
+    "additional_pairs": 27,
+    "messages_blob_after_743": "3d2abb2c496f64ab04b5dcbf55dc4e4272d7b237",
+    "proof_sha256": "718cf1ab027c7017210953c26d13b895aeffbb8aa1d1018b740cd48f7d201b01",
+    "script_sha256": "eab2e4a300b53a043c5d7841cefa4f51fc76a08190affd06d47df5a4cf7439db"
+  },
+  "desktop_manifest": {
+    "git": "fd7a50fdb6bd8f25ec02ff46fc11e8ea849512cb",
+    "pins": {
+      "extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+      "harness": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+      "modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1"
+    }
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "8b18d96fb7ddeecb873640ed4d3047327a9b64d9",
+    "Proteus-harness/Proteus-desktop": "c7840cf1edac1c6b6930a09dd3a64e2296a6ec1c",
+    "Proteus-harness/Proteus-desktop-extensions": "0e0a301761184acabbb73f3a9ce17ad875aa4371",
+    "Proteus-harness/Proteus-modules": "d780c5e9ee1a48247286bc24878b2b8b517cd3d1",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "frame_scope": {
+    "default_component_frame_bytes": 8388608,
+    "fits_static_limit_numerically": true,
+    "fixture_callback_line_bytes": 3035586,
+    "fixture_hook_line_bytes_including_lf": 4553271,
+    "native_rust_admission_not_exercised": true,
+    "static_pin_files": {
+      "framing.rs": "95922b31e1968e2b16f950bdc8bb8ba83481e09f",
+      "pi.config.toml": "aed2dbe9e723e90104915ca97b4ef7e701a2050b",
+      "size.rs": "386a4610fb562136fbc0a6ab3ea064df5dc8b501",
+      "transport_config.rs": "8d89b9478c5324ee7314af3a4296588e7d4b0d73"
+    }
+  },
+  "independent_proof": {
+    "actual_worker_model_turn_generated_hint": 42000,
+    "independent_ordinary_decline": true,
+    "paired_cases_each_basis": 27,
+    "proof_sha256": "a6e8dd481f8c457d3f7c86274784b4d055c5d1efa864e77fdc5da542fac7549f",
+    "scoped_proof_sha256": "a89e87f06341581c7e6d51ae94234a401df6f9a80f54b46aa67eaf93a631c7ca",
+    "seal_sha256": "d975ece9d539f8d82f6fc49900410289eb0a8d1d4c33fb24ac4381d0e957f65d"
+  },
+  "pi_authoritative_predicate_source": {
+    "bytes": 35401,
+    "git": "07a58ac6cf6e2141fc07133677583ab18bb97298",
+    "sha256": "32714966eb644da31cd84e8eb172965256160626b3d26ae9752c3894300f2b0b"
+  },
+  "preflight_sha256": "ea25e9eb40411762c2598477db95a44ef191a7524d7240b7a7b0a86fd57b804a",
+  "producer_proof": {
+    "paired_direct_controls_per_basis": 4,
+    "paired_wire_cases_per_basis": 11,
+    "proof_sha256": "387d4f9ffd5a96ef556b4e0eb3078cf718c621661f5ae714e185455c3375f365",
+    "seal_sha256": "cd99979dbf338af4e2524841fd614fcea630a755a46b66401e69d815fed66a56"
+  },
+  "scope": "Configured Pi Modules workflow/hook/JSON-line worker with actual generated preparation and pinned predicate/estimator, real projector and inert service/remaining SDK and Core Rust host seam. No packaged SDK or native app, no physical heap/PSS/time model.",
+  "selector_roster": {
+    "by_path": {
+      "components/pi-runtime-js/messages.mjs": [
+        743
+      ],
+      "workflow/pi-runtime/compaction.mjs": [
+        740,
+        756
+      ]
+    },
+    "candidate_by_path": {
+      "tool/pi-tools/worker.mjs": [],
+      "workflow/pi-runtime/compaction.mjs": [
+        740,
+        756
+      ],
+      "workflow/pi-runtime/exports.mjs": []
+    },
+    "count": 94,
+    "digest": "88a898a035400face48800de231c177a885fcfce25b83bc708fb14eb08c48304",
+    "prior_verified_digest": "8704b1cff758f46380f52cb17f4f7cede934b21009f3fdf9829048495878a726",
+    "range": [
+      693,
+      786
+    ]
+  },
+  "source": {
+    "after": {
+      "tool/pi-tools/worker.mjs": {
+        "bytes": 563,
+        "git": "32d34b43ecacc6055f6f5332d13b960c5f699018",
+        "sha256": "6ab01728c705713465913e840893d616e3ae53bb696e65723a1b64c2ea770ba4"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 5317,
+        "git": "721d198a31dfe37b44988c406b4342add6825e0d",
+        "sha256": "783a4e7a1b222a6940a0805d5cc76182b9cf8fc44c699eb4681aaf8cc133986a"
+      },
+      "workflow/pi-runtime/exports.mjs": {
+        "bytes": 1871,
+        "git": "1a57c5c94577d6c8b041930b6e114107650a1d99",
+        "sha256": "2db679416de3c48f5f01a6ec4a2da85e0e657fb2baa5b217f49b198809aab746"
+      }
+    },
+    "before": {
+      "tool/pi-tools/worker.mjs": {
+        "bytes": 547,
+        "git": "c7d9a0c7dbf3f2a6f42328ae26e41069d9d3eb65",
+        "sha256": "e05f05f31d0ea4e9992366e904979811a89870511c4cc3bd78a3bc52528e593b"
+      },
+      "workflow/pi-runtime/compaction.mjs": {
+        "bytes": 4129,
+        "git": "0d3a8f7e7e65520a4ff9e85f4737ffe4edffd44c",
+        "sha256": "3c14939e0330592e1e387e69113cf4039c255281241cff44b49204407a6d3171"
+      },
+      "workflow/pi-runtime/exports.mjs": {
+        "bytes": 1612,
+        "git": "d0f5a2c7c261140ae52edaf3e7434550681e4b9b",
+        "sha256": "19ee3e9ae38f3935cd8702e51d08a7b10947ffcadd536df7f68887939ff256d9"
+      }
+    },
+    "closure": {
+      "components/module-runtime-js/component.mjs": {
+        "bytes": 7629,
+        "git": "2dfd4c97f08f60b48ef9a3acf28f17924da29634",
+        "sha256": "1de13fe3827212428b3af17f0a6e578c84efe0333ce819920e22f9d10b6c99ed"
+      },
+      "components/pi-runtime-js/messages.mjs": {
+        "bytes": 5824,
+        "git": "43c0372fcfd6b17337d7fd042e25e4b23ee6fa2c",
+        "sha256": "49dc568d367992e0d932b987ad1dbd3bfa85616f03eda51ff213c16c6172bbe0"
+      },
+      "workflow/pi-runtime/loop.mjs": {
+        "bytes": 11346,
+        "git": "6dfac8c5fb240435d39c6d02fef4edcadd1893e3",
+        "sha256": "f32e5aa3a7f7b66180bbffbbfe507cb7b79420f29040ea2a0b21e92c60da51e3"
+      },
+      "workflow/pi-runtime/upstream.mjs": {
+        "bytes": 2269,
+        "git": "55f1b556eaf7b8353d7c9abddaa46dd32e2f389c",
+        "sha256": "23975e1a606a199a0f7ec41f8d4bf68900abd27adc87d47331a016e673feff11"
+      }
+    },
+    "patch": {
+      "bytes": 5374,
+      "git": "8c48f45b5e9ef4c43564dd0a7ac6904b819e69a4",
+      "sha256": "a0f9ac7c0ff83ef17da04b4323abf9a150baea316bed51660d68f4a9a6f02574"
+    },
+    "strict_forward_reverse_exact": true
+  }
+}
