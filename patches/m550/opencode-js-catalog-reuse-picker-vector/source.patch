@@ -1,0 +1,16 @@
+diff --git a/model/opencode-provider/runtime.mjs b/model/opencode-provider/runtime.mjs
+index 2965603d6b00f18af75157d516fa51b0d7e75c6b..193092023d8c37f8b45e1e470cabb574024bb064 100644
+--- a/model/opencode-provider/runtime.mjs
++++ b/model/opencode-provider/runtime.mjs
+@@ -200,7 +200,10 @@
+     return {
+         async catalog(signal) {
+             const models = (await snapshot(signal)).models
+-                .filter(model => model.providerID === providerID && supportsChat(model)).map(catalogEntry);
++                .filter(model => model.providerID === providerID && supportsChat(model));
++            // Filter all rows before formatting, then reuse the private result vector.
++            for (let index = 0, count = models.length; index < count; index++)
++                models[index] = catalogEntry(models[index]);
+             if (seed && models.length) {
+                 const local = new Map((await seed(signal)).models.map(model => [model.id, model]));
+                 for (const entry of models) {
