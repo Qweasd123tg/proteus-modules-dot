@@ -1,0 +1,22 @@
+diff --git a/packages/mermaid-render/worker.mjs b/packages/mermaid-render/worker.mjs
+index 4d750203f9dc38bbc03e479e111127d3aca41c58..2564c10d0a4ce6d8b80fdbd4b4c37d15b74a61f1 100644
+--- a/packages/mermaid-render/worker.mjs
++++ b/packages/mermaid-render/worker.mjs
+@@ -1,6 +1,8 @@
+ import { pathToFileURL } from 'node:url';
+ import { render, forgetTextWidths } from './vendor/pele/pele.mjs';
+ import { materializeSvg, prepareRenderTheme, themeVariables } from './svg-theme.mjs';
++
++const HAS_SOURCE_TEXT = /\S/;
+ 
+ export const MAX_SOURCE = 50_000;
+ export const MAX_SVG = 1024 * 1024;
+@@ -17,7 +19,7 @@
+ 
+ function renderRequest(request, fromWire) {
+   const source = request?.source;
+-  if (typeof source !== 'string' || !source.trim()) throw new Error('Mermaid source is empty');
++  if (typeof source !== 'string' || !HAS_SOURCE_TEXT.test(source)) throw new Error('Mermaid source is empty');
+   if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE) throw new Error('Mermaid source exceeds 50,000 bytes');
+   const prepared = fromWire ? prepareRenderTheme(request.theme) : null;
+   const variables = prepared ? null : themeVariables(request.theme);
