@@ -1,0 +1,17 @@
+diff --git a/package.py b/package.py
+index 8e5b82a1e3a7c6332061a72de378e88b98308c3d..874699714510d2157e7b15004f0375c13a1f2b04 100644
+--- a/package.py
++++ b/package.py
+@@ -237,8 +237,10 @@
+     metadata = module / "module.json"
+     sources = {module / "licenses/LICENSE": root / "LICENSE"}
+     # Preserve upstream provenance beside the exact implementation being shipped.
+-    for source in sorted(package.implementation.rglob("*")):
+-        if source.is_file() and source.name in ("LICENSE", "NOTICE", "UPSTREAM.md", "PROVENANCE.md"):
++    provenance = (source for source in package.implementation.rglob("*")
++                  if source.name in ("LICENSE", "NOTICE", "UPSTREAM.md", "PROVENANCE.md"))
++    for source in sorted(provenance):
++        if source.is_file():
+             sources[module / "licenses" / source.relative_to(package.implementation)] = source
+     sources[executable] = binary
+ 
