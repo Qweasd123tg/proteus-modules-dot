@@ -1,0 +1,15 @@
+diff --git a/model/opencode-provider/response.mjs b/model/opencode-provider/response.mjs
+index f71183b2a39b0167d2f52de9aef81de8d1d71392..ecade60d762a1c877acdc5d85e43da2d339067a5 100644
+--- a/model/opencode-provider/response.mjs
++++ b/model/opencode-provider/response.mjs
+@@ -162,6 +162,10 @@
+             if (!finishReasons[event.reason?.normalized]) throw malformed('Native model has no valid finish reason');
+             this.reason = event.reason;
+             this.response = this.buildResponse();
++            // The response owns the final parts; no more events can use the builder.
++            this.parts.length = 0;
++            this.blocks.clear();
++            this.#lastBlock = undefined;
+             const events = [];
+             if (this.response.usage) events.push({ Usage: { usage: this.response.usage } });
+             events.push({ MessageCompleted: { message: this.response.messages[0] } });
