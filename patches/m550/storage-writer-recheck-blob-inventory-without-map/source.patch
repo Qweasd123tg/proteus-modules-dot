@@ -1,0 +1,13 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index 82be7a8735a7de4d516426a3684ad3460ba7ee3a..7e26236dd6344e97169e7ccf76b256b5e1463474 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -402,7 +402,7 @@ impl Writer {
+             self.head = blobs
+                 .filter(|blobs| {
+                     catalog::source_stamp(dir, kind).ok().as_ref() == Some(&stamps)
+-                        && catalog::durable::blob_stamps(dir).as_ref() == Some(blobs)
++                        && catalog::durable::matches_blob_stamps(dir, blobs) == Some(true)
+                 })
+                 .map(|blobs| catalog::WriterHead {
+                     stamps,
