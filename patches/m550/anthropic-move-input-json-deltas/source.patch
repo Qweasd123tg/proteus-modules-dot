@@ -1,0 +1,69 @@
+diff --git a/model/model-pack/src/adapters/anthropic/stream.rs b/model/model-pack/src/adapters/anthropic/stream.rs
+index c2dfc39fc3ca8ed63743ae28b2b341050168683e..673e14430b668d6174dc5b7cfe8bae85cd8f4134 100644
+--- a/model/model-pack/src/adapters/anthropic/stream.rs
++++ b/model/model-pack/src/adapters/anthropic/stream.rs
+@@ -64,7 +64,7 @@ impl AnthropicStreamState {
+     }
+ 
+     pub(super) fn translate(&mut self, event_type: &str, data: &str) -> Vec<ModelStreamEvent> {
+-        let Ok(parsed) = serde_json::from_str::<Value>(data) else {
++        let Ok(mut parsed) = serde_json::from_str::<Value>(data) else {
+             return vec![ModelStreamEvent::Error {
+                 failure: ModelFailure::other("malformed Anthropic SSE JSON"),
+             }];
+@@ -214,35 +214,33 @@ impl AnthropicStreamState {
+                         self.append_text(index, text)
+                     }
+                     "input_json_delta" => {
+-                        let partial = delta
+-                            .and_then(|d| d.get("partial_json"))
+-                            .and_then(Value::as_str)
+-                            .unwrap_or("");
+-                        let call_id = if let Some(AnthropicBlock::ToolUse {
++                        let Some(Value::String(partial)) = parsed
++                            .get_mut("delta")
++                            .and_then(|d| d.get_mut("partial_json"))
++                            .map(Value::take)
++                        else {
++                            return Vec::new();
++                        };
++                        if partial.is_empty() {
++                            return Vec::new();
++                        }
++                        let Some(AnthropicBlock::ToolUse {
+                             id,
+                             initial_input,
+                             input_json,
+                             ..
+                         }) = self.blocks.get_mut(index)
+-                        {
+-                            if !partial.is_empty() {
+-                                // JSON-дельты заменяют input, а не дополняют его.
+-                                *initial_input = Value::Null;
+-                            }
+-                            input_json.push_str(partial);
+-                            id.clone()
+-                        } else {
++                        else {
+                             return Vec::new();
+                         };
+-                        if partial.is_empty() {
+-                            Vec::new()
+-                        } else {
+-                            vec![ModelStreamEvent::ToolCallDelta {
+-                                call_id,
+-                                name: None,
+-                                args_delta: partial.to_owned(),
+-                            }]
+-                        }
++                        // JSON-дельты заменяют input, а не дополняют его.
++                        *initial_input = Value::Null;
++                        input_json.push_str(&partial);
++                        vec![ModelStreamEvent::ToolCallDelta {
++                            call_id: id.clone(),
++                            name: None,
++                            args_delta: partial,
++                        }]
+                     }
+                     _ => Vec::new(),
+                 }
