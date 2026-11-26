@@ -1,0 +1,84 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index a610ca7099a4647d1aee27e908d9408ff9c3ed47..03e0993ec64bccc06838ea4bd06056dd52aa1bbb 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -338,7 +338,8 @@ impl SnapshotState {
+     }
+     pub fn conversation_at(&mut self, point: StorageHistoryPoint) -> Result<StorageConversation> {
+         if point == StorageHistoryPoint::Current {
+-            let state = self.fold()?;
++            // The pinned conversation response needs model context, not usage.
++            let state = self.fold_with_terminal::<true, false>(false)?.0;
+             return Ok(StorageConversation {
+                 revision: state.revision(),
+                 model_context: state.model_context.snapshot(),
+diff --git a/storage/session-storage/src/tests/usage.rs b/storage/session-storage/src/tests/usage.rs
+index d98f220c2f8cb6fb79d9b26d77544ad315951112..fbbcb909943fe054ce5fe5b651f68d3698926455 100644
+--- a/storage/session-storage/src/tests/usage.rs
++++ b/storage/session-storage/src/tests/usage.rs
+@@ -115,6 +115,65 @@ fn read(f: &Fixture, snapshot: &StorageSnapshot) -> SessionStorageResponse {
+     out
+ }
+ 
++#[test]
++fn current_conversation_matches_the_full_display_projection_at_the_pinned_revision() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("current-only usage-rich fixture")]);
++        add_turn(&mut f, false);
++        add_turn(&mut f, true);
++        let SessionStorageResponse::DisplaySnapshot {
++            projection: Some(full),
++        } = f
++            .service
++            .execute(SessionStorageRequest::OpenDisplaySnapshot {
++                session: f.descriptor.session.clone(),
++            })
++            .unwrap()
++        else {
++            panic!("missing display projection");
++        };
++
++        let old = full.snapshot;
++        let expected = SessionStorageResponse::Conversation {
++            conversation: full.state.conversation,
++        };
++        let SessionStorageResponse::Conversation { conversation } = &expected else {
++            unreachable!()
++        };
++        assert!(!conversation.model_context.is_empty());
++        assert_eq!(full.state.usage.requests.len(), 2);
++        let expected_usage = SessionStorageResponse::Usage {
++            usage: full.state.usage,
++        };
++        let read_current = |fixture: &Fixture| {
++            let req = SessionStorageRequest::ReadConversation {
++                snapshot: old.clone(),
++                point: StorageHistoryPoint::Current,
++            };
++            let out = fixture.service.execute(req.clone()).unwrap();
++            req.validate_response(&out).unwrap();
++            assert_eq!(
++                serde_json::to_vec(&out).unwrap(),
++                serde_json::to_vec(&expected).unwrap()
++            );
++        };
++        crate::diagnostics::reset();
++        read_current(&f);
++        assert_eq!(
++            crate::diagnostics::get().decoded,
++            old.revision.session_seq,
++            "the read-only fold still decodes the complete fixed prefix"
++        );
++        assert_eq!(read(&f, &old), expected_usage);
++        // An unrelated later writer suffix is not visible through the old
++        // display handle, even though current conversation has another fold.
++        add_turn(&mut f, false);
++        read_current(&f);
++        assert_eq!(read(&f, &old), expected_usage);
++    }
++}
++
+ #[test]
+ fn read_usage_holds_the_same_prefix_without_losing_conversation_context() {
+     for kind in backends() {

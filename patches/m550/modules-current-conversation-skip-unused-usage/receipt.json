@@ -1,0 +1,249 @@
+{
+  "alternate": {
+    "both_minimum_orders_equal_tree": true,
+    "full_800_803_804_805_candidate_tree": "25d55adc1bf49890efd7efd78428c1f621669c50",
+    "full_800_803_804_805_predecessor_tree": "3a44f51844ffc35b1c2e22457c14a927979d91fb",
+    "full_order_mixed_equal_tree": true,
+    "minimal_candidate_tree": "662625a8a08505cdf65e2b1637ee499f914f77b6",
+    "minimal_predecessor_tree": "0e20491fcd18b336709abe2b6e705a19840f4396",
+    "minimum_exact_predecessors": [
+      800,
+      804
+    ],
+    "native_not_tested": true,
+    "optional_disjoint_predecessors": [
+      803,
+      805
+    ],
+    "source": {
+      "storage/session-storage/src/snapshot.rs": {
+        "postimage": {
+          "bytes": 17702,
+          "git": "f26b6822b00f36bbd1511100fd5e81cc3ae21f7a",
+          "mode": "100644",
+          "sha256": "f65bc44b8c2bfc434489f2d4e0965a8b784c6961b9858b42cc13d8c7e3647740"
+        },
+        "preimage": {
+          "bytes": 17586,
+          "git": "312c3f0e10a1f56878d806240b3079cb1c7e89eb",
+          "mode": "100644",
+          "sha256": "4bcd2bd551124906f59ba459a49977d51dad29e71eaa31b0e43445304425586f"
+        }
+      },
+      "storage/session-storage/src/tests/usage.rs": {
+        "postimage": {
+          "bytes": 11036,
+          "git": "85b36dcc60531219cfae6090e7ca9ed2b9e6ccc2",
+          "mode": "100644",
+          "sha256": "38b6f4f590701b63e62b52a44e66801bb0caec8e30698bd7fd9722e7fb23fe33"
+        },
+        "preimage": {
+          "bytes": 8808,
+          "git": "7c4598d61929e185e57907d5de533745fa41090b",
+          "mode": "100644",
+          "sha256": "f5daf656a2616e876ab7db06e4495ddd88a0e6b81654b68f027999ce1cfa1732"
+        }
+      }
+    }
+  },
+  "alternate_needed": true,
+  "alternate_scoped_patch": "diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs\nindex 312c3f0e10a1f56878d806240b3079cb1c7e89eb..f26b6822b00f36bbd1511100fd5e81cc3ae21f7a 100644\n--- a/storage/session-storage/src/snapshot.rs\n+++ b/storage/session-storage/src/snapshot.rs\n@@ -342,7 +342,8 @@ impl SnapshotState {\n     }\n     pub fn conversation_at(&mut self, point: StorageHistoryPoint) -> Result<StorageConversation> {\n         if point == StorageHistoryPoint::Current {\n-            let state = self.fold()?;\n+            // The pinned conversation response needs model context, not usage.\n+            let state = self.fold_with_terminal::<true, false>(false)?.0;\n             return Ok(StorageConversation {\n                 revision: state.revision(),\n                 model_context: state.model_context.snapshot(),\ndiff --git a/storage/session-storage/src/tests/usage.rs b/storage/session-storage/src/tests/usage.rs\nindex 7c4598d61929e185e57907d5de533745fa41090b..85b36dcc60531219cfae6090e7ca9ed2b9e6ccc2 100644\n--- a/storage/session-storage/src/tests/usage.rs\n+++ b/storage/session-storage/src/tests/usage.rs\n@@ -115,6 +115,65 @@ fn read(f: &Fixture, snapshot: &StorageSnapshot) -> SessionStorageResponse {\n     out\n }\n \n+#[test]\n+fn current_conversation_matches_the_full_display_projection_at_the_pinned_revision() {\n+    for kind in backends() {\n+        let mut f = Fixture::new(kind);\n+        f.append(vec![text(\"current-only usage-rich fixture\")]);\n+        add_turn(&mut f, false);\n+        add_turn(&mut f, true);\n+        let SessionStorageResponse::DisplaySnapshot {\n+            projection: Some(full),\n+        } = f\n+            .service\n+            .execute(SessionStorageRequest::OpenDisplaySnapshot {\n+                session: f.descriptor.session.clone(),\n+            })\n+            .unwrap()\n+        else {\n+            panic!(\"missing display projection\");\n+        };\n+\n+        let old = full.snapshot;\n+        let expected = SessionStorageResponse::Conversation {\n+            conversation: full.state.conversation,\n+        };\n+        let SessionStorageResponse::Conversation { conversation } = &expected else {\n+            unreachable!()\n+        };\n+        assert!(!conversation.model_context.is_empty());\n+        assert_eq!(full.state.usage.requests.len(), 2);\n+        let expected_usage = SessionStorageResponse::Usage {\n+            usage: full.state.usage,\n+        };\n+        let read_current = |fixture: &Fixture| {\n+            let req = SessionStorageRequest::ReadConversation {\n+                snapshot: old.clone(),\n+                point: StorageHistoryPoint::Current,\n+            };\n+            let out = fixture.service.execute(req.clone()).unwrap();\n+            req.validate_response(&out).unwrap();\n+            assert_eq!(\n+                serde_json::to_vec(&out).unwrap(),\n+                serde_json::to_vec(&expected).unwrap()\n+            );\n+        };\n+        crate::diagnostics::reset();\n+        read_current(&f);\n+        assert_eq!(\n+            crate::diagnostics::get().decoded,\n+            old.revision.session_seq,\n+            \"the read-only fold still decodes the complete fixed prefix\"\n+        );\n+        assert_eq!(read(&f, &old), expected_usage);\n+        // An unrelated later writer suffix is not visible through the old\n+        // display handle, even though current conversation has another fold.\n+        add_turn(&mut f, false);\n+        read_current(&f);\n+        assert_eq!(read(&f, &old), expected_usage);\n+    }\n+}\n+\n #[test]\n fn read_usage_holds_the_same_prefix_without_losing_conversation_context() {\n     for kind in backends() {\n",
+  "alternate_scoped_patch_sha256": "4ad6f2432fb3587a18a8b796cdcc152202921a23a49efa41320ae8af5b4221b5",
+  "desktop_manifest": {
+    "git": "0238b928a49bb01194be6a47503c67c17ff17aae",
+    "pins": {
+      "extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+      "harness": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+      "modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba"
+    }
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+    "Proteus-harness/Proteus-desktop": "df3363eae5207204b8d34f122a50bd67277221d1",
+    "Proteus-harness/Proteus-desktop-extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+    "Proteus-harness/Proteus-modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "historical": [
+    {
+      "canonical_git": "61801b07f57ce030b51f8997bb90d7f55ad46809",
+      "canonical_sha256": "6ee8dc2e01a6793e39be2c9a9d7bcaf9061617045bff3c5712307d955f3bdd81",
+      "head": "0c68c9b0cf98df5f978a3960fcc96fb37f15e7bd",
+      "overlap": [
+        "storage/session-storage/src/tests/usage.rs"
+      ],
+      "pr": 800,
+      "receipt_sha256": null,
+      "selected_source_sha256": "6ee8dc2e01a6793e39be2c9a9d7bcaf9061617045bff3c5712307d955f3bdd81"
+    },
+    {
+      "canonical_git": "a899ff0a2c074509738bf7700e0b6ea307348dfd",
+      "canonical_sha256": "131200a95f59ccba842126564e24ae4e92f8fc67867903cb4ce8838325747d5c",
+      "head": "e441856004b19adb6efef17478ee8d89c07870dc",
+      "overlap": [],
+      "pr": 803,
+      "receipt_sha256": null,
+      "selected_source_sha256": "131200a95f59ccba842126564e24ae4e92f8fc67867903cb4ce8838325747d5c"
+    },
+    {
+      "canonical_git": "f6a6d44fdca355e31517e3ca9cccb0544c71ae65",
+      "canonical_sha256": "6583a7561cca4c040475cff86171c101b5e49274f77abe4c1aa28107304e269d",
+      "head": "0b92399ef3eb6e6b856920906c1c0ccada3d6dd6",
+      "overlap": [
+        "storage/session-storage/src/snapshot.rs"
+      ],
+      "pr": 804,
+      "receipt_sha256": null,
+      "selected_source_sha256": "6583a7561cca4c040475cff86171c101b5e49274f77abe4c1aa28107304e269d"
+    },
+    {
+      "canonical_git": "6f3de38fa8a3e99f0a8b4a1a7a98e779b4a13f26",
+      "canonical_sha256": "75f64f9a4c3898550c5f64364d02e1d7f1cb6abfb61f68d2543f9e60eddda56e",
+      "head": "aa4616691865399aaddf7dd022d2c3338d9d5ab4",
+      "overlap": [],
+      "pr": 805,
+      "receipt_sha256": "8d6dae66acb9bd05c245957c32e3661365f21d911f28a0824e9964326786fce3",
+      "selected_source_sha256": "2cc543a3ec281ef59e1752721a8a18cf11d38a521076ad9f143cb46a19bf803b"
+    }
+  ],
+  "locked_core": {
+    "bytes": 98598,
+    "git": "6fa9a1af3af741a2ba4597e74496670a3dc07e2e",
+    "mode": "100644",
+    "sdk_rev": "0c1b7572313230e5d123e95c722e1258a2e9ecd6",
+    "sha256": "5a790b005a0ddfa6c4632f218f4c9c4b9573f4bf659615c05ba2486105f3a8b2"
+  },
+  "native": {
+    "alternate_native_tested": false,
+    "exact_candidate_full_tree": "1fb423dda515c25f6a4d7879655215f485a848d2",
+    "exact_source_worktree_diff_verified": true,
+    "existing_manual_perf_ignored": 1,
+    "failed": 0,
+    "isolated_source_and_target": true,
+    "locked_offline": true,
+    "negotiated_v3": {
+      "backends": [
+        "jsonl",
+        "sqlite"
+      ],
+      "checks": [
+        "open_projection",
+        "current_old",
+        "usage_old",
+        "old_current_after_new_append",
+        "old_usage_after_new_append",
+        "full_writer_resume",
+        "fresh_current",
+        "release_refusal"
+      ],
+      "driver_sha256": "97e5afe1ccb3f1fafdc797ec365b527a9f21c562a0c80e0c8a932d31c5db9e05",
+      "ordered_normalized_equal_payloads_per_backend": 8,
+      "parity_report_sha256": "b8e0607aa46e61e1c7aaa9e035617b5d6c088d99ca39d541c06c8f05ca758b5f",
+      "prior_driver_sha256": "b94e0cabdaaa50c697228d9e40cce9d3a93ea6f8205479b350f9703fdd728d63",
+      "seed_records": 9,
+      "suffix_records": 1,
+      "worker_elf": {
+        "candidate": {
+          "bytes": 30579040,
+          "sha256": "4bd257d598a57f73729d994265d3da65e23b698606a0adfe32a3eb8829c0e871"
+        },
+        "stock": {
+          "bytes": 30575240,
+          "sha256": "c2cf27827ebb7a5895cd19e01f60d519623dc0991bdcdf74af009156cfa0cc7a"
+        }
+      }
+    },
+    "rust": "1.95.0",
+    "scope": "Only stock versus exact standalone candidate. Owned storage-only synthetic fixtures; no tool execution, model call, timing, heap, PSS or GUI measurement.",
+    "standalone": true,
+    "suites": {
+      "storage_lib": {
+        "all_passed_tests_sha256": "f4dd53a78937e4d7b85e0c7a773e7ab114c5adc508c5dd475bd20ebbfd55a33d",
+        "command": "cargo test --locked --offline -j 2 -p session-storage --lib",
+        "failed": 0,
+        "ignored": [
+          "tests::performance::sixteen_mib_history_warm_snapshot_and_head_publication_cost"
+        ],
+        "passed": 105
+      },
+      "worker_process": {
+        "all_passed_tests_sha256": "22b5222cd6683e48a25705d5aa4d883fc8d4fc717784116c6dd4df47ef4b1c9c",
+        "command": "cargo test --locked --offline -j 2 -p proteus-session-storage-module --test process",
+        "failed": 0,
+        "ignored": [],
+        "passed": 2
+      }
+    },
+    "test_elf": {
+      "storage_lib": {
+        "bytes": 30893152,
+        "path": "target-native-exact/debug/deps/session_storage-a2503a2a0f04d998",
+        "sha256": "44699ad48e9555086e468de92a296d2356d574313a7ae9f1b23ac7af8b0167db"
+      },
+      "worker_process": {
+        "bytes": 9295560,
+        "path": "target-native-exact/debug/deps/process-4620e036b85b2fea",
+        "sha256": "384ad7d7d43fdc39b7c1fa144d62e3d6ddeb0d09aedb3e8b4c7f223b1224ffe3"
+      }
+    },
+    "test_log_sha256": "fafcb4aae909a1c17ce562509f0d4f2e04a447a77cc31f9d71abe68db8fbb45e",
+    "unique_passed": 107
+  },
+  "native_gate_sha256": "ec45d332c4258bb4a6f9039404f89aec9107fcb920b5bd934587edac084b83ab",
+  "owner_base": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+  "owner_tree": "6b42d3ba575f7f61b894b44faa2de99a108ee1fe",
+  "repo": "Proteus-harness/Proteus-modules",
+  "scope": "Only omits a discarded usage projection from fixed-prefix ReadConversation(Current) fold; no source scan removed, no default GUI/provider claim, does not affect ReadUsage, historical selectors, writer or persistence.",
+  "selection": "Apply one only: source.patch on exact Modules owner target preimages; or embedded alternate when exact #800 AND #804 selected. #803/#805 do not affect these two preimages; if using #805 obey its own #803 dependency. No exact selector provided for just #800 or just #804. Never apply both or reapply a predecessor.",
+  "selector_roster": {
+    "compact_sha256": "606c5cbe15c9fd53f6c3f1f56f13a59fd953e45e9986c344b377e44c7d286b44",
+    "count": 114,
+    "pretty_sha256": "61d78e0850abf3d5cb19951bfa8543a55242244e563b2c6025d2894c6c75060a",
+    "range": [
+      693,
+      806
+    ],
+    "same_target_overlap": {
+      "800": [
+        "storage/session-storage/src/tests/usage.rs"
+      ],
+      "804": [
+        "storage/session-storage/src/snapshot.rs"
+      ]
+    },
+    "selector_inputs_sha256": "2df06793d1bcacc559723324ce6d0a3e7a098e53b30b399347bc2754c7c68fc7"
+  },
+  "source": {
+    "storage/session-storage/src/snapshot.rs": {
+      "postimage": {
+        "bytes": 17635,
+        "git": "03e0993ec64bccc06838ea4bd06056dd52aa1bbb",
+        "mode": "100644",
+        "sha256": "315d4df471867b60fae40a53e63511a5b17153bfe215fe6073756abdc2e9420c"
+      },
+      "preimage": {
+        "bytes": 17519,
+        "git": "a610ca7099a4647d1aee27e908d9408ff9c3ed47",
+        "mode": "100644",
+        "sha256": "ce342e5387e587ce27557ff2cdf27c68afa6654df04f4a73854b63c8c9717b4e"
+      }
+    },
+    "storage/session-storage/src/tests/usage.rs": {
+      "postimage": {
+        "bytes": 7940,
+        "git": "fbbcb909943fe054ce5fe5b651f68d3698926455",
+        "mode": "100644",
+        "sha256": "3fd9c63cc63cf3bba00c85eda9ca369330c14b6986edc847992f95e9acb1bf9c"
+      },
+      "preimage": {
+        "bytes": 5712,
+        "git": "d98f220c2f8cb6fb79d9b26d77544ad315951112",
+        "mode": "100644",
+        "sha256": "b0af5af12ebce228209262fbb1a905e4056ed29c0f7876c199105ca6b8284021"
+      }
+    }
+  },
+  "source_gate_sha256": "695762af731e909a0a9daa2a8d63fa6e005f9f2cea1ceed7ebfc615da116a4e5",
+  "source_patch_sha256": "85bff045fbec4cc7f77fd0cfcb060edc80186fe52cdb7cf9ea5731588726c79e",
+  "standalone_candidate_tree": "1fb423dda515c25f6a4d7879655215f485a848d2"
+}
