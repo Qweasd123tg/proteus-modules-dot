@@ -1,0 +1,322 @@
+diff --git a/tool/shell-tool/src/unified_exec/capture/tests.rs b/tool/shell-tool/src/unified_exec/capture/tests.rs
+index 448931d914a7950cc8282af56518f09bddaffd27..98d0fc175fe615bf1ab02c6c63b0425be59a8179 100644
+--- a/tool/shell-tool/src/unified_exec/capture/tests.rs
++++ b/tool/shell-tool/src/unified_exec/capture/tests.rs
+@@ -395,7 +395,10 @@ fn binding_drop_stops_writer_without_future_lookup_or_reader_eof() {
+     wait_for(|| weak.upgrade().is_none());
+     assert_eq!(quota.used.load(Ordering::Acquire), 0);
+     session.push_output(b"preview still works");
+-    assert_eq!(lock(&session.output).buffer, b"preview still works");
++    assert_eq!(
++        lock(&session.output).buffer.contiguous_for_test(),
++        b"preview still works"
++    );
+ }
+ 
+ #[test]
+diff --git a/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs b/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs
+index cea72cc012be56a0a00d212cb6d8eac7ad963639..249175a072e4380c87f4b36d640a36b75121df2e 100644
+--- a/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs
++++ b/tool/shell-tool/src/unified_exec/capture/tests/read_ranges.rs
+@@ -38,6 +38,28 @@ fn actual_model_text_exposes_failed_pending_and_truncated_receipts() {
+     assert_eq!(view["envelope"]["readable"], false);
+ }
+ 
++#[test]
++fn bounded_model_output_does_not_drop_from_source_capture_accounting() {
++    use crate::unified_exec::SESSION_BUFFER_LIMIT;
++
++    let prefix = b"capture-original";
++    let (_dir, store, context) = fixture(prefix.len() as u64, 1);
++    let (session, record) = attached(&store, &context, true);
++    session.push_output(prefix);
++    let chunk = [b'x'; CHUNK_BYTES];
++    let chunks = SESSION_BUFFER_LIMIT / chunk.len() + 1;
++    for _ in 0..chunks {
++        session.push_output(&chunk);
++    }
++    session.mark_reader_ended(ReaderEnd::Eof);
++    sealed(&record);
++    let receipt = record.receipt();
++    assert_eq!(receipt["observed_bytes"], prefix.len() + chunks * chunk.len());
++    assert_eq!(receipt["prefix_truncated"], true);
++    let view = read(&store, &context, json!({"handle": record.handle()})).unwrap();
++    assert_eq!(view["envelope"]["text"], "capture-original");
++}
++
+ #[test]
+ fn raw_binary_and_mid_codepoint_ranges_have_explicit_utf8_or_hex_behavior() {
+     let (_dir, store, context) = fixture(100, 1);
+diff --git a/tool/shell-tool/src/unified_exec/output.rs b/tool/shell-tool/src/unified_exec/output.rs
+index d93e0ee973ad9c745f91256570c50619ffc67615..5cabbb074893c0206ea35d2014dcb15f13b5d342 100644
+--- a/tool/shell-tool/src/unified_exec/output.rs
++++ b/tool/shell-tool/src/unified_exec/output.rs
+@@ -19,6 +19,78 @@ pub(super) struct Collected {
+     pub(super) exit_code: Option<i32>,
+ }
+ 
++/// The model buffer keeps the first half and a circular last half after
++/// overflow. Only collection needs the retained suffix in stream order.
++#[derive(Default)]
++pub(super) struct BoundedOutput {
++    bytes: Vec<u8>,
++    next_tail: usize,
++    dropped_bytes: usize,
++}
++
++impl BoundedOutput {
++    const HEAD: usize = SESSION_BUFFER_LIMIT / 2;
++    const TAIL: usize = SESSION_BUFFER_LIMIT - Self::HEAD;
++
++    pub(super) fn push(&mut self, chunk: &[u8]) {
++        let len = self.bytes.len();
++        let fit = chunk.len().min(SESSION_BUFFER_LIMIT - len);
++        let retained = len + fit;
++        let excess = chunk.len() - fit;
++        let replaces_tail = excess != 0 && chunk.len() >= Self::TAIL;
++        let capacity = self.bytes.capacity();
++        if retained > capacity && (capacity > Self::HEAD || replaces_tail) {
++            // A large replacement appends twice (head then tail). Reserve
++            // both at once so neither that nor an ordinary large append can
++            // double a partly filled allocation past the retention limit.
++            self.bytes.reserve_exact(SESSION_BUFFER_LIMIT - len);
++        }
++        if excess == 0 {
++            self.bytes.extend_from_slice(chunk);
++            return;
++        }
++        self.dropped_bytes = self.dropped_bytes.saturating_add(excess);
++        if replaces_tail {
++            let missing_head = Self::HEAD.saturating_sub(len);
++            self.bytes.truncate(Self::HEAD);
++            self.bytes.extend_from_slice(&chunk[..missing_head]);
++            self.bytes.extend_from_slice(&chunk[chunk.len() - Self::TAIL..]);
++            self.next_tail = 0;
++            return;
++        }
++
++        self.bytes.extend_from_slice(&chunk[..fit]);
++        let chunk = &chunk[fit..];
++        let tail = &mut self.bytes[Self::HEAD..];
++        let first = chunk.len().min(Self::TAIL - self.next_tail);
++        tail[self.next_tail..self.next_tail + first].copy_from_slice(&chunk[..first]);
++        tail[..chunk.len() - first].copy_from_slice(&chunk[first..]);
++        self.next_tail = (self.next_tail + chunk.len()) % Self::TAIL;
++    }
++
++    #[cfg(test)]
++    pub(super) fn len(&self) -> usize {
++        self.bytes.len()
++    }
++
++    #[cfg(test)]
++    pub(super) fn contiguous_for_test(&self) -> &[u8] {
++        assert_eq!(self.next_tail, 0, "test expected ordered bytes");
++        &self.bytes
++    }
++
++    pub(super) fn take(&mut self, final_output: bool) -> (Vec<u8>, usize) {
++        let next_tail = std::mem::take(&mut self.next_tail);
++        if next_tail != 0 {
++            self.bytes[Self::HEAD..].rotate_left(next_tail);
++        }
++        (
++            take_ready_bytes(&mut self.bytes, final_output),
++            std::mem::take(&mut self.dropped_bytes),
++        )
++    }
++}
++
+ /// Ждёт до дедлайна (или до exit + drain) и забирает накопленный вывод.
+ pub(super) fn wait_and_collect(
+     session: &ExecSession,
+@@ -61,9 +133,10 @@ pub(super) fn wait_and_collect(
+         output = guard;
+     }
+     let final_output = output.exited || output.readers.is_closed();
++    let (bytes, dropped_bytes) = output.buffer.take(final_output);
+     Ok(Collected {
+-        bytes: take_ready_bytes(&mut output.buffer, final_output),
+-        dropped_bytes: std::mem::take(&mut output.dropped_bytes),
++        bytes,
++        dropped_bytes,
+         exited: output.exited,
+         exit_code: output.exit_code,
+     })
+diff --git a/tool/shell-tool/src/unified_exec/output/tests.rs b/tool/shell-tool/src/unified_exec/output/tests.rs
+index 232c94b2c76e4d6b40ed59832ffec18a9b378bc7..e52494be366e6472581aa6662da78338e5c7cb08 100644
+--- a/tool/shell-tool/src/unified_exec/output/tests.rs
++++ b/tool/shell-tool/src/unified_exec/output/tests.rs
+@@ -1,5 +1,76 @@
+ use super::*;
+ 
++#[test]
++fn circular_output_matches_append_then_drain_across_chunk_boundaries() {
++    const LIMIT: usize = SESSION_BUFFER_LIMIT;
++    const HEAD: usize = BoundedOutput::HEAD;
++    const TAIL: usize = BoundedOutput::TAIL;
++    // Short output, exact fill, crossing the cutoff, the ring wraps, and a
++    // single large chunk supplies both a missing head and its latest tail.
++    for lengths in [
++        &[0, 17, 1][..],
++        &[HEAD - 3, 1, TAIL + 2, 1, HEAD / 5, TAIL - 7, 29],
++        &[3, 3 * LIMIT + 17, 5],
++        &[LIMIT, TAIL, TAIL + 1, LIMIT + 2],
++        &[HEAD - 37, TAIL - 41, 4096, TAIL / 3, TAIL / 3, TAIL / 3, 32768],
++    ] {
++        let mut state = BoundedOutput::default();
++        let mut stock = Vec::new();
++        let mut dropped = 0usize;
++        let mut byte_state = 7u32;
++        for len in lengths.iter().copied() {
++            let chunk = (0..len)
++                .map(|_| {
++                    byte_state ^= byte_state << 13;
++                    byte_state ^= byte_state >> 17;
++                    byte_state ^= byte_state << 5;
++                    byte_state as u8
++                })
++                .collect::<Vec<_>>();
++            state.push(&chunk);
++            stock.extend_from_slice(&chunk);
++            let excess = stock.len().saturating_sub(LIMIT);
++            if excess != 0 {
++                stock.drain(HEAD..HEAD + excess);
++            }
++            dropped = dropped.saturating_add(excess);
++            assert_eq!(state.bytes.len(), stock.len());
++        }
++        assert_eq!(state.take(true), (stock, dropped));
++        assert_eq!(state.take(true), (Vec::new(), 0));
++    }
++}
++
++#[test]
++fn full_ring_does_not_reallocate_for_a_small_overflowing_chunk() {
++    let mut state = BoundedOutput::default();
++    state.push(&vec![b'x'; SESSION_BUFFER_LIMIT]);
++    let allocation = (state.bytes.as_ptr(), state.bytes.capacity());
++    state.push(b"new-tail");
++    assert_eq!((state.bytes.as_ptr(), state.bytes.capacity()), allocation);
++    let (bytes, dropped) = state.take(true);
++    assert_eq!(dropped, 8);
++    assert_eq!(bytes.len(), SESSION_BUFFER_LIMIT);
++    assert!(bytes.ends_with(b"new-tail"));
++}
++
++#[test]
++fn huge_chunk_reserves_head_and_tail_together_after_a_partial_head() {
++    let mut state = BoundedOutput::default();
++    let old_len = 400 * 1024;
++    state.push(&vec![b'a'; old_len]);
++    assert_eq!(state.bytes.capacity(), old_len);
++    assert!(old_len < BoundedOutput::HEAD && old_len * 3 > SESSION_BUFFER_LIMIT);
++
++    state.push(&vec![b'b'; SESSION_BUFFER_LIMIT + 17]);
++    assert_eq!(state.bytes.capacity(), SESSION_BUFFER_LIMIT);
++    let (bytes, dropped) = state.take(true);
++    assert_eq!(dropped, old_len + 17);
++    assert_eq!(bytes.len(), SESSION_BUFFER_LIMIT);
++    assert!(bytes[..old_len].iter().all(|&byte| byte == b'a'));
++    assert!(bytes[old_len..].iter().all(|&byte| byte == b'b'));
++}
++
+ #[test]
+ fn every_pair_of_poll_boundaries_preserves_valid_utf8() {
+     for text in ["", "ASCII", "é", "中", "😀", "aé中😀z"] {
+@@ -130,16 +201,21 @@ fn split_scalar_renders_once_and_output_bytes_count_delivered_bytes() {
+ 
+ #[test]
+ fn retained_suffix_does_not_break_existing_dropped_middle_rendering() {
+-    let mut buffer = vec![b'x'; SESSION_BUFFER_LIMIT];
+-    buffer[SESSION_BUFFER_LIMIT - 2..].copy_from_slice(&[0xf0, 0x9f]);
+-    let first = rendered(take_ready_bytes(&mut buffer, false), 17, false);
++    let mut buffer = BoundedOutput::default();
++    buffer.push(&vec![b'x'; SESSION_BUFFER_LIMIT]);
++    buffer.push(b"0123456789abcde");
++    buffer.push(&[0xf0, 0x9f]);
++    let (bytes, dropped) = buffer.take(false);
++    let first = rendered(bytes, dropped, false);
+     assert_eq!(first["metadata"]["output_bytes"], SESSION_BUFFER_LIMIT - 2);
+     assert_eq!(first["metadata"]["dropped_bytes"], 17);
+     assert_eq!(first["metadata"]["truncated"], true);
+     assert!(!first["output"].as_str().unwrap().contains('�'));
+-    assert_eq!(buffer, [0xf0, 0x9f]);
+-    buffer.extend_from_slice(&[0x98, 0x80]);
+-    let second = rendered(take_ready_bytes(&mut buffer, true), 0, true);
++    assert_eq!(buffer.bytes, [0xf0, 0x9f]);
++    buffer.push(&[0x98, 0x80]);
++    let (bytes, dropped) = buffer.take(true);
++    assert_eq!(dropped, 0);
++    let second = rendered(bytes, dropped, true);
+     assert!(second["output"].as_str().unwrap().ends_with("Output:\n😀"));
+ }
+ 
+diff --git a/tool/shell-tool/src/unified_exec/session.rs b/tool/shell-tool/src/unified_exec/session.rs
+index aefcd680bdc41fa404a3b19b6c555360809cb4cb..f284e6cf37ea30adb015cd643c40cb1753b7bb19 100644
+--- a/tool/shell-tool/src/unified_exec/session.rs
++++ b/tool/shell-tool/src/unified_exec/session.rs
+@@ -1,9 +1,10 @@
+ //! Session ownership, storage and lifetime.
+ use super::capture::{CaptureTap, PreparedCapture};
++use super::output::BoundedOutput;
+ use super::reader::{ReaderCompletions, ReaderEnd};
+ use super::{
+-    CANCELLATION_POLL_INTERVAL, EXIT_DRAIN_GRACE, MAX_SESSIONS, SESSION_BUFFER_LIMIT,
+-    SESSION_JANITOR_INTERVAL, SESSION_MAX_IDLE, ensure_not_cancelled,
++    CANCELLATION_POLL_INTERVAL, EXIT_DRAIN_GRACE, MAX_SESSIONS, SESSION_JANITOR_INTERVAL,
++    SESSION_MAX_IDLE, ensure_not_cancelled,
+ };
+ use crate::sandbox::SandboxKind;
+ use anyhow::{Result, anyhow};
+@@ -20,8 +21,7 @@ use std::{
+ 
+ /// Состояние вывода сессии; reader/wait-потоки будят ожидающих через Condvar.
+ pub(super) struct SessionOutput {
+-    pub(super) buffer: Vec<u8>,
+-    pub(super) dropped_bytes: usize,
++    pub(super) buffer: BoundedOutput,
+     /// Reader termination facts; closed readers may have failed or timed out.
+     pub(super) readers: ReaderCompletions,
+     pub(super) exited: bool,
+@@ -116,8 +116,7 @@ impl ExecSession {
+         Self {
+             interaction: Mutex::new(()),
+             output: Mutex::new(SessionOutput {
+-                buffer: Vec::new(),
+-                dropped_bytes: 0,
++                buffer: BoundedOutput::default(),
+                 readers: ReaderCompletions::new(tty),
+                 exited: false,
+                 exit_code: None,
+@@ -181,13 +180,7 @@ impl ExecSession {
+             capture.observe(chunk);
+         }
+         self.terminal.append(chunk);
+-        output.buffer.extend_from_slice(chunk);
+-        if output.buffer.len() > SESSION_BUFFER_LIMIT {
+-            let excess = output.buffer.len() - SESSION_BUFFER_LIMIT;
+-            let head = SESSION_BUFFER_LIMIT / 2;
+-            output.buffer.drain(head..head + excess);
+-            output.dropped_bytes = output.dropped_bytes.saturating_add(excess);
+-        }
++        output.buffer.push(chunk);
+         drop(output);
+         self.output_cond.notify_all();
+     }
+diff --git a/tool/shell-tool/src/unified_exec/terminal/tests.rs b/tool/shell-tool/src/unified_exec/terminal/tests.rs
+index 6729c292c95d09ff0449ef9466616092d93572ec..bc13d34a230fc2316aba5d95eb894006c51f49b0 100644
+--- a/tool/shell-tool/src/unified_exec/terminal/tests.rs
++++ b/tool/shell-tool/src/unified_exec/terminal/tests.rs
+@@ -351,7 +351,10 @@ fn finished_requires_exit_and_reader_completion_and_does_not_consume_model_bytes
+     let snapshot = session.terminal.read(None, 100, 0).unwrap();
+     assert!(snapshot.finished);
+     assert_eq!(STANDARD.decode(snapshot.data_base64).unwrap(), b"headtail");
+-    assert_eq!(lock(&session.output).buffer, b"headtail");
++    assert_eq!(
++        lock(&session.output).buffer.contiguous_for_test(),
++        b"headtail"
++    );
+ }
+ 
+ #[test]
