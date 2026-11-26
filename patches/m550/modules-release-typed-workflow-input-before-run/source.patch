@@ -1,0 +1,15 @@
+diff --git a/components/module-runtime/src/exports.rs b/components/module-runtime/src/exports.rs
+index db1018b286e811764eb612bfad3d38408c516917..e320da856b943e6fe0d8169acd429e040db24e0f 100644
+--- a/components/module-runtime/src/exports.rs
++++ b/components/module-runtime/src/exports.rs
+@@ -357,7 +357,9 @@
+             runtime: input.runtime,
+         };
+         let mut host = WorkflowHostBridge(bridge.clone());
+-        let output = match workflow.run_json(serde_json::to_string(&module_input)?, &mut host) {
++        let input_json = serde_json::to_string(&module_input)?;
++        drop(module_input);
++        let output = match workflow.run_json(input_json, &mut host) {
+             Ok(output) => output,
+             Err(failure) => return encode(ProcessWorkflowResponse::failed(failure)),
+         };
