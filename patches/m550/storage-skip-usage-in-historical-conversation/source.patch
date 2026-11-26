@@ -1,0 +1,13 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index f26b6822b00f36bbd1511100fd5e81cc3ae21f7a..761d2ec06c63efdebc108da4403bb769c759cd52 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -386,7 +386,7 @@ impl SnapshotState {
+                     }
+                 }
+             }
+-            state.apply(self.identity.session.session_id, &record)?;
++            state.apply_projected::<true, false>(self.identity.session.session_id, &record)?;
+             if let StorageHistoryPoint::Revision { history_revision } = point {
+                 if selected.is_none() && state.validation.history_revision() == history_revision {
+                     selected = Some(state.conversation());
