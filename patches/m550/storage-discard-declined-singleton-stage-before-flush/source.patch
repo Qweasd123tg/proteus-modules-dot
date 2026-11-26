@@ -1,0 +1,55 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 0fd89c4b5d13e568fce31f4dd27640b263e35439..3e7fc2d38b72020f1659040428fd7d54fbd01b46 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -70,10 +70,20 @@ impl DisplayWriter {
+         Ok(())
+     }
+ 
++    pub fn staged_bytes(&self) -> u64 {
++        self.budget - self.remaining
++    }
++
++    pub fn discard(self) {
++        // The private stage will not be read. Avoid BufWriter's final flush.
++        drop(self.writer.into_parts());
++    }
++
+     pub fn finish(self) -> Option<DisplayRecords> {
++        let bytes = self.staged_bytes();
+         Some(DisplayRecords {
+             reader: BufReader::new(self.writer.into_inner().ok()?),
+-            bytes: self.budget - self.remaining,
++            bytes,
+             after: None,
+             pending: None,
+             large_lines: (!self.large_lines.is_empty()).then(|| {
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index b107f79f80c3cabde8df2d8b3d897b2ca752dae5..89d99c819c46442316edb0a3a0435f9fac151b74 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -104,7 +104,7 @@ impl State {
+             };
+             self.save_catalog_head(&dir, summary, &prefix, blobs);
+         }
+-        let Some(display) = display.and_then(DisplayWriter::finish) else {
++        let Some(display) = display else {
+             return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
+         };
+         // With one large history mutation, canonical replay already receives all
+@@ -112,10 +112,14 @@ impl State {
+         // A projected reply would send the same large messages a second time.
+         if identity.revision.session_seq == 1
+             && identity.revision.history_revision == 1
+-            && display.bytes >= SESSION_STORAGE_PAGE_BYTE_BUDGET as u64
++            && display.staged_bytes() >= SESSION_STORAGE_PAGE_BYTE_BUDGET as u64
+         {
++            display.discard();
+             return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
+         }
++        let Some(display) = display.finish() else {
++            return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
++        };
+         let state = state.into_resume(session.session_id);
+         if !state_fits(&state) {
+             return Ok(SessionStorageResponse::DisplaySnapshot { projection: None });
