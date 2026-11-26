@@ -1,0 +1,7 @@
+# Modules: keep the warm writer's source-stamp buffer
+
+An ordinary append with a verified resident writer head still probes journal, WAL and session marker in the same order before and after the durable write. The precheck compares three local values with the existing stamps; a successful append reuses the writer head's stamp buffer. This removes two temporary stamp vectors on that path, not any metadata probe, integrity check or disk write. A stale or failed observation still discards the cached head. Lease, validation, durable append, blob checks and acknowledgement are unchanged.
+
+Direct Rust 1.95 library tests used the same locked dependencies for stock and the exact standalone candidate: 104 stock tests and 105 candidate tests passed. The focused candidate test, rerun on the same binary, verified retained allocation and stale-head rejection for owned JSONL and SQLite fixtures. One existing manual performance test was ignored in each full suite. No separate worker, cold-cache speed, application memory or end-to-end performance was measured.
+
+Use one variant: `source.patch` on the exact Modules preimages, or the embedded alternate in `receipt.json` after exact #800. The alternate is source-verified, not compiled or run. Do not replay #716: its descriptor change is already in the owner. Optional #803, #804, #805 and #807 are disjoint from these preimages and retain their own dependencies.

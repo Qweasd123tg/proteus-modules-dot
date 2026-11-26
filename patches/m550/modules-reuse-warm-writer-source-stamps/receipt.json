@@ -1,0 +1,267 @@
+{
+  "alternate": {
+    "composed_basis_tree": "25d55adc1bf49890efd7efd78428c1f621669c50",
+    "composed_candidate_tree": "4357a53c9ac2723fb89d125e2af0f3b4a54adce6",
+    "minimum_basis_tree": "261e924a7538dda46772d0169cbc67955ff8dfb4",
+    "minimum_candidate_tree": "b0a71a1d7a4d0d5a8447d49ff3ead143093d6907",
+    "minimum_exact_predecessors": [
+      800
+    ],
+    "native_not_tested": true,
+    "optional_disjoint": [
+      803,
+      804,
+      805,
+      807
+    ],
+    "source": {
+      "storage/session-storage/src/service/catalog.rs": {
+        "postimage": {
+          "bytes": 12622,
+          "git": "bae27642c5a026696694b4d2f271fd53dd58a8e5",
+          "mode": "100644",
+          "sha256": "010ab11062667f73fadbdaded19d1786624c235c5be7df18df1dd1140ee87977"
+        },
+        "preimage": {
+          "bytes": 12158,
+          "git": "833eb062ac2f283d8f5c4f7fc61e8468bc28309b",
+          "mode": "100644",
+          "sha256": "5e446e096864e2e3425eba3c5f2ecfca9eab1d04f5a678a856a0e0c9ae789b7a"
+        }
+      },
+      "storage/session-storage/src/service/catalog/tests.rs": {
+        "postimage": {
+          "bytes": 13917,
+          "git": "2af6141d6918c42ff4194eb5c30539a26863b67a",
+          "mode": "100644",
+          "sha256": "1a6284b23f4d19bfd6b8deb991f85ddf71128dfb3d388ed7296bed7e0499828c"
+        },
+        "preimage": {
+          "bytes": 12308,
+          "git": "65f51a823dd6760761f3e1a93d60e2108d71f57f",
+          "mode": "100644",
+          "sha256": "e549383e0273fe0fa64b3bdf85d2f1c9ad197f1faf78369770e6f86d1d2ed9c8"
+        }
+      },
+      "storage/session-storage/src/service/commits.rs": {
+        "postimage": {
+          "bytes": 4901,
+          "git": "be7397f74afde4b3b4cc50d4197a899bfed8bff3",
+          "mode": "100644",
+          "sha256": "de9d4ee34a41b2e0306fd6197b7e61f5d977aac694c4fed1bb5aff609e6a4b2f"
+        },
+        "preimage": {
+          "bytes": 4938,
+          "git": "5203b14ad8bc3aa719523114a087b671f545e7fb",
+          "mode": "100644",
+          "sha256": "1494b8cf58274938226088fa17e6e9fe7d5e6229a09a6b403aac160e4f0bb642"
+        }
+      }
+    },
+    "standalone_contextual_reverse_order_same_bytes": true,
+    "strict_scoped_inverse_exact": true
+  },
+  "alternate_needed": true,
+  "alternate_scoped_patch": "diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs\nindex 833eb062ac2f283d8f5c4f7fc61e8468bc28309b..bae27642c5a026696694b4d2f271fd53dd58a8e5 100644\n--- a/storage/session-storage/src/service/catalog.rs\n+++ b/storage/session-storage/src/service/catalog.rs\n@@ -44,9 +44,13 @@ fn file_stamp(meta: &Metadata) -> Result<FileStamp> {\n }\n pub(super) type SourceStamp = Vec<Option<FileStamp>>;\n pub(super) fn source_stamp(dir: &Path, kind: BackendKind) -> Result<SourceStamp> {\n+    Ok(source_stamp_items(dir, kind)?.into())\n+}\n+\n+fn source_stamp_items(dir: &Path, kind: BackendKind) -> Result<[Option<FileStamp>; 3]> {\n     let journal = kind.backend().description_path(dir);\n     let wal = PathBuf::from(format!(\"{}-wal\", journal.to_string_lossy()));\n-    Ok(vec![\n+    Ok([\n         stamp(&journal)?,\n         // Opening a read-only SQLite snapshot may create an empty WAL. It\n         // carries no committed data and is equivalent to a missing WAL.\n@@ -69,13 +73,20 @@ pub(super) struct WriterHead {\n }\n \n impl WriterHead {\n+    pub(super) fn matches_source(&self, dir: &Path, kind: BackendKind) -> bool {\n+        source_stamp_items(dir, kind).is_ok_and(|items| items.as_slice() == self.stamps.as_slice())\n+    }\n+\n     pub fn advance(\n         &mut self,\n         dir: &Path,\n         kind: BackendKind,\n         append: crate::backend::Append,\n     ) -> Option<()> {\n-        self.stamps = source_stamp(dir, kind).ok()?;\n+        let items = source_stamp_items(dir, kind).ok()?;\n+        // Keep the allocation owned by the current verified writer head.\n+        self.stamps.clear();\n+        self.stamps.extend(items);\n         durable::update_blobs(dir, &mut self.blobs, append.blobs)?;\n         self.extent = append.extent;\n         self.hash.update(&append.bytes);\ndiff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs\nindex 65f51a823dd6760761f3e1a93d60e2108d71f57f..2af6141d6918c42ff4194eb5c30539a26863b67a 100644\n--- a/storage/session-storage/src/service/catalog/tests.rs\n+++ b/storage/session-storage/src/service/catalog/tests.rs\n@@ -29,6 +29,42 @@ fn resident_catalog_uses_observed_descriptor_with_the_cached_projection() {\n     }\n }\n \n+#[test]\n+fn warm_writer_reuses_stamp_storage_without_accepting_changed_metadata() {\n+    for kind in backends() {\n+        let mut f = Fixture::new(kind);\n+        f.append(vec![text(\"ordinary first record\")]);\n+        let dir = f.descriptor.local_path.clone().unwrap();\n+        let observe = |fixture: &Fixture| {\n+            let state = fixture.service.lock_state().unwrap();\n+            let head = state.writers[&fixture.lease.session].head.as_ref().unwrap();\n+            assert!(head.stamps == source_stamp(&dir, kind).unwrap());\n+            (head.stamps.as_ptr(), head.extent)\n+        };\n+        let (allocation, first_extent) = observe(&f);\n+        f.append(vec![text(\"ordinary second record\")]);\n+        let (next_allocation, second_extent) = observe(&f);\n+        assert_eq!(next_allocation, allocation);\n+        assert!(second_extent > first_extent);\n+\n+        // Change only the synthetic session marker's mtime, not its content\n+        // or any journal/WAL bytes. A stale head must still be discarded.\n+        let marker = std::fs::OpenOptions::new()\n+            .write(true)\n+            .open(dir.join(\"session.json\"))\n+            .unwrap();\n+        let before = marker.metadata().unwrap().modified().unwrap();\n+        marker\n+            .set_modified(before - std::time::Duration::from_secs(3600))\n+            .unwrap();\n+        assert_ne!(marker.metadata().unwrap().modified().unwrap(), before);\n+        drop(marker);\n+        f.append(vec![text(\"ordinary third record\")]);\n+        let state = f.service.lock_state().unwrap();\n+        assert!(state.writers[&f.lease.session].head.is_none());\n+    }\n+}\n+\n fn pending(f: &Fixture) -> (PathBuf, CatalogRead, Projection) {\n     let dir = f.descriptor.local_path.clone().unwrap();\n     let descriptor = sessions::open(f.service.kind, &dir).unwrap();\ndiff --git a/storage/session-storage/src/service/commits.rs b/storage/session-storage/src/service/commits.rs\nindex 5203b14ad8bc3aa719523114a087b671f545e7fb..be7397f74afde4b3b4cc50d4197a899bfed8bff3 100644\n--- a/storage/session-storage/src/service/commits.rs\n+++ b/storage/session-storage/src/service/commits.rs\n@@ -54,7 +54,7 @@ impl State {\n         let kind = self.kind;\n         let writer = self.writer(&commit.lease)?;\n         if let Some(head) = writer.head.as_ref()\n-            && catalog::source_stamp(&dir, kind).ok().as_ref() != Some(&head.stamps)\n+            && !head.matches_source(&dir, kind)\n         {\n             writer.head = None;\n         }\n",
+  "alternate_scoped_patch_sha256": "999cab6d62b4c8278f692bbb0fc24704cdbf30a5218365a6dc78fc5f9f4b19b5",
+  "desktop_manifest": {
+    "git": "0238b928a49bb01194be6a47503c67c17ff17aae",
+    "pins": {
+      "extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+      "harness": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+      "modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba"
+    }
+  },
+  "exact_716_replay_policy": {
+    "contextual_reverse_reapply_roundtrip": true,
+    "do_not_reapply": true,
+    "old_moved_descriptor_behavior_already_in_owner": true,
+    "raw_forward_rejected": true,
+    "strict_source_variant_not_applicable_to_historical_blob": true
+  },
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+    "Proteus-harness/Proteus-desktop": "df3363eae5207204b8d34f122a50bd67277221d1",
+    "Proteus-harness/Proteus-desktop-extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+    "Proteus-harness/Proteus-modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "historical": [
+    {
+      "head": "ea66ab5f0de4c5282ce1c6b7b5603338c6b5849e",
+      "pr": 716,
+      "same_target_paths": [
+        "storage/session-storage/src/service/catalog.rs"
+      ],
+      "source_git": "8501ec2f2ed41e316f1a323e8415abbe0f8ee313",
+      "source_sha256": "c7ea43305aec2c0e577b5fe096148b638dcde46b3a6fccdf6b438b22a43bed4b"
+    },
+    {
+      "head": "0c68c9b0cf98df5f978a3960fcc96fb37f15e7bd",
+      "pr": 800,
+      "same_target_paths": [
+        "storage/session-storage/src/service/catalog.rs"
+      ],
+      "source_git": "61801b07f57ce030b51f8997bb90d7f55ad46809",
+      "source_sha256": "6ee8dc2e01a6793e39be2c9a9d7bcaf9061617045bff3c5712307d955f3bdd81"
+    },
+    {
+      "head": "e441856004b19adb6efef17478ee8d89c07870dc",
+      "pr": 803,
+      "same_target_paths": [],
+      "source_git": "a899ff0a2c074509738bf7700e0b6ea307348dfd",
+      "source_sha256": "131200a95f59ccba842126564e24ae4e92f8fc67867903cb4ce8838325747d5c"
+    },
+    {
+      "head": "0b92399ef3eb6e6b856920906c1c0ccada3d6dd6",
+      "pr": 804,
+      "same_target_paths": [],
+      "source_git": "f6a6d44fdca355e31517e3ca9cccb0544c71ae65",
+      "source_sha256": "6583a7561cca4c040475cff86171c101b5e49274f77abe4c1aa28107304e269d"
+    },
+    {
+      "head": "aa4616691865399aaddf7dd022d2c3338d9d5ab4",
+      "pr": 805,
+      "same_target_paths": [],
+      "scoped_source_used_sigma256": "2cc543a3ec281ef59e1752721a8a18cf11d38a521076ad9f143cb46a19bf803b",
+      "source_git": "6f3de38fa8a3e99f0a8b4a1a7a98e779b4a13f26",
+      "source_sha256": "75f64f9a4c3898550c5f64364d02e1d7f1cb6abfb61f68d2543f9e60eddda56e"
+    },
+    {
+      "head": "f64c3d265dfd2da30ef8e31c532e78e22ab10a0a",
+      "pr": 807,
+      "same_target_paths": [],
+      "scoped_source_used_sigma256": "4ad6f2432fb3587a18a8b796cdcc152202921a23a49efa41320ae8af5b4221b5",
+      "source_git": "723e29e9b2b8f4ae58906a0def26a5ece39e9f0e",
+      "source_sha256": "85bff045fbec4cc7f77fd0cfcb060edc80186fe52cdb7cf9ea5731588726c79e"
+    }
+  ],
+  "native": {
+    "direct_compilation_using_unchanged_prebuilt_locked_cargo_dependencies": true,
+    "exact_candidate_full_tree": "21d08e2b1d4947c7e79027d7c991769c2e3201bb",
+    "failed": 0,
+    "focused_same_elf_rerun": 1,
+    "native_log_sha256": "a843837a00d2eb8a6c3da122953400587068f8ba74ba1c8a54c4e2c36d04a802",
+    "old_manual_performance_test_ignored_in_each_full_suite": 1,
+    "producer_native_proof_sha256": "3a5e1d1a6e40c720c45227709f5041504fd8e8fc03a82a36faf5fd492052b184",
+    "rust": "1.95.0",
+    "scope": "Direct Rust lib test executables using W170 exact 1.95 locked-Cargo dependencies, no fresh Cargo package build or separate worker. Exact same-pointer warm witness and stale metadata fallback inside typed JSONL/SQLite StorageService test; no deployed eligibility or performance measured.",
+    "stock_full_tests": 104,
+    "suites": {
+      "candidate_full": {
+        "failed": 0,
+        "ignored": [
+          "tests::performance::sixteen_mib_history_warm_snapshot_and_head_publication_cost"
+        ],
+        "passed": 105,
+        "passed_set_sha256": "bf55058156ba1c070c0c25e03495ed0ae82e29a27c371ae586972335b051b8e7"
+      },
+      "focused_same_candidate_repeat": {
+        "failed": 0,
+        "ignored": [],
+        "passed": 1,
+        "passed_set_sha256": "5756855b346a2aae769b3f53f24addc4772936a369274e92eaa5919c3e089244"
+      },
+      "stock_full": {
+        "failed": 0,
+        "ignored": [
+          "tests::performance::sixteen_mib_history_warm_snapshot_and_head_publication_cost"
+        ],
+        "passed": 104,
+        "passed_set_sha256": "87d848790cdbeb548cd54c82e49f0e6f6574ba933d4be5dd8832fac27f00e639"
+      }
+    },
+    "test_elfs": {
+      "candidate": {
+        "bytes": 37215696,
+        "file": "candidate-session-storage-tests",
+        "sha256": "8c16d5aa2b611b7b05cd1aa4b3ce058b932224428459cea964588d763d0c4a77"
+      },
+      "stock": {
+        "bytes": 37192520,
+        "file": "stock-session-storage-tests",
+        "sha256": "3b235d2dd72b5a5963c959fc8d1644473ea453d01219c45711b334325217de90"
+      }
+    },
+    "unique_candidate_passed": 105,
+    "w170_dependency_source_proof_sha256": "4fcc2c52d44663e6ac39bea845aa8a879beb7d23892b1e1920d154f769e7bd7f"
+  },
+  "native_gate_sha256": "3e5bc584429ccf2de89f71c5ede9980c9d42576e89c9b33636526260feb8decc",
+  "owner_base": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+  "owner_lock": {
+    "bytes": 98598,
+    "git": "6fa9a1af3af741a2ba4597e74496670a3dc07e2e",
+    "mode": "100644",
+    "sdk_rev": "0c1b7572313230e5d123e95c722e1258a2e9ecd6",
+    "sha256": "5a790b005a0ddfa6c4632f218f4c9c4b9573f4bf659615c05ba2486105f3a8b2"
+  },
+  "owner_tree": "6b42d3ba575f7f61b894b44faa2de99a108ee1fe",
+  "repo": "Proteus-harness/Proteus-modules",
+  "scope": "Two explicit stamp Vec constructions removed on eligible warm writer append with resident head; fresh pre/post observations, order, error discard, fold, writer lock/lease, durable append, blob/hash and ACK unchanged. No ascription to cold cache writes or whole-app performance.",
+  "selection": "Choose standalone only at exact Modules owner, or scoped alternate after exact #800. Other disjoint optional packets keep their own selectors/dependencies; never replay already-integrated #716 or apply both variants.",
+  "selector_roster": {
+    "compact_sha256": "e434f95348f176f9af49e53ca99e525069167158e166d94274e95f1b749c1cf4",
+    "count": 115,
+    "pretty_sha256": "5131878904aa53458f092528a8aa1e5043a06d2294de2d2a5778ba6eaf005349",
+    "range": [
+      693,
+      807
+    ],
+    "same_target_overlap": {
+      "716": [
+        "storage/session-storage/src/service/catalog.rs"
+      ],
+      "800": [
+        "storage/session-storage/src/service/catalog.rs"
+      ]
+    },
+    "selector_inputs_sha256": "336e500a0facbcd52f8cec55d21716141a2ad465cb9afbb13e8ff119d85298c4"
+  },
+  "source": {
+    "storage/session-storage/src/service/catalog.rs": {
+      "postimage": {
+        "bytes": 12602,
+        "git": "8a65e3c1b6925dc271a63c226a66812dfee2a663",
+        "mode": "100644",
+        "sha256": "89f5a37144293a876a500002835ac69ff0b53b5d989ef8c2017e8080d993f9dd"
+      },
+      "preimage": {
+        "bytes": 12138,
+        "git": "a79eb4a82bf2668312f28ef64af5b476aa59509f",
+        "mode": "100644",
+        "sha256": "313db7de70fa9ad6606a344a3a31e600a94a126591c664f4da73c195d9e0ac54"
+      }
+    },
+    "storage/session-storage/src/service/catalog/tests.rs": {
+      "postimage": {
+        "bytes": 13917,
+        "git": "2af6141d6918c42ff4194eb5c30539a26863b67a",
+        "mode": "100644",
+        "sha256": "1a6284b23f4d19bfd6b8deb991f85ddf71128dfb3d388ed7296bed7e0499828c"
+      },
+      "preimage": {
+        "bytes": 12308,
+        "git": "65f51a823dd6760761f3e1a93d60e2108d71f57f",
+        "mode": "100644",
+        "sha256": "e549383e0273fe0fa64b3bdf85d2f1c9ad197f1faf78369770e6f86d1d2ed9c8"
+      }
+    },
+    "storage/session-storage/src/service/commits.rs": {
+      "postimage": {
+        "bytes": 4901,
+        "git": "be7397f74afde4b3b4cc50d4197a899bfed8bff3",
+        "mode": "100644",
+        "sha256": "de9d4ee34a41b2e0306fd6197b7e61f5d977aac694c4fed1bb5aff609e6a4b2f"
+      },
+      "preimage": {
+        "bytes": 4938,
+        "git": "5203b14ad8bc3aa719523114a087b671f545e7fb",
+        "mode": "100644",
+        "sha256": "1494b8cf58274938226088fa17e6e9fe7d5e6229a09a6b403aac160e4f0bb642"
+      }
+    }
+  },
+  "source_gate_sha256": "424fafacb165ecaf94e2b655fd3fbff456f48d4b0ae600f4f99ce634723fa0d3",
+  "source_patch_sha256": "9cf18953b2925cb6239dc626b1f06e6a870b9e0e0d421dd65e99cdbfcb5246cd",
+  "standalone_candidate_tree": "21d08e2b1d4947c7e79027d7c991769c2e3201bb"
+}
