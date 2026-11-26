@@ -1,0 +1,26 @@
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 88fb3820542dbd50370178894191c87ea9a6a4a5..7fd961522f2fa27cc8349c6677f671ec7702dce0 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -122,7 +122,7 @@ impl<'a> BlobStampMatch<'a> {
+     }
+ }
+ 
+-fn matches_blob_stamps(dir: &Path, expected: &BlobStamps) -> Option<bool> {
++pub(in crate::service) fn matches_blob_stamps(dir: &Path, expected: &BlobStamps) -> Option<bool> {
+     let mut seen = BlobStampMatch::new(expected);
+     walk_blob_stamps(dir, |name, stamp| seen.observe(name, stamp))?;
+     Some(seen.matches())
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index a72aceea5d8ef30115d6693c375af64821d088f6..b88bdf61740b54acc65f3315af0b698b9fd99ad2 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -84,7 +84,7 @@ impl State {
+             content_sha256: source.fingerprint().to_owned(),
+         };
+         if let Some(blobs) = blobs
+-            && catalog::durable::blob_stamps(&dir).as_ref() == Some(&blobs)
++            && catalog::durable::matches_blob_stamps(&dir, &blobs) == Some(true)
+             && catalog::source_stamp(&dir, self.kind)? == stamps
+         {
+             let prefix = views::PrefixCache {
