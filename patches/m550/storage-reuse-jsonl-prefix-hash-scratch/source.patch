@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 2c08aa98b0db4810ba59be86c2715be5cf17e392..9334e11f79ff1fa83e0d010069fc4da942169220 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -441,7 +441,8 @@ impl RecordSnapshot for JsonlSnapshot {
+     fn prefix_fingerprint(&mut self, sequence: u64) -> Result<Option<String>> {
+         self.reset()?;
+         let mut found = (sequence == 0).then(|| crate::io::sha256_hex(b""));
+-        while let Some(record) = self.next()? {
++        let mut line = Vec::new();
++        while let Some(record) = self.next_with_scratch(&mut line)? {
+             if record.session_seq == sequence {
+                 found = Some(self.consumed_fingerprint());
+             }
