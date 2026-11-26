@@ -1,0 +1,67 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..b6cdf5c8e4586c3896b0383a70fad8beafaa6189 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -1,5 +1,7 @@
+ //! Lossless content-defined chunks shared by large journal payloads.
+-use crate::io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_file_eq, bounded_read_into, sha256_hex};
++use crate::io::{
++    MAX_PAYLOAD_BYTES, atomic_write, bounded_file_eq, bounded_read_into, sha256_hex, sha256_matches,
++};
+ use anyhow::{Result, ensure};
+ use serde::{Deserialize, Serialize};
+ use std::{
+@@ -219,7 +221,7 @@ fn unpack_checked<'a>(
+     let Some(body) = stored.strip_prefix(MAGIC) else {
+         if let Some((hash, length)) = expected {
+             ensure!(stored.len() as u64 == length, "journal blob size mismatch");
+-            ensure!(sha256_hex(stored) == hash, "journal blob hash mismatch");
++            ensure!(sha256_matches(stored, hash), "journal blob hash mismatch");
+         }
+         return Ok(Cow::Borrowed(stored));
+     };
+@@ -265,14 +267,14 @@ fn unpack_checked<'a>(
+         let count = bounded_read_into(&path, MAX_CHUNK, content)?;
+         ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
+         ensure!(
+-            sha256_hex(content) == chunk.sha256,
++            sha256_matches(content, &chunk.sha256),
+             "shared blob chunk hash mismatch"
+         );
+         vacant.insert((start, chunk.bytes));
+     }
+     ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
+     ensure!(
+-        sha256_hex(&bytes) == manifest.sha256,
++        sha256_matches(&bytes, &manifest.sha256),
+         "shared blob hash mismatch"
+     );
+     Ok(Cow::Owned(bytes))
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 406621c061a592509fa76ac56da82e3ca95e7e6a..642a6a492d2f3dac7b4f7ebcf83a7b48c7dd5690 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -13,8 +13,22 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+     digest_hex(digest(&SHA256, bytes))
+ }
+ 
++const HEX: &[u8; 16] = b"0123456789abcdef";
++
++pub(crate) fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
++    let digest = digest(&SHA256, bytes);
++    let expected = expected.as_bytes();
++    expected.len() == digest.as_ref().len() * 2
++        && digest
++            .as_ref()
++            .iter()
++            .zip(expected.chunks_exact(2))
++            .all(|(&byte, hex)| {
++                hex[0] == HEX[(byte >> 4) as usize] && hex[1] == HEX[(byte & 0x0f) as usize]
++            })
++}
++
+ pub(crate) fn digest_hex(digest: ring::digest::Digest) -> String {
+-    const HEX: &[u8; 16] = b"0123456789abcdef";
+     let bytes = digest.as_ref();
+     let mut encoded = String::with_capacity(bytes.len() * 2);
+     for &byte in bytes {
