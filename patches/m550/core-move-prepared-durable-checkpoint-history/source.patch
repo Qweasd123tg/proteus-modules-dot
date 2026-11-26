@@ -1,0 +1,143 @@
+diff --git a/crates/proteus-core/src/core/runtime/checkpoint.rs b/crates/proteus-core/src/core/runtime/checkpoint.rs
+index 84b40b987bb3bbec833999c6dc0dd82fe35a4a5f..41c55551191aa5b5199b3708f353b322cfdae281 100644
+--- a/crates/proteus-core/src/core/runtime/checkpoint.rs
++++ b/crates/proteus-core/src/core/runtime/checkpoint.rs
+@@ -161,7 +161,7 @@ impl WorkflowHistoryRecorder for TurnHistoryRecorder {
+                 .checkpoint_history(
+                     agent.thread_id,
+                     agent.turn_id,
+-                    &prepared.final_messages,
++                    prepared.final_messages,
+                     compaction.clone(),
+                     checkpoint.tool_results,
+                 )
+diff --git a/crates/proteus-core/src/core/session_store/checkpoint_tests.rs b/crates/proteus-core/src/core/session_store/checkpoint_tests.rs
+index d6ae07729f9aaa6638f030ba2828020246164f40..d5c38bc019e131707b4c602570df74c20ac3c0d6 100644
+--- a/crates/proteus-core/src/core/session_store/checkpoint_tests.rs
++++ b/crates/proteus-core/src/core/session_store/checkpoint_tests.rs
+@@ -2,7 +2,7 @@ use super::*;
+ use crate::{
+     contracts::ToolExecutionRecorder,
+     contracts::{ExecutionAttribution, WorkflowToolResultBinding},
+-    core::{JournalEntry, SessionToolExecutionRecorder, TurnOpened},
++    core::{HistoryMutationKind, JournalEntry, SessionToolExecutionRecorder, TurnOpened},
+     domain::{
+         AgentTask, HistoryCompactionReport, ToolCall, ToolCallResolution, ToolResult,
+         new_execution_id, new_session_id, new_thread_id, new_turn_id,
+@@ -48,9 +48,23 @@ async fn committed_history_matches_replay_after_checkpoints_and_writer_restart()
+         .await
+         .unwrap();
+     store
+-        .checkpoint_history(thread, turn, &history, Some(report.clone()), vec![])
++        .checkpoint_history(thread, turn, history.clone(), Some(report.clone()), vec![])
+         .await
+         .unwrap();
++    let records = store.load_records().unwrap();
++    let checkpoint = records.last().unwrap();
++    let JournalEntry::HistoryMutated(mutation) = &checkpoint.entry else {
++        panic!("expected the committed checkpoint record");
++    };
++    assert_eq!(
++        (checkpoint.thread_id, checkpoint.turn_id),
++        (Some(thread), Some(turn))
++    );
++    assert_eq!(mutation.mutation, HistoryMutationKind::Checkpoint);
++    assert_eq!((mutation.previous_revision, mutation.new_revision), (1, 2));
++    assert_eq!(mutation.messages, history);
++    assert_eq!(mutation.compaction.as_ref(), Some(&report));
++    assert!(mutation.tool_results.is_empty());
+     store
+         .replace_history(thread, Some(turn), &history, Some(report))
+         .await
+@@ -167,14 +181,14 @@ async fn checkpoint_captures_only_declared_root_results_in_binding_order() {
+     ] {
+         assert!(
+             store
+-                .checkpoint_history(thread, turn, &history, None, invalid)
++                .checkpoint_history(thread, turn, history.clone(), None, invalid)
+                 .await
+                 .is_err()
+         );
+     }
+     assert_eq!(store.load_projection().unwrap().history_revision, 1);
+     store
+-        .checkpoint_history(thread, turn, &history, None, bindings.clone())
++        .checkpoint_history(thread, turn, history.clone(), None, bindings.clone())
+         .await
+         .unwrap();
+     let recorder = SessionToolExecutionRecorder::new(store.clone());
+@@ -258,7 +272,13 @@ async fn checkpoint_captures_only_declared_root_results_in_binding_order() {
+         "later model item",
+     ));
+     store
+-        .checkpoint_history(thread, turn, &acknowledged, None, vec![bindings[1].clone()])
++        .checkpoint_history(
++            thread,
++            turn,
++            acknowledged.clone(),
++            None,
++            vec![bindings[1].clone()],
++        )
+         .await
+         .unwrap();
+     let mut expected = acknowledged.clone();
+@@ -275,14 +295,14 @@ async fn checkpoint_captures_only_declared_root_results_in_binding_order() {
+     changed[2].parts.clear();
+     assert!(
+         store
+-            .checkpoint_history(thread, turn, &changed, None, vec![bindings[1].clone()])
++            .checkpoint_history(thread, turn, changed, None, vec![bindings[1].clone()])
+             .await
+             .is_err()
+     );
+     acknowledged.remove(2);
+     assert!(
+         store
+-            .checkpoint_history(thread, turn, &acknowledged, None, vec![bindings[1].clone()])
++            .checkpoint_history(thread, turn, acknowledged, None, vec![bindings[1].clone()])
+             .await
+             .is_err()
+     );
+diff --git a/crates/proteus-core/src/core/session_store/remote/writer.rs b/crates/proteus-core/src/core/session_store/remote/writer.rs
+index 038d25fa023f1593bc85e5eee39883b011c05b4c..c77651df0e2d2f646c1adf8a0b139f848a023c02 100644
+--- a/crates/proteus-core/src/core/session_store/remote/writer.rs
++++ b/crates/proteus-core/src/core/session_store/remote/writer.rs
+@@ -386,14 +386,14 @@ impl RemoteSessionStore {
+         &self,
+         thread_id: ThreadId,
+         turn_id: TurnId,
+-        messages: &[CanonicalMessage],
++        messages: Vec<CanonicalMessage>,
+         compaction: Option<HistoryCompactionReport>,
+         tool_results: Vec<proteus_contracts::contracts::WorkflowToolResultBinding>,
+     ) -> Result<()> {
+         self.mutate_history(
+             thread_id,
+             Some(turn_id),
+-            messages.to_vec(),
++            messages,
+             HistoryMutationKind::Checkpoint,
+             compaction,
+             tool_results,
+diff --git a/crates/proteus-core/src/core/workflow_replay/tests/compaction.rs b/crates/proteus-core/src/core/workflow_replay/tests/compaction.rs
+index c9b7386325233995a6e20ccc6552174fbd2cef08..2c4686b007e16612c8c9b14c32ad42772dc78da0 100644
+--- a/crates/proteus-core/src/core/workflow_replay/tests/compaction.rs
++++ b/crates/proteus-core/src/core/workflow_replay/tests/compaction.rs
+@@ -258,7 +258,7 @@ async fn compacted_journal_with_metadata(metadata: serde_json::Value) -> TestJou
+         .checkpoint_history(
+             thread_id,
+             turn_id,
+-            &compacted_messages,
++            compacted_messages.clone(),
+             Some(report.clone()),
+             vec![],
+         )
+@@ -301,7 +301,7 @@ async fn compacted_journal_with_metadata(metadata: serde_json::Value) -> TestJou
+     let mut final_history = compacted_messages;
+     final_history.extend(response.messages);
+     store
+-        .checkpoint_history(thread_id, turn_id, &final_history, None, vec![])
++        .checkpoint_history(thread_id, turn_id, final_history.clone(), None, vec![])
+         .await
+         .expect("compacted history");
+     append_preparation_hook(
