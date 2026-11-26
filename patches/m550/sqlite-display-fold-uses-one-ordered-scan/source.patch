@@ -1,0 +1,223 @@
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index bbe9bdfd2b7ca7226271cbc04d7e149926ca7a8c..bf981c5695d8038c474f0600a64cef794f1dd538 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -109,6 +109,57 @@ fn snapshot_source(
+ }
+ 
+ impl Sqlite {
++    pub(crate) fn replay_display<T>(
++        dir: &Path,
++        id: SessionId,
++        cut: Option<u64>,
++        initialize: impl Fn() -> T,
++        apply: impl Fn(&mut T, &JournalRecord, Option<String>) -> Result<()>,
++    ) -> Result<(Box<dyn RecordSnapshot>, T)> {
++        let (conn, end) = open_source(dir, id)?;
++        if let Some(tx) = &conn
++            && end > 0
++            && !tx.is_autocommit()
++            && writer_journal_for_display(tx)
++        {
++            let mut folded = initialize();
++            // Use the complete stock fingerprint range. Any failure discards
++            // this attempt and lets the legacy path preserve error precedence.
++            let scanned = scan_display_rows(tx, id, end, cut, true, |record, boundary| {
++                apply(&mut folded, record, boundary)
++            });
++            if let Ok((hash, after)) = scanned
++                && after == end
++            {
++                let fingerprint = crate::io::digest_hex(hash.clone().finish());
++                return Ok((
++                    Box::new(SqliteSnapshot {
++                        conn,
++                        end,
++                        id,
++                        after,
++                        fingerprint,
++                        current_hash: hash,
++                    }),
++                    folded,
++                ));
++            }
++        }
++
++        let mut source = snapshot_source(conn, id, end, None)?;
++        let mut folded = initialize();
++        if !source.try_visit_display_rows(cut, &mut |record, boundary| {
++            apply(&mut folded, record, boundary)
++        })? {
++            while let Some(record) = source.next()? {
++                let boundary =
++                    (cut == Some(record.session_seq)).then(|| source.consumed_fingerprint());
++                apply(&mut folded, &record, boundary)?;
++            }
++        }
++        Ok((Box::new(source), folded))
++    }
++
+     /// Cold catalog only. Hand back proof after every ordered row has passed
+     /// the visitor and EOF is reached, without exposing an unverified snapshot.
+     pub(crate) fn replay_catalog<T: Default>(
+@@ -329,22 +380,9 @@ impl RecordSnapshot for SqliteSnapshot {
+             return Ok(false);
+         }
+ 
+-        // The exact writer table has one integral row per sequence. Match the
+-        // seek reader's positive range; sequence gaps still fail in the fold.
+-        let mut stmt = conn.prepare(
+-            "SELECT sequence,payload FROM journal WHERE sequence>0 AND sequence<=?1 ORDER BY sequence",
+-        )?;
+-        let mut rows = stmt.query([i64::try_from(self.end)?])?;
+-        while let Some(row) = rows.next()? {
+-            let sequence = u64::try_from(row.get::<_, i64>(0)?)?;
+-            let bytes = payload_bytes(row, 1)?;
+-            self.current_hash.update(bytes);
+-            let record = decode_record(self.id, sequence, bytes)?;
+-            self.after = record.session_seq;
+-            let boundary = (cut == Some(self.after))
+-                .then(|| crate::io::digest_hex(self.current_hash.clone().finish()));
+-            visit(&record, boundary)?;
+-        }
++        let (hash, after) = scan_display_rows(conn, self.id, self.end, cut, false, visit)?;
++        self.current_hash = hash;
++        self.after = after;
+         let actual = crate::io::digest_hex(self.current_hash.clone().finish());
+         ensure!(actual == self.fingerprint, "SQLite snapshot prefix changed");
+         Ok(true)
+@@ -388,6 +426,39 @@ impl RecordSnapshot for SqliteSnapshot {
+     }
+ }
+ 
++fn scan_display_rows(
++    conn: &Connection,
++    id: SessionId,
++    end: u64,
++    cut: Option<u64>,
++    full_range: bool,
++    mut visit: impl FnMut(&JournalRecord, Option<String>) -> Result<()>,
++) -> Result<(HashContext, u64)> {
++    // Exact writer DDL proves one integral row per sequence; the caller folds
++    // every record and checks continuity. Hash the literal stored BLOB bytes.
++    let mut stmt = conn.prepare(if full_range {
++        "SELECT sequence,payload FROM journal WHERE sequence<=?1 ORDER BY sequence"
++    } else {
++        "SELECT sequence,payload FROM journal WHERE sequence>0 AND sequence<=?1 ORDER BY sequence"
++    })?;
++    let mut rows = stmt.query([i64::try_from(end)?])?;
++    let mut hash = HashContext::new(&SHA256);
++    let mut after = 0_u64;
++    while let Some(row) = rows.next()? {
++        let sequence = u64::try_from(row.get::<_, i64>(0)?)?;
++        if full_range {
++            ensure!(after.checked_add(1) == Some(sequence), "unexpected SQLite sequence");
++        }
++        let bytes = payload_bytes(row, 1)?;
++        hash.update(bytes);
++        let record = decode_record(id, sequence, bytes)?;
++        after = record.session_seq;
++        let boundary = (cut == Some(after)).then(|| crate::io::digest_hex(hash.clone().finish()));
++        visit(&record, boundary)?;
++    }
++    Ok((hash, after))
++}
++
+ fn writer_journal_for_display(conn: &Connection) -> bool {
+     conn.query_row(
+         "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 8a37ca10bb60c1083512afbc1dec6cb526715b10..e6add860d6f688a34396535263f8f9c79e815604 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -11,15 +11,10 @@ impl State {
+         let descriptor = self.describe(&session)?;
+         let stamps = catalog::source_stamp(&dir, self.kind)?;
+         let blobs = catalog::durable::blob_stamps(&dir);
+-        let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+-        let version = source.source_version()?;
+         let cut = self
+             .prefixes
+             .get(&session)
+             .map(|cache| cache.revision.session_seq);
+-        let mut state = Fold::default();
+-        let mut previous_boundary =
+-            (cut == Some(0)).then(|| (state.revision(), source.consumed_fingerprint()));
+         let staged: u64 = self
+             .snapshots
+             .values()
+@@ -27,36 +22,54 @@ impl State {
+             .map(|display| display.bytes)
+             .sum();
+         let budget = MAX_STAGING_BYTES.saturating_sub(staged);
+-        let mut display = match self.kind {
+-            BackendKind::Jsonl => DisplayWriter::for_jsonl(budget, source.extent()),
+-            BackendKind::Sqlite => DisplayWriter::new(budget),
+-        };
+-        let mut apply = |record: &JournalRecord, boundary| -> Result<()> {
++        let apply = |(state, previous_boundary, display): &mut (Fold, Option<_>, Option<DisplayWriter>),
++                     record: &JournalRecord, boundary| -> Result<()> {
+             state.apply(session.session_id, record)?;
+             if let Some(hash) = boundary {
+-                previous_boundary = Some((state.revision(), hash));
++                *previous_boundary = Some((state.revision(), hash));
+             }
+             if record.entry.kind().is_display_record()
+-                && let Some(writer) = &mut display
++                && let Some(writer) = display
+                 && writer.push(record).is_err()
+             {
+-                display = None;
++                *display = None;
+             }
+             Ok(())
+         };
+-        if !source.try_visit_display_rows(cut, &mut apply)? {
+-            let mut line = Vec::new();
+-            while let Some(record) = source.next_with_scratch(&mut line)? {
+-                let boundary = (cut == Some(record.session_seq)).then(|| {
+-                    source.remember_page_boundary(record.session_seq);
+-                    source.consumed_fingerprint()
+-                });
+-                apply(&record, boundary)?;
++        let (source, (state, previous_boundary, display)) = match self.kind {
++            BackendKind::Sqlite => Sqlite::replay_display(
++                &dir,
++                session.session_id,
++                cut,
++                || (Fold::default(), None, DisplayWriter::new(budget)),
++                apply,
++            )?,
++            BackendKind::Jsonl => {
++                let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
++                let version = source.source_version()?;
++                let writer = DisplayWriter::for_jsonl(budget, source.extent());
++                let mut staged = (Fold::default(), None, writer);
++                if !source.try_visit_display_rows(cut, &mut |record, hash| {
++                    apply(&mut staged, record, hash)
++                })? {
++                    let mut line = Vec::new();
++                    while let Some(record) = source.next_with_scratch(&mut line)? {
++                        let boundary = (cut == Some(record.session_seq)).then(|| {
++                            source.remember_page_boundary(record.session_seq);
++                            source.consumed_fingerprint()
++                        });
++                        apply(&mut staged, &record, boundary)?;
++                    }
++                }
++                if source.source_version()? != version {
++                    source.verify_fixed_prefix()?;
++                }
++                (source, staged)
+             }
+-        }
+-        if source.source_version()? != version {
+-            source.verify_fixed_prefix()?;
+-        }
++        };
++        let previous_boundary = previous_boundary.or_else(|| {
++            (cut == Some(0)).then(|| (StorageRevision::default(), crate::io::sha256_hex(b"")))
++        });
+         let identity = StorageSnapshot {
+             session: session.clone(),
+             snapshot_id: Uuid::new_v4().to_string(),
