@@ -1,0 +1,142 @@
+diff --git a/crates/proteus-contracts/src/contracts/context_preparation.rs b/crates/proteus-contracts/src/contracts/context_preparation.rs
+index 5e2cdd1420f4ba0004a7d45e87a46a9ec616f43c..2fb60405742aa8aa30b3bc815a90d02f5205d380 100644
+--- a/crates/proteus-contracts/src/contracts/context_preparation.rs
++++ b/crates/proteus-contracts/src/contracts/context_preparation.rs
+@@ -147,14 +147,29 @@ impl HistoryCompactionReport {
+     pub fn from_context_preparation_output(
+         input: &ContextPreparationInput,
+         output: &ContextPreparationOutput,
++    ) -> Self {
++        Self::from_context_preparation_summary(
++            input.reason.clone(),
++            input.messages.len(),
++            input.token_estimate,
++            output,
++        )
++    }
++
++    /// Builds the same report without retaining the full preparation input.
++    pub fn from_context_preparation_summary(
++        reason: Option<String>,
++        input_messages: usize,
++        token_estimate: Option<u32>,
++        output: &ContextPreparationOutput,
+     ) -> Self {
+         Self {
+             changed: output.changed,
+             user_message_replacements: output.user_message_replacements.clone(),
+-            reason: input.reason.clone(),
+-            input_messages: input.messages.len(),
++            reason,
++            input_messages,
+             output_messages: output.messages.len(),
+-            original_token_estimate: output.original_token_estimate.or(input.token_estimate),
++            original_token_estimate: output.original_token_estimate.or(token_estimate),
+             output_token_estimate: output.token_estimate,
+             trigger_tokens: output.trigger_tokens,
+             summary_source: output.summary_source.clone(),
+@@ -461,7 +476,9 @@ mod tests {
+ 
+     #[test]
+     fn typed_diagnostics_are_strict_and_metadata_does_not_override_report() {
+-        let input = input().with_token_estimate(Some(64));
++        let input = input()
++            .with_reason("codex_pre_turn")
++            .with_token_estimate(Some(64));
+         let mut output = ContextPreparationOutput::unchanged(input.messages.clone());
+         output.token_estimate = Some(12);
+         output.metadata = json!({"input_messages":999,"trigger_tokens":999});
+@@ -470,6 +487,24 @@ mod tests {
+         assert_eq!(report.output_token_estimate, Some(12));
+         assert_eq!(report.original_token_estimate, Some(64));
+         assert_eq!(report.trigger_tokens, None);
++        assert_eq!(report.reason.as_deref(), Some("codex_pre_turn"));
++
++        let summary = |output: &ContextPreparationOutput| {
++            HistoryCompactionReport::from_context_preparation_summary(
++                input.reason.clone(),
++                input.messages.len(),
++                input.token_estimate,
++                output,
++            )
++        };
++        assert_eq!(summary(&output), report);
++        output.original_token_estimate = Some(96);
++        assert_eq!(summary(&output).original_token_estimate, Some(96));
++        assert_eq!(
++            summary(&output),
++            HistoryCompactionReport::from_context_preparation_output(&input, &output)
++        );
++
+         let valid = serde_json::to_value(HookResponse::ContextPreparation { output }).unwrap();
+         for (field, value) in [
+             ("original_token_estimate", json!(-1)),
+diff --git a/crates/proteus-core/src/core/workflow_host.rs b/crates/proteus-core/src/core/workflow_host.rs
+index bb9de0de0d2ac2be209278403a85e38706c25a5b..fccab912fc90a0bd6d08ebf1258ea9541a97b1b6 100644
+--- a/crates/proteus-core/src/core/workflow_host.rs
++++ b/crates/proteus-core/src/core/workflow_host.rs
+@@ -15,7 +15,7 @@ use crate::{
+         HookEvent, HookInput, ModelCallOrigin, ToolSelectionInput, ToolSelectionOutput,
+         ToolSelectionRequest, WorkflowInvocationContext, WorkflowRuntimeStatus,
+     },
+-    domain::{AgentTask, Event, ToolCall, ToolResult, ToolSpec},
++    domain::{AgentTask, Event, HistoryCompactionReport, ToolCall, ToolResult, ToolSpec},
+     model_standard::{CanonicalModelRequest, CanonicalModelResponse},
+ };
+ 
+@@ -189,18 +189,45 @@ impl WorkflowHostRuntime {
+                 }
+             };
+         self.run_active(async {
+-            if let Ok(ctx) = self.ctx.agent() {
+-                ctx.emit(Event::HistoryCompactionStarted { reason: input.reason.clone(), input_messages: input.messages.len(), token_estimate: input.token_estimate, trigger_tokens: None }).await?;
+-            }
+-            let result = preparation.prepare(input.clone()).await;
+-            if let Ok(ctx) = self.ctx.agent() {
+-                match &result {
+-                    Ok(result) => ctx.emit(Event::HistoryCompactionCompleted { report: crate::domain::HistoryCompactionReport::from_context_preparation_output(&input, &result.output) }).await?,
+-                    Err(error) => ctx.emit(Event::HistoryCompactionFailed { reason: input.reason.clone(), input_messages: input.messages.len(), token_estimate: input.token_estimate, trigger_tokens: None, message: format!("{error:#}") }).await?,
+-                }
++            let report = if let Ok(ctx) = self.ctx.agent() {
++                let reason = input.reason.clone();
++                let input_messages = input.messages.len();
++                let token_estimate = input.token_estimate;
++                ctx.emit(Event::HistoryCompactionStarted {
++                    reason: reason.clone(),
++                    input_messages,
++                    token_estimate,
++                    trigger_tokens: None,
++                })
++                .await?;
++                Some((ctx, reason, input_messages, token_estimate))
++            } else {
++                None
++            };
++            let result = preparation.prepare(input).await;
++            if let Some((ctx, reason, input_messages, token_estimate)) = report {
++                let event = match &result {
++                    Ok(result) => Event::HistoryCompactionCompleted {
++                        report: HistoryCompactionReport::from_context_preparation_summary(
++                            reason,
++                            input_messages,
++                            token_estimate,
++                            &result.output,
++                        ),
++                    },
++                    Err(error) => Event::HistoryCompactionFailed {
++                        reason,
++                        input_messages,
++                        token_estimate,
++                        trigger_tokens: None,
++                        message: format!("{error:#}"),
++                    },
++                };
++                ctx.emit(event).await?;
+             }
+             result
+-        }).await
++        })
++        .await
+     }
+ 
+     pub(crate) fn visible_tools(&self, cwd: PathBuf) -> Result<Vec<ToolSpec>> {
