@@ -1,0 +1,25 @@
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 88fb3820542dbd50370178894191c87ea9a6a4a5..a530bf660d07b5d926c3121e595f675efa5d7b2f 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -136,12 +136,14 @@ pub(in crate::service) fn blob_stamp_digest(stamps: &BlobStamps) -> BlobStampDig
+         let path = path.as_os_str().as_encoded_bytes();
+         hash.update(&(path.len() as u64).to_le_bytes());
+         hash.update(path);
+-        hash.update(&stamp.len.to_le_bytes());
+-        hash.update(&stamp.modified.to_le_bytes());
+-        hash.update(&stamp.device.to_le_bytes());
+-        hash.update(&stamp.inode.to_le_bytes());
+-        hash.update(&stamp.changed.0.to_le_bytes());
+-        hash.update(&stamp.changed.1.to_le_bytes());
++        let mut metadata = [0; 56];
++        metadata[..8].copy_from_slice(&stamp.len.to_le_bytes());
++        metadata[8..24].copy_from_slice(&stamp.modified.to_le_bytes());
++        metadata[24..32].copy_from_slice(&stamp.device.to_le_bytes());
++        metadata[32..40].copy_from_slice(&stamp.inode.to_le_bytes());
++        metadata[40..48].copy_from_slice(&stamp.changed.0.to_le_bytes());
++        metadata[48..].copy_from_slice(&stamp.changed.1.to_le_bytes());
++        hash.update(&metadata);
+     }
+     hash.finish()
+         .as_ref()
