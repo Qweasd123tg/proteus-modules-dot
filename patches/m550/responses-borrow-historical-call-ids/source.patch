@@ -1,0 +1,22 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 0aba7e994e9ec98497ef85c52dbe76b40ebba0ad..160e3cc3854b25c9f062fbd532e73e7311cd3e50 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -412,7 +412,7 @@ fn to_openai_input(
+                     input.push(message);
+                 }
+                 ContentPart::ToolCall { call } => {
+-                    tool_call_surfaces.insert(call.id.clone(), call.surface);
++                    tool_call_surfaces.insert(call.id.as_str(), call.surface);
+                     match call.surface {
+                         ToolCallSurface::Function => input.push(json!({
+                             "type": "function_call",
+@@ -440,7 +440,7 @@ fn to_openai_input(
+                 }
+                 ContentPart::ToolResult { result } => {
+                     let surface = tool_call_surfaces
+-                        .get(&result.call_id)
++                        .get(result.call_id.as_str())
+                         .copied()
+                         .unwrap_or_default();
+                     let output_type = match surface {
