@@ -1,0 +1,294 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 9fdbf8176b2076926005027a836dd5c27c9af23b..7b79befc5075c337ece0fa5f964e60dee55c8cfa 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -247,8 +247,7 @@ impl RemoteSessionStore {
+     }
+ 
+     pub(crate) fn saved_transcript(&self, revision: &str) -> Option<Vec<AppTranscriptMessage>> {
+-        let header = cache::header_at_revision(self, revision)?;
+-        cache::read_section(self, &header.transcript, 0, header.transcript.rows)
++        cache::load_named_transcript(self, revision)
+     }
+ 
+     pub(crate) fn saved_tool_state(&self, name: &str) -> Option<AppLatestToolState> {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index de00f00f48693c5f857d321053f00f1f4f8fbd1b..bfc44625a78819dff366f64384cd422004f5dea9 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -225,17 +225,32 @@ fn matches(store: &RemoteSessionStore, header: &Header) -> bool {
+ // complete source and section checks on this owned, immutable header.
+ struct CheckedHeader(Header);
+ 
++struct CheckedSection<'a>(&'a Section);
++
+ impl CheckedHeader {
+     fn read(store: &RemoteSessionStore, key: &str) -> Option<Self> {
+         let header = serde_json::from_value(read_value(store, key)?).ok()?;
+         matches(store, &header).then_some(Self(header))
+     }
++
++    fn conversation(&self) -> CheckedSection<'_> {
++        CheckedSection(&self.0.conversation)
++    }
++
++    fn transcript(&self) -> CheckedSection<'_> {
++        CheckedSection(&self.0.transcript)
++    }
++
++    fn context(&self) -> CheckedSection<'_> {
++        CheckedSection(&self.0.context)
++    }
+ }
+ 
+ pub(super) fn header(store: &RemoteSessionStore) -> Option<Header> {
+     CheckedHeader::read(store, HEAD).map(|checked| checked.0)
+ }
+ 
++#[cfg(test)]
+ pub(super) fn header_at_revision(store: &RemoteSessionStore, revision: &str) -> Option<Header> {
+     checked_header_at_revision(store, revision).map(|checked| checked.0)
+ }
+@@ -249,8 +264,12 @@ fn checked_header_at_revision(store: &RemoteSessionStore, revision: &str) -> Opt
+ }
+ 
+ pub(super) fn fresh_header(store: &RemoteSessionStore) -> Option<Header> {
+-    let header = header(store)?;
+-    (RemoteCacheSource::read(store).as_ref() == Some(&header.source)).then_some(header)
++    fresh_checked_header(store).map(|checked| checked.0)
++}
++
++fn fresh_checked_header(store: &RemoteSessionStore) -> Option<CheckedHeader> {
++    let checked = CheckedHeader::read(store, HEAD)?;
++    (RemoteCacheSource::read(store).as_ref() == Some(&checked.0.source)).then_some(checked)
+ }
+ 
+ pub(super) fn publish(store: &RemoteSessionStore, header: &Header) -> Option<()> {
+@@ -275,25 +294,25 @@ pub(super) fn publish(store: &RemoteSessionStore, header: &Header) -> Option<()>
+ 
+ fn load_cached<T>(
+     store: &RemoteSessionStore,
+-    read_conversation: impl FnOnce(&Header) -> Option<(T, usize)>,
++    read_conversation: impl FnOnce(&CheckedHeader) -> Option<(T, usize)>,
+ ) -> Option<(Header, T, Vec<AppTranscriptMessage>)> {
+-    let header = fresh_header(store)?;
+-    let (conversation, message_count) = read_conversation(&header)?;
+-    let transcript = read_section(store, &header.transcript, 0, header.transcript.rows)?;
++    let checked = fresh_checked_header(store)?;
++    let (conversation, message_count) = read_conversation(&checked)?;
++    let transcript = checked.transcript().read_full(store)?;
++    let CheckedHeader(header) = checked;
+     (SessionReadModel::matches_parts(store, &header.summary, &header.usage, message_count)
+         && RemoteCacheSource::read(store).as_ref() == Some(&header.source))
+     .then_some((header, conversation, transcript))
+ }
+ 
+ pub(super) fn load_model(store: &RemoteSessionStore) -> Option<SessionReadModel> {
+-    let (header, conversation, transcript) = load_cached(store, |header| {
+-        let messages: Vec<CanonicalMessage> =
+-            read_section(store, &header.conversation, 0, header.conversation.rows)?;
++    let (header, conversation, transcript) = load_cached(store, |checked| {
++        let messages: Vec<CanonicalMessage> = checked.conversation().read_full(store)?;
+         let message_count = messages.len();
+-        let model_context = read_section(store, &header.context, 0, header.context.rows)?;
++        let model_context = checked.context().read_full(store)?;
+         Some((
+             ConversationSnapshot {
+-                revision: header.revision,
++                revision: checked.0.revision,
+                 messages,
+                 model_context,
+             },
+@@ -310,31 +329,32 @@ pub(super) fn load_model(store: &RemoteSessionStore) -> Option<SessionReadModel>
+ }
+ 
+ pub(super) fn load_transcript(store: &RemoteSessionStore) -> Option<Vec<AppTranscriptMessage>> {
+-    load_cached(store, |header| {
++    load_cached(store, |checked| {
+         // Verify the same typed rows and pages, but keep neither unused output vector.
+         let mut message_count = 0usize;
+-        visit_section::<CanonicalMessage>(
+-            store,
+-            &header.conversation,
+-            0,
+-            header.conversation.rows,
+-            |_| {
++        checked
++            .conversation()
++            .visit_full::<CanonicalMessage>(store, |_| {
+                 message_count = message_count.checked_add(1)?;
+                 Some(())
+-            },
+-        )?;
+-        visit_section::<ModelContextObservation>(
+-            store,
+-            &header.context,
+-            0,
+-            header.context.rows,
+-            |_| Some(()),
+-        )?;
++            })?;
++        checked
++            .context()
++            .visit_full::<ModelContextObservation>(store, |_| Some(()))?;
+         Some(((), message_count))
+     })
+     .map(|(_, _, transcript)| transcript)
+ }
+ 
++pub(super) fn load_named_transcript(
++    store: &RemoteSessionStore,
++    revision: &str,
++) -> Option<Vec<AppTranscriptMessage>> {
++    checked_header_at_revision(store, revision)?
++        .transcript()
++        .read_full(store)
++}
++
+ pub(super) fn load_view(
+     store: &RemoteSessionStore,
+ ) -> Option<(RemoteCacheSource, SessionReadView, bool)> {
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index ca35509cc407e645881b73add42292b839f1b6ff..4898d32da51a5db3503b47eb76a35f6ef53baa27 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -202,6 +202,20 @@ pub(super) fn read_checked_transcript<T: DeserializeOwned>(
+     collect_section(store, &checked.0.transcript, start, end, true)
+ }
+ 
++impl super::CheckedSection<'_> {
++    pub(super) fn read_full<T: DeserializeOwned>(self, store: &RemoteSessionStore) -> Option<Vec<T>> {
++        collect_section(store, self.0, 0, self.0.rows, true)
++    }
++
++    pub(super) fn visit_full<T: DeserializeOwned>(
++        self,
++        store: &RemoteSessionStore,
++        visit: impl FnMut(T) -> Option<()>,
++    ) -> Option<()> {
++        visit_section_impl(store, self.0, 0, self.0.rows, true, visit)
++    }
++}
++
+ fn collect_section<T: DeserializeOwned>(
+     store: &RemoteSessionStore,
+     section: &Section,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests.rs b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+index 83ce9cd3a8c39e58dc49473cff3b320ba338da9a..c3582dd10e865b4028a4b2b4bd43041d37057e5f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests.rs
+@@ -263,6 +263,114 @@ fn cache_fingerprints_ignore_independent_worker_object_order() {
+     assert!(store.fresh_read_model().is_some());
+ }
+ 
++#[test]
++fn full_cache_reads_keep_physical_order_and_pinned_history() {
++    use crate::model_standard::CanonicalMessage;
++    use proteus_contracts::contracts::ModelContextObservation;
++
++    let (backend, store) = Backend::store();
++    backend.append(953);
++    let model = store.project_read_model(full).unwrap();
++    let header = cache::header(&store).unwrap();
++    let revision = header.source.revision().unwrap();
++    let records = backend.0.lock().unwrap().record_reads;
++    let rows = serde_json::to_value(&model.transcript).unwrap();
++
++    // Establish the reference traversal from the general section readers.
++    backend.0.lock().unwrap().cache_reads.clear();
++    cache::read_section::<CanonicalMessage>(&store, &header.conversation, 0, header.conversation.rows)
++        .unwrap();
++    cache::read_section::<ModelContextObservation>(&store, &header.context, 0, header.context.rows)
++        .unwrap();
++    let mut current_reads = vec!["display-view-v1-head".to_owned()];
++    current_reads.append(&mut backend.0.lock().unwrap().cache_reads);
++    cache::read_section::<AppTranscriptMessage>(&store, &header.transcript, 0, header.transcript.rows)
++        .unwrap();
++    let body_reads = std::mem::take(&mut backend.0.lock().unwrap().cache_reads);
++    current_reads.extend(body_reads.iter().cloned());
++
++    let current = store.fresh_read_model().unwrap();
++    assert_eq!(current.conversation, model.conversation);
++    assert_eq!(serde_json::to_value(current.transcript).unwrap(), rows);
++    assert_eq!(
++        std::mem::take(&mut backend.0.lock().unwrap().cache_reads),
++        current_reads,
++    );
++    assert_eq!(
++        serde_json::to_value(store.fresh_read_transcript().unwrap()).unwrap(),
++        rows,
++    );
++    assert_eq!(
++        std::mem::take(&mut backend.0.lock().unwrap().cache_reads),
++        current_reads,
++    );
++
++    // Even when the latest revision changes during the read, the stored
++    // named revision stays available and cannot become the current result.
++    backend.0.lock().unwrap().append_on_cache_read = body_reads.last().cloned();
++    assert!(store.fresh_read_transcript().is_none());
++    assert_eq!(
++        std::mem::take(&mut backend.0.lock().unwrap().cache_reads),
++        current_reads,
++    );
++    assert_eq!(
++        serde_json::to_value(store.saved_transcript(&revision).unwrap()).unwrap(),
++        rows,
++    );
++    let mut expected = vec![format!("display-revision-{revision}")];
++    expected.extend(body_reads);
++    let state = backend.0.lock().unwrap();
++    assert_eq!(state.cache_reads, expected);
++    assert_eq!(state.record_reads, records);
++}
++
++#[test]
++fn full_cache_reads_reject_bad_unused_manifest_and_bad_typed_body() {
++    use serde_json::json;
++
++    const HEAD: &str = "display-view-v1-head";
++    let (backend, store) = Backend::store();
++    backend.append(4);
++    store.project_read_model(full).unwrap();
++    let revision = cache::header(&store).unwrap().source.revision().unwrap();
++    let named = format!("display-revision-{revision}");
++    let head = backend.0.lock().unwrap().cache[HEAD].clone();
++
++    // A corrupt context manifest is rejected even for a named transcript,
++    // where the context body would not otherwise be accessed.
++    let mut bad_header = head.clone();
++    bad_header["context"]["rows"] = json!(1);
++    {
++        let mut state = backend.0.lock().unwrap();
++        state.cache.insert(HEAD.to_owned(), bad_header.clone());
++        state.cache.insert(named.clone(), bad_header);
++        state.cache_reads.clear();
++    }
++    assert!(store.fresh_read_model().is_none());
++    assert!(store.fresh_read_transcript().is_none());
++    assert!(store.saved_transcript(&revision).is_none());
++    assert_eq!(
++        std::mem::take(&mut backend.0.lock().unwrap().cache_reads),
++        [HEAD.to_owned(), HEAD.to_owned(), named],
++    );
++
++    // A valid manifest and matching content hash cannot bypass typed decoding.
++    let bad_body = json!([0, 1, 2, 3]);
++    let hash = proteus_contracts::contracts::storage_value_etag(&bad_body).unwrap();
++    let key = format!("display-data-{hash}");
++    let mut checked_shape = head;
++    checked_shape["conversation"]["pages"][0]["hash"] = json!(hash);
++    checked_shape["conversation"]["pages"][0]["bytes"] =
++        json!(serde_json::to_vec(&bad_body).unwrap().len());
++    {
++        let mut state = backend.0.lock().unwrap();
++        state.cache.insert(HEAD.to_owned(), checked_shape);
++        state.cache.insert(key.clone(), bad_body);
++    }
++    assert!(store.fresh_read_transcript().is_none());
++    assert_eq!(backend.0.lock().unwrap().cache_reads, [HEAD.to_owned(), key]);
++}
++
+ mod latest_page;
+ mod packs;
+ 
