@@ -1,0 +1,31 @@
+diff --git a/packages/mermaid-render/svg-theme.mjs b/packages/mermaid-render/svg-theme.mjs
+index 1eecae1506bc0151767aa2bdc616d7b85c53c07e..c5093547740b9316dbfa93572074f98fa3a2c8dd 100644
+--- a/packages/mermaid-render/svg-theme.mjs
++++ b/packages/mermaid-render/svg-theme.mjs
+@@ -154,13 +154,14 @@ function materializeWithTheme(svg, variables, color) {
+     }
+     if (/^<[!?]/.test(tag)) return tag;
+     const parent = stack.at(-1);
++    // Interleave keys and values without allocating a tuple per attribute.
+     const attributes = [];
+     let inlineStyle;
+     let inlineColor;
+     for (const match of tag.matchAll(/([\w:-]+)="([^"]*)"/g)) {
+       const key = match[1];
+       const value = unescapeAttribute(match[2]);
+-      attributes.push([key, value]);
++      attributes.push(key, value);
+       if (key === 'style') inlineStyle ??= value;
+       else if (key === 'color') inlineColor ??= value;
+     }
+@@ -193,7 +194,9 @@ function materializeWithTheme(svg, variables, color) {
+       } else (css ??= []).push(`${key}:${resolved}`);
+     }
+     const output = [];
+-    for (const [key, value] of attributes) {
++    for (let index = 0; index < attributes.length; index += 2) {
++      const key = attributes[index];
++      const value = attributes[index + 1];
+       if (key === 'style') {
+         if (css) output.push(encodeAttribute(key, css.join(';')));
+       } else if (!extra?.has(key)) {
