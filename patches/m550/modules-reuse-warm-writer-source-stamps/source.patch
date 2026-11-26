@@ -1,0 +1,101 @@
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index a79eb4a82bf2668312f28ef64af5b476aa59509f..8a65e3c1b6925dc271a63c226a66812dfee2a663 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -44,9 +44,13 @@ fn file_stamp(meta: &Metadata) -> Result<FileStamp> {
+ }
+ pub(super) type SourceStamp = Vec<Option<FileStamp>>;
+ pub(super) fn source_stamp(dir: &Path, kind: BackendKind) -> Result<SourceStamp> {
++    Ok(source_stamp_items(dir, kind)?.into())
++}
++
++fn source_stamp_items(dir: &Path, kind: BackendKind) -> Result<[Option<FileStamp>; 3]> {
+     let journal = kind.backend().description_path(dir);
+     let wal = PathBuf::from(format!("{}-wal", journal.to_string_lossy()));
+-    Ok(vec![
++    Ok([
+         stamp(&journal)?,
+         // Opening a read-only SQLite snapshot may create an empty WAL. It
+         // carries no committed data and is equivalent to a missing WAL.
+@@ -69,13 +73,20 @@ pub(super) struct WriterHead {
+ }
+ 
+ impl WriterHead {
++    pub(super) fn matches_source(&self, dir: &Path, kind: BackendKind) -> bool {
++        source_stamp_items(dir, kind).is_ok_and(|items| items.as_slice() == self.stamps.as_slice())
++    }
++
+     pub fn advance(
+         &mut self,
+         dir: &Path,
+         kind: BackendKind,
+         append: crate::backend::Append,
+     ) -> Option<()> {
+-        self.stamps = source_stamp(dir, kind).ok()?;
++        let items = source_stamp_items(dir, kind).ok()?;
++        // Keep the allocation owned by the current verified writer head.
++        self.stamps.clear();
++        self.stamps.extend(items);
+         durable::update_blobs(dir, &mut self.blobs, append.blobs)?;
+         self.extent = append.extent;
+         self.hash.update(&append.bytes);
+diff --git a/storage/session-storage/src/service/catalog/tests.rs b/storage/session-storage/src/service/catalog/tests.rs
+index 65f51a823dd6760761f3e1a93d60e2108d71f57f..2af6141d6918c42ff4194eb5c30539a26863b67a 100644
+--- a/storage/session-storage/src/service/catalog/tests.rs
++++ b/storage/session-storage/src/service/catalog/tests.rs
+@@ -29,6 +29,42 @@ fn resident_catalog_uses_observed_descriptor_with_the_cached_projection() {
+     }
+ }
+ 
++#[test]
++fn warm_writer_reuses_stamp_storage_without_accepting_changed_metadata() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("ordinary first record")]);
++        let dir = f.descriptor.local_path.clone().unwrap();
++        let observe = |fixture: &Fixture| {
++            let state = fixture.service.lock_state().unwrap();
++            let head = state.writers[&fixture.lease.session].head.as_ref().unwrap();
++            assert!(head.stamps == source_stamp(&dir, kind).unwrap());
++            (head.stamps.as_ptr(), head.extent)
++        };
++        let (allocation, first_extent) = observe(&f);
++        f.append(vec![text("ordinary second record")]);
++        let (next_allocation, second_extent) = observe(&f);
++        assert_eq!(next_allocation, allocation);
++        assert!(second_extent > first_extent);
++
++        // Change only the synthetic session marker's mtime, not its content
++        // or any journal/WAL bytes. A stale head must still be discarded.
++        let marker = std::fs::OpenOptions::new()
++            .write(true)
++            .open(dir.join("session.json"))
++            .unwrap();
++        let before = marker.metadata().unwrap().modified().unwrap();
++        marker
++            .set_modified(before - std::time::Duration::from_secs(3600))
++            .unwrap();
++        assert_ne!(marker.metadata().unwrap().modified().unwrap(), before);
++        drop(marker);
++        f.append(vec![text("ordinary third record")]);
++        let state = f.service.lock_state().unwrap();
++        assert!(state.writers[&f.lease.session].head.is_none());
++    }
++}
++
+ fn pending(f: &Fixture) -> (PathBuf, CatalogRead, Projection) {
+     let dir = f.descriptor.local_path.clone().unwrap();
+     let descriptor = sessions::open(f.service.kind, &dir).unwrap();
+diff --git a/storage/session-storage/src/service/commits.rs b/storage/session-storage/src/service/commits.rs
+index 5203b14ad8bc3aa719523114a087b671f545e7fb..be7397f74afde4b3b4cc50d4197a899bfed8bff3 100644
+--- a/storage/session-storage/src/service/commits.rs
++++ b/storage/session-storage/src/service/commits.rs
+@@ -54,7 +54,7 @@ impl State {
+         let kind = self.kind;
+         let writer = self.writer(&commit.lease)?;
+         if let Some(head) = writer.head.as_ref()
+-            && catalog::source_stamp(&dir, kind).ok().as_ref() != Some(&head.stamps)
++            && !head.matches_source(&dir, kind)
+         {
+             writer.head = None;
+         }
