@@ -1,0 +1,109 @@
+diff --git a/model/model-pack/src/adapters/openai/go/catalog.rs b/model/model-pack/src/adapters/openai/go/catalog.rs
+index 7cc011d51be05f357e7fc65eae26394f49ff5e11..9f22cd506913c4e44897804dd52e119b1f34b548 100644
+--- a/model/model-pack/src/adapters/openai/go/catalog.rs
++++ b/model/model-pack/src/adapters/openai/go/catalog.rs
+@@ -57,6 +57,10 @@ struct Feature {
+ 
+ impl Models {
+     pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
++        Ok(Self::parse_with_catalog(bytes)?.0)
++    }
++
++    pub(super) fn parse_with_catalog(bytes: &[u8]) -> Result<(Self, ModelCatalog)> {
+         let mut models: Self =
+             serde_json::from_slice(bytes).context("invalid OpenCode Go model list")?;
+         models.data.retain(|entry| entry.kind == "chat");
+@@ -69,8 +73,9 @@ impl Models {
+                     .all(|entry| !entry.id.is_empty() && ids.insert(&entry.id)),
+             "invalid OpenCode Go chat model IDs"
+         );
+-        models.catalog().validate().map_err(anyhow::Error::msg)?;
+-        Ok(models)
++        let catalog = models.catalog();
++        catalog.validate().map_err(anyhow::Error::msg)?;
++        Ok((models, catalog))
+     }
+     pub(super) fn get(&self, id: &str) -> Option<&Entry> {
+         self.data.iter().find(|entry| entry.id == id)
+diff --git a/model/model-pack/src/adapters/openai/go/mod.rs b/model/model-pack/src/adapters/openai/go/mod.rs
+index 95e22f528652d971a6e1c34c5861188b43c18a4a..b6c0e80686ac1d8e0fe0d2abc95346a6f1d0591e 100644
+--- a/model/model-pack/src/adapters/openai/go/mod.rs
++++ b/model/model-pack/src/adapters/openai/go/mod.rs
+@@ -118,14 +118,14 @@ impl Go {
+                 2 * 1024 * 1024,
+             )
+             .await
+-            .and_then(|raw| Models::parse(&raw));
+-            if let Ok(models) = fresh {
++            .and_then(|raw| Models::parse_with_catalog(&raw));
++            if let Ok((models, catalog)) = fresh {
+                 *self.models.write().unwrap() = models;
+                 *refresh_after = Some(Instant::now() + Duration::from_secs(300));
+-            } else {
+-                // Keep the last valid list or the packaged offline snapshot. Retry in 15 seconds.
+-                *refresh_after = Some(Instant::now() + Duration::from_secs(15));
++                return Ok(catalog);
+             }
++            // Keep the last valid list or the packaged offline snapshot. Retry in 15 seconds.
++            *refresh_after = Some(Instant::now() + Duration::from_secs(15));
+         }
+         Ok(self.models.read().unwrap().catalog())
+     }
+diff --git a/model/model-pack/src/adapters/openai/go/tests.rs b/model/model-pack/src/adapters/openai/go/tests.rs
+index 49bdacc646f52e33caa04f14add8f8df7146bf6d..109f8869033f53bb975b9c7c64d88ed563092f52 100644
+--- a/model/model-pack/src/adapters/openai/go/tests.rs
++++ b/model/model-pack/src/adapters/openai/go/tests.rs
+@@ -119,23 +119,40 @@ fn catalog_omits_non_chat_and_sampling_uses_model_flags() {
+ async fn live_catalog_is_shared_and_invalid_updates_keep_offline_models() {
+     let mut go = Go::new().unwrap();
+     Arc::get_mut(&mut go).unwrap().http = Client::builder().no_proxy().build().unwrap();
+-    let (bad, bad_server) = test_http::server(vec![(200, "application/json", "{}".into())]).await;
+-    assert!(
+-        go.catalog_from(&bad)
+-            .await
+-            .unwrap()
+-            .models
+-            .iter()
+-            .any(|entry| entry.id == "deepseek-v4.1-flash")
+-    );
+-    bad_server.await.unwrap();
++    let seed = go.models.read().unwrap().catalog();
++    assert!(seed.models.iter().any(|entry| entry.id == "deepseek-v4.1-flash"));
++    for invalid in [
++        json!({}),
++        json!({"data":[{"id":"next-model","type":"chat",
++            "capabilities":{"reasoning":{"effort":["low","low"]}}}]}),
++    ] {
++        *go.refresh_after.lock().await = None;
++        let (bad, bad_server) =
++            test_http::server(vec![(200, "application/json", invalid.to_string())]).await;
++        assert_eq!(go.catalog_from(&bad).await.unwrap(), seed);
++        assert_eq!(bad_server.await.unwrap().len(), 1);
++    }
+     *go.refresh_after.lock().await = None;
+-    let fixture =
+-        json!({"data":[{"id":"next-model","type":"chat","limit":{"input":900,"output":100}}]});
++    let fixture = json!({"data":[
++        {"id":"ignored","type":"embedding"},
++        {"id":"next-model","type":"chat","limit":{"input":900,"output":100}},
++        {"id":"legacy","type":"chat","name":"Former model","description":"Old",
++         "status":"deprecated","capabilities":{"reasoning":{"effort":["low","high"]}}}
++    ]});
+     let (url, server) =
+         test_http::server(vec![(200, "application/json", fixture.to_string())]).await;
+     let (a, b) = tokio::join!(go.catalog_from(&url), go.catalog_from(&url));
+-    assert_eq!(a.unwrap(), b.unwrap());
++    let a = a.unwrap();
++    assert_eq!(a, b.unwrap());
++    assert_eq!(
++        serde_json::to_value(&a).unwrap(),
++        json!({"models":[
++            {"id":"next-model","display_name":"next-model","description":null,"hidden":false,
++             "reasoning_efforts":[],"default_reasoning_effort":null},
++            {"id":"legacy","display_name":"Former model","description":"Old","hidden":true,
++             "reasoning_efforts":["low","high"],"default_reasoning_effort":null}
++        ]})
++    );
+     assert_eq!(
+         go.capabilities("next-model").unwrap().max_input_tokens,
+         Some(900)
