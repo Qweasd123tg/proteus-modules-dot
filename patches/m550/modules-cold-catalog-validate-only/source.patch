@@ -1,0 +1,107 @@
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index a79eb4a82bf2668312f28ef64af5b476aa59509f..833eb062ac2f283d8f5c4f7fc61e8468bc28309b 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -233,13 +233,13 @@ impl CatalogRead {
+         let (fold, hint) = match kind {
+             BackendKind::Sqlite => {
+                 Sqlite::replay_catalog(dir, session, |fold: &mut Fold, record| {
+-                    fold.apply(session, record)
++                    fold.apply_validated(session, record)
+                 })?
+             }
+             BackendKind::Jsonl => {
+                 let (source, fold) =
+                     Jsonl::replay_snapshot(dir, session, None, |fold: &mut Fold, record, _| {
+-                        fold.apply(session, record)
++                        fold.apply_validated(session, record)
+                     })?;
+                 let hint = crate::backend::PrefixHint {
+                     extent: source.extent(),
+diff --git a/storage/session-storage/src/tests/usage.rs b/storage/session-storage/src/tests/usage.rs
+index d98f220c2f8cb6fb79d9b26d77544ad315951112..7c4598d61929e185e57907d5de533745fa41090b 100644
+--- a/storage/session-storage/src/tests/usage.rs
++++ b/storage/session-storage/src/tests/usage.rs
+@@ -167,3 +167,82 @@ fn read_usage_holds_the_same_prefix_without_losing_conversation_context() {
+         assert!(page.next_after_seq.is_none());
+     }
+ }
++
++#[test]
++fn cold_catalog_matches_strict_model_turn_history_and_audit() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("  первый чат 🦀  ")]);
++        add_turn(&mut f, false);
++        add_turn(&mut f, true);
++        f.append(vec![text("latest history message")]);
++
++        // The full display fold provides an independent, strictly validated
++        // reference for the catalog's history, revision and content digest.
++        let SessionStorageResponse::DisplaySnapshot {
++            projection: Some(full),
++        } = f
++            .service
++            .execute(SessionStorageRequest::OpenDisplaySnapshot {
++                session: f.descriptor.session.clone(),
++            })
++            .unwrap()
++        else {
++            panic!("missing strict display snapshot");
++        };
++        assert_eq!(full.state.conversation.messages.len(), 2);
++        assert_eq!(full.state.usage.requests.len(), 2);
++        assert!(!full.state.conversation.model_context.is_empty());
++
++        // Use a fresh reader and remove only the fixture's disposable index,
++        // so a success from either warm layer cannot mask the cold traversal.
++        let index_path = f
++            .descriptor
++            .local_path
++            .as_ref()
++            .unwrap()
++            .join(".storage-catalog-v1.json");
++        std::fs::remove_file(&index_path).unwrap();
++        let catalog = StorageService::new(kind);
++        let list = |audit| SessionStorageRequest::List {
++            config_root: f.root.path().to_owned(),
++            workspace_path: None,
++            audit,
++        };
++        crate::diagnostics::reset();
++        let normal = catalog.execute(list(false)).unwrap();
++        assert_eq!(
++            crate::diagnostics::get().decoded,
++            full.snapshot.revision.session_seq
++        );
++        let SessionStorageResponse::Sessions { sessions } = &normal else {
++            panic!("missing catalog sessions");
++        };
++        let [summary] = sessions.as_slice() else {
++            panic!("expected a single catalog entry");
++        };
++        assert_eq!(summary.descriptor.session, full.snapshot.session);
++        assert_eq!(summary.message_count, full.state.conversation.messages.len());
++        assert_eq!(summary.preview.as_deref(), Some("первый чат 🦀"));
++
++        let index: serde_json::Value =
++            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
++        assert_eq!(
++            index["data"]["revision"],
++            serde_json::to_value(full.snapshot.revision).unwrap()
++        );
++        assert_eq!(
++            index["data"]["fingerprint"].as_str(),
++            Some(full.snapshot.content_sha256.as_str())
++        );
++
++        crate::diagnostics::reset();
++        assert_eq!(catalog.execute(list(false)).unwrap(), normal);
++        assert_eq!(crate::diagnostics::get().decoded, 0);
++        assert_eq!(catalog.execute(list(true)).unwrap(), normal);
++        assert_eq!(
++            crate::diagnostics::get().decoded,
++            full.snapshot.revision.session_seq
++        );
++    }
++}
