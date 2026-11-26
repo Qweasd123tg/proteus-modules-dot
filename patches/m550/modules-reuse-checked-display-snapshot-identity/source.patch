@@ -1,0 +1,175 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 4a6e3d3914111bdbae4e468a879d39e12ba64760..0fd89c4b5d13e568fce31f4dd27640b263e35439 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -292,12 +292,12 @@ impl DisplayRecords {
+ 
+     pub fn page(
+         &mut self,
+-        snapshot: &StorageSnapshot,
++        final_seq: u64,
+         after: u64,
+         limit: u32,
+-    ) -> Result<StorageRecordPage> {
++    ) -> Result<(Vec<JournalRecord>, Option<u64>)> {
+         ensure!(
+-            after <= snapshot.revision.session_seq,
++            after <= final_seq,
+             "display cursor is past the snapshot prefix"
+         );
+         if self.after != Some(after) {
+@@ -333,11 +333,8 @@ impl DisplayRecords {
+         }
+         let last = records.last().map_or(after, |record| record.session_seq);
+         self.after = Some(last);
+-        Ok(StorageRecordPage {
+-            snapshot: snapshot.clone(),
+-            records,
+-            next_after_seq: (!finished && last < snapshot.revision.session_seq).then_some(last),
+-        })
++        let next_after_seq = (!finished && last < final_seq).then_some(last);
++        Ok((records, next_after_seq))
+     }
+ }
+ 
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index cf30b968378537ba0744722815fd14c843d8353e..e5d49c2032c14f92a63e5ab2ae5a1c168dcbe409 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -208,11 +208,31 @@ impl State {
+                 snapshot,
+                 after_seq,
+                 limit,
+-            } => Ok(SessionStorageResponse::Records {
+-                page: self
+-                    .get_snapshot(&snapshot)?
+-                    .display_page(after_seq, limit)?,
+-            }),
++            } => {
++                let state = self.get_snapshot(&snapshot)?;
++                let (records, next_after_seq) = state.display_page(after_seq, limit)?;
++                // The live handle was checked exactly. Do not retain spare
++                // capacity carried by an in-process caller in its response.
++                let compact = [
++                    &snapshot.snapshot_id,
++                    &snapshot.session.key,
++                    &snapshot.content_sha256,
++                ]
++                .into_iter()
++                .all(|text| text.capacity() == text.len());
++                let snapshot = if compact {
++                    snapshot
++                } else {
++                    state.identity.clone()
++                };
++                Ok(SessionStorageResponse::Records {
++                    page: StorageRecordPage {
++                        snapshot,
++                        records,
++                        next_after_seq,
++                    },
++                })
++            }
+             ReadConversation { snapshot, point } => Ok(SessionStorageResponse::Conversation {
+                 conversation: self.get_snapshot(&snapshot)?.conversation_at(point)?,
+             }),
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index a610ca7099a4647d1aee27e908d9408ff9c3ed47..312c3f0e10a1f56878d806240b3079cb1c7e89eb 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -319,7 +319,11 @@ impl SnapshotState {
+             next_after_seq,
+         })
+     }
+-    pub fn display_page(&mut self, after: u64, limit: u32) -> Result<StorageRecordPage> {
++    pub fn display_page(
++        &mut self,
++        after: u64,
++        limit: u32,
++    ) -> Result<(Vec<JournalRecord>, Option<u64>)> {
+         let version = self.source.source_version()?;
+         if version != self.verified_version {
+             self.source.verify_fixed_prefix()?;
+@@ -329,7 +333,7 @@ impl SnapshotState {
+             .display
+             .as_mut()
+             .ok_or_else(|| anyhow::anyhow!("snapshot has no display projection"))?
+-            .page(&self.identity, after, limit)?;
++            .page(self.identity.revision.session_seq, after, limit)?;
+         if self.source.source_version()? != self.verified_version {
+             self.source.verify_fixed_prefix()?;
+             self.verified_version = self.source.source_version()?;
+diff --git a/storage/session-storage/src/tests/display.rs b/storage/session-storage/src/tests/display.rs
+index 5930c634da435e6586524923dc7b2291ca3b5e41..5a836d0c3b5e419f4fe889b497e9a90697edb8fa 100644
+--- a/storage/session-storage/src/tests/display.rs
++++ b/storage/session-storage/src/tests/display.rs
+@@ -301,3 +301,69 @@ fn display_reuses_page_scratch_without_reordering_pending_rows() {
+         assert_eq!(read(2), second);
+     }
+ }
++
++#[test]
++fn display_page_reuses_only_the_exact_live_request_snapshot() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        f.append(vec![text("ordinary first record")]);
++        let projection = open(&f);
++        let expected = &projection.snapshot;
++
++        let mut wrong = expected.clone();
++        wrong.session.key.push('x');
++        let error = f
++            .service
++            .execute(SessionStorageRequest::ReadDisplayRecords {
++                snapshot: wrong,
++                after_seq: 0,
++                limit: 1,
++            })
++            .unwrap_err();
++        assert_eq!(
++            error.to_string(),
++            "snapshot identity/revision/fingerprint mismatch"
++        );
++
++        let supplied = expected.clone();
++        let owned = (
++            supplied.snapshot_id.as_ptr(),
++            supplied.session.key.as_ptr(),
++            supplied.content_sha256.as_ptr(),
++        );
++        let read_page = |snapshot| {
++            let SessionStorageResponse::Records { page } = f
++                .service
++                .execute(SessionStorageRequest::ReadDisplayRecords {
++                    snapshot,
++                    after_seq: 0,
++                    limit: 1,
++                })
++                .unwrap()
++            else {
++                panic!("expected a display page");
++            };
++            page
++        };
++        let page = read_page(supplied);
++        assert_eq!(&page.snapshot, expected);
++        assert_eq!(
++            (
++                page.snapshot.snapshot_id.as_ptr(),
++                page.snapshot.session.key.as_ptr(),
++                page.snapshot.content_sha256.as_ptr(),
++            ),
++            owned,
++        );
++        assert_eq!(page.records.len(), 1);
++        assert_eq!(page.records[0].session_seq, 1);
++        assert_eq!(page.next_after_seq, None);
++
++        let mut with_spare = expected.clone();
++        with_spare.session.key.reserve_exact(4096);
++        let spare = with_spare.session.key.as_ptr();
++        let compact = read_page(with_spare);
++        assert_eq!(compact, page);
++        assert_ne!(compact.snapshot.session.key.as_ptr(), spare);
++    }
++}
