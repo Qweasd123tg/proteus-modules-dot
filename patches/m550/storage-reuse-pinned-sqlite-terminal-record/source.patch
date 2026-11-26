@@ -1,0 +1,45 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index c63fc3b46b6cd07a47363ecd3907960a6185d1c7..25c68a3b2fc2a916f244721095560e1dc6ae3980 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -241,9 +241,8 @@ impl SnapshotState {
+         let before = self.source.source_version()?;
+         let mut terminal = None;
+         if !self.verified || before != self.verified_version {
+-            let capture = limit > 0
+-                && before.is_some()
+-                && self.identity.revision.session_seq.checked_sub(1) == Some(after);
++            let capture =
++                limit > 0 && self.identity.revision.session_seq.checked_sub(1) == Some(after);
+             // Canonical pages need full verification, not the derived views.
+             terminal = self.fold_with_terminal::<false, false>(capture)?.1;
+         }
+@@ -253,7 +252,8 @@ impl SnapshotState {
+         let page_version = self.source.source_version()?;
+         // For an exact terminal page, the complete fold already decoded the
+         // one result and left the reader at EOF. Only hand it to the existing
+-        // page checks after independently authenticating the pinned bytes.
++        // page checks after the backend confirms the pinned data (by a
++        // read transaction or by authenticating the complete prefix).
+         // Blob-bearing JSONL, changed or unknown sources keep the normal scan.
+         if terminal.is_some() && before == page_version && self.source.confirm_verified_data()? {
+             self.pending = terminal.map(|record| PendingPageRecord::Buffered {
+diff --git a/storage/session-storage/src/tests/seek.rs b/storage/session-storage/src/tests/seek.rs
+index b926b26b4ae1658a88c1faa05251decf4b488ab1..9b565e006078ffd8c124d67e87f36ad5632bbca7 100644
+--- a/storage/session-storage/src/tests/seek.rs
++++ b/storage/session-storage/src/tests/seek.rs
+@@ -188,13 +188,7 @@ fn freshly_validated_terminal_page_decodes_each_pinned_record_once() {
+             assert_eq!(page.snapshot, warm);
+             assert_eq!(page.records, expected);
+             assert!(page.next_after_seq.is_none());
+-            assert_eq!(
+-                crate::diagnostics::get().decoded,
+-                match kind {
+-                    BackendKind::Jsonl => 8,
+-                    BackendKind::Sqlite => 16, // Unchanged: no physical version.
+-                }
+-            );
++            assert_eq!(crate::diagnostics::get().decoded, 8);
+             if matches!(kind, BackendKind::Jsonl) {
+                 let bytes = std::fs::metadata(f.descriptor.record_location.as_ref().unwrap())
+                     .unwrap()
