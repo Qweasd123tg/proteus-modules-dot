@@ -1,0 +1,23 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 0aba7e994e9ec98497ef85c52dbe76b40ebba0ad..acee304a3b9f41a3e8ae6b69b3c79f737e812647 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -478,12 +478,16 @@ fn to_openai_input(
+                     input.push(data.clone());
+                 }
+                 ContentPart::Image { image } => {
+-                    let block = json!({ "type": "input_image", "image_url": super::super::images::data_url(image)?, "detail": "auto" });
++                    let mut block = json!({ "type": "input_image", "image_url": null, "detail": "auto" });
++                    *block.get_mut("image_url").expect("image URL slot") =
++                        Value::String(super::super::images::data_url(image)?);
+                     if let Some(index) = text_message_index {
+                         input[index]["content"].as_array_mut().expect("message content array").push(block);
+                     } else {
+                         text_message_index = Some(input.len());
+-                        input.push(json!({ "type":"message", "role":role_to_openai(&message.role), "content":[block] }));
++                        let mut item = json!({ "type":"message", "role":role_to_openai(&message.role), "content":null });
++                        *item.get_mut("content").expect("message content slot") = Value::Array(vec![block]);
++                        input.push(item);
+                     }
+                 },
+                 ContentPart::FileRef { path, content } => input.push(json!({
