@@ -1,0 +1,246 @@
+{
+  "alternate": {
+    "after_803_then_804_then_alternate_strict_forward_inverse": true,
+    "after_803_then_alternate_then_804_exact_equal_tree": true,
+    "alternate_native_not_tested": true,
+    "exact_prior_803": [
+      803,
+      "e441856004b19adb6efef17478ee8d89c07870dc",
+      "modules-reply-move-compact-reasoning-strings"
+    ],
+    "exact_prior_803_patch_sha256": "131200a95f59ccba842126564e24ae4e92f8fc67867903cb4ce8838325747d5c",
+    "related_804_patch_sha256": "6583a7561cca4c040475cff86171c101b5e49274f77abe4c1aa28107304e269d",
+    "related_disjoint_804": [
+      804,
+      "0b92399ef3eb6e6b856920906c1c0ccada3d6dd6",
+      "modules-reuse-checked-display-snapshot-identity"
+    ],
+    "source": {
+      "components/session-storage-module/src/display_reply.rs": {
+        "postimage": {
+          "bytes": 10911,
+          "git": "a6fcf3984b251efc6afcf842f1dccaa6aaf5983b",
+          "mode": "100644",
+          "sha256": "fd80d63ab7ee093843596b583b094b5658f32f1ff4ce0feb42b835e4785ad1f2"
+        },
+        "preimage": {
+          "bytes": 8927,
+          "git": "42b374dad3ed6dedfdbbe3ecde356bcbb3659483",
+          "mode": "100644",
+          "sha256": "956dc6fe72b54b9adcc778b4a4f64cc7cb938db792be1ca99fe19a4e8cf1859e"
+        }
+      },
+      "components/session-storage-module/tests/tool_result_reply.rs": {
+        "postimage": {
+          "bytes": 5205,
+          "git": "daec0a475831f77816ee0aecb580690baea5cf25",
+          "mode": "100644",
+          "sha256": "f6488a5babedc1e080457a2cd6b9cb44680f2f348296c8601cbf02eb752bee80"
+        },
+        "preimage": null
+      }
+    }
+  },
+  "alternate_needed": true,
+  "alternate_scoped_patch": "diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs\nindex 42b374dad3ed6dedfdbbe3ecde356bcbb3659483..a6fcf3984b251efc6afcf842f1dccaa6aaf5983b 100644\n--- a/components/session-storage-module/src/display_reply.rs\n+++ b/components/session-storage-module/src/display_reply.rs\n@@ -2,6 +2,7 @@\n use anyhow::{Context, Result, ensure};\n use proteus_module_sdk::contracts::{\n     contracts::SessionStorageResponse,\n+    domain::ToolResult,\n     model_standard::{CanonicalMessage, ContentPart},\n     storage::journal::JournalEntry,\n };\n@@ -62,6 +63,13 @@ pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value>\n                         )?;\n                     move_messages(output_messages, messages)?;\n                     output.push(value);\n+                } else if let JournalEntry::ToolResultRecorded(recorded)\n+                | JournalEntry::ToolEffectRecorded(recorded) = &mut record.entry\n+                {\n+                    let strings = ToolResultStrings::take(&mut recorded.result);\n+                    let mut value = serde_json::to_value(record)?;\n+                    strings.restore(&mut value, &[\"entry\", \"payload\", \"result\"])?;\n+                    output.push(value);\n                 } else {\n                     output.push(serde_json::to_value(record)?);\n                 }\n@@ -125,6 +133,42 @@ fn take_compact_opaque_leaf(format: &str, data: &mut Value) -> Option<(&'static\n     take_compact_string(text).map(|text| (field, text))\n }\n \n+struct ToolResultStrings([Option<String>; 2]);\n+\n+impl ToolResultStrings {\n+    fn take(result: &mut ToolResult) -> Self {\n+        Self([\n+            take_compact_string(&mut result.output),\n+            result.error.as_mut().and_then(take_compact_string),\n+        ])\n+    }\n+\n+    fn restore(self, envelope: &mut Value, path: &[&str]) -> Result<()> {\n+        if self.0.iter().all(Option::is_none) {\n+            return Ok(());\n+        }\n+        let mut result = envelope;\n+        for segment in path {\n+            result = result\n+                .get_mut(*segment)\n+                .context(\"serialized display tool result omitted its payload\")?;\n+        }\n+        for (field, text) in [\"output\", \"error\"].into_iter().zip(self.0) {\n+            if let Some(text) = text {\n+                let slot = result\n+                    .get_mut(field)\n+                    .context(\"serialized display tool result omitted its string slot\")?;\n+                ensure!(\n+                    slot.as_str() == Some(\"\"),\n+                    \"serialized display tool result string slot changed\"\n+                );\n+                *slot = Value::String(text);\n+            }\n+        }\n+        Ok(())\n+    }\n+}\n+\n fn move_messages(\n     serialized_messages: &mut Vec<Value>,\n     messages: Vec<CanonicalMessage>,\n@@ -142,6 +186,10 @@ fn move_messages(\n             .context(\"serialized display message omitted its parts array\")?;\n         serialized_parts.reserve_exact(parts.len());\n         for mut part in parts {\n+            let tool_result = match &mut part.payload {\n+                ContentPart::ToolResult { result } => Some(ToolResultStrings::take(result)),\n+                _ => None,\n+            };\n             let owned_text = match &mut part.payload {\n                 ContentPart::Text { text } => Some(mem::take(text)),\n                 _ => None,\n@@ -195,6 +243,9 @@ fn move_messages(\n                 );\n                 *slot = Value::String(text);\n             }\n+            if let Some(strings) = tool_result {\n+                strings.restore(&mut value, &[\"payload\", \"ToolResult\", \"result\"])?;\n+            }\n             serialized_parts.push(value);\n         }\n         serialized_messages.push(value);\ndiff --git a/components/session-storage-module/tests/tool_result_reply.rs b/components/session-storage-module/tests/tool_result_reply.rs\nnew file mode 100644\nindex 0000000000000000000000000000000000000000..daec0a475831f77816ee0aecb580690baea5cf25\n--- /dev/null\n+++ b/components/session-storage-module/tests/tool_result_reply.rs\n@@ -0,0 +1,145 @@\n+//! Inert DTO parity: never invokes a tool, provider, or subprocess.\n+#[path = \"../src/display_reply.rs\"]\n+mod display_reply;\n+\n+use proteus_contracts::{\n+    contracts::{\n+        SessionLocator, SessionStorageResponse, StorageRecordPage, StorageRevision, StorageSnapshot,\n+    },\n+    domain::{ToolContent, ToolResult, new_record_id, new_session_id},\n+    model_standard::{CanonicalMessage, ContentPart, MessageRole},\n+    storage::journal::{\n+        HistoryMutated, HistoryMutationKind, JOURNAL_SCHEMA_VERSION, JournalEntry, JournalRecord,\n+        ToolResultRecorded,\n+    },\n+};\n+use serde_json::json;\n+\n+fn string(bytes: usize) -> String {\n+    let mut text = \"\u00e9\ud83e\udd80\\\"\\n\\t\\0\".to_owned();\n+    text.extend(std::iter::repeat_n('x', bytes - text.len()));\n+    let text = text.into_boxed_str().into_string();\n+    assert_eq!(text.capacity(), bytes);\n+    text\n+}\n+\n+fn tool(id: &str, output: String, error: Option<String>) -> ToolResult {\n+    ToolResult::new(\n+        id.to_owned(),\n+        error.is_none(),\n+        output,\n+        vec![ToolContent::Text {\n+            text: \"inert structured content\".into(),\n+        }],\n+        error,\n+        json!({ \"z\": [\"unchanged\", 1], \"a\": {\"fixture\": true} }),\n+    )\n+}\n+\n+#[test]\n+fn transfers_only_owned_compact_tool_leaves_on_existing_reply_routes() {\n+    let compact_output = string(4096);\n+    let compact_error = string(8192);\n+    let mut spare_output = string(8192);\n+    spare_output.reserve_exact(4096);\n+    assert!(spare_output.capacity() > spare_output.len());\n+    let short = string(4095);\n+    let history_output = string(8192);\n+    let history_error = string(4096);\n+    let addresses = [\n+        compact_output.as_ptr(),\n+        compact_error.as_ptr(),\n+        spare_output.as_ptr(),\n+        short.as_ptr(),\n+        history_output.as_ptr(),\n+        history_error.as_ptr(),\n+    ];\n+    let entries = [\n+        JournalEntry::ToolResultRecorded(ToolResultRecorded {\n+            result: tool(\"sample-one\", compact_output, None),\n+        }),\n+        JournalEntry::ToolEffectRecorded(ToolResultRecorded {\n+            result: tool(\"sample-two\", spare_output, Some(compact_error)),\n+        }),\n+        JournalEntry::HistoryMutated(HistoryMutated {\n+            previous_revision: 0,\n+            new_revision: 1,\n+            mutation: HistoryMutationKind::Append,\n+            messages: vec![\n+                CanonicalMessage::new(\n+                    MessageRole::Tool,\n+                    vec![ContentPart::ToolResult {\n+                        result: tool(\"sample-three\", short, Some(String::new())),\n+                    }],\n+                ),\n+                CanonicalMessage::new(\n+                    MessageRole::Tool,\n+                    vec![ContentPart::ToolResult {\n+                        result: tool(\"sample-four\", history_output, Some(history_error)),\n+                    }],\n+                ),\n+            ],\n+            compaction: None,\n+            tool_results: vec![],\n+        }),\n+    ];\n+    let session_id = new_session_id();\n+    let response = SessionStorageResponse::Records {\n+        page: StorageRecordPage {\n+            snapshot: StorageSnapshot {\n+                session: SessionLocator {\n+                    session_id,\n+                    key: \"fixture\".into(),\n+                },\n+                snapshot_id: \"fixture-handle\".into(),\n+                revision: StorageRevision {\n+                    session_seq: 3,\n+                    history_revision: 1,\n+                },\n+                content_sha256: \"0\".repeat(64),\n+            },\n+            records: entries\n+                .into_iter()\n+                .enumerate()\n+                .map(|(i, entry)| JournalRecord {\n+                    schema_version: JOURNAL_SCHEMA_VERSION,\n+                    record_id: new_record_id(),\n+                    session_seq: i as u64 + 1,\n+                    timestamp_ms: 42,\n+                    session_id,\n+                    execution_id: None,\n+                    thread_id: None,\n+                    turn_id: None,\n+                    entry,\n+                })\n+                .collect(),\n+            next_after_seq: None,\n+        },\n+    };\n+    let expected = serde_json::to_value(&response).unwrap();\n+    let actual = display_reply::into_value(response).unwrap();\n+    assert_eq!(\n+        serde_json::to_vec(&actual).unwrap(),\n+        serde_json::to_vec(&expected).unwrap()\n+    );\n+\n+    let records = &actual[\"page\"][\"records\"];\n+    let first = &records[0][\"entry\"][\"payload\"][\"result\"];\n+    let second = &records[1][\"entry\"][\"payload\"][\"result\"];\n+    let messages = &records[2][\"entry\"][\"payload\"][\"messages\"];\n+    let short_result = &messages[0][\"parts\"][0][\"payload\"][\"ToolResult\"][\"result\"];\n+    let long_result = &messages[1][\"parts\"][0][\"payload\"][\"ToolResult\"][\"result\"];\n+    assert!(first[\"error\"].is_null());\n+    assert_eq!(short_result[\"error\"], \"\");\n+    let leaves = [\n+        (&first[\"output\"], true),\n+        (&second[\"error\"], true),\n+        (&second[\"output\"], false),\n+        (&short_result[\"output\"], false),\n+        (&long_result[\"output\"], true),\n+        (&long_result[\"error\"], true),\n+    ];\n+    for ((leaf, moved), original) in leaves.into_iter().zip(addresses) {\n+        assert_eq!(leaf.as_str().unwrap().as_ptr() == original, moved);\n+    }\n+}\n",
+  "alternate_scoped_patch_sha256": "2cc543a3ec281ef59e1752721a8a18cf11d38a521076ad9f143cb46a19bf803b",
+  "desktop_manifest": {
+    "git": "0238b928a49bb01194be6a47503c67c17ff17aae",
+    "pins": {
+      "extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+      "harness": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+      "modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba"
+    }
+  },
+  "earlier_integrated": [
+    {
+      "head": "c37598230c27fd4049c3665eec279303e8db4173",
+      "n": 618,
+      "source_sha256": "aa50e0536ea464f523414c15117d52275b3799eecd13f00f58259ec6179b6971"
+    },
+    {
+      "head": "d876c254c80609f4fd85a321149edb8c03a0fe68",
+      "n": 664,
+      "source_sha256": "5ea11a9026e248ed704847459cedf2df190c5b9d0468ac69fb30623a7705dfd4"
+    }
+  ],
+  "five_refs": {
+    "Proteus-harness/Proteus-core": "b6d1bfee98488ab233048f36c87fb990f4ccba09",
+    "Proteus-harness/Proteus-desktop": "df3363eae5207204b8d34f122a50bd67277221d1",
+    "Proteus-harness/Proteus-desktop-extensions": "f9d72d104e4d3f94075947ffac8d55906bdfb1d2",
+    "Proteus-harness/Proteus-modules": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+    "Qweasd123tg/proteus-modules-dot": "f1b8ba523f1b6b2e2493f3877d1a167946f3a7fa"
+  },
+  "locked_sdk_core": {
+    "cargo_lock_git": "6fa9a1af3af741a2ba4597e74496670a3dc07e2e",
+    "cargo_lock_sha256": "5a790b005a0ddfa6c4632f218f4c9c4b9573f4bf659615c05ba2486105f3a8b2",
+    "desktop_pin_distinct": true,
+    "exact_dto_git": {
+      "crates/proteus-contracts/src/domain/tool.rs": "a4fb43299a3168511595ff7112e71b787cb2d23d",
+      "crates/proteus-contracts/src/model_standard/content_part.rs": "9675ad69faa4e300aa5a00d8128f6992eeff4c57",
+      "crates/proteus-contracts/src/storage/journal.rs": "1d9e53119afab178b2c8e10cb7afa7b711b64ddf"
+    },
+    "revision": "0c1b7572313230e5d123e95c722e1258a2e9ecd6"
+  },
+  "native": {
+    "cargo_command": "cargo test --locked --offline -j 2 -p proteus-session-storage-module --test tool_result_reply --test process",
+    "cumulative_native_not_tested": true,
+    "isolated_source_and_target": true,
+    "pointer_transfer_only_in_typed_adapter_fixture": true,
+    "rust": "1.95.0",
+    "standalone_native_tree": "b95ef57533e04b0a84e07268d7b0129f38cbf2d4",
+    "suites": {
+      "process": {
+        "failed": 0,
+        "ignored": 0,
+        "names": [
+          "unmaterialized_create_survives_worker_restart_with_parent_identity",
+          "committed_record_survives_process_death_before_application_receives_ack"
+        ],
+        "passed": 2
+      },
+      "tool_result_reply": {
+        "failed": 0,
+        "ignored": 0,
+        "names": [
+          "transfers_only_owned_compact_tool_leaves_on_existing_reply_routes"
+        ],
+        "passed": 1
+      }
+    },
+    "test_binaries": {
+      "process": {
+        "bytes": 9295560,
+        "path": "target-native-exact/debug/deps/process-4620e036b85b2fea",
+        "sha256": "99e2be0b249d777339fffcbcd7abe63e849d333eaad1b19b7adc0450d571c1d6"
+      },
+      "tool_result_reply": {
+        "bytes": 3811640,
+        "path": "target-native-exact/debug/deps/tool_result_reply-51e13ec6ae7fa73f",
+        "sha256": "5c994ca205c9b6509c2c02f334fbb0e05bd7bbcf5db426a28ce42a84853bc7b0"
+      }
+    },
+    "unique_passed": 3,
+    "verified_log_sha256": "11ca6b9db5d038ddc788e88f62857f9869c62a6c248f286eb0b12e9fbc0ccb7b"
+  },
+  "native_gate_sha256": "490452eff3ac8ff224023cd2db0e98f359f9ebfd76ac84eaa0def0ab518296f4",
+  "negotiated_parity": {
+    "checks": {
+      "jsonl": {
+        "canonical_records": {
+          "bytes": 62668,
+          "sha256": "607d0465ff6ab7df23c5d81a219deeaf7c87364d1af215b8bf9825982e9918d9"
+        },
+        "conversation": {
+          "bytes": 20764,
+          "sha256": "7c2de7acd2cb35aa10c595c269d277247ee8915786a1e50c1a8d735cc5b9c66c"
+        },
+        "display_records": {
+          "bytes": 62668,
+          "sha256": "607d0465ff6ab7df23c5d81a219deeaf7c87364d1af215b8bf9825982e9918d9"
+        },
+        "open_projection": {
+          "bytes": 21286,
+          "sha256": "3654da557ef3fa237085454c8399c350c642996beafd31fd04313ac92bb7a333"
+        },
+        "released_refusal": {
+          "bytes": 62,
+          "sha256": "a009195578147063ecbc683b71e4ff7367859275396b42b658a63643648b51fb"
+        }
+      },
+      "sqlite": {
+        "canonical_records": {
+          "bytes": 62668,
+          "sha256": "7016b4f0d1157c415bf8805363953bfbc90ea5cbe74efdaa2c81b2d4c1301e83"
+        },
+        "conversation": {
+          "bytes": 20764,
+          "sha256": "7c2de7acd2cb35aa10c595c269d277247ee8915786a1e50c1a8d735cc5b9c66c"
+        },
+        "display_records": {
+          "bytes": 62668,
+          "sha256": "7016b4f0d1157c415bf8805363953bfbc90ea5cbe74efdaa2c81b2d4c1301e83"
+        },
+        "open_projection": {
+          "bytes": 21286,
+          "sha256": "bab046d140f1cbcc14bd2a00ea7913f70d76af3c4733c479c26199d5b7d97bda"
+        },
+        "released_refusal": {
+          "bytes": 62,
+          "sha256": "a009195578147063ecbc683b71e4ff7367859275396b42b658a63643648b51fb"
+        }
+      }
+    },
+    "driver_sha256": "e81351c60daec06048300e77e1eb9a0b30d4f5f9fe8d1c989b6fd872a9622a35",
+    "report_sha256": "af00aba74edfd7d1dbc6587d75d54c59480b213f15ee59319c769e7dd68c6101",
+    "runner_sha256": "b94e0cabdaaa50c697228d9e40cce9d3a93ea6f8205479b350f9703fdd728d63",
+    "scope": "Standalone stock/candidate negotiated v3 storage read only on independently copied stock seeds. Seven inert facts, no tool/provider execution. Five ordered parsed result/error comparisons per JSONL and SQLite; normalize fresh handle and test locator before re-encoding. No raw RPC, allocator, latency or production rate claim.",
+    "seed_order": [
+      "turn_opened",
+      "tool_call_recorded",
+      "tool_call_recorded",
+      "tool_effect_recorded",
+      "tool_result_recorded",
+      "history_mutated",
+      "turn_settled"
+    ],
+    "stock_prior_proof_sha256": "002e9c75e70cb43e7aa7ebff7fd75c142cce8660efac701abda903744c778df0",
+    "workers": {
+      "candidate": {
+        "bytes": 30591680,
+        "sha256": "9cd24cd6dc9c5bb0cdbd067af7f55cdc56fc183badf6bb26e087453fc5fca024"
+      },
+      "stock": {
+        "bytes": 30575240,
+        "sha256": "c2cf27827ebb7a5895cd19e01f60d519623dc0991bdcdf74af009156cfa0cc7a"
+      }
+    }
+  },
+  "owner_base": "4fa39c3ce94119e36f3ff4a86e28dd2171342aba",
+  "producer_native_manifest_sha256": "fb3969b972270d41caf3dddf2abc88f7996246e6ee5066158337a9297a8e183b",
+  "repo": "Proteus-harness/Proteus-modules",
+  "scope": "Modules owned tool output/error string storage reply adapter only. No tools, model, policy, pin, storage-write or SDK envelope changes. Native evidence must identify exact standalone variant only.",
+  "selection": "Apply one variant only: source.patch on exact Modules owner; or embedded alternate after exact #803, with #804 disjoint. Never apply both or replay #618/#664.",
+  "selector_roster": {
+    "compact_sha256": "c361d4a8927a70211bb07203edad22534116ed8137942dafd6a0a3370284dea6",
+    "count": 112,
+    "pretty_sha256": "4d145d461a3d7d976a07dab417e895150692319b73e572bc76484e147bb5a0a7",
+    "range": [
+      693,
+      804
+    ],
+    "same_target_overlap": {
+      "803": [
+        "components/session-storage-module/src/display_reply.rs"
+      ]
+    },
+    "selector_inputs_sha256": "6375e01cfd2f7a1ae315eb739e42d7a5cddbc4d53a189c403e6bb0391344f763"
+  },
+  "source": {
+    "components/session-storage-module/src/display_reply.rs": {
+      "postimage": {
+        "bytes": 9325,
+        "git": "ce27f6332ab04497da5f3b14ed92b1312bad550d",
+        "mode": "100644",
+        "sha256": "d1ee720ad53eb5f6957f4db6891c6487e1f71bd8543398fc773ef6fbe02d7c4d"
+      },
+      "preimage": {
+        "bytes": 7148,
+        "git": "c88224db42c32ddf02c6a686e05bff569a21720f",
+        "mode": "100644",
+        "sha256": "9f36962355173886180b39dde6f013f1673ca4306a06b7951d37ca8d094d8aff"
+      }
+    },
+    "components/session-storage-module/tests/tool_result_reply.rs": {
+      "postimage": {
+        "bytes": 5205,
+        "git": "daec0a475831f77816ee0aecb580690baea5cf25",
+        "mode": "100644",
+        "sha256": "f6488a5babedc1e080457a2cd6b9cb44680f2f348296c8601cbf02eb752bee80"
+      },
+      "preimage": null
+    }
+  },
+  "source_patch_sha256": "75f64f9a4c3898550c5f64364d02e1d7f1cb6abfb61f68d2543f9e60eddda56e",
+  "static_gate_sha256": "a7578e00653036ee804fdd4d58afc86cedba43d81eef29250ea4380e6ff38c3e"
+}

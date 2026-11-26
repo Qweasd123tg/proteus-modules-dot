@@ -1,0 +1,246 @@
+diff --git a/components/session-storage-module/src/display_reply.rs b/components/session-storage-module/src/display_reply.rs
+index c88224db42c32ddf02c6a686e05bff569a21720f..ce27f6332ab04497da5f3b14ed92b1312bad550d 100644
+--- a/components/session-storage-module/src/display_reply.rs
++++ b/components/session-storage-module/src/display_reply.rs
+@@ -2,6 +2,7 @@
+ use anyhow::{Context, Result, ensure};
+ use proteus_module_sdk::contracts::{
+     contracts::SessionStorageResponse,
++    domain::ToolResult,
+     model_standard::{CanonicalMessage, ContentPart},
+     storage::journal::JournalEntry,
+ };
+@@ -62,6 +63,13 @@ pub(super) fn into_value(mut response: SessionStorageResponse) -> Result<Value>
+                         )?;
+                     move_messages(output_messages, messages)?;
+                     output.push(value);
++                } else if let JournalEntry::ToolResultRecorded(recorded)
++                | JournalEntry::ToolEffectRecorded(recorded) = &mut record.entry
++                {
++                    let strings = ToolResultStrings::take(&mut recorded.result);
++                    let mut value = serde_json::to_value(record)?;
++                    strings.restore(&mut value, &["entry", "payload", "result"])?;
++                    output.push(value);
+                 } else {
+                     output.push(serde_json::to_value(record)?);
+                 }
+@@ -101,6 +109,47 @@ fn take_compact_opaque_leaf(format: &str, data: &mut Value) -> Option<(&'static
+         .then(|| (field, mem::take(text)))
+ }
+ 
++struct ToolResultStrings([Option<String>; 2]);
++
++impl ToolResultStrings {
++    fn take(result: &mut ToolResult) -> Self {
++        fn take_compact_string(text: &mut String) -> Option<String> {
++            (text.len() >= 4 * 1024 && text.capacity() == text.len())
++                .then(|| mem::take(text))
++        }
++
++        Self([
++            take_compact_string(&mut result.output),
++            result.error.as_mut().and_then(take_compact_string),
++        ])
++    }
++
++    fn restore(self, envelope: &mut Value, path: &[&str]) -> Result<()> {
++        if self.0.iter().all(Option::is_none) {
++            return Ok(());
++        }
++        let mut result = envelope;
++        for segment in path {
++            result = result
++                .get_mut(*segment)
++                .context("serialized display tool result omitted its payload")?;
++        }
++        for (field, text) in ["output", "error"].into_iter().zip(self.0) {
++            if let Some(text) = text {
++                let slot = result
++                    .get_mut(field)
++                    .context("serialized display tool result omitted its string slot")?;
++                ensure!(
++                    slot.as_str() == Some(""),
++                    "serialized display tool result string slot changed"
++                );
++                *slot = Value::String(text);
++            }
++        }
++        Ok(())
++    }
++}
++
+ fn move_messages(
+     serialized_messages: &mut Vec<Value>,
+     messages: Vec<CanonicalMessage>,
+@@ -118,6 +167,10 @@ fn move_messages(
+             .context("serialized display message omitted its parts array")?;
+         serialized_parts.reserve_exact(parts.len());
+         for mut part in parts {
++            let tool_result = match &mut part.payload {
++                ContentPart::ToolResult { result } => Some(ToolResultStrings::take(result)),
++                _ => None,
++            };
+             let owned_text = match &mut part.payload {
+                 ContentPart::Text { text } => Some(mem::take(text)),
+                 _ => None,
+@@ -152,6 +205,9 @@ fn move_messages(
+                 );
+                 *slot = Value::String(text);
+             }
++            if let Some(strings) = tool_result {
++                strings.restore(&mut value, &["payload", "ToolResult", "result"])?;
++            }
+             serialized_parts.push(value);
+         }
+         serialized_messages.push(value);
+diff --git a/components/session-storage-module/tests/tool_result_reply.rs b/components/session-storage-module/tests/tool_result_reply.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..daec0a475831f77816ee0aecb580690baea5cf25
+--- /dev/null
++++ b/components/session-storage-module/tests/tool_result_reply.rs
+@@ -0,0 +1,145 @@
++//! Inert DTO parity: never invokes a tool, provider, or subprocess.
++#[path = "../src/display_reply.rs"]
++mod display_reply;
++
++use proteus_contracts::{
++    contracts::{
++        SessionLocator, SessionStorageResponse, StorageRecordPage, StorageRevision, StorageSnapshot,
++    },
++    domain::{ToolContent, ToolResult, new_record_id, new_session_id},
++    model_standard::{CanonicalMessage, ContentPart, MessageRole},
++    storage::journal::{
++        HistoryMutated, HistoryMutationKind, JOURNAL_SCHEMA_VERSION, JournalEntry, JournalRecord,
++        ToolResultRecorded,
++    },
++};
++use serde_json::json;
++
++fn string(bytes: usize) -> String {
++    let mut text = "é🦀\"\n\t\0".to_owned();
++    text.extend(std::iter::repeat_n('x', bytes - text.len()));
++    let text = text.into_boxed_str().into_string();
++    assert_eq!(text.capacity(), bytes);
++    text
++}
++
++fn tool(id: &str, output: String, error: Option<String>) -> ToolResult {
++    ToolResult::new(
++        id.to_owned(),
++        error.is_none(),
++        output,
++        vec![ToolContent::Text {
++            text: "inert structured content".into(),
++        }],
++        error,
++        json!({ "z": ["unchanged", 1], "a": {"fixture": true} }),
++    )
++}
++
++#[test]
++fn transfers_only_owned_compact_tool_leaves_on_existing_reply_routes() {
++    let compact_output = string(4096);
++    let compact_error = string(8192);
++    let mut spare_output = string(8192);
++    spare_output.reserve_exact(4096);
++    assert!(spare_output.capacity() > spare_output.len());
++    let short = string(4095);
++    let history_output = string(8192);
++    let history_error = string(4096);
++    let addresses = [
++        compact_output.as_ptr(),
++        compact_error.as_ptr(),
++        spare_output.as_ptr(),
++        short.as_ptr(),
++        history_output.as_ptr(),
++        history_error.as_ptr(),
++    ];
++    let entries = [
++        JournalEntry::ToolResultRecorded(ToolResultRecorded {
++            result: tool("sample-one", compact_output, None),
++        }),
++        JournalEntry::ToolEffectRecorded(ToolResultRecorded {
++            result: tool("sample-two", spare_output, Some(compact_error)),
++        }),
++        JournalEntry::HistoryMutated(HistoryMutated {
++            previous_revision: 0,
++            new_revision: 1,
++            mutation: HistoryMutationKind::Append,
++            messages: vec![
++                CanonicalMessage::new(
++                    MessageRole::Tool,
++                    vec![ContentPart::ToolResult {
++                        result: tool("sample-three", short, Some(String::new())),
++                    }],
++                ),
++                CanonicalMessage::new(
++                    MessageRole::Tool,
++                    vec![ContentPart::ToolResult {
++                        result: tool("sample-four", history_output, Some(history_error)),
++                    }],
++                ),
++            ],
++            compaction: None,
++            tool_results: vec![],
++        }),
++    ];
++    let session_id = new_session_id();
++    let response = SessionStorageResponse::Records {
++        page: StorageRecordPage {
++            snapshot: StorageSnapshot {
++                session: SessionLocator {
++                    session_id,
++                    key: "fixture".into(),
++                },
++                snapshot_id: "fixture-handle".into(),
++                revision: StorageRevision {
++                    session_seq: 3,
++                    history_revision: 1,
++                },
++                content_sha256: "0".repeat(64),
++            },
++            records: entries
++                .into_iter()
++                .enumerate()
++                .map(|(i, entry)| JournalRecord {
++                    schema_version: JOURNAL_SCHEMA_VERSION,
++                    record_id: new_record_id(),
++                    session_seq: i as u64 + 1,
++                    timestamp_ms: 42,
++                    session_id,
++                    execution_id: None,
++                    thread_id: None,
++                    turn_id: None,
++                    entry,
++                })
++                .collect(),
++            next_after_seq: None,
++        },
++    };
++    let expected = serde_json::to_value(&response).unwrap();
++    let actual = display_reply::into_value(response).unwrap();
++    assert_eq!(
++        serde_json::to_vec(&actual).unwrap(),
++        serde_json::to_vec(&expected).unwrap()
++    );
++
++    let records = &actual["page"]["records"];
++    let first = &records[0]["entry"]["payload"]["result"];
++    let second = &records[1]["entry"]["payload"]["result"];
++    let messages = &records[2]["entry"]["payload"]["messages"];
++    let short_result = &messages[0]["parts"][0]["payload"]["ToolResult"]["result"];
++    let long_result = &messages[1]["parts"][0]["payload"]["ToolResult"]["result"];
++    assert!(first["error"].is_null());
++    assert_eq!(short_result["error"], "");
++    let leaves = [
++        (&first["output"], true),
++        (&second["error"], true),
++        (&second["output"], false),
++        (&short_result["output"], false),
++        (&long_result["output"], true),
++        (&long_result["error"], true),
++    ];
++    for ((leaf, moved), original) in leaves.into_iter().zip(addresses) {
++        assert_eq!(leaf.as_str().unwrap().as_ptr() == original, moved);
++    }
++}
