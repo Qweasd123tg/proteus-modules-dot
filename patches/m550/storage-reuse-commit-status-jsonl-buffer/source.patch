@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/service/commits.rs b/storage/session-storage/src/service/commits.rs
+index be7397f74afde4b3b4cc50d4197a899bfed8bff3..b050c43e730b06adfa3e3375c5d7a75203f6dfee 100644
+--- a/storage/session-storage/src/service/commits.rs
++++ b/storage/session-storage/src/service/commits.rs
+@@ -100,7 +100,8 @@ impl State {
+         let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+         let mut fold = Fold::default();
+         let mut found = None;
+-        while let Some(record) = source.next()? {
++        let mut line = Vec::new();
++        while let Some(record) = source.next_with_scratch(&mut line)? {
+             // An ACK needs the validated revision and original record, not the
+             // model-context or usage views. Still validate the entire suffix.
+             fold.apply_validated(session.session_id, &record)?;
