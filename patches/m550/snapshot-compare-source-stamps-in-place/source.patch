@@ -1,0 +1,37 @@
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index bae27642c5a026696694b4d2f271fd53dd58a8e5..68bebad1b4e8de24df5e6bd65de5aad55c05c4eb 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -47,6 +47,10 @@ pub(super) fn source_stamp(dir: &Path, kind: BackendKind) -> Result<SourceStamp>
+     Ok(source_stamp_items(dir, kind)?.into())
+ }
+ 
++pub(super) fn source_matches(dir: &Path, kind: BackendKind, stamps: &SourceStamp) -> Result<bool> {
++    Ok(source_stamp_items(dir, kind)?.as_slice() == stamps.as_slice())
++}
++
+ fn source_stamp_items(dir: &Path, kind: BackendKind) -> Result<[Option<FileStamp>; 3]> {
+     let journal = kind.backend().description_path(dir);
+     let wal = PathBuf::from(format!("{}-wal", journal.to_string_lossy()));
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 5cb1bb2e987c14dab1b75bb7943c4ff86ab44ed4..9d96e39ec291e5c5df0bd3e5f8c4cf77be450cf0 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -70,7 +70,7 @@ impl State {
+                     .backend()
+                     .snapshot_warm(&dir, session.session_id, &cached.hint)?;
+             ensure!(
+-                catalog::source_stamp(&dir, self.kind)? == cached.stamps,
++                catalog::source_matches(&dir, self.kind, &cached.stamps)?,
+                 "journal changed during snapshot capture"
+             );
+             (source, cached.revision)
+@@ -112,7 +112,7 @@ impl State {
+             };
+             let revision = prefix.revision;
+             if let Some(blobs) = blobs
+-                && catalog::source_stamp(&dir, self.kind)? == prefix.stamps
++                && catalog::source_matches(&dir, self.kind, &prefix.stamps)?
+             {
+                 let messages = state.validation.history();
+                 let summary = StorageSessionSummary {
