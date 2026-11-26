@@ -1,0 +1,34 @@
+diff --git a/model/model-pack/src/adapters/openai/stream.rs b/model/model-pack/src/adapters/openai/stream.rs
+index f83fe306c9eb71fe48a349c73c47eba7951d2346..b86893faded9f8cd096451afc7e2da888f97d13a 100644
+--- a/model/model-pack/src/adapters/openai/stream.rs
++++ b/model/model-pack/src/adapters/openai/stream.rs
+@@ -12,13 +12,13 @@ mod tests;
+ /// finalize_completed_event; неизвестные events здесь игнорируются.
+ pub(super) fn translate_non_message_event(
+     event_type: &str,
+-    parsed: &Value,
++    parsed: &mut Value,
+ ) -> Vec<ModelStreamEvent> {
+     match event_type {
+         "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta" => {
+-            if let Some(delta) = parsed.get("delta").and_then(Value::as_str) {
++            if let Some(Value::String(delta)) = parsed.get_mut("delta") {
+                 return vec![ModelStreamEvent::ReasoningSummaryDelta {
+-                    text: delta.to_owned(),
++                    text: std::mem::take(delta),
+                 }];
+             }
+             Vec::new()
+diff --git a/model/model-pack/src/adapters/openai/stream_state.rs b/model/model-pack/src/adapters/openai/stream_state.rs
+index 2e9d51e5d5848635f9b691bf49e8955e0f14cb14..f4228fb8629c2a5dfb9cbeab7e748ccc177fe8cb 100644
+--- a/model/model-pack/src/adapters/openai/stream_state.rs
++++ b/model/model-pack/src/adapters/openai/stream_state.rs
+@@ -216,7 +216,7 @@ impl OpenAiStreamState {
+                 {
+                     parsed["call_id"] = Value::String(call_id);
+                 }
+-                translate_non_message_event(&event_type, &parsed)
++                translate_non_message_event(&event_type, &mut parsed)
+             }
+         }
+     }
