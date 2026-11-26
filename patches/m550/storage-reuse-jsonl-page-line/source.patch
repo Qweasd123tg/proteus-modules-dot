@@ -1,0 +1,26 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..2254d9700ad728f9298723c57f628bc330da5a8a 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -270,6 +270,7 @@ impl SnapshotState {
+         }
+         let mut records = Vec::new();
+         let mut bytes = 0_usize;
++        let mut line = Vec::new();
+         while records.len() < limit as usize {
+             let cursor = (!sole_snapshot && !records.is_empty()).then(|| self.source.page_cursor());
+             let (record, known_bytes) = match self.pending.take() {
+@@ -280,11 +281,11 @@ impl SnapshotState {
+                 Some(PendingPageRecord::OnSource { encoded_bytes }) => {
+                     let record = self
+                         .source
+-                        .next()?
++                        .next_with_scratch(&mut line)?
+                         .ok_or_else(|| anyhow::anyhow!("missing deferred journal record"))?;
+                     (record, Some(encoded_bytes))
+                 }
+-                None => match self.source.next()? {
++                None => match self.source.next_with_scratch(&mut line)? {
+                     Some(record) => (record, None),
+                     None => break,
+                 },
