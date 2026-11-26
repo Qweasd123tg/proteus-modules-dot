@@ -1,0 +1,22 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index f26b6822b00f36bbd1511100fd5e81cc3ae21f7a..010537d616d466e0b5e16e765ea67bbe035f5ea8 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -194,7 +194,8 @@ impl SnapshotState {
+         self.source.reset()?;
+         let mut state = Fold::default();
+         let mut terminal = None;
+-        while let Some(record) = self.source.next()? {
++        let mut line = Vec::new();
++        while let Some(record) = self.source.next_with_scratch(&mut line)? {
+             state.apply_projected::<MODEL_CONTEXT, USAGE>(
+                 self.identity.session.session_id,
+                 &record,
+@@ -203,6 +204,7 @@ impl SnapshotState {
+                 terminal = Some(record);
+             }
+         }
++        drop(line);
+         ensure!(
+             state.revision() == self.identity.revision,
+             "snapshot revision changed"
