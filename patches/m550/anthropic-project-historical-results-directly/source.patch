@@ -1,0 +1,21 @@
+diff --git a/model/model-pack/src/adapters/anthropic/request.rs b/model/model-pack/src/adapters/anthropic/request.rs
+index f54d1063ada366142d37494d30c467aca7cbb5f7..af76cede8fab6bb67f883f80c8d5520764280286 100644
+--- a/model/model-pack/src/adapters/anthropic/request.rs
++++ b/model/model-pack/src/adapters/anthropic/request.rs
+@@ -306,7 +306,7 @@ fn anthropic_content_blocks(message: &CanonicalMessage) -> Result<Vec<Value>> {
+     Ok(blocks)
+ }
+ 
+-fn tool_result_blocks(message: &CanonicalMessage) -> Vec<Value> {
++fn tool_result_blocks(message: &CanonicalMessage) -> impl Iterator<Item = Value> + '_ {
+     message
+         .parts
+         .iter()
+@@ -314,7 +314,6 @@ fn tool_result_blocks(message: &CanonicalMessage) -> Vec<Value> {
+             ContentPart::ToolResult { result } => Some(tool_result_block(result)),
+             _ => None,
+         })
+-        .collect()
+ }
+ 
+ fn tool_result_block(result: &crate::domain::ToolResult) -> Value {
