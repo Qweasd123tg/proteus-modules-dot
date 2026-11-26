@@ -1,0 +1,29 @@
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 36c2fb2953e7d6051aac06ba16bdabc45a51ab32..08f4f0c569cc0db0890ac62ee6914d3c22c5f718 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -120,7 +120,7 @@ impl<'a> BlobStampMatch<'a> {
+     }
+ }
+ 
+-fn matches_blob_stamps(dir: &Path, expected: &BlobStamps) -> Option<bool> {
++pub(in crate::service) fn matches_blob_stamps(dir: &Path, expected: &BlobStamps) -> Option<bool> {
+     let mut seen = BlobStampMatch::new(expected);
+     walk_blob_stamps(dir, |name, stamp| seen.observe(name, stamp))?;
+     Some(seen.matches())
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 5cb1bb2e987c14dab1b75bb7943c4ff86ab44ed4..9fb8d87199b69506192b8f37d0dbf6b89c648f96 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -99,8 +99,9 @@ impl State {
+             previous_boundary = boundary.or_else(|| {
+                 (cut == Some(0)).then(|| (StorageRevision::default(), crate::io::sha256_hex(b"")))
+             });
+-            let blobs =
+-                blobs.filter(|blobs| catalog::durable::blob_stamps(&dir).as_ref() == Some(blobs));
++            let blobs = blobs.filter(|blobs| {
++                catalog::durable::matches_blob_stamps(&dir, blobs) == Some(true)
++            });
+             let prefix = PrefixCache {
+                 stamps,
+                 revision: state.revision(),
