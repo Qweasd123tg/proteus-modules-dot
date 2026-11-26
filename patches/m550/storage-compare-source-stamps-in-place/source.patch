@@ -1,0 +1,22 @@
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 88fb3820542dbd50370178894191c87ea9a6a4a5..54fbaeacf8d070ea6b628b2ef00ff0410605140c 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -221,7 +221,7 @@ pub(super) fn load(
+         || index.summary.descriptor.session != descriptor.session
+         || &index.stamps != stamps
+         || !matches_blob_stamps(dir, &index.blobs)?
+-        || source_stamp(dir, journal_kind(descriptor)?)
++        || source_stamp_items(dir, journal_kind(descriptor)?)
+             .ok()?
+             .as_slice()
+             != stamps.as_slice()
+@@ -282,7 +282,7 @@ pub(super) fn save(
+         let kind = journal_kind(&summary.descriptor).context("catalog journal kind")?;
+         // A concurrent append or payload replacement makes this generation unusable.
+         ensure!(
+-            source_stamp(dir, kind)? == prefix.stamps,
++            source_stamp_items(dir, kind)?.as_slice() == prefix.stamps.as_slice(),
+             "catalog source changed"
+         );
+         ensure!(
