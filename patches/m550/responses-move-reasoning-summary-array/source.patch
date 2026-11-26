@@ -1,0 +1,28 @@
+diff --git a/model/model-pack/src/adapters/openai/request.rs b/model/model-pack/src/adapters/openai/request.rs
+index 0aba7e994e9ec98497ef85c52dbe76b40ebba0ad..0752e91177b6f987b2374bc81e70253d9e18c16c 100644
+--- a/model/model-pack/src/adapters/openai/request.rs
++++ b/model/model-pack/src/adapters/openai/request.rs
+@@ -558,16 +558,15 @@ fn openai_text_message(message: &CanonicalMessage, text: &str) -> Result<Value>
+ }
+ 
+ fn openai_reasoning_item(summary: &str, encrypted_content: Option<&str>) -> Value {
+-    let summary = if summary.trim().is_empty() {
+-        Vec::new()
+-    } else {
+-        vec![json!({ "type": "summary_text", "text": summary })]
+-    };
+-    json!({
++    let mut item = json!({
+         "type": "reasoning",
+-        "summary": summary,
++        "summary": [],
+         "encrypted_content": encrypted_content,
+-    })
++    });
++    if !summary.trim().is_empty() {
++        item["summary"] = Value::Array(vec![json!({ "type": "summary_text", "text": summary })]);
++    }
++    item
+ }
+ 
+ fn freeform_tool_input(call: &ToolCall) -> Result<&str> {
