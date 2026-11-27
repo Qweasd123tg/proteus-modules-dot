@@ -1,0 +1,153 @@
+diff --git a/src/catalog/mod.rs b/src/catalog/mod.rs
+index 04ea8105d41f6a4f78aef6cfdd8b7c11b23d515b..a78c0bfa76e94635731ab276b32bbb1e248c0161 100644
+--- a/src/catalog/mod.rs
++++ b/src/catalog/mod.rs
+@@ -132,7 +132,7 @@ pub struct Locations {
+ impl Locations {
+     pub fn local() -> Result<Self> {
+         let home = PathBuf::from(std::env::var_os("HOME").context("Не задан HOME")?);
+-        let config = crate::preferences::config_dir().context("Не найдена папка настроек")?;
++        let config = crate::paths::config_dir().context("Не найдена папка настроек")?;
+         let agent_home = std::env::var_os("PROTEUS_HOME")
+             .map(PathBuf::from)
+             .unwrap_or_else(|| home.join(".proteus"));
+diff --git a/src/declarative/manifest.rs b/src/declarative/manifest.rs
+index f9e153b56cce14f734ab15ad754a76745e5278d7..2308702fbe3c205554fd949c4afb0bb16154350b 100644
+--- a/src/declarative/manifest.rs
++++ b/src/declarative/manifest.rs
+@@ -230,7 +230,7 @@ pub struct Problem {
+ 
+ /// Where the user keeps extensions.
+ pub fn root() -> Option<PathBuf> {
+-    Some(crate::preferences::config_dir()?.join("extensions"))
++    Some(crate::paths::config_dir()?.join("extensions"))
+ }
+ 
+ /// Portable assets or the source checkout used by `cargo run`.
+diff --git a/src/main.rs b/src/main.rs
+index 3967f4e2db4d8f31191a4f61e3805c0b0009aaa2..40c00ac673f51ef537703434d28c772193983bb7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,6 +11,7 @@ mod launch;
+ mod navigation;
+ mod notify;
+ mod packages;
++mod paths;
+ mod preferences;
+ mod recent;
+ #[cfg(test)]
+diff --git a/src/paths.rs b/src/paths.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9deefe6eb21d55eec5db65d7cd8a6bc272ff767
+--- /dev/null
++++ b/src/paths.rs
+@@ -0,0 +1,12 @@
++//! On-device paths shared by the native client and its package discovery.
++
++use std::path::PathBuf;
++
++/// Directory of the client's files on this device.
++pub(crate) fn config_dir() -> Option<PathBuf> {
++    let base = std::env::var_os("XDG_CONFIG_HOME")
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute())
++        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
++    Some(base.join(crate::APP_ID))
++}
+diff --git a/src/preferences.rs b/src/preferences.rs
+index 9552703b861995662e8ecd9dc08e172c1edd4e19..7f4a9b205e7b784790d0811fb4ded96f38ee6ae4 100644
+--- a/src/preferences.rs
++++ b/src/preferences.rs
+@@ -611,17 +611,8 @@ fn move_before(saved: &mut Vec<String>, known: &[&str], id: &str, before: Option
+     *saved = items.into_iter().map(str::to_string).collect();
+ }
+ 
+-/// Directory of the client's files on this device.
+-pub fn config_dir() -> Option<PathBuf> {
+-    let base = std::env::var_os("XDG_CONFIG_HOME")
+-        .map(PathBuf::from)
+-        .filter(|path| path.is_absolute())
+-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+-    Some(base.join(crate::APP_ID))
+-}
+-
+ fn path() -> Option<PathBuf> {
+-    Some(config_dir()?.join("preferences.json"))
++    Some(crate::paths::config_dir()?.join("preferences.json"))
+ }
+ 
+ /// Saved preferences; a missing file means defaults. A file that cannot be
+diff --git a/src/ui/chat/scroller/scrollbar/height_store.rs b/src/ui/chat/scroller/scrollbar/height_store.rs
+index 6f554b9e74aed3d10d7e0b6773da124fde6d9845..f2bd3ba99dad58fdef8d696b32997411eb4b9e68 100644
+--- a/src/ui/chat/scroller/scrollbar/height_store.rs
++++ b/src/ui/chat/scroller/scrollbar/height_store.rs
+@@ -97,11 +97,7 @@ fn cache_dir() -> Option<PathBuf> {
+ }
+ 
+ fn preferences_dir() -> Option<PathBuf> {
+-    let root = std::env::var_os("XDG_CONFIG_HOME")
+-        .map(PathBuf::from)
+-        .filter(|path| path.is_absolute())
+-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+-    Some(root.join(crate::APP_ID).join("extension-preferences"))
++    Some(crate::paths::config_dir()?.join("extension-preferences"))
+ }
+ 
+ pub(super) fn global() -> Option<&'static Store> {
+diff --git a/src/ui/launcher/visual.rs b/src/ui/launcher/visual.rs
+index 6c00810c1af87d9bc3fe0f06eb2611c78889cd56..1d3145096497be210d54d1d57ff588aa40023fa0 100644
+--- a/src/ui/launcher/visual.rs
++++ b/src/ui/launcher/visual.rs
+@@ -83,7 +83,7 @@ fn save_as(window: &mut Window, cx: &mut App) {
+         .path
+         .as_ref()
+         .and_then(|path| path.parent().map(ToOwned::to_owned))
+-        .or_else(crate::preferences::config_dir)
++        .or_else(crate::paths::config_dir)
+         .unwrap_or_else(|| PathBuf::from("."));
+     let picked = cx.prompt_for_new_path(&folder, Some("desktop.json"));
+     let handle = window.window_handle();
+diff --git a/src/ui/prefs/visual.rs b/src/ui/prefs/visual.rs
+index c916846cad24668c724d4752bdb312ed6f9b2dc6..8c08a227d3fcc8845b06778b57f4ab0951f75635 100644
+--- a/src/ui/prefs/visual.rs
++++ b/src/ui/prefs/visual.rs
+@@ -169,7 +169,7 @@ fn registry(cx: &App) -> crate::visual_config::Registry {
+     }
+     if registry.default_config.is_none() {
+         if let Some(path) =
+-            crate::preferences::config_dir().map(|root| root.join("desktop/default.json"))
++            crate::paths::config_dir().map(|root| root.join("desktop/default.json"))
+         {
+             if path.is_file() {
+                 registry.default_config = Some(path);
+@@ -338,7 +338,7 @@ fn persist(cx: &mut App) {
+     let promote = state.selection.path.is_none();
+     let path =
+         match state.selection.path.clone().or_else(|| {
+-            crate::preferences::config_dir().map(|path| path.join("desktop/default.json"))
++            crate::paths::config_dir().map(|path| path.join("desktop/default.json"))
+         }) {
+             Some(path) => path,
+             None => return report("Папка визуальных конфигов недоступна".into(), cx),
+diff --git a/src/ui/theme/mod.rs b/src/ui/theme/mod.rs
+index 223f9da861339d7b368175dd1db2e4f45ee150b5..535118214265f5ab7f1ef653c9139bd02b96db9c 100644
+--- a/src/ui/theme/mod.rs
++++ b/src/ui/theme/mod.rs
+@@ -14,7 +14,7 @@ use std::rc::Rc;
+ use gpui_kit::component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry};
+ use gpui_kit::*;
+ 
+-use crate::preferences::{self, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, ThemeNames};
++use crate::preferences::{DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, ThemeNames};
+ 
+ const BUNDLED: &str = include_str!("proteus.json");
+ 
+@@ -40,7 +40,7 @@ pub(super) fn init(cx: &mut App) {
+             .expect("bundled palettes are valid");
+     }
+     let mut problems = Vec::new();
+-    if let Some(dir) = preferences::config_dir().map(|dir| dir.join("themes"))
++    if let Some(dir) = crate::paths::config_dir().map(|dir| dir.join("themes"))
+         && let Ok(entries) = std::fs::read_dir(&dir)
+     {
+         let mut files: Vec<_> = entries
