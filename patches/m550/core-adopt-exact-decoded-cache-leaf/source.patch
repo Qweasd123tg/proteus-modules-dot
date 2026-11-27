@@ -1,0 +1,64 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index 4898d32da51a5db3503b47eb76a35f6ef53baa27..25f8e1ff481aa45ed031e57a5345b2c5ed4842ee 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -224,10 +224,21 @@ fn collect_section<T: DeserializeOwned>(
+     checked: bool,
+ ) -> Option<Vec<T>> {
+     let mut result = None;
+-    visit_section_impl(store, section, start, end, checked, |row| {
+-        result
+-            .get_or_insert_with(|| Vec::with_capacity(end - start))
+-            .push(row);
++    visit_section_pages(store, section, start, end, checked, |rows: Vec<T>, selected| {
++        if result.is_none()
++            && selected == (0..rows.len())
++            && rows.len() == end - start
++            && rows.capacity() == rows.len()
++        {
++            // Return the exact decoded allocation without retaining spare rows.
++            result = Some(rows);
++        } else {
++            for row in rows.into_iter().skip(selected.start).take(selected.len()) {
++                result
++                    .get_or_insert_with(|| Vec::with_capacity(end - start))
++                    .push(row);
++            }
++        }
+         Some(())
+     })?;
+     Some(result.unwrap_or_default())
+@@ -252,6 +263,22 @@ fn visit_section_impl<T: DeserializeOwned>(
+     end: usize,
+     checked: bool,
+     mut visit: impl FnMut(T) -> Option<()>,
++) -> Option<()> {
++    visit_section_pages(store, section, start, end, checked, |rows: Vec<T>, selected| {
++        for row in rows.into_iter().skip(selected.start).take(selected.len()) {
++            visit(row)?;
++        }
++        Some(())
++    })
++}
++
++fn visit_section_pages<T: DeserializeOwned>(
++    store: &RemoteSessionStore,
++    section: &Section,
++    start: usize,
++    end: usize,
++    checked: bool,
++    mut visit: impl FnMut(Vec<T>, std::ops::Range<usize>) -> Option<()>,
+ ) -> Option<()> {
+     if start > end || end > section.rows || (!checked && !valid_section(section)) {
+         return None;
+@@ -300,9 +327,7 @@ fn visit_section_impl<T: DeserializeOwned>(
+                     }
+                     let first = start.saturating_sub(offset);
+                     let last = (end - offset).min(page.rows);
+-                    for value in rows.into_iter().skip(first).take(last - first) {
+-                        visit(value)?;
+-                    }
++                    visit(rows, first..last)?;
+                 }
+                 offset = next;
+             }
