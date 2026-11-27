@@ -1,0 +1,141 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..cc42e683f7d1e17033377b624daa1a44e3deace5 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -98,6 +98,11 @@ impl<'a> BlobIdentity<'a> {
+         self.sha256
+     }
+ 
++    pub(crate) fn matches_stored(&self, session: &Path, stored: &[u8]) -> Result<bool> {
++        let actual = unpack_checked(session, stored, None, Some(self.bytes))?;
++        Ok(std::ptr::eq(actual.as_ref(), self.bytes) || actual.as_ref() == self.bytes)
++    }
++
+     pub(crate) fn pack(&self, session: &Path) -> Result<PackedBlob> {
+         pack_inner(session, self.bytes, Some(&self.sha256))
+     }
+@@ -182,7 +187,7 @@ fn store_chunk(session: &Path, bytes: &[u8]) -> Result<Chunk> {
+ /// Ordinary JSON blobs remain readable. Packed bytes are verified both at each
+ /// chunk and as a complete payload before a caller parses canonical records.
+ pub fn unpack<'a>(session: &Path, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+-    unpack_checked(session, stored, None)
++    unpack_checked(session, stored, None, None)
+ }
+ 
+ /// The caller has already packed or verified these bytes.
+@@ -204,13 +209,14 @@ pub(crate) fn unpack_expected<'a>(
+     sha256: &str,
+     bytes: u64,
+ ) -> Result<Cow<'a, [u8]>> {
+-    unpack_checked(session, stored, Some((sha256, bytes)))
++    unpack_checked(session, stored, Some((sha256, bytes)), None)
+ }
+ 
+ fn unpack_checked<'a>(
+     session: &Path,
+     stored: &'a [u8],
+     expected: Option<(&str, u64)>,
++    compare: Option<&'a [u8]>,
+ ) -> Result<Cow<'a, [u8]>> {
+     ensure!(
+         stored.len() <= MAX_PAYLOAD_BYTES,
+@@ -238,44 +244,79 @@ fn unpack_checked<'a>(
+             "shared manifest differs from journal blob identity"
+         );
+     }
+-    let mut bytes = Vec::with_capacity(manifest.bytes);
++    // While every chunk agrees, the caller's bytes are the verified prefix.
++    // If not, retain the actual bytes and finish all checks before comparing.
++    let mut bytes = compare.is_none().then(|| Vec::with_capacity(manifest.bytes));
++    let mut scratch = Vec::new();
++    let mut start = 0;
++    let compare = compare.unwrap_or_default();
+     // A chunk can occur many times in one payload. Index only ranges in our
+     // output; a later unpack verifies its files independently.
+     let mut verified = HashMap::new();
+     for chunk in &manifest.chunks {
+-        let start = bytes.len();
+         ensure!(
+             chunk.bytes > 0
+                 && chunk.bytes <= MAX_CHUNK
+                 && chunk.bytes <= manifest.bytes.saturating_sub(start),
+             "shared blob chunk exceeds declared payload"
+         );
++        let end = start + chunk.bytes;
+         let vacant = match verified.entry(chunk.sha256.as_str()) {
+             Entry::Occupied(entry) => {
+                 let (offset, len): (usize, usize) = *entry.get();
+                 ensure!(len == chunk.bytes, "shared blob chunk size mismatch");
+-                bytes.extend_from_within(offset..offset + len);
++                let range = offset..offset + len;
++                if bytes.is_none() && compare.get(start..end) != Some(&compare[range.clone()]) {
++                    let mut observed = Vec::with_capacity(manifest.bytes);
++                    observed.extend_from_slice(&compare[..start]);
++                    bytes = Some(observed);
++                }
++                if let Some(bytes) = &mut bytes {
++                    bytes.extend_from_within(range);
++                }
++                start = end;
+                 continue;
+             }
+             Entry::Vacant(entry) => entry,
+         };
+         let path = chunk_path(session, &chunk.sha256)?;
+-        bytes.resize(start + chunk.bytes, 0);
+-        let content = &mut bytes[start..];
++        let content = if let Some(bytes) = &mut bytes {
++            bytes.resize(end, 0);
++            &mut bytes[start..end]
++        } else {
++            if scratch.is_empty() {
++                scratch.resize(MAX_CHUNK, 0);
++            }
++            &mut scratch[..chunk.bytes]
++        };
+         let count = bounded_read_into(&path, MAX_CHUNK, content)?;
+         ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
+         ensure!(
+             sha256_hex(content) == chunk.sha256,
+             "shared blob chunk hash mismatch"
+         );
++        if bytes.is_none() {
++            let content = &scratch[..chunk.bytes];
++            if compare.get(start..end) != Some(content) {
++                let mut observed = Vec::with_capacity(manifest.bytes);
++                observed.extend_from_slice(&compare[..start]);
++                observed.extend_from_slice(content);
++                bytes = Some(observed);
++            }
++        }
+         vacant.insert((start, chunk.bytes));
++        start = end;
+     }
+-    ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
++    ensure!(start == manifest.bytes, "shared blob size mismatch");
++    let bytes = match bytes {
++        Some(bytes) => Cow::Owned(bytes),
++        None => Cow::Borrowed(&compare[..start]),
++    };
+     ensure!(
+         sha256_hex(&bytes) == manifest.sha256,
+         "shared blob hash mismatch"
+     );
+-    Ok(Cow::Owned(bytes))
++    Ok(bytes)
+ }
+ 
+ #[cfg(test)]
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 0da045513f551ef5ca4a91ec04e0b3f982b4c059..947a82a60b00a7e96ea133db4c74f2828f4d6334 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -77,7 +77,7 @@ pub(crate) fn encode(
+         blobs = if path.try_exists()? {
+             let stored = bounded_read(&path, MAX_PAYLOAD_BYTES)?;
+             ensure!(
+-                crate::blob_codec::unpack(session, &stored)? == bytes,
++                identity.matches_stored(session, &stored)?,
+                 "content-addressed blob collision"
+             );
+             crate::blob_codec::chunk_files(&stored)?
