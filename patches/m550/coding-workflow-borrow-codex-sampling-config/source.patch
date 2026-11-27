@@ -1,0 +1,13 @@
+diff --git a/workflow/coding-workflow/src/codex_sampling.rs b/workflow/coding-workflow/src/codex_sampling.rs
+index 08eeebb82ceea614415a3e10703f79d1aeb5e8e0..a6f10ef0593c9f4d7cb90eabf00178633f4e6b34 100644
+--- a/workflow/coding-workflow/src/codex_sampling.rs
++++ b/workflow/coding-workflow/src/codex_sampling.rs
+@@ -31,7 +31,7 @@ fn default_stream_max_retries() -> u64 {
+ 
+ impl StreamRetryConfig {
+     pub(crate) fn from_config(config: &Value) -> Result<Self, ProcessModuleError> {
+-        let mut config: Self = serde_json::from_value(config.clone()).map_err(|error| {
++        let mut config: Self = Self::deserialize(config).map_err(|error| {
+             ProcessModuleError::new(format!("invalid codex_loop config: {error}"))
+         })?;
+         config.stream_max_retries = config.stream_max_retries.min(100);
