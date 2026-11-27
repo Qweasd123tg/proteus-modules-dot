@@ -1,0 +1,23 @@
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 562b0097590b33c76ee8cb20a1b4ea8eb310b6fa..c95851e4f70564d10ab0a194e5ee51e69f49e8be 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -79,7 +79,8 @@ impl State {
+             Ok(dir) if dir.is_dir() => dir,
+             _ => return Ok(SessionStorageResponse::CacheWritten { etag: None }),
+         };
+-        let current = self.prepare_snapshot(session.clone())?.identity;
++        let session_id = session.session_id;
++        let current = self.prepare_snapshot(session)?.identity;
+         if !same_prefix(&current, &source) {
+             return Ok(SessionStorageResponse::CacheWritten { etag: None });
+         }
+@@ -112,7 +113,7 @@ impl State {
+             }
+             file.sync_data()?;
+             ensure!(
+-                identity::resolve_session_identity(&dir)?.session_id == session.session_id,
++                identity::resolve_session_identity(&dir)?.session_id == session_id,
+                 "cache target identity changed"
+             );
+             let destination = path(&dir, &key);
