@@ -1,0 +1,16 @@
+diff --git a/crates/proteus-process-host/src/framing.rs b/crates/proteus-process-host/src/framing.rs
+index 95922b31e1968e2b16f950bdc8bb8ba83481e09f..fb8709f27bc935ae9262060788a9b2cc55917298 100644
+--- a/crates/proteus-process-host/src/framing.rs
++++ b/crates/proteus-process-host/src/framing.rs
+@@ -150,9 +150,10 @@ impl Framing for ContentLengthFraming {
+ fn read_content_length<R: BufRead>(reader: &mut R, max_frame_bytes: usize) -> Result<usize> {
+     let mut content_length = None;
+     let mut header_bytes = 0usize;
++    let mut line = Vec::new();
+ 
+     loop {
+-        let mut line = Vec::new();
++        line.clear();
+         loop {
+             let buffer = reader.fill_buf()?;
+             if buffer.is_empty() {
