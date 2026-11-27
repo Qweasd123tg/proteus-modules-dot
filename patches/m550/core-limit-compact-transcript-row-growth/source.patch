@@ -1,0 +1,106 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 40908e9961eaeb79949127e2ac1139adce67dad3..ed60750755f6ec57677b3714fede4048490bd154 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -6,6 +6,8 @@
+ //! unpublished until every pass succeeds.
+ use anyhow::Result;
+ 
++use super::super::rows::reserve_text_append_tail;
++
+ use crate::{
+     contracts::OperationOwner,
+     core::{
+@@ -261,6 +263,8 @@ fn render_causal(
+                     .state
+                     .timestamps
+                     .record_staged_text_append(timestamp_ms);
++                let input_rows = append.into_rows();
++                let ceiling = input_rows.len();
+                 let mut rows = Vec::new();
+                 for StagedTextRow {
+                     id,
+@@ -269,12 +273,13 @@ fn render_causal(
+                     part_id,
+                     scope,
+                     mut text,
+-                } in append.into_rows()
++                } in input_rows
+                 {
+                     if let Some(text) = replay
+                         .state
+                         .take_staged_text_value(part_id, scope, &mut text)
+                     {
++                        reserve_text_append_tail(&mut rows, ceiling);
+                         rows.push(CompactTextRow {
+                             message_id: id,
+                             phase,
+@@ -300,9 +305,11 @@ fn render_causal(
+                         .iter()
+                         .all(|message| message.parts.len() == 1)
+                 {
++                    let ceiling = mutation.messages.len();
+                     let mut rows = Vec::new();
+                     for mut message in std::mem::take(&mut mutation.messages) {
+                         if let Some(text) = replay.state.take_staged_text(&mut message.parts[0]) {
++                            reserve_text_append_tail(&mut rows, ceiling);
+                             rows.push(CompactTextRow {
+                                 message_id: message.id,
+                                 phase: message.phase,
+diff --git a/crates/proteus-core/src/app_server/transcript/rows.rs b/crates/proteus-core/src/app_server/transcript/rows.rs
+index 65c335e64f29495a8b4b1190250fede6398b43af..d4ede3cd669164ac3875a60a9c9d7f11a0e8b906 100644
+--- a/crates/proteus-core/src/app_server/transcript/rows.rs
++++ b/crates/proteus-core/src/app_server/transcript/rows.rs
+@@ -19,6 +19,16 @@ pub(super) struct TranscriptRows {
+ #[cfg(test)]
+ mod tests;
+ 
++/// A certified text-only append emits at most one row per input message.
++/// Try smaller growth only when the next accepted row already requires it.
++pub(super) fn reserve_text_append_tail<T>(rows: &mut Vec<T>, ceiling: usize) {
++    let cap = rows.capacity();
++    if rows.len() == cap && ceiling > cap && ceiling < cap.saturating_mul(2) {
++        // A refused optional reserve leaves Vec's ordinary growth intact.
++        let _ = rows.try_reserve_exact(ceiling - cap);
++    }
++}
++
+ impl TranscriptRows {
+     /// A single text-only append produces at most one row per input message.
+     /// Do not preallocate while all decoded inputs are still owned.
+@@ -30,21 +40,9 @@ impl TranscriptRows {
+         }
+     }
+ 
+-    fn reserve_text_append_tail(&mut self) {
+-        let cap = self.rows.capacity();
+-        if self.rows.len() == cap
+-            && self.text_append_ceiling > cap
+-            && self.text_append_ceiling < cap.saturating_mul(2)
+-        {
+-            // The row already passed filtering; growth is inevitable now.
+-            // A refused optional reserve leaves Vec's ordinary growth intact.
+-            let _ = self.rows.try_reserve_exact(self.text_append_ceiling - cap);
+-        }
+-    }
+-
+     pub(super) fn push(&mut self, row: AppTranscriptMessage) {
+         if self.text_append_ceiling != 0 {
+-            self.reserve_text_append_tail();
++            reserve_text_append_tail(&mut self.rows, self.text_append_ceiling);
+             // No reasoning row can search old answer positions in this append.
+         } else if row.role == "assistant"
+             && let Some(id) = row.message_id
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+index 0f71969a4d4e84dac08bd85b32bfb05eb4b3acf9..faa8c057280d89d8ba5831cb07ba5db86d9de3bf 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records/text_append.rs
+@@ -154,7 +154,7 @@ impl StagedTextAppend {
+         self.messages.iter().map(PlainHistoryMessage::identities)
+     }
+ 
+-    pub(crate) fn into_rows(self) -> impl Iterator<Item = StagedTextRow> {
++    pub(crate) fn into_rows(self) -> impl ExactSizeIterator<Item = StagedTextRow> {
+         self.messages.into_iter().map(|m| {
+             let (id, role, phase, part_id, scope, text) = m.into_display_fields();
+             StagedTextRow {
