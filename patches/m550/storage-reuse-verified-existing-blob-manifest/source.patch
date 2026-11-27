@@ -1,0 +1,81 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..ea26a44ad375ea1a02d7f7b977c2246f01a01fe7 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -182,7 +182,22 @@ fn store_chunk(session: &Path, bytes: &[u8]) -> Result<Chunk> {
+ /// Ordinary JSON blobs remain readable. Packed bytes are verified both at each
+ /// chunk and as a complete payload before a caller parses canonical records.
+ pub fn unpack<'a>(session: &Path, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+-    unpack_checked(session, stored, None)
++    Ok(unpack_checked(session, stored, None)?.0)
++}
++
++/// Reuse the descriptors from the same manifest whose data matched the write.
++pub(crate) fn verified_chunk_files(
++    session: &Path,
++    stored: &[u8],
++    requested: &[u8],
++) -> Result<Vec<PathBuf>> {
++    let (content, chunks) = unpack_checked(session, stored, None)?;
++    ensure!(content == requested, "content-addressed blob collision");
++    drop(content);
++    match chunks {
++        Some(chunks) => files_for_chunks(&chunks),
++        None => Ok(Vec::new()),
++    }
+ }
+ 
+ /// The caller has already packed or verified these bytes.
+@@ -204,14 +219,14 @@ pub(crate) fn unpack_expected<'a>(
+     sha256: &str,
+     bytes: u64,
+ ) -> Result<Cow<'a, [u8]>> {
+-    unpack_checked(session, stored, Some((sha256, bytes)))
++    Ok(unpack_checked(session, stored, Some((sha256, bytes)))?.0)
+ }
+ 
+ fn unpack_checked<'a>(
+     session: &Path,
+     stored: &'a [u8],
+     expected: Option<(&str, u64)>,
+-) -> Result<Cow<'a, [u8]>> {
++) -> Result<(Cow<'a, [u8]>, Option<Vec<Chunk>>)> {
+     ensure!(
+         stored.len() <= MAX_PAYLOAD_BYTES,
+         "stored blob exceeds maximum"
+@@ -221,7 +236,7 @@ fn unpack_checked<'a>(
+             ensure!(stored.len() as u64 == length, "journal blob size mismatch");
+             ensure!(sha256_hex(stored) == hash, "journal blob hash mismatch");
+         }
+-        return Ok(Cow::Borrowed(stored));
++        return Ok((Cow::Borrowed(stored), None));
+     };
+     let manifest: Manifest = serde_json::from_slice(body)?;
+     ensure!(
+@@ -275,7 +290,8 @@ fn unpack_checked<'a>(
+         sha256_hex(&bytes) == manifest.sha256,
+         "shared blob hash mismatch"
+     );
+-    Ok(Cow::Owned(bytes))
++    drop(verified);
++    Ok((Cow::Owned(bytes), Some(manifest.chunks)))
+ }
+ 
+ #[cfg(test)]
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 0da045513f551ef5ca4a91ec04e0b3f982b4c059..3f57b315f7974e79c72cfb20c5faa8769362798f 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -76,11 +76,7 @@ pub(crate) fn encode(
+         let path = session.join(&relative_path);
+         blobs = if path.try_exists()? {
+             let stored = bounded_read(&path, MAX_PAYLOAD_BYTES)?;
+-            ensure!(
+-                crate::blob_codec::unpack(session, &stored)? == bytes,
+-                "content-addressed blob collision"
+-            );
+-            crate::blob_codec::chunk_files(&stored)?
++            crate::blob_codec::verified_chunk_files(session, &stored, &bytes)?
+         } else {
+             let packed = identity.pack(session)?;
+             atomic_write(&path, packed.as_bytes())?;
