@@ -1,0 +1,31 @@
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index bae27642c5a026696694b4d2f271fd53dd58a8e5..6c21feba43ee38cf24c2cc827afc18eefb814c7a 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -48,13 +48,22 @@ pub(super) fn source_stamp(dir: &Path, kind: BackendKind) -> Result<SourceStamp>
+ }
+ 
+ fn source_stamp_items(dir: &Path, kind: BackendKind) -> Result<[Option<FileStamp>; 3]> {
+-    let journal = kind.backend().description_path(dir);
+-    let wal = PathBuf::from(format!("{}-wal", journal.to_string_lossy()));
++    let mut journal = kind.backend().description_path(dir);
++    let journal_stamp = stamp(&journal)?;
++    let wal = if journal.capacity() - journal.as_os_str().len() >= "-wal".len()
++        && journal.to_str().is_some()
++    {
++        journal.as_mut_os_string().push("-wal");
++        stamp(&journal)?
++    } else {
++        // Preserve the lossy sidecar name for non-UTF-8 paths.
++        stamp(Path::new(&format!("{}-wal", journal.to_string_lossy())))?
++    };
+     Ok([
+-        stamp(&journal)?,
++        journal_stamp,
+         // Opening a read-only SQLite snapshot may create an empty WAL. It
+         // carries no committed data and is equivalent to a missing WAL.
+-        stamp(&wal)?.filter(|stamp| stamp.len != 0),
++        wal.filter(|stamp| stamp.len != 0),
+         stamp(&dir.join("session.json"))?,
+     ])
+ }
