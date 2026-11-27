@@ -1,0 +1,37 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+index d3b2400ab26c1478f76c3999d3faf3058be540d4..d57967811f5dfc0c8f55790caf9f1ab1d2eb7bb9 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -237,11 +237,18 @@ impl TranscriptReplay {
+     }
+ 
+     fn finish(mut self) -> Vec<AppTranscriptMessage> {
+-        for row in &mut self.state.transcript.rows {
++        let mut rows = std::mem::take(&mut self.state.transcript.rows);
++        let subagent_bindings = {
++            // Row finalization no longer needs the replay indexes.
++            let replay = self;
++            replay.subagent_bindings
++        };
++
++        for row in &mut rows {
+             let Some(tool) = &mut row.tool else {
+                 continue;
+             };
+-            let Some(binding) = self.subagent_bindings.get(&tool.call_id) else {
++            let Some(binding) = subagent_bindings.get(&tool.call_id) else {
+                 continue;
+             };
+             if !tool.metadata.is_object() {
+@@ -253,8 +260,9 @@ impl TranscriptReplay {
+                 "session_id": binding.session_id, "session_dir": binding.session_dir,
+             });
+         }
+-        finalize_interrupted_tools(&mut self.state.transcript.rows);
+-        self.state.transcript.rows
++        drop(subagent_bindings);
++        finalize_interrupted_tools(&mut rows);
++        rows
+     }
+ }
+ 
