@@ -1,0 +1,131 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 2c08aa98b0db4810ba59be86c2715be5cf17e392..0c0f4c71e219d07ce003e526ff53335fff271b82 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -150,9 +150,6 @@ impl JournalBackend for Jsonl {
+             blobs,
+         })
+     }
+-    fn description_path(&self, dir: &Path) -> PathBuf {
+-        dir.join(codec::JOURNAL_FILE)
+-    }
+ }
+ 
+ struct PageBoundary {
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 5f8d403a2d0febe75ea1d7d003a79028188545f6..4cb29fa9aa8356f46a4c678d56d5e560ba1c83be 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
+ mod jsonl;
+ mod sqlite;
+ pub(crate) use jsonl::Jsonl;
+-pub(crate) use sqlite::Sqlite;
++pub(crate) use sqlite::{FILE as SQLITE_JOURNAL_FILE, Sqlite};
+ 
+ #[derive(Clone)]
+ pub(crate) struct PrefixHint {
+@@ -95,7 +95,6 @@ pub(crate) trait JournalBackend: Send {
+     /// Caller holds the persistent writer lease. Only recovery may repair a torn tail.
+     fn recover(&mut self, dir: &Path, id: SessionId) -> Result<()>;
+     fn append(&mut self, dir: &Path, record: &JournalRecord) -> Result<Append>;
+-    fn description_path(&self, dir: &Path) -> std::path::PathBuf;
+ }
+ 
+ pub(crate) fn replay_records<T: Default>(
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index bf981c5695d8038c474f0600a64cef794f1dd538..9be0a388484e0c89ed4e856fa2b4f10c21cfd26e 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -3,10 +3,9 @@ use super::*;
+ use anyhow::{Context, ensure};
+ use ring::digest::{Context as HashContext, SHA256};
+ use rusqlite::{Connection, OpenFlags, params};
+-use std::path::PathBuf;
+ mod record;
+ 
+-const FILE: &str = "journal.sqlite";
++pub(crate) const FILE: &str = "journal.sqlite";
+ // Exact schema text of the built-in writer (SQLite drops IF NOT EXISTS).
+ // Anything else, including hand-built compatible tables, uses the seek reader.
+ const WRITER_JOURNAL_SCHEMA: &str = "CREATE TABLE journal (
+@@ -313,9 +312,6 @@ impl JournalBackend for Sqlite {
+             blobs: Vec::new(),
+         })
+     }
+-    fn description_path(&self, dir: &Path) -> PathBuf {
+-        dir.join(FILE)
+-    }
+ }
+ 
+ struct SqliteSnapshot {
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index 82be7a8735a7de4d516426a3684ad3460ba7ee3a..47224a2034ff142d405128e0d3a9cb964883b640 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -64,6 +64,13 @@ struct Writer {
+     _ownership: SessionWriteOwnership,
+ }
+ impl BackendKind {
++    fn description_path(self, dir: &Path) -> PathBuf {
++        dir.join(match self {
++            Self::Jsonl => crate::codec::JOURNAL_FILE,
++            Self::Sqlite => crate::backend::SQLITE_JOURNAL_FILE,
++        })
++    }
++
+     fn backend(self) -> Box<dyn JournalBackend> {
+         match self {
+             Self::Jsonl => Box::new(Jsonl::new()),
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index bae27642c5a026696694b4d2f271fd53dd58a8e5..aeea8252386414602e29f188f36f954273d9f5b1 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -48,7 +48,7 @@ pub(super) fn source_stamp(dir: &Path, kind: BackendKind) -> Result<SourceStamp>
+ }
+ 
+ fn source_stamp_items(dir: &Path, kind: BackendKind) -> Result<[Option<FileStamp>; 3]> {
+-    let journal = kind.backend().description_path(dir);
++    let journal = kind.description_path(dir);
+     let wal = PathBuf::from(format!("{}-wal", journal.to_string_lossy()));
+     Ok([
+         stamp(&journal)?,
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 87905b496ace48438d0f75d3cade488560fc2b9f..fee0ed249cfe2b64ff718bb84ef9b3c05c4fea4d 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -12,7 +12,6 @@ fn check_selected_format(kind: BackendKind, path: &Path) -> Result<()> {
+         BackendKind::Jsonl => BackendKind::Sqlite,
+         BackendKind::Sqlite => BackendKind::Jsonl,
+     }
+-    .backend()
+     .description_path(path);
+     ensure!(
+         !other.try_exists()?,
+@@ -39,7 +38,7 @@ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescr
+     let identity = identity::resolve_session_identity(&path)?;
+     let workspace_path = workspace_dir::workspace_path_from_session_dir(&path)?;
+     let meta = std::fs::metadata(&path)?;
+-    let journal = kind.backend().description_path(&path);
++    let journal = kind.description_path(&path);
+     let mut modified = std::fs::metadata(&journal)
+         .and_then(|m| m.modified())
+         .or_else(|_| meta.modified())?;
+@@ -217,7 +216,7 @@ impl State {
+                 session: session.clone(),
+                 parent_session_id: parent,
+                 workspace_path: workspace,
+-                record_location: Some(self.kind.backend().description_path(&path)),
++                record_location: Some(self.kind.description_path(&path)),
+                 local_path: Some(path),
+                 created_at_ms: 0,
+                 updated_at_ms: 0,
+@@ -243,7 +242,7 @@ impl State {
+                 session: session.clone(),
+                 parent_session_id: key.parent_session_id,
+                 workspace_path: key.workspace,
+-                record_location: Some(self.kind.backend().description_path(&path)),
++                record_location: Some(self.kind.description_path(&path)),
+                 local_path: Some(path),
+                 created_at_ms: 0,
+                 updated_at_ms: 0,
