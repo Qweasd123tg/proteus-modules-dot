@@ -1,0 +1,270 @@
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index 1bd44f4ff5304d6f4bf905328be78d1f720c9875..c92991c2e70e474e012e7c1884e9a1d0c7d3d48d 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -26,7 +26,7 @@ pub(crate) use remote::{
+ };
+ pub use workspace_dir::{decode_workspace_path, encode_workspace_path};
+ pub(crate) mod read_cache {
+-    pub(crate) use super::remote::view::RemoteCacheSource as SourceFingerprint;
++    pub(crate) use super::remote::snapshot::RemoteCacheSource as SourceFingerprint;
+ }
+ pub fn configured_session_storage(
+     config: &AppConfig,
+diff --git a/crates/proteus-core/src/core/session_store/remote/mod.rs b/crates/proteus-core/src/core/session_store/remote/mod.rs
+index 2a9b01a5e9c77e8eca33c2daab7e6dd1edd3dafe..69ffe6c87acef516bf779f2c861dca7328a8c77d 100644
+--- a/crates/proteus-core/src/core/session_store/remote/mod.rs
++++ b/crates/proteus-core/src/core/session_store/remote/mod.rs
+@@ -15,6 +15,7 @@ use std::{
+ 
+ pub(crate) mod catalog;
+ mod plain_history;
++mod prefix;
+ pub(crate) mod prepared;
+ pub(crate) mod snapshot;
+ pub(crate) mod view;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix.rs b/crates/proteus-core/src/core/session_store/remote/prefix.rs
+similarity index 100%
+rename from crates/proteus-core/src/core/session_store/remote/view/prefix.rs
+rename to crates/proteus-core/src/core/session_store/remote/prefix.rs
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs b/crates/proteus-core/src/core/session_store/remote/prefix/packed.rs
+similarity index 94%
+rename from crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
+rename to crates/proteus-core/src/core/session_store/remote/prefix/packed.rs
+index 13f86afbf9fe81d51086f8810cbdb2c3c0cac459..62dd19e8739d7f228f6c3e12c55be8a6bc1bd464 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/prefix/packed.rs
+@@ -12,11 +12,11 @@ use uuid::Uuid;
+ // Packed<C, String> instead and does not trust received fields.
+ #[derive(Serialize)]
+ #[serde(transparent)]
+-pub(in crate::core::session_store::remote::view) struct GeneratedBase64(String);
++pub(in crate::core::session_store::remote) struct GeneratedBase64(String);
+ 
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-pub(in crate::core::session_store::remote::view) struct Packed<C, B = String> {
++pub(in crate::core::session_store::remote) struct Packed<C, B = String> {
+     format: u8,
+     history: B,
+     turns: B,
+@@ -27,7 +27,7 @@ pub(in crate::core::session_store::remote::view) struct Packed<C, B = String> {
+     calls: C,
+ }
+ 
+-pub(in crate::core::session_store::remote::view) type EncodedPrefix<'a> =
++pub(in crate::core::session_store::remote) type EncodedPrefix<'a> =
+     Packed<Cow<'a, HashSet<CallId>>, GeneratedBase64>;
+ 
+ impl<C: Serialize> Packed<C, GeneratedBase64> {
+@@ -57,7 +57,7 @@ impl<C: Serialize> Packed<C, GeneratedBase64> {
+         crate::core::session_store::json_size::encoded_len(&overhead, limit).map(|_| ())
+     }
+ 
+-    pub(in crate::core::session_store::remote::view) fn into_bounded_value(self) -> Option<Value> {
++    pub(in crate::core::session_store::remote) fn into_bounded_value(self) -> Option<Value> {
+         self.fits_bytes(LIMIT)?;
+         // Match the derived field order, including when Map preserves insertion order.
+         let mut object = serde_json::Map::with_capacity(7);
+@@ -203,7 +203,7 @@ impl<'a> PrefixFields<'a> {
+ }
+ 
+ impl PrefixIdentities {
+-    pub(in crate::core::session_store::remote::view) fn encode_cache(
++    pub(in crate::core::session_store::remote) fn encode_cache(
+         &self,
+     ) -> Option<EncodedPrefix<'_>> {
+         PrefixFields {
+@@ -217,7 +217,7 @@ impl PrefixIdentities {
+         .encode()
+     }
+ 
+-    pub(in crate::core::session_store::remote::view) fn into_encoded_cache(
++    pub(in crate::core::session_store::remote) fn into_encoded_cache(
+         self,
+     ) -> Option<EncodedPrefix<'static>> {
+         PrefixFields {
+@@ -231,7 +231,7 @@ impl PrefixIdentities {
+         .encode()
+     }
+ 
+-    pub(in crate::core::session_store::remote::view) fn decode_cache(value: Value) -> Option<Self> {
++    pub(in crate::core::session_store::remote) fn decode_cache(value: Value) -> Option<Self> {
+         let data: Packed<Vec<CallId>> = serde_json::from_value(value).ok()?;
+         if data.format != 1 {
+             return None;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs b/crates/proteus-core/src/core/session_store/remote/prefix/packed/tests.rs
+similarity index 100%
+rename from crates/proteus-core/src/core/session_store/remote/view/prefix/packed/tests.rs
+rename to crates/proteus-core/src/core/session_store/remote/prefix/packed/tests.rs
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index d95be63560b138bbfd8b8af1715ffdabceb9d326..97fd971d1199823a0cea2a29e60a1048ee603380 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -1,5 +1,5 @@
+ //! Fixed-prefix typed cursors over the selected service, never filesystem paths.
+-use super::*;
++use super::{prefix::PrefixIdentities, *};
+ use proteus_contracts::{
+     contracts::{StorageConversation, StorageHistoryPoint, StorageSnapshot},
+     storage::journal::{JournalKind, JournalRecord},
+@@ -23,6 +23,38 @@ impl RemoteJournalCursor {
+     }
+ }
+ 
++/// A cache source identifies the committed prefix, not a particular open handle.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct RemoteCacheSource {
++    pub(crate) snapshot: StorageSnapshot,
++}
++
++impl PartialEq for RemoteCacheSource {
++    fn eq(&self, other: &Self) -> bool {
++        self.snapshot.session == other.snapshot.session
++            && self.snapshot.revision == other.snapshot.revision
++            && self.snapshot.content_sha256 == other.snapshot.content_sha256
++    }
++}
++impl Eq for RemoteCacheSource {}
++
++impl RemoteCacheSource {
++    pub(crate) fn read(store: &RemoteSessionStore) -> Option<Self> {
++        Self::try_read(store).ok()
++    }
++    pub(crate) fn try_read(store: &RemoteSessionStore) -> Result<Self> {
++        Ok(Self {
++            snapshot: store.journal_snapshot()?,
++        })
++    }
++    pub(crate) fn from_cursor(cursor: &RemoteJournalCursor) -> Self {
++        Self {
++            snapshot: cursor.snapshot.clone(),
++        }
++    }
++}
++
+ pub(crate) struct RemoteJournalSnapshot {
+     store: RemoteSessionStore,
+     snapshot: StorageSnapshot,
+@@ -113,11 +145,11 @@ impl RemoteJournalSnapshot {
+         }
+     }
+ 
+-    pub(super) fn scan_display_prefix(&mut self) -> Result<super::view::PrefixIdentities> {
++    pub(super) fn scan_display_prefix(&mut self) -> Result<PrefixIdentities> {
+         if let Some(records) = &mut self.display_records {
+             return records.scan_prefix();
+         }
+-        let mut prefix = super::view::PrefixIdentities::default();
++        let mut prefix = PrefixIdentities::default();
+         self.scan_display(|record| {
+             prefix.visit_owned_prefix(record);
+             Ok(())
+@@ -297,10 +329,10 @@ impl RemoteValidatedRead {
+ 
+     pub(crate) fn open_for_display_if_changed(
+         store: RemoteSessionStore,
+-        cached_source: &super::view::RemoteCacheSource,
++        cached_source: &RemoteCacheSource,
+     ) -> Result<Option<Self>> {
+         let source = store.snapshot()?;
+-        if super::view::RemoteCacheSource::from_cursor(&source.cursor()) == *cached_source {
++        if RemoteCacheSource::from_cursor(&source.cursor()) == *cached_source {
+             return Ok(None);
+         }
+         if let Some(read) = Self::open_projected_display(&store)? {
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+index 2f10f41c9d410a1ed54bedb5de75475cd72aa5e9..ccc5582f659b1d61214ff5a20eb618e2834eebfb 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot/display_records.rs
+@@ -1,7 +1,6 @@
+ //! Rewindable, snapshot-local render input. No replay-only payloads cross this
+ //! buffer. Failure to stage the records leaves the original streaming reader.
+-use super::super::view::PrefixIdentities;
+-use super::{JournalKind, JournalRecord};
++use super::{JournalKind, JournalRecord, PrefixIdentities};
+ use crate::{
+     core::{HistoryMutated, HistoryMutationKind, JournalEntry, ModelResponseOutcome},
+     domain::{PartId, ThreadId, TurnId},
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 5d145873c9302947d0c06a7046d624e933d1cf49..8c9ef16a2a827bfe3a44b9fbfc6c8a837bd15598 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -19,13 +19,11 @@ mod cache;
+ mod committed;
+ mod incremental;
+ pub(crate) use committed::CommittedDisplay;
+-mod prefix;
+ mod publishing;
+ pub(super) use publishing::PublishingTranscript;
+ mod startup_history;
+ mod text_rows;
+-pub(crate) use cache::RemoteCacheSource;
+-pub(crate) use prefix::PrefixIdentities;
++pub(crate) use super::{prefix::PrefixIdentities, snapshot::RemoteCacheSource};
+ use startup_history::StartupHistory;
+ pub(crate) use text_rows::{CompactTextRow, DisplayRows, transcript_role};
+ 
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index ba92900836cd3643969cfac6859cc312db82aeb5..973f7ee0cb85a1feda3083f664315b088b0b09d7 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -6,7 +6,7 @@ use proteus_contracts::{
+     app_protocol::{AppLatestToolState, AppToolState, AppTranscriptBase},
+     contracts::{
+         ModelContextObservation, SessionStorageRequest as Request,
+-        SessionStorageResponse as Response, StorageSnapshot,
++        SessionStorageResponse as Response,
+     },
+     model_standard::CanonicalMessage,
+ };
+@@ -31,35 +31,7 @@ pub(super) use pages::{
+ };
+ use pages::{read_checked_transcript, valid_section, write_transcript_iter};
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize)]
+-#[serde(deny_unknown_fields)]
+-pub(crate) struct RemoteCacheSource {
+-    pub(crate) snapshot: StorageSnapshot,
+-}
+-
+-impl PartialEq for RemoteCacheSource {
+-    fn eq(&self, other: &Self) -> bool {
+-        self.snapshot.session == other.snapshot.session
+-            && self.snapshot.revision == other.snapshot.revision
+-            && self.snapshot.content_sha256 == other.snapshot.content_sha256
+-    }
+-}
+-impl Eq for RemoteCacheSource {}
+-
+ impl RemoteCacheSource {
+-    pub(crate) fn read(store: &RemoteSessionStore) -> Option<Self> {
+-        Self::try_read(store).ok()
+-    }
+-    pub(crate) fn try_read(store: &RemoteSessionStore) -> Result<Self> {
+-        Ok(Self {
+-            snapshot: store.journal_snapshot()?,
+-        })
+-    }
+-    pub(crate) fn from_cursor(cursor: &RemoteJournalCursor) -> Self {
+-        Self {
+-            snapshot: cursor.snapshot.clone(),
+-        }
+-    }
+     pub(crate) fn revision(&self) -> Option<String> {
+         hash(
+             &serde_json::to_value((
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+index a12598b53261d55ba891a747c9c612296afd7514..581bce841fa2ea32977d126fac4e9362eae97356 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+@@ -1,6 +1,7 @@
+ //! Startup-only owner for the independently validated canonical conversation.
+ use super::super::{RemoteSessionStore, plain_history::PlainHistoryMessage};
+-use super::cache::{self, RemoteCacheSource, Section};
++use super::cache::{self, Section};
++use super::RemoteCacheSource;
+ use crate::model_standard::CanonicalMessage;
+ use anyhow::Result;
+ use proteus_contracts::app_protocol::AppContextHistorySummary;
