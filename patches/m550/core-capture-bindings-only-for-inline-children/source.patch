@@ -1,0 +1,26 @@
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index aae4a62158344b5f0854aad22edcb8d8375974a8..c4abd242cb926e5fc7f4b1b5f9863488819bc880 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -148,7 +148,20 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+             inherit_bindings(object, parent, &scope.presets)?;
+         }
+     }
+-    capture_bindings(object, &mut scope);
++    // Binding snapshots are only consumed by inline children. External roles
++    // and the scope returned to a caller use only the catalogue and selection.
++    if object
++        .get("agent_control")
++        .and_then(|control| control.get("roles"))
++        .and_then(Value::as_array)
++        .is_some_and(|roles| {
++            roles
++                .iter()
++                .any(|role| role.get("config").is_some_and(Value::is_object))
++        })
++    {
++        capture_bindings(object, &mut scope);
++    }
+     let Some(control) = object
+         .get_mut("agent_control")
+         .and_then(Value::as_object_mut)
