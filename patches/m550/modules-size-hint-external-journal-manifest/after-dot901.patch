@@ -1,0 +1,21 @@
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 3cafc346470120bd91930f2b4f5bcd3938c15542..b902d6a290f86f9748aecbbebcd37bf0229098dd 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -1,6 +1,6 @@
+ //! Schema-21 JSONL encoding. Kept byte-format compatible with existing sessions.
+ use crate::{
+-    io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read},
++    io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read, bounded_read_with_size_hint},
+     types::*,
+ };
+ use anyhow::{Context, Result, bail, ensure};
+@@ -203,7 +203,7 @@ pub(crate) fn decode_with_witness(
+ fn read_blob(session: &Path, sha256: &str, bytes: u64, path: &Path) -> Result<Vec<u8>> {
+     validate_blob(sha256, path)?;
+     ensure!(bytes <= MAX_PAYLOAD_BYTES as u64, "declared blob exceeds maximum");
+-    bounded_read(&session.join(path), MAX_PAYLOAD_BYTES)
++    bounded_read_with_size_hint(&session.join(path), MAX_PAYLOAD_BYTES, 256 * 1024)
+ }
+ 
+ fn validate_blob(hash: &str, path: &Path) -> Result<()> {
