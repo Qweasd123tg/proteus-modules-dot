@@ -1,0 +1,134 @@
+{
+  "component": "Proteus-harness/Proteus-core",
+  "base_commit": "024fb944a91382026bb2aa5c7b8da65c284d0305",
+  "base_tree": "18187387ab899ab096df8859023c3068531c4f28",
+  "patched_tree": "bba90ac38fa1e134f4774f55cff8f742c7907bef",
+  "prior_selected_stack_tree": "452e66d768959ce5e41f9a3bd56fdd8274b77571",
+  "prior_selected_stack_after_tree": "60a577da99ced3bdb6fb55bfeeb0917bb186cdb4",
+  "stack_scope": "Context apply and inverse restore exact known previous tree incl #926 and #936; this stack was not natively built for this receipt.",
+  "patch_sha256": "0c473901b7e1557f09111ea29823ad40ba15c9d06ecee68039b44d28e9e66203",
+  "toolchain": "rustc 1.95.0 (59807616e1fa2540724bfbac14d7976d7e4a3860)",
+  "cargo_lock_sha256": "4a1bbdfd2f0746cb0a6bf2088c6a11f9cff5f3800181f5ae073d62cfea8784b5",
+  "native_tests": {
+    "stock": {
+      "binary_sha256": "7cfa158caf51ae015ec29401668e2e915d9ef2723e42c22759b7f1e0b8aea1f2",
+      "tests": {
+        "transcript": {
+          "passed": 59,
+          "stdout_sha256": "ebf42884bf08a360b1be2b903c6724b00ca26aaadb2dd5a7dd753fd9d4ca9800"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "7c107308753600aed614970a38e6816af3bddbef075ae9fb8155c3ae5c44e3dd"
+        }
+      }
+    },
+    "owner": {
+      "binary_sha256": "2d40c085461b2a119c1a5136d47378d7a2bee69868cf9d9fff08bf205fcb0f90",
+      "tests": {
+        "transcript": {
+          "passed": 59,
+          "stdout_sha256": "2419c0953393672454d169cfd7cfdf763103fdeb5ac9f77fcd14de746c99268d"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "d3007a79a1663aaf92aa57c253b7aa51975ba573624de3bdc119859556d61cb9"
+        }
+      }
+    }
+  },
+  "witness_fields": [
+    "scan_count",
+    "live_bytes_after_third_scan",
+    "live_bytes_at_fourth_scan_entry",
+    "max_live_bytes_over_scoped_replay",
+    "live_bytes_after_return"
+  ],
+  "witnesses": {
+    "stock": {
+      "0": [
+        2,
+        -1,
+        -1,
+        175,
+        0
+      ],
+      "1": [
+        4,
+        944,
+        944,
+        3939,
+        2620
+      ],
+      "256": [
+        4,
+        74712,
+        74712,
+        305587,
+        179200
+      ],
+      "4096": [
+        4,
+        1188312,
+        1188312,
+        4879027,
+        2867200
+      ]
+    },
+    "owner": {
+      "0": [
+        2,
+        -1,
+        -1,
+        175,
+        0
+      ],
+      "1": [
+        4,
+        944,
+        792,
+        3787,
+        2620
+      ],
+      "256": [
+        4,
+        74712,
+        52680,
+        283555,
+        179200
+      ],
+      "4096": [
+        4,
+        1188312,
+        836040,
+        4526755,
+        2867200
+      ]
+    }
+  },
+  "exact_serialized_output": {
+    "0": {
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "bytes": 2
+    },
+    "1": {
+      "sha256": "b14892ce62d812235bd4e43da58d3769f22c284f5058a1e13008b3d0594a7f61",
+      "bytes": 283
+    },
+    "256": {
+      "sha256": "0b887e03a12c14ac183d70e16cb4251af96744cc83cb4f6e810b851236bd160f",
+      "bytes": 72599
+    },
+    "4096": {
+      "sha256": "9a4a6f8b6baf762d07a3c600aa60bf89b8bc8ec5a3dc63083cc1b9d1212364f3",
+      "bytes": 1166257
+    }
+  },
+  "scope": "Synchronous thread-local net live allocator requests; successful realloc uses new size minus old. Prebuilt strict JournalProjection and its synthetic inputs are outside the meter. Pure in-process requested-call renderer, no model responses or execution. Separate existing transcript and HTTP tests cover executed response visibility, reset, nested/auxiliary cases, and other legitimate behavior. No process PSS measured. Negative mark (-1) means the 2-pass empty control never reaches that marker.",
+  "reproduction": {
+    "runner": "set -eu\nhere=$PWD\n: \"${PROTEUS_TEST_REFERENCE_MODULE:?point to the matching inert fixture executable}\"\n: \"${PROTEUS_TEST_SESSION_STORAGE_MODULE:?point to the matching inert fixture executable}\"\nfor arm in stock owner; do (\n cd \"$arm\"\n c=crates/proteus-core/src\n path=$c/app_server/transcript/journal/tests.rs\n for f in \"$path\" \"$c/lib.rs\"; do cp \"$f\" \"$f.w332-backup\"; done\n cp \"$here/meter.rs\" \"$c/w332_alloc.rs\"\n printf '\\n#[cfg(test)]\\nmod w332_alloc;\\n' >> \"$c/lib.rs\"\n cat \"$here/probe.rs\" >> \"$path\"\n cargo test --offline --locked --release -p proteus-core --lib --no-run -j 4 >\"$here/$arm.build.log\" 2>&1\n grep -F \"($here/$arm/crates/proteus-core)\" \"$here/$arm.build.log\"\n bin=$(sed -nE 's/.*Executable unittests src\\/lib.rs \\(([^)]+)\\).*/\\1/p' \"$here/$arm.build.log\")\n cp \"$bin\" \"$here/$arm-tests\"\n for f in \"$path\" \"$c/lib.rs\"; do mv \"$f.w332-backup\" \"$f\"; done\n rm \"$c/w332_alloc.rs\"\n cd crates/proteus-core\n mkdir -p \"$here/$arm.wire\"\n W332_WITNESS_DIR=\"$here/$arm.wire\" \"$here/$arm-tests\" 'app_server::transcript::' --test-threads=1 --nocapture >\"$here/$arm.test.log\" 2>&1\n \"$here/$arm-tests\" 'app_server::http::tests::' --test-threads=1 --nocapture >\"$here/$arm.api.log\" 2>&1\n); done\n",
+    "allocator": "use std::{alloc::{GlobalAlloc,Layout,System},cell::Cell};\n\n#[derive(Default, Copy, Clone, Debug)]\npub(crate) struct Live {\n    now: isize, pub peak: isize, pub after_prepare: Option<isize>, pub start_render: Option<isize>,\n}\nthread_local! { static LIVE: Cell<Option<Live>> = const { Cell::new(None) }; }\nstruct Alloc;\n#[global_allocator] static COUNT: Alloc = Alloc;\nfn update(f: impl FnOnce(&mut Live)) {\n    let _ = LIVE.try_with(|slot| {\n        if let Some(mut state) = slot.get() {f(&mut state); slot.set(Some(state));}\n    });\n}\nfn change(delta:isize) {\n    update(|s| { s.now += delta; s.peak = s.peak.max(s.now); });\n}\nunsafe impl GlobalAlloc for Alloc {\n    unsafe fn alloc(&self,l:Layout)->*mut u8 {\n        let p=unsafe {System.alloc(l)};\n        if !p.is_null() {change(l.size() as isize);}\n        p\n    }\n    unsafe fn alloc_zeroed(&self,l:Layout)->*mut u8 {\n        let p=unsafe {System.alloc_zeroed(l)};\n        if !p.is_null() {change(l.size() as isize);}\n        p\n    }\n    unsafe fn dealloc(&self,p:*mut u8,l:Layout) {\n        unsafe {System.dealloc(p,l)};\n        change(-(l.size() as isize));\n    }\n    unsafe fn realloc(&self,p:*mut u8,l:Layout,s:usize)->*mut u8 {\n        let p=unsafe {System.realloc(p,l,s)};\n        if !p.is_null() {change(s as isize-l.size() as isize);}\n        p\n    }\n}\npub(crate) fn after_prepare() {update(|s| s.after_prepare=Some(s.now));}\npub(crate) fn start_render() {update(|s| s.start_render=Some(s.now));}\nstruct Reset;\nimpl Drop for Reset { fn drop(&mut self){let _=LIVE.try_with(|s|s.set(None));} }\npub(crate) fn measure<T>(f:impl FnOnce()->T)->(T, Live,isize) {\n    assert!(LIVE.with(|s|s.replace(Some(Live::default()))).is_none());\n    let _guard=Reset;\n    let value=f();\n    let live=LIVE.with(|s|s.get().unwrap());\n    (value,live,live.now)\n}\n",
+    "probe": "\n#[test]\nfn w332_prepared_workflow_index_live_bytes() {\n    use crate::{app_server::transcript::journal::source::transcript_from_scan,\n        contracts::OperationOwner, domain::{ExecutionId, SessionId}};\n    for n in [0, 1, 256, 4096] {\n        let (session, thread, turn, exec)=(SessionId::from_u128(1), ThreadId::from_u128(2),\n            TurnId::from_u128(3), ExecutionId::from_uuid(uuid::Uuid::from_u128(4)));\n        let mut records=vec![record(session,Some(exec),thread,turn,1,JournalEntry::TurnOpened(TurnOpened{\n            intent:None,task:AgentTask::new(\"fixture\",\"/synthetic/workspace\".into()),\n            base_history_revision:0,module_epoch:0,config_snapshot:json!({}),\n        }))];\n        for i in 0..n {\n            let call=ToolCall::new(format!(\"fixture-requested-workflow-call-{i:04}\"),\"fixture\",json!({}));\n            records.push(record(session,Some(exec),thread,turn,(i+2) as u64,\n                JournalEntry::ToolCallRecorded(ToolCallRecorded{\n                    call,phase:ToolCallRecordPhase::Requested{owner:OperationOwner::Workflow},\n                })));\n        }\n        let projection=JournalProjection::build(session,records).expect(\"valid synthetic interrupted journal\");\n        let mut pass=0;\n        let (rows,m,end)=crate::w332_alloc::measure(||transcript_from_scan(|visit| {\n            pass+=1;\n            if pass==4 {crate::w332_alloc::start_render();}\n            for record in &projection.records {visit(record.clone())?;}\n            if pass==3 {crate::w332_alloc::after_prepare();}\n            Ok(())\n        },None).unwrap());\n        assert_eq!(pass,if n==0 {2}else{4});\n        assert_eq!(rows.len(),n);\n        for (i,row) in rows.iter().enumerate() {\n            let tool=row.tool.as_ref().unwrap();\n            assert_eq!(tool.call_id,format!(\"fixture-requested-workflow-call-{i:04}\"));\n            assert_eq!(tool.status,\"interrupted\");\n        }\n        let wire=serde_json::to_vec(&rows).unwrap();\n        let materialized=TranscriptReplay::new(&projection.records,0).render(projection.records.iter(),None);\n        assert_eq!(wire,serde_json::to_vec(&materialized).unwrap());\n        if let Some(dir)=std::env::var_os(\"W332_WITNESS_DIR\") {\n            std::fs::write(std::path::PathBuf::from(dir).join(format!(\"{n}.json\")),wire).unwrap();\n        }\n        eprintln!(\"W332 {n} {pass} {} {} {} {end}\",\n            m.after_prepare.unwrap_or(-1),m.start_render.unwrap_or(-1),m.peak);\n    }\n}\n",
+    "runner_environment": "Supply the matching local inert reference and session-storage fixtures from the existing Core test setup to the runner. Both native binaries are standalone stock/candidate, not full-app releases."
+  }
+}
