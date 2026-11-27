@@ -1,0 +1,49 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..6567db5ddd8ec147cb1cdc528273c707d957062f 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -47,11 +47,16 @@ fn chunk_path(session: &Path, hash: &str) -> Result<PathBuf> {
+ }
+ 
+ fn chunk_file(hash: &str) -> Result<PathBuf> {
++    validate_chunk_hash(hash)?;
++    Ok(Path::new("shared").join(format!("{hash}.bin")))
++}
++
++fn validate_chunk_hash(hash: &str) -> Result<()> {
+     ensure!(
+         hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+         "invalid shared blob hash"
+     );
+-    Ok(Path::new("shared").join(format!("{hash}.bin")))
++    Ok(())
+ }
+ 
+ /// Gear shifts the previous state left one bit for every byte. After 64
+@@ -242,6 +247,7 @@ fn unpack_checked<'a>(
+     // A chunk can occur many times in one payload. Index only ranges in our
+     // output; a later unpack verifies its files independently.
+     let mut verified = HashMap::new();
++    let mut path = session.join("blobs").join("shared");
+     for chunk in &manifest.chunks {
+         let start = bytes.len();
+         ensure!(
+@@ -259,7 +265,9 @@ fn unpack_checked<'a>(
+             }
+             Entry::Vacant(entry) => entry,
+         };
+-        let path = chunk_path(session, &chunk.sha256)?;
++        validate_chunk_hash(&chunk.sha256)?;
++        path.push(&chunk.sha256);
++        path.set_extension("bin");
+         bytes.resize(start + chunk.bytes, 0);
+         let content = &mut bytes[start..];
+         let count = bounded_read_into(&path, MAX_CHUNK, content)?;
+@@ -269,6 +277,7 @@ fn unpack_checked<'a>(
+             "shared blob chunk hash mismatch"
+         );
+         vacant.insert((start, chunk.bytes));
++        path.pop();
+     }
+     ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
+     ensure!(
