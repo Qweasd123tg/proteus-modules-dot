@@ -1,0 +1,111 @@
+{
+  "component": "Proteus-harness/Proteus-core",
+  "base_commit": "024fb944a91382026bb2aa5c7b8da65c284d0305",
+  "base_tree": "18187387ab899ab096df8859023c3068531c4f28",
+  "patched_tree": "789956a1b31c10d042433bdb10083bb63e30a90c",
+  "prior_selected_stack_tree": "cf450da7b06aaf2c7905cfd89b5a99bf87eb26cd",
+  "prior_selected_stack_after_tree": "805bd33c52c937708d01efc31e8307328ac2f6f4",
+  "stack_scope": "Context apply and inverse restore exact known previous tree through #939 (including #927 and #933); this stack was not natively built for this receipt.",
+  "patch_sha256": "a077a8d5c57f58d795d4cff7a451d7075242325dac697320cceccb163d7c780e",
+  "toolchain": "rustc 1.95.0 (59807616e1fa2540724bfbac14d7976d7e4a3860)",
+  "cargo_lock_sha256": "4a1bbdfd2f0746cb0a6bf2088c6a11f9cff5f3800181f5ae073d62cfea8784b5",
+  "native_tests": {
+    "stock": {
+      "binary_sha256": "c45217281a2c4df98cc052fc986addc363cb09697fff38120e426c24516933c2",
+      "tests": {
+        "config_summary": {
+          "passed": 1,
+          "stdout_sha256": "9a5e2a81b77fe6387f4bab2ba5293165dbc384dc0cb70cf89cdcf7c522d0c2ee"
+        },
+        "session_model": {
+          "passed": 10,
+          "stdout_sha256": "3419520f75bdaa96ef83ffd18b3885c7f28b64a33d98cf6f70437bc053eaaf03"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "5c54c5ba90fe141a0cbedcfbb13b175f65dc63f825ebb9885c143d0527b2971e"
+        }
+      }
+    },
+    "owner": {
+      "binary_sha256": "83e9945c9f2d67ce5110431914e1657075469796818cfe4311a0faabc2075352",
+      "tests": {
+        "config_summary": {
+          "passed": 1,
+          "stdout_sha256": "bd90f8c1773b3915cf39556157e7bbf887e43862569ea0597193d2ffef50e844"
+        },
+        "session_model": {
+          "passed": 10,
+          "stdout_sha256": "4541d4e27a9d1d76965eeebedaf8bc3470bf80800a2528d3ca5d9737f1a2f0b3"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "c8a89f6210bf57dd9cf7cb04410497ef3a32bf3b9a8d2af9feba75ada720eba4"
+        }
+      }
+    }
+  },
+  "witness_fields": [
+    "phase_boundary_live_requested_bytes",
+    "whole_isolated_probe_peak_live_requested_bytes",
+    "probe_end_live_requested_bytes"
+  ],
+  "witnesses": {
+    "stock": {
+      "0": [
+        0,
+        868,
+        222
+      ],
+      "5": [
+        3810,
+        5517,
+        1433
+      ],
+      "128": [
+        1086345,
+        1113588,
+        30696
+      ]
+    },
+    "owner": {
+      "0": [
+        0,
+        868,
+        222
+      ],
+      "5": [
+        858,
+        4370,
+        1433
+      ],
+      "128": [
+        21587,
+        1099697,
+        30696
+      ]
+    }
+  },
+  "exact_serialized_output": {
+    "0": {
+      "sha256": "b96a2b04464e861f03282b117e8bf706c7c5a68d3040837922dc72a9a245a65c",
+      "bytes": 240
+    },
+    "5": {
+      "sha256": "5590683aaaac20f6c7fe3007418503c0fbd5708b71e7c7b79d09f69bad83943b",
+      "bytes": 1362
+    },
+    "128": {
+      "sha256": "75a33d250acf59a6866df87810b62d7b1ff8b506ee76b76cd13eee3d1c01e17a",
+      "bytes": 28474
+    }
+  },
+  "scope": "Synchronous synthetic probe of the exact seam: copy identical raw fixture entries as capture, stock retains ToolSpec to display then projects; patched projects before the simulated wait point then displays. Both use real summary helpers, no live tool call, provider, task suspension or physical RSS/PSS measurement. Initial spec creation still occurs in the product. Separate paired native API regressions exercise actual route.",
+  "reproduction": {
+    "runner": "set -eu\nhere=$PWD\n: \"${PROTEUS_TEST_REFERENCE_MODULE:?point to the matching inert fixture executable}\"\n: \"${PROTEUS_TEST_SESSION_STORAGE_MODULE:?point to the matching inert fixture executable}\"\nfor arm in stock owner; do (\n cd \"$arm\"\n c=crates/proteus-core\n path=$c/src/app_server/config_summary.rs\n cp \"$path\" \"$here/$arm.settings.orig\"\n cp \"$c/src/lib.rs\" \"$here/$arm.lib.orig\"\n cp \"$here/meter.rs\" \"$c/src/w335_alloc.rs\"\n printf '\\n#[cfg(test)]\\nmod w335_alloc;\\n' >> \"$c/src/lib.rs\"\n cat \"$here/$arm.probe.rs\" >> \"$path\"\n cargo test --offline --locked --release -p proteus-core --lib --no-run -j 4 >\"$here/$arm.build.log\" 2>&1\n grep -F \"($here/$arm/crates/proteus-core)\" \"$here/$arm.build.log\"\n bin=$(sed -nE 's/.*Executable unittests src\\/lib.rs \\(([^)]+)\\).*/\\1/p' \"$here/$arm.build.log\")\n cp \"$bin\" \"$here/$arm-tests\"\n mv \"$here/$arm.settings.orig\" \"$path\"\n mv \"$here/$arm.lib.orig\" \"$c/src/lib.rs\"\n rm \"$c/src/w335_alloc.rs\"\n cd \"$c\"\nmkdir -p \"$here/$arm.wire\"\n export W335_WITNESS_DIR=\"$here/$arm.wire\"\n \"$here/$arm-tests\" 'app_server::config_summary::' --skip w312_no_such_test --test-threads=1 --nocapture >\"$here/$arm.test.log\" 2>&1\n \"$here/$arm-tests\" 'app_server::session_model::' --test-threads=1 --nocapture >\"$here/$arm.model.log\" 2>&1\n \"$here/$arm-tests\" 'app_server::http::tests::' --test-threads=1 --nocapture >\"$here/$arm.api.log\" 2>&1\n); done\n",
+    "allocator": "use std::{alloc::{GlobalAlloc,Layout,System},cell::Cell};\n\n#[derive(Default, Copy, Clone, Debug)]\npub(crate) struct Live {\n    now: isize, pub peak: isize, pub metadata: Option<isize>, pub statuses: Option<isize>,\n}\nthread_local! { static LIVE: Cell<Option<Live>> = const { Cell::new(None) }; }\nstruct Alloc;\n#[global_allocator] static COUNT: Alloc = Alloc;\nfn update(f: impl FnOnce(&mut Live)) {\n    let _ = LIVE.try_with(|slot| {\n        if let Some(mut state) = slot.get() {f(&mut state); slot.set(Some(state));}\n    });\n}\nfn change(delta:isize) {\n    update(|s| { s.now += delta; s.peak = s.peak.max(s.now); });\n}\nunsafe impl GlobalAlloc for Alloc {\n    unsafe fn alloc(&self,l:Layout)->*mut u8 {\n        let p=unsafe {System.alloc(l)};\n        if !p.is_null() {change(l.size() as isize);}\n        p\n    }\n    unsafe fn alloc_zeroed(&self,l:Layout)->*mut u8 {\n        let p=unsafe {System.alloc_zeroed(l)};\n        if !p.is_null() {change(l.size() as isize);}\n        p\n    }\n    unsafe fn dealloc(&self,p:*mut u8,l:Layout) {\n        unsafe {System.dealloc(p,l)};\n        change(-(l.size() as isize));\n    }\n    unsafe fn realloc(&self,p:*mut u8,l:Layout,s:usize)->*mut u8 {\n        let p=unsafe {System.realloc(p,l,s)};\n        if !p.is_null() {change(s as isize-l.size() as isize);}\n        p\n    }\n}\npub(crate) fn metadata() {update(|s| s.metadata=Some(s.now));}\npub(crate) fn statuses() {update(|s| s.statuses=Some(s.now));}\nstruct Reset;\nimpl Drop for Reset { fn drop(&mut self){let _=LIVE.try_with(|s|s.set(None));} }\npub(crate) fn measure<T>(f:impl FnOnce()->T)->(T, Live,isize) {\n    assert!(LIVE.with(|s|s.replace(Some(Live::default()))).is_none());\n    let _guard=Reset;\n    let value=f();\n    let live=LIVE.with(|s|s.get().unwrap());\n    (value,live,live.now)\n}\n",
+    "stock_probe": "\n#[cfg(test)]\nmod w335_tests {\n    use super::*;\n    use crate::{contracts::ProcessToolOwner, domain::{ToolSafety,ToolSpec}};\n    use serde_json::json;\n\n    #[test]\n    fn w335_summary_projects_tool_snapshot_before_wait() {\n        let empty:AppConfig=serde_json::from_value(json!({})).unwrap();\n        let variants=[\n            (ToolSource::builtin(\"fixture builtin\"),ToolSafety::ReadOnly),\n            (ToolSource::ProviderHosted{provider:\"fixture provider\".into()},ToolSafety::WritesFiles),\n            (ToolSource::Mcp{server:\"\u0442\u0435\u0441\u0442 mcp\".into()},ToolSafety::RunsCommands),\n            (ToolSource::Process{owner:ProcessToolOwner{component_id:\"fixture\".into(),module_id:\"\u043c\u043e\u0434\u0443\u043b\u044c\".into()}},ToolSafety::Network),\n            (ToolSource::Dynamic{origin:\"\u0442\u0435\u0441\u0442\u043e\u0432\u044b\u0439\".into()},ToolSafety::Dangerous),\n        ];\n        for n in [0,5,128] {\n            let mut entries=Vec::new();\n            for i in 0..n {\n                let (source,safety)=&variants[i%variants.len()];\n                let meta=if n>5 {json!({\"extra\":\"\u03bc\".repeat(768),\"nest\":[{\"v\":\"z\".repeat(1024)}]})} else {Value::Null};\n                let schema=if n>5 {json!({\"type\":\"object\",\"properties\":{\"value\":{\"description\":\"\u6587\".repeat(1024),\"enum\":[\"x\".repeat(128),\"y\".repeat(256)]}}})} else {json!({\"type\":\"object\"})};\n                let mut desc=String::with_capacity(512);\n                desc.push_str(if i%2==0 {\"\u043e\u043f\u0438\u0441\u0430\u043d\u0438\u0435\\n\u0434\u0430\u043b\u044c\u0448\u0435\"} else {\"\"});\n                let tool=ToolSpec::new(format!(\"fixture-{i:03}\"),desc,schema,safety.clone())\n                    .with_parallel_tool_calls(i%3==0).with_timeout(123).with_metadata(meta);\n                entries.push((source.clone(),tool));\n            }\n            let expected_section=if entries.is_empty() {\"  (none)\".into()} else {\n                entries.iter().map(|(s,t)|format!(\"  - {} [{} {:?}] {}\",t.name,s.label(),t.safety,t.description)).collect::<Vec<_>>().join(\"\\n\")\n            };\n            let expected_dto=serde_json::to_value(registered_tool_summaries(entries.clone())).unwrap();\n            let ((display,dto),m,end)=crate::w335_alloc::measure(||{\n                let tools=entries.clone();\n                crate::w335_alloc::metadata();\n                let display=render_config_summary(&empty,None,Path::new(\"/synthetic/workspace\"),\n                    PermissionMode::Normal,&tools,crate::core::ModuleEpoch::initial());\n                let dto=registered_tool_summaries(tools);\n                (display,dto)\n            });\n            assert_eq!(display.split_once(\"registered tools:\\n\").unwrap().1,expected_section);\n            assert_eq!(serde_json::to_value(&dto).unwrap(),expected_dto);\n            if let Some(dir)=std::env::var_os(\"W335_WITNESS_DIR\") {\n                std::fs::write(std::path::PathBuf::from(dir).join(format!(\"{n}.json\")),\n                    serde_json::to_vec(&(display,dto)).unwrap()).unwrap();\n            }\n            eprintln!(\"W335 {n} {} {} {end}\",m.metadata.unwrap(),m.peak);\n        }\n    }\n}\n",
+    "owner_probe": "\n#[cfg(test)]\nmod w335_tests {\n    use super::*;\n    use crate::{contracts::ProcessToolOwner, domain::{ToolSafety,ToolSpec}};\n    use serde_json::json;\n\n    #[test]\n    fn w335_summary_projects_tool_snapshot_before_wait() {\n        let empty:AppConfig=serde_json::from_value(json!({})).unwrap();\n        let variants=[\n            (ToolSource::builtin(\"fixture builtin\"),ToolSafety::ReadOnly),\n            (ToolSource::ProviderHosted{provider:\"fixture provider\".into()},ToolSafety::WritesFiles),\n            (ToolSource::Mcp{server:\"\u0442\u0435\u0441\u0442 mcp\".into()},ToolSafety::RunsCommands),\n            (ToolSource::Process{owner:ProcessToolOwner{component_id:\"fixture\".into(),module_id:\"\u043c\u043e\u0434\u0443\u043b\u044c\".into()}},ToolSafety::Network),\n            (ToolSource::Dynamic{origin:\"\u0442\u0435\u0441\u0442\u043e\u0432\u044b\u0439\".into()},ToolSafety::Dangerous),\n        ];\n        for n in [0,5,128] {\n            let mut entries=Vec::new();\n            for i in 0..n {\n                let (source,safety)=&variants[i%variants.len()];\n                let meta=if n>5 {json!({\"extra\":\"\u03bc\".repeat(768),\"nest\":[{\"v\":\"z\".repeat(1024)}]})} else {Value::Null};\n                let schema=if n>5 {json!({\"type\":\"object\",\"properties\":{\"value\":{\"description\":\"\u6587\".repeat(1024),\"enum\":[\"x\".repeat(128),\"y\".repeat(256)]}}})} else {json!({\"type\":\"object\"})};\n                let mut desc=String::with_capacity(512);\n                desc.push_str(if i%2==0 {\"\u043e\u043f\u0438\u0441\u0430\u043d\u0438\u0435\\n\u0434\u0430\u043b\u044c\u0448\u0435\"} else {\"\"});\n                let tool=ToolSpec::new(format!(\"fixture-{i:03}\"),desc,schema,safety.clone())\n                    .with_parallel_tool_calls(i%3==0).with_timeout(123).with_metadata(meta);\n                entries.push((source.clone(),tool));\n            }\n            let expected_section=if entries.is_empty() {\"  (none)\".into()} else {\n                entries.iter().map(|(s,t)|format!(\"  - {} [{} {:?}] {}\",t.name,s.label(),t.safety,t.description)).collect::<Vec<_>>().join(\"\\n\")\n            };\n            let expected_dto=serde_json::to_value(registered_tool_summaries(entries.clone())).unwrap();\n            let ((display,dto),m,end)=crate::w335_alloc::measure(||{\n                let tools=registered_tool_summaries(entries.clone());\n                crate::w335_alloc::metadata();\n                let display=render_config_summary(&empty,None,Path::new(\"/synthetic/workspace\"),\n                    PermissionMode::Normal,&tools,crate::core::ModuleEpoch::initial());\n                let dto=tools;\n                (display,dto)\n            });\n            assert_eq!(display.split_once(\"registered tools:\\n\").unwrap().1,expected_section);\n            assert_eq!(serde_json::to_value(&dto).unwrap(),expected_dto);\n            if let Some(dir)=std::env::var_os(\"W335_WITNESS_DIR\") {\n                std::fs::write(std::path::PathBuf::from(dir).join(format!(\"{n}.json\")),\n                    serde_json::to_vec(&(display,dto)).unwrap()).unwrap();\n            }\n            eprintln!(\"W335 {n} {} {} {end}\",m.metadata.unwrap(),m.peak);\n        }\n    }\n}\n",
+    "runner_environment": "Supply the matching local inert reference and session-storage fixtures from the existing Core test setup to the runner. Both native binaries are standalone stock/candidate, not full-app releases."
+  }
+}
