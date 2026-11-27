@@ -1,0 +1,26 @@
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index aae4a62158344b5f0854aad22edcb8d8375974a8..8d0248f794c4ddc3a4027e0566027dff1f38de8f 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -254,16 +254,11 @@ fn inherit_bindings(
+         .values()
+         .map(|profile| profile.provider.as_str())
+         .collect::<std::collections::BTreeSet<_>>();
+-    let mut components = object
+-        .remove("components")
+-        .map(|value| {
+-            value
+-                .as_object()
+-                .cloned()
+-                .context("components must be an object")
+-        })
+-        .transpose()?
+-        .unwrap_or_default();
++    let mut components = match object.remove("components") {
++        Some(Value::Object(components)) => components,
++        Some(_) => anyhow::bail!("components must be an object"),
++        None => Map::new(),
++    };
+     for (name, inherited) in &parent.components {
+         let models = inherited["exports"]["model"]
+             .as_object()
