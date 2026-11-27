@@ -1,0 +1,41 @@
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index aae4a62158344b5f0854aad22edcb8d8375974a8..3266b8bd73b4b3b27813cbed7b963ebc5c023b83 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -245,6 +245,17 @@ fn capture_bindings(object: &Map<String, Value>, scope: &mut ModelScope) {
+         .unwrap_or_default();
+ }
+ 
++fn same_component_launch(left: &Map<String, Value>, right: &Map<String, Value>) -> bool {
++    let launch_len = |fields: &Map<String, Value>| {
++        fields.len() - usize::from(fields.contains_key("exports"))
++    };
++    launch_len(left) == launch_len(right)
++        && left
++            .iter()
++            .filter(|(name, _)| name.as_str() != "exports")
++            .all(|(name, value)| right.get(name) == Some(value))
++}
++
+ fn inherit_bindings(
+     object: &mut Map<String, Value>,
+     parent: &ModelScope,
+@@ -284,15 +295,10 @@ fn inherit_bindings(
+                 target["exports"]["model"] = serde_json::json!({});
+                 target
+             });
+-            let mut target_launch = target.clone();
+-            target_launch
+-                .as_object_mut()
+-                .context("component must be an object")?
+-                .remove("exports");
+-            let mut inherited_launch = inherited.clone();
+-            inherited_launch.as_object_mut().unwrap().remove("exports");
++            let target_launch = target.as_object().context("component must be an object")?;
++            let inherited_launch = inherited.as_object().unwrap();
+             ensure!(
+-                target_launch == inherited_launch,
++                same_component_launch(target_launch, inherited_launch),
+                 "conflicting model component binding {name:?}"
+             );
+             let exports = target
