@@ -1,0 +1,27 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+index 4898d32da51a5db3503b47eb76a35f6ef53baa27..115e02d5c74bdda0e7b4d85b4ee3bde1cb2a3dd3 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache/pages.rs
+@@ -280,14 +280,18 @@ fn visit_section_impl<T: DeserializeOwned>(
+         index += count;
+         let upper = offset + pages.iter().map(|p| p.rows).sum::<usize>();
+         if upper > start {
+-            let (encoding, bodies) = match pack {
+-                Some(pack) => pack.read(store, pages)?,
++            let (encoding, leaf, bodies) = match pack {
++                Some(pack) => {
++                    let (encoding, bodies) = pack.read(store, pages)?;
++                    (encoding, None, bodies)
++                }
+                 None => (
+                     packs::Encoding::Json,
+-                    vec![super::read_content_value(store, &pages[0].hash)?],
++                    Some(super::read_content_value(store, &pages[0].hash)?),
++                    Vec::new(),
+                 ),
+             };
+-            for (page, body) in pages.iter().zip(bodies) {
++            for (page, body) in pages.iter().zip(leaf.into_iter().chain(bodies)) {
+                 let next = offset + page.rows;
+                 if next > start && offset < end {
+                     let body = encoding.decode(body, page.bytes)?;
