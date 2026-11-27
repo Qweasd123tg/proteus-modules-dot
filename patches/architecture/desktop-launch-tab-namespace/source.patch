@@ -1,0 +1,374 @@
+diff --git a/src/launch.rs b/src/launch.rs
+index 6744f25624517b8f5eccb198a477b3d00347a965..6731d27720c974ae7c1aa77ece1f03b1a4d0a077 100644
+--- a/src/launch.rs
++++ b/src/launch.rs
+@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
+ use anyhow::{Context as _, Result, bail};
+ 
+ use crate::conversations::AgentKind;
++use crate::preferences::{Preferences, TabWorkspace};
+ 
+ #[derive(Clone)]
+ pub enum Target {
+@@ -16,6 +17,16 @@ pub enum Target {
+     },
+ }
+ 
++impl Target {
++    /// Attached servers have no persisted layout namespace.
++    pub(crate) fn tab_workspace(&self, workspace: &Path) -> Option<TabWorkspace> {
++        let Self::Spawn { profile } = self else {
++            return None;
++        };
++        TabWorkspace::new(workspace, profile.as_deref())
++    }
++}
++
+ pub struct LaunchOptions {
+     pub workspace: PathBuf,
+     pub target: Target,
+@@ -126,7 +137,7 @@ impl Launch {
+     /// Restore the server that owns the saved layout before considering recent
+     /// project folders: one server can have chats from several folders open.
+     /// A forced picker and an explicit workspace always keep their meaning.
+-    pub fn restore_workspace(&mut self, preferences: &crate::preferences::Preferences) {
++    pub fn restore_workspace(&mut self, preferences: &Preferences) {
+         if !self.explicit_agent {
+             self.agent = preferences.preferred_agent;
+         }
+@@ -136,9 +147,7 @@ impl Launch {
+                 .as_ref()
+                 .filter(|saved| {
+                     saved.workspace.is_dir()
+-                        && crate::preferences::TabWorkspace::new(&saved.workspace, &self.target)
+-                            .as_ref()
+-                            == Some(*saved)
++                        && self.target.tab_workspace(&saved.workspace).as_ref() == Some(*saved)
+                 })
+                 .map(|saved| saved.workspace.clone())
+                 .or_else(|| {
+@@ -167,7 +176,6 @@ fn anchor_profile(profile: String) -> String {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::preferences::{Preferences, TabWorkspace};
+ 
+     fn parse(args: &[&str]) -> Launch {
+         Launch::parse(args.iter().map(|arg| (*arg).to_owned())).unwrap()
+@@ -196,8 +204,9 @@ mod tests {
+         assert!(launch.workspace.is_none());
+         let mut prefs = Preferences::default();
+         prefs.recent.touch(Path::new(env!("CARGO_MANIFEST_DIR")));
+-        prefs.tabs_workspace =
+-            TabWorkspace::new(Path::new(env!("CARGO_MANIFEST_DIR")), &launch.target);
++        prefs.tabs_workspace = launch
++            .target
++            .tab_workspace(Path::new(env!("CARGO_MANIFEST_DIR")));
+         let mut picker = parse(&["--choose-workspace"]);
+         picker.restore_workspace(&prefs);
+         assert!(picker.workspace.is_none());
+@@ -211,7 +220,7 @@ mod tests {
+         let mut prefs = Preferences::default();
+         prefs.recent.touch(explicit.parent().unwrap());
+         let mut launch = parse(&[explicit.to_str().unwrap(), "--config", "./Cargo.toml"]);
+-        prefs.tabs_workspace = TabWorkspace::new(explicit.parent().unwrap(), &launch.target);
++        prefs.tabs_workspace = launch.target.tab_workspace(explicit.parent().unwrap());
+         launch.restore_workspace(&prefs);
+         assert_eq!(launch.workspace, Some(explicit));
+         let Target::Spawn { profile } = launch.target else {
+@@ -240,13 +249,13 @@ mod tests {
+         let mut prefs = Preferences::default();
+         prefs.recent.touch(&owner);
+         prefs.recent.touch(&other_project);
+-        prefs.tabs_workspace = TabWorkspace::new(&owner, &launch.target);
++        prefs.tabs_workspace = launch.target.tab_workspace(&owner);
+         prefs.tabs.select("chat:project-b-session");
+         launch.restore_workspace(&prefs);
+         assert_eq!(launch.workspace, Some(owner.clone()));
+         assert!(
+             prefs
+-                .tabs_for(&owner, &launch.target)
++                .tabs_for(launch.target.tab_workspace(&owner).as_ref())
+                 .contains("chat:project-b-session")
+         );
+ 
+@@ -255,7 +264,7 @@ mod tests {
+         assert_eq!(other_profile.workspace, Some(other_project.clone()));
+         assert!(
+             !prefs
+-                .tabs_for(&other_project, &other_profile.target)
++                .tabs_for(other_profile.target.tab_workspace(&other_project).as_ref())
+                 .contains("chat:project-b-session")
+         );
+ 
+@@ -318,6 +327,27 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn attached_credentials_never_supply_a_saved_layout_owner() {
++        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
++        let local = parse(&[]).target.tab_workspace(workspace).unwrap();
++        assert_eq!(local.profile, None, "the default local profile is an owner");
++        let remote = parse(&[
++            "--origin",
++            "http://localhost:9",
++            "--token",
++            "never-persist-this",
++        ]);
++        let preferences = Preferences {
++            tabs_workspace: remote.target.tab_workspace(workspace),
++            ..Preferences::default()
++        };
++        assert!(preferences.tabs_workspace.is_none());
++        let encoded = serde_json::to_string(&preferences).unwrap();
++        assert!(!encoded.contains("http://localhost:9"));
++        assert!(!encoded.contains("never-persist-this"));
++    }
++
+     #[test]
+     fn config_selects_proteus_even_when_the_last_driver_was_native_codex() {
+         let mut prefs = Preferences::default();
+diff --git a/src/preferences.rs b/src/preferences.rs
+index 9552703b861995662e8ecd9dc08e172c1edd4e19..ca144206e3e2b998047b7b92f7d749d0383813ec 100644
+--- a/src/preferences.rs
++++ b/src/preferences.rs
+@@ -151,13 +151,10 @@ pub struct TabWorkspace {
+ }
+ 
+ impl TabWorkspace {
+-    pub fn new(workspace: &Path, target: &crate::launch::Target) -> Option<Self> {
+-        let crate::launch::Target::Spawn { profile } = target else {
+-            return None;
+-        };
++    pub(crate) fn new(workspace: &Path, profile: Option<&str>) -> Option<Self> {
+         Some(Self {
+             workspace: workspace.canonicalize().ok()?,
+-            profile: profile.clone(),
++            profile: profile.map(str::to_owned),
+         })
+     }
+ }
+@@ -165,24 +162,19 @@ impl TabWorkspace {
+ impl Preferences {
+     /// Unowned or differently scoped tabs cannot be rehosted into this folder.
+     #[cfg(test)]
+-    pub fn tabs_for(&self, workspace: &Path, target: &crate::launch::Target) -> TabLayout {
+-        self.spaces_for(workspace, target).active_layout().clone()
++    pub fn tabs_for(&self, owner: Option<&TabWorkspace>) -> TabLayout {
++        self.spaces_for(owner).active_layout().clone()
+     }
+ 
+     /// Restore all independent chat areas only in their saved server namespace.
+-    pub fn spaces_for(&self, workspace: &Path, target: &crate::launch::Target) -> ChatSpaces {
+-        self.saved_spaces_for(workspace, target)
+-            .cloned()
+-            .unwrap_or_default()
++    pub fn spaces_for(&self, owner: Option<&TabWorkspace>) -> ChatSpaces {
++        self.saved_spaces_for(owner).cloned().unwrap_or_default()
+     }
+ 
+-    pub(crate) fn saved_spaces_for(
+-        &self,
+-        workspace: &Path,
+-        target: &crate::launch::Target,
+-    ) -> Option<&ChatSpaces> {
+-        let owner = TabWorkspace::new(workspace, target);
+-        (owner.is_some() && owner == self.tabs_workspace).then_some(&self.tabs)
++    pub(crate) fn saved_spaces_for(&self, owner: Option<&TabWorkspace>) -> Option<&ChatSpaces> {
++        owner
++            .is_some_and(|owner| self.tabs_workspace.as_ref() == Some(owner))
++            .then_some(&self.tabs)
+     }
+ }
+ 
+@@ -767,61 +759,28 @@ mod tests {
+     #[test]
+     fn saved_tabs_restore_only_in_their_folder_and_profile() {
+         use super::TabWorkspace;
+-        use crate::launch::Target;
+         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+-        let target = Target::Spawn {
+-            profile: Some("fixture".into()),
+-        };
++        let owner = TabWorkspace::new(workspace, Some("fixture"));
+         let mut prefs = Preferences::default();
+         let mut layout = crate::tabs::TabLayout::default();
+         layout.open("file:relative/source.rs", |_| false);
+         prefs.tabs.save_active(layout);
+         // Ownerless preferences are not guessed into the current server.
+-        assert!(
+-            !prefs
+-                .tabs_for(workspace, &target)
+-                .contains("file:relative/source.rs")
+-        );
+-        prefs.tabs_workspace = TabWorkspace::new(workspace, &target);
+-        assert!(
+-            prefs
+-                .tabs_for(workspace, &target)
+-                .contains("file:relative/source.rs")
+-        );
+-        assert!(
+-            !prefs
+-                .tabs_for(workspace.parent().unwrap(), &target)
+-                .contains("file:relative/source.rs")
+-        );
+-        assert!(
+-            !prefs
+-                .tabs_for(workspace, &Target::Spawn { profile: None })
+-                .contains("file:relative/source.rs")
+-        );
+-        let attached = Target::Attach {
+-            origin: "http://localhost:9".into(),
+-            token: "never-persist-this".into(),
+-        };
+-        assert!(TabWorkspace::new(workspace, &attached).is_none());
+-        assert!(
+-            !prefs
+-                .tabs_for(workspace, &attached)
+-                .contains("file:relative/source.rs")
+-        );
++        let tab = "file:relative/source.rs";
++        assert!(!prefs.tabs_for(owner.as_ref()).contains(tab));
++        prefs.tabs_workspace = owner.clone();
++        assert!(prefs.tabs_for(owner.as_ref()).contains(tab));
++        let other_folder = TabWorkspace::new(workspace.parent().unwrap(), Some("fixture"));
++        assert!(!prefs.tabs_for(other_folder.as_ref()).contains(tab));
++        let default_profile = TabWorkspace::new(workspace, None);
++        assert!(!prefs.tabs_for(default_profile.as_ref()).contains(tab));
++        assert!(!prefs.tabs_for(None).contains(tab));
+         let encoded = serde_json::to_string(&prefs).unwrap();
+-        assert!(!encoded.contains("never-persist-this"));
+         let reopened: Preferences = serde_json::from_str(&encoded).unwrap();
+-        assert!(
+-            reopened
+-                .tabs_for(workspace, &target)
+-                .contains("file:relative/source.rs")
+-        );
++        assert!(reopened.tabs_for(owner.as_ref()).contains(tab));
+         // Canonically equivalent folder names share the layout.
+-        assert!(
+-            reopened
+-                .tabs_for(&workspace.join("."), &target)
+-                .contains("file:relative/source.rs")
+-        );
++        let alias = TabWorkspace::new(&workspace.join("."), Some("fixture"));
++        assert!(reopened.tabs_for(alias.as_ref()).contains(tab));
+     }
+ 
+     #[test]
+diff --git a/src/preferences/chat_spaces_tests.rs b/src/preferences/chat_spaces_tests.rs
+index f8be1b4c4f8be423db527c94383716fb90b99bc1..bf44ee5f2696fb1c49b4ec9acf89a2c98e86a3a3 100644
+--- a/src/preferences/chat_spaces_tests.rs
++++ b/src/preferences/chat_spaces_tests.rs
+@@ -3,11 +3,9 @@ use super::*;
+ #[test]
+ fn saved_chat_areas_restore_together_only_in_their_namespace() {
+     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+-    let target = crate::launch::Target::Spawn {
+-        profile: Some("areas".into()),
+-    };
++    let owner = TabWorkspace::new(workspace, Some("areas"));
+     let mut prefs = Preferences::default();
+-    prefs.tabs_workspace = TabWorkspace::new(workspace, &target);
++    prefs.tabs_workspace = owner.clone();
+     prefs.tabs.select("chat:/first");
+     let mut first = prefs.tabs.active_layout().clone();
+     first.open("files:first.rs", |_| true);
+@@ -21,37 +19,22 @@ fn saved_chat_areas_restore_together_only_in_their_namespace() {
+     );
+     assert_eq!(
+         restored
+-            .tabs_for(workspace, &target)
++            .tabs_for(owner.as_ref())
+             .chats()
+             .collect::<Vec<_>>(),
+         ["codex:second"]
+     );
+-    let mut areas = restored.spaces_for(workspace, &target);
++    let mut areas = restored.spaces_for(owner.as_ref());
+     areas.select("chat:/first");
+     assert_eq!(
+         serde_json::to_value(areas.active_layout()).unwrap(),
+         serde_json::to_value(&first).unwrap()
+     );
+-    let other = crate::launch::Target::Spawn {
+-        profile: Some("other".into()),
+-    };
+-    assert!(restored.spaces_for(workspace, &other).is_empty());
+-    assert!(
+-        restored
+-            .spaces_for(workspace.parent().unwrap(), &target)
+-            .is_empty()
+-    );
+-    assert!(
+-        restored
+-            .spaces_for(
+-                workspace,
+-                &crate::launch::Target::Attach {
+-                    origin: "http://localhost:9".into(),
+-                    token: "unpersisted".into()
+-                }
+-            )
+-            .is_empty()
+-    );
++    let other = TabWorkspace::new(workspace, Some("other"));
++    assert!(restored.spaces_for(other.as_ref()).is_empty());
++    let other_folder = TabWorkspace::new(workspace.parent().unwrap(), Some("areas"));
++    assert!(restored.spaces_for(other_folder.as_ref()).is_empty());
++    assert!(restored.spaces_for(None).is_empty());
+ }
+ 
+ #[test]
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index be78aa9b96ff3f829d2099026b2674a6987f7bc7..b6e52894e466c0ab406b8ec8a9e0e9f06cc72b27 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -188,12 +188,13 @@ impl Workspace {
+         cx: &mut Context<Self>,
+     ) -> Self {
+         let workspace_path = options.workspace.clone();
++        let owner = options.target.tab_workspace(&workspace_path);
+         let spaces = if options.startup == StartupIntent::Fresh {
+             ChatSpaces::default()
+         } else {
+-            super::prefs::current(cx).spaces_for(&workspace_path, &options.target)
++            super::prefs::current(cx).spaces_for(owner.as_ref())
+         };
+-        let windows = WindowGroup::new(&workspace_path, &options.target);
++        let windows = WindowGroup::new(owner);
+         let mut workspace = Self::empty(
+             workspace_path.clone(),
+             options.target.clone(),
+diff --git a/src/ui/workspace/startup.rs b/src/ui/workspace/startup.rs
+index b0e1ebe5334ec014613783282159c0ef9a663d04..d6d1aaa22e9732bde406e5b12bba17715c13ed79 100644
+--- a/src/ui/workspace/startup.rs
++++ b/src/ui/workspace/startup.rs
+@@ -48,7 +48,10 @@ impl Preparation {
+     ) -> Option<Self> {
+         let workspace = launch.workspace.clone()?;
+         let saved = preferences
+-            .and_then(|preferences| preferences.saved_spaces_for(&workspace, &launch.target))
++            .and_then(|preferences| {
++                let owner = launch.target.tab_workspace(&workspace);
++                preferences.saved_spaces_for(owner.as_ref())
++            })
+             .map(BootLayout::from_spaces)
+             .unwrap_or_default();
+         let options = LaunchOptions {
+diff --git a/src/ui/workspace/windows.rs b/src/ui/workspace/windows.rs
+index c2c83e2457a60674781a8afbc2fdc95b2367af26..0bb9f0a07c72eb66a68e5730451bd25262d77077 100644
+--- a/src/ui/workspace/windows.rs
++++ b/src/ui/workspace/windows.rs
+@@ -35,9 +35,9 @@ struct Group {
+ }
+ 
+ impl WindowGroup {
+-    pub(super) fn new(workspace: &std::path::Path, target: &crate::launch::Target) -> Self {
++    pub(super) fn new(owner: Option<TabWorkspace>) -> Self {
+         Self(Rc::new(RefCell::new(Group {
+-            owner: TabWorkspace::new(workspace, target),
++            owner,
+             ..Group::default()
+         })))
+     }
