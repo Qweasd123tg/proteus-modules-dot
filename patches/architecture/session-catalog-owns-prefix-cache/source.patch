@@ -1,0 +1,188 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..82783986fae3d31ca98d1564d0f1eb4f97d8e98a 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -52,7 +52,7 @@ struct State {
+     snapshot_order: VecDeque<String>,
+     catalog: HashMap<SessionLocator, catalog::CachedSummary>,
+     catalog_order: VecDeque<SessionLocator>,
+-    prefixes: HashMap<SessionLocator, views::PrefixCache>,
++    prefixes: HashMap<SessionLocator, catalog::PrefixCache>,
+     prefix_order: VecDeque<SessionLocator>,
+ }
+ struct Writer {
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 10db88af44c3196caef77a904ad8cb2af246f8a6..be7835bae59d8fbdb26e73423b1cd9cd9b4a3a2d 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -67,6 +67,26 @@ pub(super) struct CachedSummary {
+     summary: StorageSessionSummary,
+ }
+ 
++#[derive(Clone)]
++pub(super) struct PrefixCache {
++    pub stamps: SourceStamp,
++    pub revision: StorageRevision,
++    pub hint: crate::backend::PrefixHint,
++    pub blob_digest: Option<durable::BlobStampDigest>,
++}
++
++impl PrefixCache {
++    pub(super) fn valid_at(&self, dir: &Path, stamps: &SourceStamp) -> bool {
++        &self.stamps == stamps
++            && self.blob_digest.is_some_and(|digest| {
++                durable::blob_stamps(dir)
++                    .as_ref()
++                    .map(durable::blob_stamp_digest)
++                    == Some(digest)
++            })
++    }
++}
++
+ /// Authority for a resident fold starts at a verified replay and advances
+ /// only across this writer's own successful appends.
+ pub(super) struct WriterHead {
+@@ -99,6 +119,10 @@ impl WriterHead {
+ }
+ 
+ impl State {
++    fn remember_prefix(&mut self, session: SessionLocator, cache: PrefixCache) {
++        remember_catalog_entry(&mut self.prefixes, &mut self.prefix_order, session, cache);
++    }
++
+     pub(super) fn close_writer(&mut self, session: &SessionLocator, writer: Writer) {
+         let Writer {
+             backend,
+@@ -129,7 +153,7 @@ impl State {
+     fn catalog_before_sqlite_close(
+         &self,
+         session: &SessionLocator,
+-    ) -> Option<(PathBuf, super::views::PrefixCache, StorageSessionSummary)> {
++    ) -> Option<(PathBuf, PrefixCache, StorageSessionSummary)> {
+         if !matches!(self.kind, BackendKind::Sqlite) {
+             return None;
+         }
+@@ -148,7 +172,7 @@ impl State {
+         dir: &Path,
+         descriptor: &StorageSessionDescriptor,
+         stamps: &SourceStamp,
+-    ) -> Option<super::views::PrefixCache> {
++    ) -> Option<PrefixCache> {
+         let (summary, prefix) = durable::load(dir, descriptor, stamps)?;
+         self.remember_prefix(descriptor.session.clone(), prefix.clone());
+         self.remember_summary(stamps.clone(), summary);
+@@ -159,7 +183,7 @@ impl State {
+         &mut self,
+         dir: &Path,
+         summary: StorageSessionSummary,
+-        prefix: &super::views::PrefixCache,
++        prefix: &PrefixCache,
+         blobs: durable::BlobStamps,
+     ) {
+         durable::save(dir, &summary, prefix, blobs);
+@@ -215,7 +239,7 @@ impl State {
+ 
+ // Each resident has exactly one queue entry. Only a refresh can already
+ // be in the queue, and only a new admission may evict a resident.
+-pub(super) fn remember_catalog_entry<V>(
++fn remember_catalog_entry<V>(
+     entries: &mut HashMap<SessionLocator, V>,
+     order: &mut VecDeque<SessionLocator>,
+     session: SessionLocator,
+@@ -240,7 +264,7 @@ struct CatalogRead {
+     blobs: Option<durable::BlobStamps>,
+ }
+ 
+-type Projection = (StorageSessionSummary, super::views::PrefixCache);
++type Projection = (StorageSessionSummary, PrefixCache);
+ 
+ impl CatalogRead {
+     fn replay(&self, kind: BackendKind, dir: &Path) -> Result<Projection> {
+@@ -263,7 +287,7 @@ impl CatalogRead {
+                 (fold, hint)
+             }
+         };
+-        let prefix = super::views::PrefixCache {
++        let prefix = PrefixCache {
+             stamps: self.stamps.clone(),
+             revision: fold.revision(),
+             hint,
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index a5c72ed4e6c9a7f5993bd13d2b83ea08ec9d4414..fdbb0ffd538fc147da911b1644d3f50a1fede3be 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -222,7 +222,7 @@ pub(super) fn load(
+     dir: &Path,
+     descriptor: &StorageSessionDescriptor,
+     stamps: &SourceStamp,
+-) -> Option<(StorageSessionSummary, super::super::views::PrefixCache)> {
++) -> Option<(StorageSessionSummary, PrefixCache)> {
+     let bytes = crate::io::bounded_read(&dir.join(FILE), MAX_BYTES).ok()?;
+     let Envelope {
+         checksum: expected,
+@@ -244,7 +244,7 @@ pub(super) fn load(
+     {
+         return None;
+     }
+-    let prefix = super::super::views::PrefixCache {
++    let prefix = PrefixCache {
+         stamps: index.stamps,
+         revision: index.revision,
+         hint: crate::backend::PrefixHint {
+@@ -286,7 +286,7 @@ fn encode(data: &Index) -> Result<Vec<u8>> {
+ pub(super) fn save(
+     dir: &Path,
+     summary: &StorageSessionSummary,
+-    prefix: &super::super::views::PrefixCache,
++    prefix: &PrefixCache,
+     blobs: BlobStamps,
+ ) {
+     let result = (|| -> Result<()> {
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 9bf817b86dd61b90470ee147d00433f7ebeedff8..ab8b4e733793e81be50efa62c89ea0d581ab4f2f 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -114,7 +114,7 @@ impl State {
+             && catalog::durable::matches_blob_stamps(&dir, &blobs) == Some(true)
+             && catalog::source_stamp(&dir, self.kind)? == stamps
+         {
+-            let prefix = views::PrefixCache {
++            let prefix = catalog::PrefixCache {
+                 stamps,
+                 revision: identity.revision,
+                 hint: crate::backend::PrefixHint {
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 863dda90e6e3cbedbef3cf47be3b54d458ab49f6..a38e23e8b9212e2e01b01d8d969cc3b2f050c536 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -1,29 +1,7 @@
+-use super::*;
++use super::{*, catalog::PrefixCache};
+ use crate::backend::{PrefixHint, replay_records};
+ 
+-#[derive(Clone)]
+-pub(super) struct PrefixCache {
+-    pub stamps: catalog::SourceStamp,
+-    pub revision: StorageRevision,
+-    pub hint: PrefixHint,
+-    pub blob_digest: Option<catalog::durable::BlobStampDigest>,
+-}
+-
+-impl PrefixCache {
+-    pub fn valid_at(&self, dir: &Path, stamps: &catalog::SourceStamp) -> bool {
+-        &self.stamps == stamps
+-            && self.blob_digest.is_some_and(|digest| {
+-                catalog::durable::blob_stamps(dir)
+-                    .as_ref()
+-                    .map(catalog::durable::blob_stamp_digest)
+-                    == Some(digest)
+-            })
+-    }
+-}
+ impl State {
+-    pub(super) fn remember_prefix(&mut self, session: SessionLocator, cache: PrefixCache) {
+-        catalog::remember_catalog_entry(&mut self.prefixes, &mut self.prefix_order, session, cache);
+-    }
+     pub(super) fn prepare_snapshot(&mut self, session: SessionLocator) -> Result<SnapshotState> {
+         let dir = self.checked_path(&session)?;
+         let stamps = catalog::source_stamp(&dir, self.kind)?;
