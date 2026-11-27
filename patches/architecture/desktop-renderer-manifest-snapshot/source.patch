@@ -1,0 +1,570 @@
+diff --git a/src/ui/chat/replies.rs b/src/ui/chat/replies.rs
+index 39f6abc63aa313b65b47c8626474b9a99c064f9c..390085b712d5af3df32c1c61fcc74e97bf52f9cd 100644
+--- a/src/ui/chat/replies.rs
++++ b/src/ui/chat/replies.rs
+@@ -43,12 +43,13 @@ impl Replies {
+         window: &mut Window,
+         cx: &mut Context<Chat>,
+     ) -> Part {
+-        let Some(renderer) = content::format(media_type, cx) else {
++        let Some(selected) = content::format(media_type, cx) else {
+             // Plain text is already shared by the transcript entry. Only
+             // renderer views carry state worth retaining between frames.
+             self.0.remove(&key);
+             return Part::Plain(text.clone());
+         };
++        let renderer = selected.id;
+         let languages = content::languages(cx);
+         if let Some(reply) = self.0.get_mut(&key)
+             && reply.renderer == renderer
+@@ -71,8 +72,11 @@ impl Replies {
+         };
+         let host = Host::new(workspace, renderer).for_chat(cx.weak_entity(), session);
+         let host = if readonly { host.content_only() } else { host };
+-        let view =
+-            cx.new(|cx| content::ContentView::body(host, key.to_string(), payload, window, cx));
++        let Some(view) = content::ContentView::body(host, selected, key.to_string(), payload, window, cx)
++        else {
++            self.0.remove(&key);
++            return Part::Plain(text.clone());
++        };
+         let changes = cx.observe(&view, move |chat, _, cx| chat.remeasure_row(key, cx));
+         let resize = cx.subscribe(&view, move |chat, _, _: &content::WillResize, cx| {
+             if let Some(row) = chat.row_of(key) {
+diff --git a/src/ui/extensions/declarative/content.rs b/src/ui/extensions/declarative/content.rs
+index 9e28cac79a226c10d68bd8726bc41487d296ff0d..58c1ebb076eff35ddcaac13d6bc6cd060ae62a8c 100644
+--- a/src/ui/extensions/declarative/content.rs
++++ b/src/ui/extensions/declarative/content.rs
+@@ -9,57 +9,64 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+ use super::{code_block, view::DeclarativeView};
++use crate::declarative::manifest::ContentSurface;
+ use crate::declarative::protocol::{Content, ContentSource, SurfaceKind};
+-use crate::ui::extensions::Host;
++use crate::ui::extensions::{self, Host, Manifest};
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::kit::Hint as _;
+ 
++/// The descriptor carries registrations from the same catalog generation.
++fn content_entries(
++    ordered: Vec<&'static Manifest>,
++    enabled: impl Fn(&str) -> bool,
++) -> impl Iterator<Item = (&'static Manifest, &'static ContentSurface)> {
++    ordered
++        .into_iter()
++        .filter(move |manifest| enabled(manifest.id))
++        .filter_map(|manifest| Some((manifest, manifest.content?)))
++}
++
++fn enabled_content(
++    cx: &App,
++) -> impl Iterator<Item = (&'static Manifest, &'static ContentSurface)> + '_ {
++    content_entries(extensions::ordered(cx), move |id| {
++        extensions::is_enabled(id, cx)
++    })
++}
++
+ /// Enabled contributors in the user's extension order; the first claimant
+ /// wins a duplicate language registration deterministically.
+-fn language_entries(cx: &App) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+-    crate::ui::extensions::ordered(cx)
+-        .into_iter()
+-        .filter(move |manifest| crate::ui::extensions::is_enabled(manifest.id, cx))
+-        .flat_map(|manifest| {
+-            super::installed(manifest.id)
+-                .into_iter()
+-                .filter_map(|extension| extension.manifest.surfaces.content.as_ref())
+-                .flat_map(move |content| {
+-                    content
+-                        .languages
+-                        .iter()
+-                        .map(move |language| (language.as_str(), manifest.id))
+-                })
+-        })
++pub(super) fn language_entries(
++    cx: &App,
++) -> impl Iterator<Item = (&'static str, &'static Manifest)> + '_ {
++    enabled_content(cx).flat_map(|(manifest, content)| {
++        content
++            .languages
++            .iter()
++            .map(move |language| (language.as_str(), manifest))
++    })
+ }
+ 
+ pub(in crate::ui) fn languages(cx: &App) -> Vec<(&'static str, &'static str)> {
+-    language_entries(cx).collect()
++    language_entries(cx).map(|(name, manifest)| (name, manifest.id)).collect()
+ }
+ 
+-pub(in crate::ui) fn language_renderer(language: &str, cx: &App) -> Option<&'static str> {
++pub(super) fn language_renderer(language: &str, cx: &App) -> Option<&'static Manifest> {
+     language_entries(cx)
+         .find(|(name, _)| *name == language)
+-        .map(|(_, id)| id)
++        .map(|(_, manifest)| manifest)
+ }
+ 
+ /// Full-body contributors use an explicit media type rather than a package id.
+-pub(in crate::ui) fn format(media_type: &str, cx: &App) -> Option<&'static str> {
+-    crate::ui::extensions::ordered(cx)
+-        .into_iter()
+-        .filter(|manifest| crate::ui::extensions::is_enabled(manifest.id, cx))
+-        .find_map(|manifest| {
+-            super::installed(manifest.id)?
+-                .manifest
+-                .surfaces
+-                .content
+-                .as_ref()?
+-                .formats
+-                .iter()
+-                .any(|format| format == media_type)
+-                .then_some(manifest.id)
+-        })
++pub(in crate::ui) fn format(media_type: &str, cx: &App) -> Option<&'static Manifest> {
++    enabled_content(cx).find_map(|(manifest, content)| {
++        content
++            .formats
++            .iter()
++            .any(|format| format == media_type)
++            .then_some(manifest)
++    })
+ }
+ 
+ fn populate_context(value: &mut serde_json::Value, cx: &App) {
+@@ -153,11 +160,12 @@ pub(in crate::ui) struct ContentView {
+ }
+ 
+ impl ContentView {
+-    pub(in crate::ui) fn new(
++    fn new(
++        runtime: Entity<super::Runtime>,
+         host: Host,
+         id: String,
+         mut content: Content,
+-        _fence: Arc<str>,
++        body: bool,
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) -> Self {
+@@ -165,7 +173,6 @@ impl ContentView {
+         let content = Arc::new(content);
+         let extension = host.extension();
+         let lifetime = host.runtime_scope().lifetime;
+-        let runtime = super::runtime(&host, window, cx).expect("registered content extension");
+         let layout_ready = crate::ui::layout_readiness::Token::default();
+         let rendered = cx.new(|cx| {
+             let mut view = DeclarativeView::with_content(
+@@ -190,7 +197,7 @@ impl ContentView {
+             extension,
+             lifetime,
+             show_source: false,
+-            body: false,
++            body,
+             layout_ready,
+         }
+     }
+@@ -202,78 +209,80 @@ impl ContentView {
+         }
+     }
+ 
++    fn mount(
++        host: Host,
++        selected: &'static Manifest,
++        id: String,
++        content: Content,
++        body: bool,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> Option<Entity<Self>> {
++        let runtime = super::content_runtime(&host, selected, window, cx)?;
++        Some(cx.new(|cx| Self::new(runtime, host, id, content, body, window, cx)))
++    }
++
+     /// Full-body content uses the surrounding view's layout and actions.
+     pub(in crate::ui) fn body(
+         host: Host,
++        selected: &'static Manifest,
+         id: String,
+         content: Content,
+         window: &mut Window,
+-        cx: &mut Context<Self>,
+-    ) -> Self {
+-        let mut view = Self::new(host, id, content, Arc::from(""), window, cx);
+-        view.body = true;
+-        view
++        cx: &mut App,
++    ) -> Option<Entity<Self>> {
++        Self::mount(host, selected, id, content, true, window, cx)
+     }
+ 
+     /// Nested content routing is generic; a renderer never names a package.
+     pub(super) fn child(
+         host: Host,
++        selected: &'static Manifest,
+         id: String,
+         language: &str,
+         source: &str,
+         body: bool,
+         window: &mut Window,
+         cx: &mut App,
+-    ) -> Entity<Self> {
+-        let view = Self::child_with_context(
+-            host,
++    ) -> Option<Entity<Self>> {
++        Self::mount(
++            host.with_extension(selected.id),
++            selected,
+             id,
+-            language,
+-            source,
+-            serde_json::Value::Null,
++            Self::child_content(language, source, serde_json::Value::Null),
++            body,
+             window,
+             cx,
+-        );
+-        view.update(cx, |view, _| view.body = body);
+-        view
++        )
+     }
+ 
+     pub(super) fn inline(
+         host: Host,
++        selected: &'static Manifest,
+         id: String,
+         language: &str,
+         source: &str,
+         window: &mut Window,
+         cx: &mut App,
+     ) -> Option<Entity<Self>> {
+-        let extension = language_renderer(language, cx)?;
+-        Some(Self::child_with_context(
+-            host.with_extension(extension),
++        Self::mount(
++            host.with_extension(selected.id),
++            selected,
+             id,
+-            language,
+-            source,
+-            serde_json::json!({"presentation":"inline"}),
++            Self::child_content(language, source, serde_json::json!({"presentation":"inline"})),
++            false,
+             window,
+             cx,
+-        ))
++        )
+     }
+ 
+-    fn child_with_context(
+-        host: Host,
+-        id: String,
+-        language: &str,
+-        source: &str,
+-        context: serde_json::Value,
+-        window: &mut Window,
+-        cx: &mut App,
+-    ) -> Entity<Self> {
+-        let content = Content {
++    fn child_content(language: &str, source: &str, context: serde_json::Value) -> Content {
++        Content {
+             language: language.into(),
+             source: source.into(),
+             context,
+             source_revision: Some(0),
+-        };
+-        cx.new(|cx| Self::new(host, id, content, Arc::from(""), window, cx))
++        }
+     }
+ 
+     /// Inline content consumes the accepted atomic SVG directly, without the
+@@ -457,30 +466,30 @@ impl FormattedText {
+ impl Render for FormattedText {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         use crate::ui::kit::SelectionCopyMenu as _;
+-        let contributor = format(&self.format, cx);
++        let selected = format(&self.format, cx);
++        let contributor = selected.map(|manifest| manifest.id);
+         if self.contributor != contributor {
+-            self.view = contributor.map(|id| {
++            self.view = selected.and_then(|selected| {
+                 let content = Content {
+                     language: self.format.clone(),
+                     source: self.source.to_string().into(),
+                     context: serde_json::Value::Null,
+                     source_revision: Some(0),
+                 };
+-                cx.new(|cx| {
+-                    ContentView::body(
+-                        Host::new(self.workspace.clone(), id),
+-                        "text".into(),
+-                        content,
+-                        window,
+-                        cx,
+-                    )
+-                })
++                ContentView::body(
++                    Host::new(self.workspace.clone(), selected.id),
++                    selected,
++                    "text".into(),
++                    content,
++                    window,
++                    cx,
++                )
+             });
+             self.changes = self
+                 .view
+                 .as_ref()
+                 .map(|view| cx.observe(view, |_, _, cx| cx.notify()));
+-            self.contributor = contributor;
++            self.contributor = self.view.as_ref().and(contributor);
+         }
+         div()
+             .w_full()
+diff --git a/src/ui/extensions/declarative/content/tests.rs b/src/ui/extensions/declarative/content/tests.rs
+index 339d22b0290e469f4fd1538ccc9af1c1065e48e7..a6663c5c0dffb9ce50c7c9d108da216d2d83ea0e 100644
+--- a/src/ui/extensions/declarative/content/tests.rs
++++ b/src/ui/extensions/declarative/content/tests.rs
+@@ -1,6 +1,77 @@
+-use super::{Content, updated_content};
++use super::{Content, Manifest, content_entries, updated_content};
++use crate::declarative::manifest::Installed;
+ use serde_json::json;
+ 
++fn renderer(id: &str, language: &str, format: &str) -> &'static Manifest {
++    super::super::entry(Installed {
++        dir: id.into(),
++        revision: 0,
++        manifest: serde_json::from_value(json!({
++            "protocol": 4,
++            "id": id,
++            "title": id,
++            "command": ["never-start"],
++            "surfaces": {"content": {"languages": [language], "formats": [format]}}
++        }))
++        .unwrap(),
++    })
++    .manifest
++}
++
++#[test]
++fn renderer_registration_uses_the_ordered_catalog_snapshot() {
++    let first = renderer("first", "fixture", "text/x-fixture");
++    let second = renderer("second", "fixture", "text/x-fixture");
++    let replacement = renderer("first", "new-language", "text/x-new");
++    let registrations = |ordered: Vec<&'static Manifest>, disabled: Option<&'static str>| {
++        content_entries(ordered, move |id| Some(id) != disabled)
++            .map(|(id, content)| {
++                (
++                    id.id,
++                    content.languages[0].as_str(),
++                    content.formats[0].as_str(),
++                )
++            })
++            .collect::<Vec<_>>()
++    };
++
++    // No runtime registry lookup is needed; a second generation cannot
++    // replace the registration attached to an already captured descriptor.
++    assert_eq!(
++        registrations(vec![second, first], None),
++        [
++            ("second", "fixture", "text/x-fixture"),
++            ("first", "fixture", "text/x-fixture"),
++        ]
++    );
++    assert_eq!(
++        registrations(vec![second, first], Some("second")),
++        [("first", "fixture", "text/x-fixture")]
++    );
++    assert_eq!(
++        registrations(vec![second, replacement], Some("second")),
++        [("first", "new-language", "text/x-new")]
++    );
++}
++
++#[::core::prelude::v1::test]
++fn withdrawn_catalog_registration_cannot_mount_a_renderer() {
++    use super::{ContentView, Host};
++    use gpui_kit::WeakEntity;
++
++    let selected = renderer("withdrawn-content-fixture", "fixture", "text/x-fixture");
++    let mut app = ::gpui::TestAppContext::single();
++    app.update(|cx| {
++        gpui_kit::init(cx);
++        crate::ui::prefs::init_in_memory(cx);
++    });
++    app.add_empty_window().update(|window, cx| {
++        let host = Host::new(WeakEntity::new_invalid(), selected.id);
++        let raw = current(Some(0));
++        assert!(ContentView::body(host, selected, "text".into(), raw, window, cx).is_none());
++    });
++}
++
+ fn current(revision: Option<u64>) -> Content {
+     Content {
+         language: "fixture".into(),
+diff --git a/src/ui/extensions/declarative/inline_content.rs b/src/ui/extensions/declarative/inline_content.rs
+index e6c0b90a48034b09b226b30dd065def064a29cc8..c80ce2e091baf23dd3f1ae77e46ca2e613f83661 100644
+--- a/src/ui/extensions/declarative/inline_content.rs
++++ b/src/ui/extensions/declarative/inline_content.rs
+@@ -42,12 +42,13 @@ impl Slots {
+         self.slots
+             .retain(|id, _| specifications.iter().any(|slot| slot.id == *id));
+         let mut changed = before != self.slots.len();
+-        let languages = content::languages(cx);
++        let languages: Vec<_> = content::language_entries(cx).collect();
+         for specification in specifications {
+-            let renderer = languages
++            let selected = languages
+                 .iter()
+                 .find(|(language, _)| *language == specification.language.as_str())
+-                .map(|(_, renderer)| *renderer);
++                .map(|(_, manifest)| *manifest);
++            let renderer = selected.map(|manifest| manifest.id);
+             if let Some(slot) = self.slots.get(&specification.id)
+                 && slot.language == specification.language
+                 && slot.renderer == renderer
+@@ -60,9 +61,11 @@ impl Slots {
+                 }
+                 continue;
+             }
+-            let view = host.clone().and_then(|host| {
++            let attempted = host.is_some() && selected.is_some();
++            let view = host.clone().zip(selected).and_then(|(host, selected)| {
+                 ContentView::inline(
+                     host,
++                    selected,
+                     format!("{id}:{}", specification.id),
+                     &specification.language,
+                     &specification.source,
+@@ -85,7 +88,7 @@ impl Slots {
+                 specification.id.clone(),
+                 Slot {
+                     language: specification.language.clone(),
+-                    renderer,
++                    renderer: if attempted && view.is_none() { None } else { renderer },
+                     view,
+                     _changed: changed_subscription,
+                 },
+diff --git a/src/ui/extensions/declarative/mod.rs b/src/ui/extensions/declarative/mod.rs
+index 77d86925fa03e308f267b89cb049b3f844ad231a..dc6ea8f89e3759cf675292bc1417ef82d13e19ea 100644
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -246,16 +246,46 @@ fn runtime_of(host: &Host, cx: &App) -> Option<Entity<Runtime>> {
+ 
+ fn runtime(host: &Host, window: &Window, cx: &mut App) -> Option<Entity<Runtime>> {
+     let extension = installed(host.extension())?;
++    Some(runtime_of(host, cx).unwrap_or_else(|| create_runtime(host, extension, window, cx)))
++}
++
++/// Admit only the registration selected by the catalog, never a removed or
++/// replaced package with the same ID. Existing views still reload as before.
++fn content_runtime(
++    host: &Host,
++    selected: &'static Manifest,
++    window: &Window,
++    cx: &mut App,
++) -> Option<Entity<Runtime>> {
++    let extension = LOADED
++        .read()
++        .unwrap()
++        .as_ref()?
++        .entries
++        .iter()
++        .find(|entry| {
++            entry.manifest.id == host.extension() && std::ptr::eq(entry.manifest, selected)
++        })?
++        .installed;
+     if let Some(runtime) = runtime_of(host, cx) {
+-        return Some(runtime);
++        return runtime.read(cx).uses_installation(extension).then_some(runtime);
+     }
++    Some(create_runtime(host, extension, window, cx))
++}
++
++fn create_runtime(
++    host: &Host,
++    extension: &'static Installed,
++    window: &Window,
++    cx: &mut App,
++) -> Entity<Runtime> {
+     let runtime = cx.new(|cx| Runtime::new(extension, host.clone(), window, cx));
+     register_runtime(&extension.manifest.id, &runtime, cx);
+     if let Some(owner) = host.runtime_scope().owner {
+         let runtimes = &mut cx.default_global::<ViewRuntimes>().0;
+         runtimes.retain(|_, runtime| runtime.upgrade().is_some());
+         runtimes.insert((owner, host.extension()), runtime.downgrade());
+-        return Some(runtime);
++        return runtime;
+     }
+     cx.default_global::<Runtimes>()
+         .0
+@@ -266,7 +296,7 @@ fn runtime(host: &Host, window: &Window, cx: &mut App) -> Option<Entity<Runtime>
+     );
+     let (owner, process) = (host.clone(), runtime.clone());
+     cx.defer(move |cx| owner.retain_process(process.into(), cx));
+-    Some(runtime)
++    runtime
+ }
+ 
+ /// Register the existing process in a new window, so newly opened sibling
+diff --git a/src/ui/extensions/declarative/rich_text.rs b/src/ui/extensions/declarative/rich_text.rs
+index d52b19b63d627032f24d06c6046d057708dc73c2..1543c2eebaa944c309ea0839aad1ad313851d695 100644
+--- a/src/ui/extensions/declarative/rich_text.rs
++++ b/src/ui/extensions/declarative/rich_text.rs
+@@ -115,11 +115,12 @@ impl DeclarativeView {
+         cx: &mut Context<Self>,
+     ) {
+         let document = self.is_document();
+-        let renderer = if document {
++        let selected = if document {
+             content::format(language, cx).or_else(|| content::language_renderer(language, cx))
+         } else {
+             content::language_renderer(language, cx)
+         };
++        let renderer = selected.map(|manifest| manifest.id);
+         if let Some(content) = self.fields.contents.get_mut(id)
+             && content.language == language
+             && content.renderer == renderer
+@@ -134,9 +135,12 @@ impl DeclarativeView {
+             }
+             return;
+         }
+-        let view = self.host(cx).zip(renderer).map(|(host, extension)| {
++        let host = self.host(cx);
++        let attempted = host.is_some() && selected.is_some();
++        let view = host.zip(selected).and_then(|(host, selected)| {
+             ContentView::child(
+-                host.with_extension(extension),
++                host,
++                selected,
+                 id.into(),
+                 language,
+                 source,
+@@ -161,7 +165,7 @@ impl DeclarativeView {
+             .then(|| cx.new(|_| code_block::SourceBlock::new(language, source, document)));
+         let content = Content {
+             language: language.into(),
+-            renderer,
++            renderer: if attempted && view.is_none() { None } else { renderer },
+             view,
+             fallback,
+             _changed: changed,
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+index 48d80bc4f7731835d751344f2085430b3796d53c..fa8831822fb39c9d7561b9db2d2eb37ed63249b0 100644
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -91,6 +91,10 @@ impl Runtime {
+         &self.extension.manifest.title
+     }
+ 
++    pub(super) fn uses_installation(&self, extension: &'static Installed) -> bool {
++        std::ptr::eq(self.extension, extension)
++    }
++
+     pub(super) fn attach(
+         &mut self,
+         view: String,
