@@ -1,0 +1,36 @@
+diff --git a/crates/proteus-core/src/app_server/config_summary.rs b/crates/proteus-core/src/app_server/config_summary.rs
+index 11940899a6c3ca0fd41069113c06881ea44adb49..645f711af558456cb5b0e15c0dfb489ca3f1c5fe 100644
+--- a/crates/proteus-core/src/app_server/config_summary.rs
++++ b/crates/proteus-core/src/app_server/config_summary.rs
+@@ -14,2 +14,3 @@ pub(super) fn render_config_summary(
+     config_path: Option<&Path>,
++    config_files: &[String],
+     cwd: &Path,
+@@ -27,3 +28,2 @@ pub(super) fn render_config_summary(
+     ));
+-    let config_files = config_files(config_path);
+     if !config_files.is_empty() {
+@@ -31,3 +31,3 @@ pub(super) fn render_config_summary(
+         for path in config_files {
+-            lines.push(format!("  - {}", path.display()));
++            lines.push(format!("  - {path}"));
+         }
+@@ -206,2 +206,6 @@ impl super::AppServerHandle {
+         selection.models.extend(inactive_options);
++        let config_files = config_files(self.config_path.as_deref())
++            .iter()
++            .map(|path| path.display().to_string())
++            .collect::<Vec<_>>();
+         let summary = ConfigSummary {
+@@ -210,2 +214,3 @@ impl super::AppServerHandle {
+                 self.config_path.as_deref(),
++                &config_files,
+                 &self.cwd,
+@@ -216,6 +221,3 @@ impl super::AppServerHandle {
+             config_path: self.config_path.as_ref().map(|p| p.display().to_string()),
+-            config_files: config_files(self.config_path.as_deref())
+-                .iter()
+-                .map(|p| p.display().to_string())
+-                .collect(),
++            config_files,
+             cwd: self.cwd.display().to_string(),
