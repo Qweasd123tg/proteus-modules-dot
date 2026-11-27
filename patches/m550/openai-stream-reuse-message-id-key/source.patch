@@ -1,0 +1,17 @@
+diff --git a/model/model-pack/src/adapters/openai/stream_state.rs b/model/model-pack/src/adapters/openai/stream_state.rs
+index 2e9d51e5d5848635f9b691bf49e8955e0f14cb14..f6a6d66f3b85624d120547552640abe5970d2de8 100644
+--- a/model/model-pack/src/adapters/openai/stream_state.rs
++++ b/model/model-pack/src/adapters/openai/stream_state.rs
+@@ -119,7 +119,11 @@ impl OpenAiStreamState {
+                     .and_then(Value::as_str)
+                     .map(str::to_owned)
+                     .unwrap_or_else(|| format!("output:{index}"));
+-                let message_id = *self.ids.entry(key.clone()).or_insert_with(new_message_id);
++                let message_id = self.ids.get(key.as_str()).copied().unwrap_or_else(|| {
++                    let id = new_message_id();
++                    self.ids.insert(key.clone(), id);
++                    id
++                });
+                 let phase = self.phases.get(&key).copied().flatten();
+                 let part = parsed
+                     .get("content_index")
