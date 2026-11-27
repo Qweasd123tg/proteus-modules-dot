@@ -1,0 +1,137 @@
+diff --git a/crates/proteus-contracts/src/domain/tool.rs b/crates/proteus-contracts/src/domain/tool.rs
+index a8e94350f73795d3a77cb79d14fe25b5f32778ff..d909fba6c33dcf54b38088bde1ec38523fb17907 100644
+--- a/crates/proteus-contracts/src/domain/tool.rs
++++ b/crates/proteus-contracts/src/domain/tool.rs
+@@ -1,4 +1,4 @@
+-use std::borrow::Cow;
++use std::{borrow::Cow, fmt, io::{self, Write}};
+ 
+ use serde::{Deserialize, Serialize};
+ 
+@@ -151,40 +151,73 @@ impl ToolResult {
+     /// Text representation for model/UI boundaries where an empty result would
+     /// otherwise disappear.
+     pub fn text_or_status(&self) -> String {
+-        if let Some(error) = &self.error
+-            && !error.is_empty()
+-        {
+-            return error.clone();
++        if let Some(text) = self.direct_text() {
++            return text.to_owned();
+         }
+-
+-        if !self.output.is_empty() {
+-            return self.output.clone();
++        let items: Vec<_> = self.display_items().map(|item| match item {
++            ToolDisplayItem::Text(text) => Cow::Borrowed(text),
++            item => Cow::Owned(item.to_string()),
++        }).collect();
++        if items.is_empty() {
++            self.empty_status().to_owned()
++        } else {
++            items.join("\n")
+         }
++    }
+ 
+-        let mut content_text = Vec::new();
+-        for content in &self.content {
+-            let text = match content {
+-                ToolContent::Text { text } if !text.is_empty() => Cow::Borrowed(text.as_str()),
+-                ToolContent::Json { value } => Cow::Owned(value.to_string()),
+-                ToolContent::Image { mime_type, .. } => {
+-                    Cow::Owned(format!("[image tool content: {mime_type}]"))
+-                }
+-                ToolContent::Binary { mime_type, .. } => {
+-                    Cow::Owned(format!("[binary tool content: {mime_type}]"))
+-                }
+-                _ => continue,
+-            };
+-            content_text.push(text);
++    /// Stream the same text to a writer, propagating a byte limit or other
++    /// write error before formatting any remaining content.
++    pub fn write_text_or_status(&self, mut writer: impl Write) -> io::Result<()> {
++        if let Some(text) = self.direct_text() {
++            return writer.write_all(text.as_bytes());
+         }
+-
+-        if !content_text.is_empty() {
+-            return content_text.join("\n");
++        let mut items = self.display_items();
++        let Some(first) = items.next() else {
++            return writer.write_all(self.empty_status().as_bytes());
++        };
++        write!(writer, "{first}")?;
++        for item in items {
++            write!(writer, "\n{item}")?;
+         }
++        Ok(())
++    }
+ 
++    fn direct_text(&self) -> Option<&str> {
++        self.error.as_deref().filter(|text| !text.is_empty())
++            .or_else(|| (!self.output.is_empty()).then_some(self.output.as_str()))
++    }
++
++    fn display_items(&self) -> impl Iterator<Item = ToolDisplayItem<'_>> {
++        self.content.iter().filter_map(|content| match content {
++            ToolContent::Text { text } if !text.is_empty() => Some(ToolDisplayItem::Text(text)),
++            ToolContent::Json { value } => Some(ToolDisplayItem::Json(value)),
++            ToolContent::Image { mime_type, .. } => Some(ToolDisplayItem::Media("image", mime_type)),
++            ToolContent::Binary { mime_type, .. } => Some(ToolDisplayItem::Media("binary", mime_type)),
++            _ => None,
++        })
++    }
++
++    fn empty_status(&self) -> &'static str {
+         if self.ok {
+-            "(no output)".to_owned()
++            "(no output)"
+         } else {
+-            "(tool failed without an error message)".to_owned()
++            "(tool failed without an error message)"
++        }
++    }
++}
++
++enum ToolDisplayItem<'a> {
++    Text(&'a str),
++    Json(&'a serde_json::Value),
++    Media(&'static str, &'a str),
++}
++
++impl fmt::Display for ToolDisplayItem<'_> {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Text(text) => formatter.write_str(text),
++            Self::Json(value) => fmt::Display::fmt(value, formatter),
++            Self::Media(kind, mime_type) => write!(formatter, "[{kind} tool content: {mime_type}]"),
+         }
+     }
+ }
+diff --git a/crates/proteus-core/src/app_server/turn_progress.rs b/crates/proteus-core/src/app_server/turn_progress.rs
+index dc3b820396d7453ae38da1ddf6be41fd916ae434..23cb408a10367e9c5bc0306f019956138c1cb3be 100644
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -536,7 +536,21 @@ fn tool_result_text(result: &crate::domain::ToolResult) -> Cow<'_, str> {
+         .filter(|text| !text.is_empty())
+         .or_else(|| (!result.output.is_empty()).then_some(result.output.as_str()))
+         .map(Cow::Borrowed)
+-        .unwrap_or_else(|| Cow::Owned(result.text_or_status()))
++        .unwrap_or_else(|| {
++            use bytes::BufMut;
++            let mut prefix = Vec::new();
++            let writer = (&mut prefix).limit(MAX_SUBAGENT_TOOL_RESULT_BYTES).writer();
++            match result.write_text_or_status(writer) {
++                Ok(()) => {}
++                Err(error) if error.kind() == std::io::ErrorKind::WriteZero => {
++                    // A UTF-8 scalar may straddle the byte boundary.
++                    let valid = prefix.utf8_chunks().next().map_or(0, |chunk| chunk.valid().len());
++                    prefix.truncate(valid);
++                }
++                Err(error) => panic!("failed to render tool result preview: {error}"),
++            }
++            Cow::Owned(String::from_utf8(prefix).expect("tool result text is UTF-8"))
++        })
+ }
+ 
+ fn update_tool(
