@@ -1,0 +1,87 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+index d3b2400ab26c1478f76c3999d3faf3058be540d4..f467abacb48384f753cc71e93c8f6ecbbbf29868 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -22,7 +22,7 @@ use crate::{
+         HistoryMutationKind, JournalEntry, JournalRecord, ModelResponseOutcome,
+         ToolCallRecordPhase, TurnSettled, TurnSettlementStatus,
+     },
+-    domain::{CallId, PartId, ThreadId, ToolCallResolution, TurnId},
++    domain::{CallId, PartId, SessionId, ThreadId, ToolCallResolution, TurnId},
+     model_standard::{CanonicalMessage, CanonicalPart, ContentPart, PartProvenance, PartScope},
+ };
+ 
+@@ -90,7 +90,13 @@ struct TranscriptReplay {
+     state: TranscriptProjectionState,
+     visibility: TranscriptVisibility,
+     final_results: HashSet<CallId>,
+-    subagent_bindings: HashMap<CallId, crate::domain::SubagentSessionBinding>,
++    subagent_bindings: HashMap<CallId, TranscriptSubagentLink>,
++}
++
++struct TranscriptSubagentLink {
++    child_thread_id: ThreadId,
++    session_id: SessionId,
++    session_dir: std::path::PathBuf,
+ }
+ 
+ impl TranscriptReplay {
+@@ -116,7 +122,14 @@ impl TranscriptReplay {
+                 .iter()
+                 .filter_map(|record| match &record.entry {
+                     JournalEntry::SubagentSessionBoundRecorded(binding) => {
+-                        Some((binding.source_call_id.clone(), binding.clone()))
++                        Some((
++                            binding.source_call_id.clone(),
++                            TranscriptSubagentLink {
++                                child_thread_id: binding.child_thread_id,
++                                session_id: binding.session_id,
++                                session_dir: binding.session_dir.clone(),
++                            },
++                        ))
+                     }
+                     _ => None,
+                 })
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 40908e9961eaeb79949127e2ac1139adce67dad3..058fc32cf873c04187d944932b3d763226dd350b 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -12,13 +12,13 @@ use crate::{
+         CompactTextRow, DisplayRows, JournalEntry, JournalReadSnapshot, JournalRecord,
+         ModelResponseOutcome, StagedRenderRecord, StagedTextRow, ToolCallRecordPhase,
+     },
+-    domain::TurnId,
++    domain::{SubagentSessionBinding, TurnId},
+     model_standard::ContentPart,
+ };
+ 
+ use super::{
+     AppTranscriptMessage, HistoryMutationKind, TranscriptProjectionState, TranscriptReplay,
+-    TranscriptTimestamps, TranscriptVisibility,
++    TranscriptSubagentLink, TranscriptTimestamps, TranscriptVisibility,
+ };
+ 
+ /// The caller must strictly validate the entire snapshot before invoking this
+@@ -111,8 +111,20 @@ pub(super) fn transcript_from_scan(
+             {
+                 last_response_with_parts = Some(record.session_seq);
+             }
+-            JournalEntry::SubagentSessionBoundRecorded(binding) => {
+-                subagent_bindings.insert(binding.source_call_id.clone(), binding);
++            JournalEntry::SubagentSessionBoundRecorded(SubagentSessionBinding {
++                source_call_id,
++                child_thread_id,
++                session_id,
++                session_dir,
++            }) => {
++                subagent_bindings.insert(
++                    source_call_id,
++                    TranscriptSubagentLink {
++                        child_thread_id,
++                        session_id,
++                        session_dir,
++                    },
++                );
+             }
+             JournalEntry::ToolResultRecorded(tool) => {
+                 final_results.insert(tool.result.call_id);
