@@ -1,0 +1,20 @@
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 0da045513f551ef5ca4a91ec04e0b3f982b4c059..11bca795f9e3cf8e58fa3e78e3a402da3b89a717 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -129,8 +129,14 @@ pub(crate) fn decode(
+     let external = matches!(stored.payload, StoredPayload::Blob { .. });
+     let entry = match stored.payload {
+         StoredPayload::Inline { value } => {
++            // The compact Value cannot exceed 32 times its source JSON:
++            // string escapes cost at most 6 bytes per decoded byte, numbers
++            // need at most 24 bytes in the current serializer, and literals
++            // and structural tokens cannot grow. The whole line also bounds
++            // the payload source. Larger lines keep the exact size check.
+             ensure!(
+-                encoded_bytes(&value)? <= MAX_PAYLOAD_BYTES,
++                line.len() <= MAX_PAYLOAD_BYTES / 32
++                    || encoded_bytes(&value)? <= MAX_PAYLOAD_BYTES,
+                 "inline payload exceeds maximum"
+             );
+             JournalEntry::from_stored_kind_and_payload(stored.kind, value)?
