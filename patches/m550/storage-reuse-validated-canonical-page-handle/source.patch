@@ -1,0 +1,109 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index 82be7a8735a7de4d516426a3684ad3460ba7ee3a..d021cab634dd70e709b9b175eb90ae28bdc57a34 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -219,10 +219,11 @@ impl State {
+                 limit,
+             } => {
+                 let sole_snapshot = self.snapshots.len() == 1;
+-                let page = self
+-                    .get_snapshot(&snapshot)?
+-                    .page(after_seq, limit, sole_snapshot)?;
+-                Ok(SessionStorageResponse::Records { page })
++                let state = self.get_snapshot(&snapshot)?;
++                let (records, next_after_seq) = state.page(after_seq, limit, sole_snapshot)?;
++                Ok(SessionStorageResponse::Records {
++                    page: state.record_page(snapshot, records, next_after_seq),
++                })
+             }
+             ReadDisplayRecords {
+                 snapshot,
+@@ -231,26 +232,8 @@ impl State {
+             } => {
+                 let state = self.get_snapshot(&snapshot)?;
+                 let (records, next_after_seq) = state.display_page(after_seq, limit)?;
+-                // The live handle was checked exactly. Do not retain spare
+-                // capacity carried by an in-process caller in its response.
+-                let compact = [
+-                    &snapshot.snapshot_id,
+-                    &snapshot.session.key,
+-                    &snapshot.content_sha256,
+-                ]
+-                .into_iter()
+-                .all(|text| text.capacity() == text.len());
+-                let snapshot = if compact {
+-                    snapshot
+-                } else {
+-                    state.identity.clone()
+-                };
+                 Ok(SessionStorageResponse::Records {
+-                    page: StorageRecordPage {
+-                        snapshot,
+-                        records,
+-                        next_after_seq,
+-                    },
++                    page: state.record_page(snapshot, records, next_after_seq),
+                 })
+             }
+             ReadConversation { snapshot, point } => Ok(SessionStorageResponse::Conversation {
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..60f1f4b767dffbb6231c10a8d6c01718c9fa8110 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -231,7 +231,7 @@ impl SnapshotState {
+         after: u64,
+         limit: u32,
+         sole_snapshot: bool,
+-    ) -> Result<StorageRecordPage> {
++    ) -> Result<(Vec<JournalRecord>, Option<u64>)> {
+         ensure!(
+             after <= self.identity.revision.session_seq,
+             "record cursor is past the snapshot prefix"
+@@ -326,11 +326,28 @@ impl SnapshotState {
+         self.served_record_bytes = self.served_record_bytes.saturating_add(bytes);
+         self.page_after = Some(last);
+         let next_after_seq = (last < self.identity.revision.session_seq).then_some(last);
+-        Ok(StorageRecordPage {
+-            snapshot: self.identity.clone(),
++        Ok((records, next_after_seq))
++    }
++    pub(crate) fn record_page(
++        &self,
++        snapshot: StorageSnapshot,
++        records: Vec<JournalRecord>,
++        next_after_seq: Option<u64>,
++    ) -> StorageRecordPage {
++        // The service already checked this live handle exactly. Do not keep
++        // spare capacity carried by an in-process caller in the response.
++        let compact = [
++            &snapshot.snapshot_id,
++            &snapshot.session.key,
++            &snapshot.content_sha256,
++        ]
++        .into_iter()
++        .all(|text| text.capacity() == text.len());
++        StorageRecordPage {
++            snapshot: if compact { snapshot } else { self.identity.clone() },
+             records,
+             next_after_seq,
+-        })
++        }
+     }
+     pub fn display_page(
+         &mut self,
+diff --git a/storage/session-storage/src/tests/seek.rs b/storage/session-storage/src/tests/seek.rs
+index b926b26b4ae1658a88c1faa05251decf4b488ab1..74c5c0d3fffab96bb5293bb3286d60f742deb5d5 100644
+--- a/storage/session-storage/src/tests/seek.rs
++++ b/storage/session-storage/src/tests/seek.rs
+@@ -343,7 +343,10 @@ fn jsonl_terminal_fold_discards_its_capture_on_append_during_validation() {
+     )
+     .unwrap();
+     crate::diagnostics::reset();
+-    assert_eq!(snapshot.page(1, 1, true).unwrap(), expected);
++    assert_eq!(
++        snapshot.page(1, 1, true).unwrap(),
++        (expected.records, expected.next_after_seq)
++    );
+     assert_eq!(
+         crate::diagnostics::get().decoded,
+         4,
