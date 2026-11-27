@@ -1,0 +1,275 @@
+diff --git a/crates/proteus-module-protocol/Cargo.toml b/crates/proteus-module-protocol/Cargo.toml
+index a4e77a97e6dffe81c948e68ffa86613f2e228009..e312a9b89899a2bf8942d1ba1057a90e0b46fdff 100644
+--- a/crates/proteus-module-protocol/Cargo.toml
++++ b/crates/proteus-module-protocol/Cargo.toml
+@@ -4,22 +4,31 @@ version = "0.1.0-alpha.2"
+ edition = "2024"
+ 
+ [features]
+-default = []
+-conformance-cli = ["dep:clap"]
++default = ["host-broker"]
++host-broker = ["dep:proteus-process-host", "dep:tokio"]
++conformance-cli = ["host-broker", "dep:clap"]
+ 
+ [[bin]]
+ name = "proteus-component-conformance"
+ path = "src/bin/proteus-component-conformance.rs"
+ required-features = ["conformance-cli"]
+ 
++[[test]]
++name = "broker_v3"
++required-features = ["host-broker"]
++
++[[test]]
++name = "startup_deadline"
++required-features = ["host-broker"]
++
+ [dependencies]
+ proteus-contracts = { path = "../proteus-contracts" }
+-proteus-process-host = { path = "../proteus-process-host" }
++proteus-process-host = { path = "../proteus-process-host", optional = true }
+ anyhow = "1"
+ clap = { version = "4", features = ["derive"], optional = true }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+-tokio = { version = "1", features = ["rt", "sync", "time"] }
++tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
+ 
+ [dev-dependencies]
+ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+diff --git a/crates/proteus-module-protocol/src/authority.rs b/crates/proteus-module-protocol/src/authority.rs
+index 82a4621bdbcbf2a685db0963ee03e3fbc681e7c5..d603c58dc9837adaf8a2c6defa3823a82dc8501b 100644
+--- a/crates/proteus-module-protocol/src/authority.rs
++++ b/crates/proteus-module-protocol/src/authority.rs
+@@ -78,6 +78,7 @@ impl ProcessContractAuthority {
+         self.module_methods.contains(&method)
+     }
+ 
++    #[cfg(any(feature = "host-broker", test))]
+     pub(crate) fn feature_for_module_method(self, method: &str) -> Option<&'static str> {
+         self.module_method_features
+             .iter()
+diff --git a/crates/proteus-module-protocol/src/lib.rs b/crates/proteus-module-protocol/src/lib.rs
+index 7fe7f9b9a82b040cc371f130bc08a6ff634058ed..abb4a77c0038e5144bd35feff487f32971ccf742 100644
+--- a/crates/proteus-module-protocol/src/lib.rs
++++ b/crates/proteus-module-protocol/src/lib.rs
+@@ -1,16 +1,19 @@
+-//! Strict host-side runtime for Proteus process modules.
++//! Shared component wire and the optional host broker for Proteus process modules.
+ //!
+-//! `proteus-process-host` owns only child lifecycle and framing. This crate
+-//! adds the versioned module handshake, contract authority, bidirectional
+-//! JSON-RPC dispatch, cancellation, and terminal classification without
+-//! depending on `proteus-core` internals.
++//! Without default features, the wire types, parsers, and contract authority
++//! are available without child-process plumbing. With `host-broker` (the
++//! default), the broker uses `proteus-process-host` for lifecycle and framing,
++//! and adds handshake, dispatch, cancellation, and terminal classification.
+ 
+ mod authority;
++#[cfg(feature = "host-broker")]
+ mod binding;
++#[cfg(feature = "host-broker")]
+ mod handshake;
+ mod message;
+ pub mod v3;
+ 
+ pub use authority::*;
++#[cfg(feature = "host-broker")]
+ pub use binding::*;
+ pub use message::*;
+diff --git a/crates/proteus-module-protocol/src/v3/handshake.rs b/crates/proteus-module-protocol/src/v3/handshake.rs
+index 889df2c95a0d04985798ba900d8b94f664ff87d0..7d7e97406c508875d7dedb32f880429c3c051c78 100644
+--- a/crates/proteus-module-protocol/src/v3/handshake.rs
++++ b/crates/proteus-module-protocol/src/v3/handshake.rs
+@@ -6,7 +6,10 @@ use proteus_process_host::{NewlineJsonFraming, ProcessTransport};
+ 
+ use crate::{ProcessComponentBinding, handshake::validate_manifest};
+ 
+-use super::wire::{COMPONENT_PROTOCOL_V3, host_id, initialize_request};
++use super::{
++    COMPONENT_PROTOCOL_V3,
++    wire::{host_id, initialize_request},
++};
+ use super::{ComponentFrame, WireDirection, parse_component_frame, parse_wire_id};
+ 
+ pub(crate) fn initialize_transport(
+diff --git a/crates/proteus-module-protocol/src/v3/mod.rs b/crates/proteus-module-protocol/src/v3/mod.rs
+index e4f19d73bfb8dd66d873d36787be88e279986d60..153edb17e6e9ca11caa7243c7cb775c85f8a4b2f 100644
+--- a/crates/proteus-module-protocol/src/v3/mod.rs
++++ b/crates/proteus-module-protocol/src/v3/mod.rs
+@@ -1,34 +1,48 @@
+-//! Component Runtime v2 / strict wire v3 broker.
+-//!
+-//! This is the sole configured process-component runtime.
++//! Strict component wire v3, and its configured broker with `host-broker`.
+ 
++#[cfg(feature = "host-broker")]
+ mod broker;
++#[cfg(feature = "host-broker")]
+ mod callback_ids;
++#[cfg(feature = "host-broker")]
+ mod config;
++#[cfg(feature = "host-broker")]
+ mod failure;
+ mod frame;
++#[cfg(feature = "host-broker")]
+ mod handshake;
++#[cfg(feature = "host-broker")]
+ mod invocation;
++#[cfg(feature = "host-broker")]
+ mod notification;
++#[cfg(feature = "host-broker")]
+ mod pending;
++#[cfg(feature = "host-broker")]
+ mod routing;
++#[cfg(feature = "host-broker")]
+ mod runtime;
++#[cfg(feature = "host-broker")]
+ mod signal;
+ mod transport_config;
++#[cfg(feature = "host-broker")]
+ mod wire;
+ mod wire_id;
+ 
++#[cfg(feature = "host-broker")]
+ pub use broker::{ComponentBroker, ComponentBrokerSnapshot, WeakComponentBroker};
++#[cfg(feature = "host-broker")]
+ pub use config::ComponentBrokerOptions;
+ pub use frame::{ComponentFrame, parse_component_frame};
++#[cfg(feature = "host-broker")]
+ pub use invocation::{
+     AsyncHostRequestDispatcher, CancelCause, ComponentBrokerError, ComponentBrokerErrorKind,
+     ComponentFailure, ComponentHostRequest, HostRequestFuture, InvocationCancelHandle,
+     InvocationHandle, InvocationRef, InvocationTerminal, NoAsyncHostRequests,
+ };
++#[cfg(feature = "host-broker")]
+ pub use notification::{InvocationNotification, InvocationNotificationReceiver};
+ pub use transport_config::{
+     COMPONENT_MAX_FRAME_BYTES_ENV, ComponentTransportConfig, MAX_COMPONENT_FRAME_BYTES,
+ };
+-pub use wire::COMPONENT_PROTOCOL_V3;
++pub use proteus_contracts::contracts::PROCESS_COMPONENT_PROTOCOL_VERSION as COMPONENT_PROTOCOL_V3;
+ pub use wire_id::{WireDirection, WireId, parse_wire_id};
+diff --git a/crates/proteus-module-protocol/src/v3/transport_config.rs b/crates/proteus-module-protocol/src/v3/transport_config.rs
+index 8d89b9478c5324ee7314af3a4296588e7d4b0d73..843a8fbd715972308dba695ad76a08d1e755cb3d 100644
+--- a/crates/proteus-module-protocol/src/v3/transport_config.rs
++++ b/crates/proteus-module-protocol/src/v3/transport_config.rs
+@@ -1,12 +1,18 @@
+ //! One host-owned frame budget shared with a worker before initialization.
+ use anyhow::{Context, Result, ensure};
+-use proteus_process_host::{DEFAULT_MAX_FRAME_BYTES, ReceiveLimits};
++#[cfg(feature = "host-broker")]
++use proteus_process_host::ReceiveLimits;
+ use serde::{Deserialize, Serialize};
+ 
++#[cfg(feature = "host-broker")]
+ use super::ComponentBrokerOptions;
+ 
+ pub const COMPONENT_MAX_FRAME_BYTES_ENV: &str = "PROTEUS_MODULE_MAX_FRAME_BYTES";
+ pub const MAX_COMPONENT_FRAME_BYTES: usize = 128 * 1024 * 1024;
++const DEFAULT_COMPONENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
++// Keep the host and worker defaults equal without a worker-side host dependency.
++#[cfg(feature = "host-broker")]
++const _: () = assert!(DEFAULT_COMPONENT_FRAME_BYTES == proteus_process_host::DEFAULT_MAX_FRAME_BYTES);
+ 
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(default, deny_unknown_fields)]
+@@ -17,7 +23,7 @@ pub struct ComponentTransportConfig {
+ impl Default for ComponentTransportConfig {
+     fn default() -> Self {
+         Self {
+-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
++            max_frame_bytes: DEFAULT_COMPONENT_FRAME_BYTES,
+         }
+     }
+ }
+@@ -57,6 +63,7 @@ impl ComponentTransportConfig {
+ 
+     /// Raising one component's frame bound also raises its finite aggregate
+     /// queues enough for two maximum-sized frames. Other components are unchanged.
++    #[cfg(feature = "host-broker")]
+     pub fn apply(self, mut options: ComponentBrokerOptions) -> Result<ComponentBrokerOptions> {
+         self.validate()?;
+         let aggregate = self
+@@ -79,6 +86,7 @@ impl ComponentTransportConfig {
+ mod tests {
+     use super::*;
+ 
++    #[cfg(feature = "host-broker")]
+     #[test]
+     fn ordinary_defaults_stay_identical_and_an_override_is_component_local() {
+         let defaults = ComponentBrokerOptions::default();
+diff --git a/crates/proteus-module-protocol/src/v3/wire.rs b/crates/proteus-module-protocol/src/v3/wire.rs
+index 6612804cbccf4e9a70a180aea6579a0df3fe072a..1587ef296825648573dcfa70852be860f9dd3573 100644
+--- a/crates/proteus-module-protocol/src/v3/wire.rs
++++ b/crates/proteus-module-protocol/src/v3/wire.rs
+@@ -11,9 +11,6 @@ use crate::ProcessModuleRpcError;
+ 
+ use super::invocation::CancelCause;
+ 
+-pub const COMPONENT_PROTOCOL_V3: &str =
+-    proteus_contracts::contracts::PROCESS_COMPONENT_PROTOCOL_VERSION;
+-
+ pub(crate) type CallbackParams = ProcessModuleCallbackParams;
+ pub(crate) type NotificationParams = ProcessModuleNotificationParams;
+ 
+diff --git a/crates/proteus-module-sdk/Cargo.toml b/crates/proteus-module-sdk/Cargo.toml
+index 702d6e836691664d505a22ec7278b55da97c4d3c..766663559c28ba97f0c9eeeddaa4d3560e06cff3 100644
+--- a/crates/proteus-module-sdk/Cargo.toml
++++ b/crates/proteus-module-sdk/Cargo.toml
+@@ -5,14 +5,19 @@ edition = "2024"
+ description = "Experimental Rust worker SDK for Proteus process modules"
+ license = "MIT"
+ 
++[features]
++default = ["host-broker"]
++host-broker = ["proteus-module-protocol/host-broker"]
++
+ [dependencies]
+ anyhow = "1"
+ proteus-contracts = { path = "../proteus-contracts" }
+-proteus-module-protocol = { path = "../proteus-module-protocol" }
++proteus-module-protocol = { path = "../proteus-module-protocol", default-features = false }
+ serde = "1"
+ serde_json = "1"
+ 
+ [dev-dependencies]
++proteus-module-protocol = { path = "../proteus-module-protocol", default-features = false, features = ["host-broker"] }
+ proteus-process-host = { path = "../proteus-process-host" }
+ 
+ [[test]]
+diff --git a/crates/proteus-module-sdk/src/lib.rs b/crates/proteus-module-sdk/src/lib.rs
+index 388f26b2608b542d7240a408f6ebd7ff7dbd30f2..23f2d5d6fa60c7ea0713355cb05b8658d200f845 100644
+--- a/crates/proteus-module-sdk/src/lib.rs
++++ b/crates/proteus-module-sdk/src/lib.rs
+@@ -4,6 +4,8 @@
+ //! the general [`Export`] surface keeps other slot implementations outside Core.
+ //! SDK versions are independent from wire/slot versions. Pin an exact release or
+ //! Git revision: alpha API compatibility is not promised across releases.
++//! For worker-only builds, disable default features to omit the host broker
++//! from the `protocol` re-export. The wire and worker behavior are unchanged.
+ //!
+ //! The worker remains an executable with its configured OS permissions. Host
+ //! callbacks retain the active invocation's authority; SDK use grants no rights.
+diff --git a/docs/architecture/process-module-architecture.md b/docs/architecture/process-module-architecture.md
+index 1fe55080dbbbd51c2b1644c638e6b1e69c256b0d..3ff0811295a095887ab17cfd5f393bbd4eac038b 100644
+--- a/docs/architecture/process-module-architecture.md
++++ b/docs/architecture/process-module-architecture.md
+@@ -35,9 +35,12 @@ AppConfig.components
+ - `proteus-process-host` знает child lifecycle, OS launch policy, framing и
+   protocol-neutral duplex transport; slot, module id, callbacks и authority в
+   нём отсутствуют.
+-- `proteus-module-protocol` знает component handshake, exact export set,
+-  authority, bidirectional RPC, cancel и terminal states, но не зависит от
+-  `proteus-core`.
++- `proteus-module-protocol` содержит общие wire v3 и таблицу полномочий, а с
++  feature `host-broker` также component handshake, exact export set,
++  bidirectional RPC, cancel и terminal states. Broker включён по умолчанию,
++  ни один вариант не зависит от `proteus-core`. Worker на `proteus-module-sdk`
++  может указать `default-features = false`, чтобы не собирать host-broker.
++  Версия wire, проверки и ограничения worker при этом не меняются.
+ - `proteus-core::process_adapters` переводит canonical slot traits в wire DTO
+   и привязывает invocation-scoped callbacks к runtime.
+ - Процессный модуль реализует wire напрямую на любом языке или использует свои
