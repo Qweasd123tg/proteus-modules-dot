@@ -1,0 +1,17 @@
+diff --git a/crates/proteus-core/src/core/config/model_settings.rs b/crates/proteus-core/src/core/config/model_settings.rs
+index 7ee611b0b9c005be6dd301d44f985c2d955f5669..1b18a21b56cd13ac4a5445caf2c35a9eb909a7a6 100644
+--- a/crates/proteus-core/src/core/config/model_settings.rs
++++ b/crates/proteus-core/src/core/config/model_settings.rs
+@@ -59,8 +59,10 @@ impl ModelSourceMetadata {
+                     })
+                 })
+             });
+-        let catalogue_writable =
+-            file && complete_local && local_names == available.keys().collect::<Vec<_>>();
++        let catalogue_writable = file
++            && complete_local
++            && local_names.len() == available.len()
++            && local_names.into_iter().eq(available.keys());
+         let local_roles = local
+             .and_then(|v| v.pointer("/agent_control/roles"))
+             .and_then(Value::as_array);
