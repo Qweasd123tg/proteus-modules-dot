@@ -1,0 +1,119 @@
+{
+  "component": "Proteus-harness/Proteus-core",
+  "base_commit": "024fb944a91382026bb2aa5c7b8da65c284d0305",
+  "base_tree": "18187387ab899ab096df8859023c3068531c4f28",
+  "patched_tree": "45794faaf931e6954b0c7d9e4314985d692cfe5d",
+  "prior_selected_stack_tree": "805bd33c52c937708d01efc31e8307328ac2f6f4",
+  "prior_selected_stack_after_tree": "1be49edcd4138af504bb4a6f5ca843f6b9ce3546",
+  "stack_scope": "Context apply and inverse restore exact known previous tree through #940; this stack was not natively built for this receipt.",
+  "patch_sha256": "75a64819bd90dfa55c3eeed11c4e6c90954eafb9452e23b1b94b1d47c258cba0",
+  "toolchain": "rustc 1.95.0 (59807616e1fa2540724bfbac14d7976d7e4a3860)",
+  "cargo_lock_sha256": "4a1bbdfd2f0746cb0a6bf2088c6a11f9cff5f3800181f5ae073d62cfea8784b5",
+  "native_tests": {
+    "stock": {
+      "binary_sha256": "940db2cbaef2487bd97d95adac855478c4ee8d9d7283858810791af530c0a00c",
+      "tests": {
+        "session_model": {
+          "passed": 11,
+          "stdout_sha256": "a4c08b66cd5ab73d6fbfc38b46718cab17fd9c57a448c9930a4e0c256db236a2"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "e0bc840396b852328a61432ab882762e3993701301d6e1e51b8a23025f072106"
+        }
+      }
+    },
+    "owner": {
+      "binary_sha256": "d34d59e93edc3e3abc5610e55983f8fb49aece44580a59e44fa5b6ef3715160f",
+      "tests": {
+        "session_model": {
+          "passed": 11,
+          "stdout_sha256": "a0ea39386558bbc909de3cb392b72a9209b363244712ad6c1fd64daf02df06d7"
+        },
+        "HTTP": {
+          "passed": 92,
+          "stdout_sha256": "290b524e1d1e011cb3d804e827d783cae3d6e5b3fa3b0cf65264cee251b308e7"
+        }
+      }
+    }
+  },
+  "witness_fields": [
+    "config_files_helper_calls_inside_one_local_request",
+    "observed_diagnostic_filename_count"
+  ],
+  "witnesses": {
+    "stock": {
+      "none": [
+        2,
+        0
+      ],
+      "named": [
+        2,
+        1
+      ],
+      "inline": [
+        2,
+        1
+      ],
+      "directory": [
+        2,
+        3
+      ],
+      "missing": [
+        2,
+        0
+      ]
+    },
+    "owner": {
+      "none": [
+        1,
+        0
+      ],
+      "named": [
+        1,
+        1
+      ],
+      "inline": [
+        1,
+        1
+      ],
+      "directory": [
+        1,
+        3
+      ],
+      "missing": [
+        1,
+        0
+      ]
+    }
+  },
+  "exact_serialized_output": {
+    "none": {
+      "sha256": "ed83abe430ff53336d59523cf042e107e44c9b0c002095405d02024915e8cd84",
+      "bytes": 2618
+    },
+    "named": {
+      "sha256": "4e9a95a3edd32230fb86e6eaaf7a80fa81e2a0092710cf3835c623738dfcc865",
+      "bytes": 2728
+    },
+    "inline": {
+      "sha256": "b5af4a0275be6a4badfe7aa5fc6d6fb57bd4823e1ab5e2227c1aef52a9e0a65e",
+      "bytes": 2758
+    },
+    "directory": {
+      "sha256": "d5af05324042ca962720cf9c7532f8c3246164ad73e817344e982fb1f8d3724f",
+      "bytes": 2832
+    },
+    "missing": {
+      "sha256": "82edbbd5ddc6e8b36b89acef32e456cdaf890d7ce9bfa5a5526758798c370a51",
+      "bytes": 2655
+    }
+  },
+  "scope": "Actual native local_config_summary against inert fixture runtime. Test-only current-thread wrapper counts exact diagnostic helper invocations (not syscalls, launch, watcher, storage or unrelated route work). Full response bytes compared with per-case disposable temp root, cwd and session path replaced. Diagnostic entry fixtures are not used to parse/reload config content. Steady names for exact parity; changing files may intentionally produce one consistent observation now instead of two discrepant ones.",
+  "reproduction": {
+    "runner": "set -eu\nhere=$PWD\n: \"${PROTEUS_TEST_REFERENCE_MODULE:?point to the matching inert fixture executable}\"\n: \"${PROTEUS_TEST_SESSION_STORAGE_MODULE:?point to the matching inert fixture executable}\"\nfor arm in stock owner; do (\n cd \"$arm\"\n c=crates/proteus-core/src\n path=$c/app_server/session_model/tests.rs\n summary=$c/app_server/config_summary.rs\n for f in \"$path\" \"$summary\"; do cp \"$f\" \"$f.w336-backup\"; done\n sed -i 's/= config_files(/= measured_config_files(/g; s/config_files: config_files(/config_files: measured_config_files(/g' \"$summary\"\n cat \"$here/counter.rs\" >>\"$summary\"\n cat \"$here/probe.rs\" >>\"$path\"\n cargo test --offline --locked --release -p proteus-core --lib --no-run -j 4 >\"$here/$arm.build.log\" 2>&1\n grep -F \"($here/$arm/crates/proteus-core)\" \"$here/$arm.build.log\"\n bin=$(sed -nE 's/.*Executable unittests src\\/lib.rs \\(([^)]+)\\).*/\\1/p' \"$here/$arm.build.log\")\n cp \"$bin\" \"$here/$arm-tests\"\n for f in \"$path\" \"$summary\"; do mv \"$f.w336-backup\" \"$f\"; done\n cd crates/proteus-core\n mkdir -p \"$here/$arm.wire\"\n W336_WITNESS_DIR=\"$here/$arm.wire\" \"$here/$arm-tests\" 'app_server::session_model::' --test-threads=1 --nocapture >\"$here/$arm.test.log\" 2>&1\n \"$here/$arm-tests\" 'app_server::http::tests::' --test-threads=1 --nocapture >\"$here/$arm.api.log\" 2>&1\n); done\n",
+    "route_counter": "\n#[cfg(test)]\nthread_local! { pub(crate) static FILE_LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }\n#[cfg(test)]\nfn measured_config_files(path: Option<&Path>) -> Vec<std::path::PathBuf> {\n    FILE_LIST_CALLS.with(|calls| calls.set(calls.get()+1));\n    config_files(path)\n}\n",
+    "probe": "\n#[tokio::test(flavor = \"current_thread\")]\nasync fn w336_config_diagnostics_one_file_snapshot() {\n    let root=tempfile::tempdir().unwrap();\n    let cwd=tempfile::tempdir().unwrap();\n    let named=root.path().join(\"named.config.toml\");\n    let dir=root.path().join(\"directory\");\n    let missing=root.path().join(\"missing.config.toml\");\n    let files=[\"a.json\",\"z.toml\"];\n    std::fs::write(&named,\"# fixture\\n\").unwrap();\n    std::fs::create_dir(&dir).unwrap();\n    for f in [\"z.toml\",\"a.json\",\"ignored.TOML\",\"readme.txt\"] {\n        std::fs::write(dir.join(f),\"# fixture\\n\").unwrap();\n    }\n    std::fs::create_dir(dir.join(\"nested.toml\")).unwrap();\n    std::fs::write(dir.join(\"nested.toml/inside.toml\"),\"\").unwrap();\n    #[cfg(unix)]\n    std::os::unix::fs::symlink(dir.join(\"a.json\"),dir.join(\"m.json\")).unwrap();\n    let mut ordered=files.into_iter().map(|f|dir.join(f)).collect::<Vec<_>>();\n    #[cfg(unix)]\n    ordered.insert(1, dir.join(\"m.json\"));\n    let inline=std::path::PathBuf::from(format!(\"{}#agent=/fixture\",named.display()));\n\n    let cases=[\n        (\"none\",None,vec![]),\n        (\"named\",Some(named.clone()),vec![named.clone()]),\n        (\"inline\",Some(inline),vec![named]),\n        (\"directory\",Some(dir),ordered),\n        (\"missing\",Some(missing),vec![]),\n    ];\n    for (kind,path,files) in cases {\n        let expected=files.iter().map(|path|path.display().to_string()).collect::<Vec<_>>();\n        let server=AgentAppServer::launch(config(),cwd.path().to_owned(),path.as_deref()).await.unwrap();\n        crate::app_server::config_summary::FILE_LIST_CALLS.with(|calls|calls.set(0));\n        let result=server.local_config_summary().await;\n        let calls=crate::app_server::config_summary::FILE_LIST_CALLS.with(|calls|calls.get());\n        assert_eq!(result[\"config_files\"],json!(expected));\n        assert_eq!(result[\"config_path\"],json!(path.as_ref().map(|p|p.display().to_string())));\n        let display=result[\"display_text\"].as_str().unwrap();\n        let prefix=format!(\"Config summary\\nconfig path: {}\\n\", path.as_ref().map(|p|p.display().to_string()).unwrap_or(\"(default discovery / none)\".into()));\n        let mut section=prefix;\n        if !expected.is_empty() {\n            section.push_str(\"config files:\\n\");\n            for name in &expected {section.push_str(&format!(\"  - {name}\\n\"));}\n        }\n        section.push_str(\"cwd: \");\n        assert!(display.starts_with(&section), \"{display}\");\n        if let Some(dir)=std::env::var_os(\"W336_WITNESS_DIR\") {\n            let mut stable=serde_json::to_string(&result).unwrap();\n            if let Some(session)=result[\"session_dir\"].as_str() {stable=stable.replace(session,\"<session>\");}\n            stable=stable.replace(root.path().to_str().unwrap(),\"<fixture>\").replace(cwd.path().to_str().unwrap(),\"<cwd>\");\n            std::fs::write(std::path::PathBuf::from(dir).join(format!(\"{kind}.json\")),stable).unwrap();\n        }\n        eprintln!(\"W336 {kind} {calls} {}\",expected.len());\n        server.shutdown().await;\n    }\n}\n",
+    "runner_environment": "Supply the matching local inert reference and session-storage fixtures from the existing Core test setup to the runner. Both native binaries are standalone stock/candidate, not full-app releases."
+  }
+}
