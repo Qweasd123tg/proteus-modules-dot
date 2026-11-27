@@ -1,0 +1,24 @@
+diff --git a/crates/proteus-core/src/app_server/config_summary.rs b/crates/proteus-core/src/app_server/config_summary.rs
+index 11940899a6c3ca0fd41069113c06881ea44adb49..a038460f507e2805c4a7f81c464152b8e03c2af0 100644
+--- a/crates/proteus-core/src/app_server/config_summary.rs
++++ b/crates/proteus-core/src/app_server/config_summary.rs
+@@ -98,11 +98,14 @@ pub(super) fn configured_model_options(config: &AppConfig) -> Vec<crate::domain:
+         options.push(crate::domain::ModelRef::new(model.provider, model.model));
+     }
+     for profile in config.providers.values() {
+-        if let Ok(model) = profile.to_model_config() {
+-            let model_ref = crate::domain::ModelRef::new(model.provider, model.model);
+-            if !options.iter().any(|item| item == &model_ref) {
+-                options.push(model_ref);
+-            }
++        if !options
++            .iter()
++            .any(|item| item.provider == profile.provider && item.model == profile.model)
++        {
++            options.push(crate::domain::ModelRef::new(
++                &profile.provider,
++                &profile.model,
++            ));
+         }
+     }
+     options
