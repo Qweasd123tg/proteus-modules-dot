@@ -1,0 +1,61 @@
+diff --git a/storage/session-storage/src/service/locator.rs b/storage/session-storage/src/service/locator.rs
+index 29ca8b5cb1a2944a298b3b486329db973d887b4f..19c223a6ef37ba68d30df0baae4167b16e0ccbf8 100644
+--- a/storage/session-storage/src/service/locator.rs
++++ b/storage/session-storage/src/service/locator.rs
+@@ -2,17 +2,17 @@
+ use super::*;
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-pub(super) struct Key {
++pub(super) struct Key<P = PathBuf> {
+     version: u32,
+-    pub path: PathBuf,
+-    pub workspace: PathBuf,
++    pub path: P,
++    pub workspace: P,
+     pub parent_session_id: Option<SessionId>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub incarnation: Option<Uuid>,
+ }
+ pub(super) fn make(
+-    path: PathBuf,
+-    workspace: PathBuf,
++    path: &Path,
++    workspace: &Path,
+     id: SessionId,
+     parent_session_id: Option<SessionId>,
+     incarnation: Option<Uuid>,
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 87905b496ace48438d0f75d3cade488560fc2b9f..ab81082eb595b036a1423847f0b3c8bcc3cc2472 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -60,8 +60,8 @@ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescr
+     );
+     Ok(StorageSessionDescriptor {
+         session: super::locator::make(
+-            path.clone(),
+-            workspace_path.clone(),
++            &path,
++            &workspace_path,
+             identity.session_id,
+             identity.parent_session_id,
+             control.incarnation,
+@@ -206,15 +206,15 @@ impl State {
+         let may_create = identity::validate_new_session_target(&path, id)?;
+         let control = super::control::load(&path)?;
+         let session = super::locator::make(
+-            path.clone(),
+-            workspace.clone(),
++            &path,
++            &workspace,
+             id,
+             parent,
+             super::control::locator_incarnation(&control),
+         )?;
+         let descriptor = if may_create || control.deleted {
+             StorageSessionDescriptor {
+-                session: session.clone(),
++                session,
+                 parent_session_id: parent,
+                 workspace_path: workspace,
+                 record_location: Some(self.kind.backend().description_path(&path)),
