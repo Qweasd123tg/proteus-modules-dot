@@ -1,0 +1,47 @@
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index aae4a62158344b5f0854aad22edcb8d8375974a8..037d82a0229a7e1da0cc6a3384a2a460c0282f97 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -35,14 +35,15 @@ pub(super) fn normalize_model_sources(source: &mut Value) -> Result<()> {
+ }
+ 
+ fn named_presets(value: Value) -> Result<BTreeMap<String, ProviderProfileConfig>> {
+-    let entries = value.as_object().context("models must be an object")?;
++    let Value::Object(entries) = value else {
++        anyhow::bail!("models must be an object");
++    };
+     let mut result = BTreeMap::new();
+     for (name, profile) in entries {
+         ensure!(!name.trim().is_empty(), "model aliases must not be empty");
+-        let mut profile = profile
+-            .as_object()
+-            .with_context(|| format!("model alias {name:?} must be an object"))?
+-            .clone();
++        let Value::Object(mut profile) = profile else {
++            anyhow::bail!("model alias {name:?} must be an object");
++        };
+         for key in ["provider", "model"] {
+             ensure!(
+                 profile
+@@ -53,10 +54,8 @@ fn named_presets(value: Value) -> Result<BTreeMap<String, ProviderProfileConfig>
+             );
+         }
+         let mut reasoning = match profile.remove("reasoning") {
+-            Some(value) => value
+-                .as_object()
+-                .context("model reasoning must be an object")?
+-                .clone(),
++            Some(Value::Object(value)) => value,
++            Some(_) => anyhow::bail!("model reasoning must be an object"),
+             None => Map::new(),
+         };
+         for key in ["effort", "summary", "budget_tokens"] {
+@@ -79,7 +78,7 @@ fn named_presets(value: Value) -> Result<BTreeMap<String, ProviderProfileConfig>
+                 "model alias {name:?} has an empty effort"
+             );
+         }
+-        result.insert(name.clone(), profile);
++        result.insert(name, profile);
+     }
+     Ok(result)
+ }
