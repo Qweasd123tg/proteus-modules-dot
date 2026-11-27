@@ -1,0 +1,51 @@
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index 406621c061a592509fa76ac56da82e3ca95e7e6a..b4ec870b39c07cf04c94d1abe21a14e10cd2765e 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -14,14 +14,17 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+ }
+ 
+ pub(crate) fn digest_hex(digest: ring::digest::Digest) -> String {
++    let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
++    append_digest_hex(&mut encoded, digest);
++    encoded
++}
++
++pub(crate) fn append_digest_hex(encoded: &mut String, digest: ring::digest::Digest) {
+     const HEX: &[u8; 16] = b"0123456789abcdef";
+-    let bytes = digest.as_ref();
+-    let mut encoded = String::with_capacity(bytes.len() * 2);
+-    for &byte in bytes {
++    for &byte in digest.as_ref() {
+         encoded.push(char::from(HEX[(byte >> 4) as usize]));
+         encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+     }
+-    encoded
+ }
+ 
+ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index 562b0097590b33c76ee8cb20a1b4ea8eb310b6fa..253a71714a7124a58e4e8773ffc699597d6a468a 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -17,10 +17,16 @@ struct Cache<S = StorageSnapshot, V = serde_json::Value> {
+     value: V,
+ }
+ fn path(dir: &Path, key: &str) -> PathBuf {
+-    dir.join(format!(
+-        ".storage-cache-{}.json",
+-        crate::io::sha256_hex(key.as_bytes())
+-    ))
++    use ring::digest::{SHA256, digest};
++
++    const PREFIX: &str = ".storage-cache-";
++    const SUFFIX: &str = ".json";
++    let digest = digest(&SHA256, key.as_bytes());
++    let mut name = String::with_capacity(PREFIX.len() + digest.as_ref().len() * 2 + SUFFIX.len());
++    name.push_str(PREFIX);
++    crate::io::append_digest_hex(&mut name, digest);
++    name.push_str(SUFFIX);
++    dir.join(name)
+ }
+ fn same_prefix(a: &StorageSnapshot, b: &StorageSnapshot) -> bool {
+     a.session == b.session && a.revision == b.revision && a.content_sha256 == b.content_sha256
