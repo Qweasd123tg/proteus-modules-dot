@@ -1,0 +1,198 @@
+diff --git a/docs/development/testing.md b/docs/development/testing.md
+index 2c0719de7db4cfdbf3469a51beb713ffa99aa818..9c7d8ac3a2f381cfdbc6108e6a8cc52e61c4db13 100644
+--- a/docs/development/testing.md
++++ b/docs/development/testing.md
+@@ -93,6 +93,11 @@ git diff --check
+ выбирает весь workspace. Для локального module/helper выбирайте package или
+ filter из матрицы; полный прогон не нужен после каждого изменения.
+ 
++При явном `-p proteus-core --lib` без других целей runner готовит только
++reference и session-storage. Если пути заданы в `PROTEUS_TEST_REFERENCE_MODULE`
++и `PROTEUS_TEST_SESSION_STORAGE_MODULE`, соответствующие сборки пропускаются.
++Полный прогон и цели интеграции используют прежний набор fixtures.
++
+ Runner готовит reference-модуль из отдельного Proteus-modules через
+ `scripts/build_module.py` и передаёт его фактический Cargo artifact path в
+ `PROTEUS_TEST_REFERENCE_MODULE`. Core fixtures не запускают Cargo и не
+diff --git a/scripts/test.py b/scripts/test.py
+index cb006174d7b6eceef819dd6913ab53467585c5ea..38306ad2e511ba1b485f0c1d61619e90697dd2fb 100755
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -34,25 +34,47 @@ def selected_packages(args):
+     return packages
+ 
+ 
++def core_library_only(args, packages):
++    if packages != ["proteus-core"] or "--lib" not in args:
++        return False
++    # Cargo can combine target selectors. Only trim fixture preparation for
++    # the Core library target by itself, not for a mixed or alternate workspace.
++    other_selectors = {
++        "--test", "--tests", "--bin", "--bins", "--example", "--examples",
++        "--bench", "--benches", "--doc", "--all-targets",
++        "--workspace", "--all", "--manifest-path",
++    }
++    return not any(arg.partition("=")[0] in other_selectors for arg in args)
++
++
+ def main(args):
+     if not args or args == ["--help"]:
+         print("Usage: scripts/test.py full [Cargo options]\n"
+               "       scripts/test.py -p PACKAGE [Cargo test options]\n\n"
+               "Module implementations have their own test runner in Proteus-modules.\n"
+-              "Use PROTEUS_MODULES_SOURCE or PROTEUS_TEST_REFERENCE_MODULE to override fixtures.")
++              "Override fixtures with PROTEUS_MODULES_SOURCE, PROTEUS_TEST_REFERENCE_MODULE\n"
++              "or PROTEUS_TEST_SESSION_STORAGE_MODULE.")
+         return 0 if args else 2
+     full = args[0] == "full"
++    cargo_args = args[:args.index("--")] if "--" in args else args
++    packages = selected_packages(cargo_args)
+     if full:
+         args = ["--workspace", "--no-fail-fast",
+                 "--features", "proteus-module-protocol/conformance-cli", *args[1:]]
+-    elif not selected_packages(args):
++    elif not packages:
+         raise SystemExit("Select -p PACKAGE, or full for the harness workspace gate")
+     env = test_env()
+     start = time.monotonic()
+-    core = full or "proteus-core" in selected_packages(args)
++    core = full or "proteus-core" in packages
+     if core:
+-        if full or "--test" not in args or any(target in args for target in
+-                                              ("config_profiles", "capability_environment", "module_swap")):
++        integration_targets = ("config_profiles", "capability_environment", "module_swap")
++        needs_package_set = "--test" not in cargo_args or any(
++            target in cargo_args for target in integration_targets
++        )
++        if not full and core_library_only(cargo_args, packages):
++            # Only explicit fixture paths carry over to a library-only run.
++            env.pop("PROTEUS_TEST_MODULE_BINARIES", None)
++        elif full or needs_package_set:
+             binaries = build_packages(env=env)
+             env["PROTEUS_TEST_MODULE_BINARIES"] = json.dumps(binaries)
+             directories = list(dict.fromkeys(str(Path(path).parent) for path in binaries.values()))
+diff --git a/scripts/test_conformance_selection.py b/scripts/test_conformance_selection.py
+index 434bc4ab40e4c972cfa5f54bf4cf3330961c0d04..f4d351b8bb30ce7fa3bf99a487513786e901890c 100644
+--- a/scripts/test_conformance_selection.py
++++ b/scripts/test_conformance_selection.py
+@@ -1,6 +1,7 @@
+ """Runner-selection regression source; no Cargo or fixture process is started."""
+ import json
+ from pathlib import Path
++import tempfile
+ import unittest
+ from unittest.mock import patch
+ 
+@@ -8,46 +9,102 @@ import test as runner
+ 
+ 
+ STORAGE = str(Path("/fixture/session-storage").resolve())
++MODULES = Path("/fixture/modules")
+ 
+ 
+ class ConformanceSelection(unittest.TestCase):
+-    def invoke(self, arguments):
+-        with (patch.object(runner, "test_env", return_value={}),
++    def invoke(self, arguments, env=None):
++        with (patch.object(runner, "test_env", return_value=dict(env or {})),
+               patch.object(runner, "build_packages",
+                            return_value={"session-storage": STORAGE}) as packages,
+               patch.object(runner, "build", return_value="/fixture/reference") as reference,
++              patch.object(runner, "resolve", return_value=MODULES),
++              patch.object(runner.subprocess, "check_output",
++                           return_value=json.dumps({"session-storage": STORAGE})) as storage,
+               patch.object(runner.subprocess, "call", return_value=0) as cargo):
+             self.assertEqual(runner.main(arguments), 0)
+-        return (cargo.call_args.args[0], packages.call_count, reference.call_count,
+-                cargo.call_args.kwargs["env"])
++        cargo_env = cargo.call_args.kwargs["env"]
++        if storage.called:
++            storage.assert_called_once_with(
++                [runner.sys.executable, str(MODULES / "package.py"), "--profile", "dev",
++                 "--package", "session-storage", "--print-artifacts"],
++                cwd=MODULES, env=cargo_env, text=True,
++            )
++        return (cargo.call_args.args[0], (packages.call_count, reference.call_count, storage.call_count),
++                cargo_env)
+ 
+     def test_full_preserves_conformance_binary_coverage(self):
+-        command, packages, reference, env = self.invoke(["full", "--", "--nocapture"])
++        command, builds, env = self.invoke(["full", "--", "--nocapture"])
+         self.assertEqual(command, [
+             "cargo", "test", "--locked", "--workspace", "--no-fail-fast",
+             "--features", "proteus-module-protocol/conformance-cli",
+             "--", "--nocapture",
+         ])
+-        self.assertEqual((packages, reference), (1, 1))
++        self.assertEqual(builds, (1, 1, 0))
+         self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
+         self.assertEqual(json.loads(env["PROTEUS_TEST_MODULE_BINARIES"]),
+                          {"session-storage": STORAGE})
+ 
+     def test_selected_protocol_stays_library_only_by_default(self):
+-        command, packages, reference, env = self.invoke(["-p", "proteus-module-protocol"])
++        command, builds, env = self.invoke(["-p", "proteus-module-protocol"])
+         self.assertEqual(command, [
+             "cargo", "test", "--locked", "-p", "proteus-module-protocol",
+         ])
+-        self.assertEqual((packages, reference), (0, 0))
++        self.assertEqual(builds, (0, 0, 0))
+         self.assertNotIn("PROTEUS_TEST_SESSION_STORAGE_MODULE", env)
+ 
+     def test_explicit_cli_feature_is_forwarded_without_core_fixtures(self):
+         arguments = ["-p", "proteus-module-protocol", "--features", "conformance-cli"]
+-        command, packages, reference, env = self.invoke(arguments)
++        command, builds, env = self.invoke(arguments)
+         self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
+-        self.assertEqual((packages, reference), (0, 0))
++        self.assertEqual(builds, (0, 0, 0))
+         self.assertNotIn("PROTEUS_TEST_SESSION_STORAGE_MODULE", env)
+ 
++    def test_core_library_uses_only_named_fixtures_and_ignores_harness_args(self):
++        arguments = ["--package=proteus-core", "--lib", "--", "--skip", "module_swap"]
++        command, builds, env = self.invoke(arguments, {
++            "PATH": "/bin",
++            "PROTEUS_TEST_MODULE_BINARIES": json.dumps({"session-storage": "/old/storage"}),
++        })
++        self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++        self.assertEqual(builds, (0, 1, 1))
++        self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
++        self.assertEqual(env["PROTEUS_TEST_REFERENCE_MODULE"], "/fixture/reference")
++        self.assertNotIn("PROTEUS_TEST_MODULE_BINARIES", env)
++        self.assertEqual(env["PATH"], "/bin")
++
++    def test_core_library_honors_individual_fixture_overrides(self):
++        with tempfile.TemporaryDirectory() as directory:
++            reference = Path(directory, "reference")
++            reference.touch()
++            for given, builds in (
++                ({"PROTEUS_TEST_REFERENCE_MODULE": str(reference)}, (0, 0, 1)),
++                ({"PROTEUS_TEST_SESSION_STORAGE_MODULE": STORAGE}, (0, 1, 0)),
++                ({"PROTEUS_TEST_REFERENCE_MODULE": str(reference),
++                  "PROTEUS_TEST_SESSION_STORAGE_MODULE": STORAGE}, (0, 0, 0)),
++            ):
++                with self.subTest(given=given):
++                    _, observed, env = self.invoke(["-pproteus-core", "--lib"], given)
++                    self.assertEqual(observed, builds)
++                    self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
++                    self.assertEqual(env["PROTEUS_TEST_REFERENCE_MODULE"],
++                                     given.get("PROTEUS_TEST_REFERENCE_MODULE", "/fixture/reference"))
++
++    def test_broad_and_mixed_core_runs_keep_the_package_set(self):
++        for options in (
++            [], ["--", "--skip", "--lib"], ["--test", "config_profiles"],
++            ["--test", "capability_environment"], ["--lib", "--test=module_swap"],
++            ["--lib", "--test", "module_swap"], ["--lib", "--all-targets"],
++            ["--lib", "--tests"], ["--lib", "--bin=proteus"], ["--lib", "--workspace"],
++            ["--lib", "-p", "proteus-module-protocol"],
++        ):
++            with self.subTest(options=options):
++                arguments = ["-p", "proteus-core", *options]
++                command, builds, env = self.invoke(arguments)
++                self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                self.assertEqual(builds, (1, 1, 0))
++                self.assertIn("PROTEUS_TEST_MODULE_BINARIES", env)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
