@@ -1,0 +1,123 @@
+{
+  "format": 1,
+  "component": "Proteus-harness/Proteus-core",
+  "base_commit": "024fb944a91382026bb2aa5c7b8da65c284d0305",
+  "base_tree": "18187387ab899ab096df8859023c3068531c4f28",
+  "patched_tree": "19aad339cc52eac04cb9e0fa1a0f6f196fafb4a1",
+  "tested_prior_stack_tree": "1970cf42cf908cdcea26e7290c52cac8813f7563",
+  "tested_prior_stack_plus_patch_tree": "e3bf6658e0124dcb7cfca652572560d5a68b5466",
+  "stack_verification": "Strict indexed application and inverse; not a composed build.",
+  "source_patch_sha256": "4ccb44b580b79789d8e0e7a2e1db5db42c4f3eb441ea593435fe6795a298c28a",
+  "toolchain": "rustc 1.95.0 (59807616e1fa2540724bfbac14d7976d7e4a3860)",
+  "cargo_lock_sha256": "4a1bbdfd2f0746cb0a6bf2088c6a11f9cff5f3800181f5ae073d62cfea8784b5",
+  "build": "cargo test --offline --locked --release -p proteus-core --lib --no-run -j 4",
+  "test_filters": {
+    "test": "core::registry::",
+    "settings": "app_server::config_builder::",
+    "api": "app_server::http::tests::"
+  },
+  "tested": {
+    "stock": {
+      "binary_sha256": "566bee2e71c3e7c15886fc7a3339541bdeef370d3440c51145c78d53992e58ba",
+      "test_counts": {
+        "test": {
+          "passed": 8,
+          "log_sha256": "7a2c866366b45853daa0b0f963fb9a375cb570d81ef6652f80e19d1faf253b84"
+        },
+        "settings": {
+          "passed": 51,
+          "log_sha256": "5f5b6fb0ca6388281477293c74242777179a3778745dba219cace62739cd6755"
+        },
+        "api": {
+          "passed": 92,
+          "log_sha256": "bf8866782f8f651becf794059805a30922400f95c0192402c8f271954418b1ad"
+        }
+      }
+    },
+    "owner": {
+      "binary_sha256": "7a5c0f01bb837d50527052e9ae5951a56636cb6c8fea78ab79dcfc9e98074fb3",
+      "test_counts": {
+        "test": {
+          "passed": 8,
+          "log_sha256": "ed01e65acb977bcc18635e72d0f9ee91c90755b246f7795f2501d7b6cec2305c"
+        },
+        "settings": {
+          "passed": 51,
+          "log_sha256": "e8d86d0e43a352c56e07a00e949e3d2f1352878a7a9a55a3d9b69282f835d5cc"
+        },
+        "api": {
+          "passed": 92,
+          "log_sha256": "4139cd36e81c227c7be69e302ac17dd7840facb386f3fda9b90da0d7aa288fa1"
+        }
+      }
+    }
+  },
+  "allocation_fields": [
+    "capture_calls",
+    "capture_requested_bytes",
+    "setup_calls",
+    "setup_requested_bytes"
+  ],
+  "allocation_probe": {
+    "stock": {
+      "0": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "1": [
+        13,
+        1036,
+        0,
+        0
+      ],
+      "20": [
+        241,
+        20730,
+        0,
+        0
+      ],
+      "64": [
+        769,
+        66358,
+        0,
+        0
+      ]
+    },
+    "owner": {
+      "0": [
+        0,
+        0,
+        1,
+        40
+      ],
+      "1": [
+        0,
+        0,
+        1,
+        40
+      ],
+      "20": [
+        0,
+        0,
+        1,
+        40
+      ],
+      "64": [
+        0,
+        0,
+        1,
+        40
+      ]
+    }
+  },
+  "scope": "Private fixture compares cloning the same Vec/Arc representation created from ModuleCatalog. One synthetic component declaring 0/1/20/64 models with constant 256-byte config payload, no process launch in the allocation counter. Binding values, description and order match. Scope excludes executor, cwd cloning, manifest I/O, old/new complete product PSS and startup/GUI time.",
+  "test_fixtures": "Existing native local fixture tests for reconnect, release and settings HTTP; older inert reference and storage fixtures where required. No fresh full application run.",
+  "reproduction": {
+    "allocator": "Copy crates/proteus-contracts/src/test_alloc.rs to crates/proteus-core/src/w330_alloc.rs and declare under #[cfg(test)] in Core lib.rs.",
+    "append_probe_to": "crates/proteus-core/src/core/registry/discovery_tests.rs",
+    "stock_probe": "\n#[test]\nfn w330_schema_plan_capture() {\n    let workspace = tempfile::tempdir().unwrap();\n    for n in [0, 1, 20, 64] {\n        let mut exports = serde_json::Map::new();\n        let mut config_by_id = serde_json::Map::new();\n        for i in 0..n {\n            let id = format!(\"w330_binding_{i}\");\n            exports.insert(id.clone(), json!({\"description\": \"description\".repeat(4)}));\n            config_by_id.insert(id, json!({\"payload\": \"x\".repeat(256), \"flags\": [\"a\", \"b\"]}));\n        }\n        let config: AppConfig = serde_json::from_value(if n==0 {json!({})} else {json!({\n            \"components\": {\"w330\": {\n                \"command\": \"unused\",\n                \"exports\": {\"model\": exports}\n            }},\n            \"module_config\": {\"model\": config_by_id}\n        })}).unwrap();\n        let catalog = ModuleCatalog::from_config(&config).unwrap();\n        assert_eq!(catalog.config_exports.len(), n);\n        let source = std::hint::black_box(catalog.config_exports);\n        let (captured, counts) = crate::w330_alloc::measure(|| std::hint::black_box(source.clone()));\n        assert_eq!(captured.len(), n);\n        for (a,b) in source.iter().zip(captured.iter()) {\n            assert_eq!(a.component_id(), b.component_id());\n            assert_eq!(a.binding(), b.binding());\n            assert_eq!(a.description(), b.description());\n            let value = &a.binding().module_config;\n            assert!(value.to_string().contains(&\"x\".repeat(256)), \"{value}\");\n        }\n        let (_, setup) = crate::w330_alloc::measure(|| std::hint::black_box(Vec::<crate::process_adapters::ProcessExportConfig>::new()));\n        println!(\"CAPTURE {n} {} {} SETUP {} {}\", counts.calls, counts.bytes, setup.calls, setup.bytes);\n    }\n}\n",
+    "owner_probe": "\n#[test]\nfn w330_schema_plan_capture() {\n    let workspace = tempfile::tempdir().unwrap();\n    for n in [0, 1, 20, 64] {\n        let mut exports = serde_json::Map::new();\n        let mut config_by_id = serde_json::Map::new();\n        for i in 0..n {\n            let id = format!(\"w330_binding_{i}\");\n            exports.insert(id.clone(), json!({\"description\": \"description\".repeat(4)}));\n            config_by_id.insert(id, json!({\"payload\": \"x\".repeat(256), \"flags\": [\"a\", \"b\"]}));\n        }\n        let config: AppConfig = serde_json::from_value(if n==0 {json!({})} else {json!({\n            \"components\": {\"w330\": {\n                \"command\": \"unused\",\n                \"exports\": {\"model\": exports}\n            }},\n            \"module_config\": {\"model\": config_by_id}\n        })}).unwrap();\n        let catalog = ModuleCatalog::from_config(&config).unwrap();\n        assert_eq!(catalog.config_exports.len(), n);\n        let source = std::hint::black_box(Arc::new(catalog.config_exports));\n        let (captured, counts) = crate::w330_alloc::measure(|| std::hint::black_box(source.clone()));\n        assert_eq!(captured.len(), n);\n        for (a,b) in source.iter().zip(captured.iter()) {\n            assert_eq!(a.component_id(), b.component_id());\n            assert_eq!(a.binding(), b.binding());\n            assert_eq!(a.description(), b.description());\n            let value = &a.binding().module_config;\n            assert!(value.to_string().contains(&\"x\".repeat(256)), \"{value}\");\n        }\n        let (_, setup) = crate::w330_alloc::measure(|| std::hint::black_box(Arc::new(Vec::<crate::process_adapters::ProcessExportConfig>::new())));\n        println!(\"CAPTURE {n} {} {} SETUP {} {}\", counts.calls, counts.bytes, setup.calls, setup.bytes);\n    }\n}\n"
+  }
+}

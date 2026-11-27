@@ -1,0 +1,88 @@
+diff --git a/crates/proteus-core/src/core/registry.rs b/crates/proteus-core/src/core/registry.rs
+index ff6fa9819293b1d9463e93264c5867d622292fad..56857712435b3ea8fcb8fb83babded98625283cf 100644
+--- a/crates/proteus-core/src/core/registry.rs
++++ b/crates/proteus-core/src/core/registry.rs
+@@ -30,7 +30,8 @@ mod tool_terminal_tests;
+ 
+ #[derive(Clone)]
+ pub struct RuntimeRegistry {
+-    config_exports: Vec<crate::process_adapters::ProcessExportConfig>,
++    // Immutable per registry generation, also retained by schema discovery tasks.
++    config_exports: Arc<Vec<crate::process_adapters::ProcessExportConfig>>,
+     pub hooks: Vec<(String, Arc<dyn crate::contracts::HookHandler>)>,
+     hook_subscriptions: super::config::HookSubscriptions,
+     pub cwd: PathBuf,
+@@ -106,7 +107,7 @@ impl RuntimeRegistry {
+         let workspace = self.cwd.canonicalize()?;
+         let mut seen = std::collections::HashSet::new();
+         let mut workers = FuturesUnordered::new();
+-        for export in &self.config_exports {
++        for export in self.config_exports.iter() {
+             if export.releases_when_idle() && seen.insert(export.component_id()) {
+                 workers.push(export.release_idle_broker(&workspace));
+             }
+@@ -296,7 +297,7 @@ impl RuntimeRegistry {
+             export.release_discovery_brokers()?;
+         }
+         Ok(Self {
+-            config_exports: catalog.config_exports,
++            config_exports: Arc::new(catalog.config_exports),
+             session_storage,
+             hooks,
+             hook_subscriptions: config.modules.hook_events.clone(),
+diff --git a/crates/proteus-core/src/core/registry/compaction_tests.rs b/crates/proteus-core/src/core/registry/compaction_tests.rs
+index e350b3052171360e171b05a498791c05c690981b..de15e51e9bd86e6256692ac79b383dc673df8f93 100644
+--- a/crates/proteus-core/src/core/registry/compaction_tests.rs
++++ b/crates/proteus-core/src/core/registry/compaction_tests.rs
+@@ -184,7 +184,7 @@ async fn registry_compaction_callbacks_use_configured_hooks_without_a_strong_ref
+     };
+     let model_ref = config.model_ref();
+     let registry = RuntimeRegistry {
+-        config_exports: vec![],
++        config_exports: Arc::default(),
+         hook_subscriptions: Default::default(),
+         hooks: vec![
+             ("prepare".into(), Arc::new(NestedPreparation)),
+diff --git a/crates/proteus-core/src/core/registry/config_schemas.rs b/crates/proteus-core/src/core/registry/config_schemas.rs
+index 6844085e1dcb5e98b0fa9277c6029ad00077ff7f..47951015cef992150288c7001ad51c2ffd558878 100644
+--- a/crates/proteus-core/src/core/registry/config_schemas.rs
++++ b/crates/proteus-core/src/core/registry/config_schemas.rs
+@@ -1,6 +1,9 @@
+ //! Read-only configuration discovery, independent of behavior slot dispatch.
+ use crate::domain::ModuleConfigSchema;
+-use std::collections::{BTreeMap, BTreeSet};
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    sync::Arc,
++};
+ 
+ #[derive(Default)]
+ pub(crate) struct ConfigSchemas {
+@@ -10,12 +13,12 @@ pub(crate) struct ConfigSchemas {
+ 
+ impl super::RuntimeRegistry {
+     pub(crate) async fn config_schemas(&self) -> ConfigSchemas {
+-        let exports = self.config_exports.clone();
++        let exports = Arc::clone(&self.config_exports);
+         let cwd = self.cwd.clone();
+         match tokio::task::spawn_blocking(move || {
+             let mut result = ConfigSchemas::default();
+             let mut seen = BTreeSet::new();
+-            for export in exports {
++            for export in exports.iter() {
+                 if !seen.insert(export.component_id().to_owned()) {
+                     continue;
+                 }
+diff --git a/crates/proteus-core/src/core/tool_terminal_binding_tests.rs b/crates/proteus-core/src/core/tool_terminal_binding_tests.rs
+index 3b96051d5bb63d9183eb7379ead67a37b48b119b..484de48f571ff9c18f1c4499faf493db14857c39 100644
+--- a/crates/proteus-core/src/core/tool_terminal_binding_tests.rs
++++ b/crates/proteus-core/src/core/tool_terminal_binding_tests.rs
+@@ -203,7 +203,7 @@ fn registry(wait: bool, deny_leaf: bool) -> RuntimeRegistry {
+             .unwrap();
+     }
+     RuntimeRegistry {
+-        config_exports: vec![],
++        config_exports: Arc::default(),
+         hook_subscriptions: Default::default(),
+         hooks: vec![("fixture".into(), Arc::new(Hook))],
+         cwd: "/workspace".into(),
