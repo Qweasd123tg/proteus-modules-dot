@@ -1,0 +1,240 @@
+diff --git a/crates/proteus-core/src/core/context_provider.rs b/crates/proteus-core/src/context_provider.rs
+similarity index 100%
+rename from crates/proteus-core/src/core/context_provider.rs
+rename to crates/proteus-core/src/context_provider.rs
+diff --git a/crates/proteus-core/src/core/config.rs b/crates/proteus-core/src/core/config.rs
+index 97397c2ff89979dbba90a56e1722a3d8bbac50c6..3b6cc05d54d0c50cb98b8011ed0896bb93682b17 100644
+--- a/crates/proteus-core/src/core/config.rs
++++ b/crates/proteus-core/src/core/config.rs
+@@ -32,7 +32,7 @@ pub(crate) use files::config_files;
+ pub(crate) use inputs::ConfigInputs;
+ 
+ pub use crate::domain::{ConfiguredMcpServerConfig, ProcessEnvironmentConfig};
+-pub use loading::expand_user_path;
++pub use crate::user_path::expand_user_path;
+ pub use reference::{
+     config_reference, config_selection, physical_config_path, selected_config_value_mut,
+ };
+diff --git a/crates/proteus-core/src/core/config/loading.rs b/crates/proteus-core/src/core/config/loading.rs
+index 224ad82ed2f0fda58299888a9e1303c8c1b70e95..509bd596bc5136ad2b9820cfc1b91843f7e69246 100644
+--- a/crates/proteus-core/src/core/config/loading.rs
++++ b/crates/proteus-core/src/core/config/loading.rs
+@@ -7,6 +7,8 @@ use std::{
+ use anyhow::{Context, Result, bail};
+ use serde_json::{Map, Value};
+ 
++use crate::user_path::expand_user_path;
++
+ use super::{
+     AppConfig, ConfigInputs, config_reference, config_selection, physical_config_path,
+     selected_config_value_mut,
+@@ -617,29 +619,3 @@ fn merge_config_value(base: &mut Value, overlay: Value) {
+         }
+     }
+ }
+-
+-pub fn expand_user_path(path: impl AsRef<Path>) -> PathBuf {
+-    expand_user_path_with_home(path.as_ref(), env::var_os("HOME").as_deref())
+-}
+-
+-pub(super) fn expand_user_path_with_home(path: &Path, home: Option<&std::ffi::OsStr>) -> PathBuf {
+-    let Some(path_str) = path.to_str() else {
+-        return path.to_path_buf();
+-    };
+-    let Some(home) = home else {
+-        return path.to_path_buf();
+-    };
+-    if path_str == "~" || path_str == "$HOME" || path_str == "${HOME}" {
+-        return PathBuf::from(home);
+-    }
+-    if let Some(stripped) = path_str.strip_prefix("~/") {
+-        return PathBuf::from(home).join(stripped);
+-    }
+-    if let Some(stripped) = path_str.strip_prefix("$HOME/") {
+-        return PathBuf::from(home).join(stripped);
+-    }
+-    if let Some(stripped) = path_str.strip_prefix("${HOME}/") {
+-        return PathBuf::from(home).join(stripped);
+-    }
+-    path.to_path_buf()
+-}
+diff --git a/crates/proteus-core/src/core/config/tests.rs b/crates/proteus-core/src/core/config/tests.rs
+index 30c2bd1c5a36e0c80a518b9effbcc48a5533bae3..3735fe84d06b5d6d81df35173b9fee64da7f511f 100644
+--- a/crates/proteus-core/src/core/config/tests.rs
++++ b/crates/proteus-core/src/core/config/tests.rs
+@@ -1,9 +1,10 @@
+ use std::path::{Path, PathBuf};
+ 
++use crate::user_path::expand_user_path_with_home;
++
+ use super::{
+     loading::{
+-        config_name_ref, default_config_dir, default_config_path_from_env,
+-        expand_user_path_with_home, resolve_config_name_path,
++        config_name_ref, default_config_dir, default_config_path_from_env, resolve_config_name_path,
+     },
+     *,
+ };
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 6736e53b6e8d6d13e032c2fde6d4e3602db72d17..34181fa8d58b1502d5a50a257452385fc68cf6bc 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -9,7 +9,6 @@ mod config;
+ mod context_preparation;
+ pub(crate) use config::{CONFIG_BUILDER_OVERLAY, config_files};
+ mod config_snapshot;
+-mod context_provider;
+ pub(crate) mod core_slots;
+ mod eval_report;
+ mod event_store;
+@@ -116,7 +115,6 @@ pub use workflow_replay::{
+ pub(crate) use approval::{CachedApprovalTransport, ChannelApprovalTransport, PendingApproval};
+ pub(crate) use assembly::catalog_module_source;
+ pub(crate) use bound_tools::ToolExecutionObserver;
+-pub(crate) use context_provider::RepoAwareContextProvider;
+ pub(crate) use event_store::{FanoutEventSink, JsonlEventStore};
+ pub(crate) use model_service::ModelService;
+ pub(crate) use module_catalog::{ModuleBuildContext, PolicyBuildContext};
+diff --git a/crates/proteus-core/src/core/module_catalog.rs b/crates/proteus-core/src/core/module_catalog.rs
+index 193f0c59603086dda57fd6dc8724641b75a50181..197431fdf1c2456a59bfe51030bc5bc5ae2f421e 100644
+--- a/crates/proteus-core/src/core/module_catalog.rs
++++ b/crates/proteus-core/src/core/module_catalog.rs
+@@ -7,7 +7,8 @@ mod tools;
+ 
+ use crate::{
+     contracts::{ApprovalPolicy, ContextBuilder, Model, SessionStorage, Workflow},
+-    core::{AppConfig, ModelConfig, RepoAwareContextProvider},
++    context_provider::RepoAwareContextProvider,
++    core::{AppConfig, ModelConfig},
+     domain::{ModuleKind, ModuleManifest, SlotId, slot},
+     process_adapters::{ProcessContextProvider, ProcessExportConfig},
+ };
+diff --git a/crates/proteus-core/src/core/registry.rs b/crates/proteus-core/src/core/registry.rs
+index ff6fa9819293b1d9463e93264c5867d622292fad..354bf676794aed130296af8794ba15f1ac779f42 100644
+--- a/crates/proteus-core/src/core/registry.rs
++++ b/crates/proteus-core/src/core/registry.rs
+@@ -48,7 +48,7 @@ pub struct RuntimeRegistry {
+     pub agent_control: Option<Arc<dyn AgentControl>>,
+     pub workflow: Arc<dyn Workflow>,
+     pub session_storage: Option<Arc<dyn SessionStorage>>,
+-    pub(crate) context_providers: Vec<(String, Arc<dyn crate::core::RepoAwareContextProvider>)>,
++    pub(crate) context_providers: Vec<(String, Arc<dyn crate::context_provider::RepoAwareContextProvider>)>,
+     pub(crate) mcp_servers: Vec<proteus_contracts::app_protocol::addons::AppMcpServerState>,
+     pub(crate) plugins: Vec<proteus_contracts::app_protocol::addons::AppAgentPluginState>,
+ }
+diff --git a/crates/proteus-core/src/lib.rs b/crates/proteus-core/src/lib.rs
+index ba315cf7bca4ade2177990f0cc75923f494f558a..1da4699ffe94b156a2b647fcf47fa9e57b3a4284 100644
+--- a/crates/proteus-core/src/lib.rs
++++ b/crates/proteus-core/src/lib.rs
+@@ -1,12 +1,14 @@
+ pub(crate) use proteus_contracts::{contracts, domain, model_standard};
+ 
+ pub mod app_server;
++mod context_provider;
+ pub mod core;
+ #[cfg(feature = "memory-diagnostics")]
+ pub(crate) mod memory_diagnostics;
+ pub mod process_adapters;
+ pub(crate) mod stubs;
+ pub(crate) mod tools;
++mod user_path;
+ 
+ pub(crate) fn release_unused_allocator_pages() {
+     #[cfg(all(target_os = "linux", target_env = "gnu"))]
+diff --git a/crates/proteus-core/src/process_adapters/context.rs b/crates/proteus-core/src/process_adapters/context.rs
+index 1a23b59023207df90bb7402a99eabdb65d096ffb..2dba6636b8a6019e5148a9ec974840dd35b22524 100644
+--- a/crates/proteus-core/src/process_adapters/context.rs
++++ b/crates/proteus-core/src/process_adapters/context.rs
+@@ -12,6 +12,7 @@ use serde::Serialize;
+ use serde_json::Value;
+ 
+ use crate::{
++    context_provider::RepoAwareContextProvider,
+     contracts::{
+         CONTEXT_HOST_PROVIDER_METHOD, ContextBuildInput, ContextBuilder,
+         PROCESS_CONTEXT_BUILD_METHOD, PROCESS_CONTEXT_CONTRACT_VERSION,
+@@ -19,7 +20,6 @@ use crate::{
+         ProcessContextChunksResponse, ProcessContextInput, ProcessContextProviderInput,
+         ProcessContextResponse,
+     },
+-    core::RepoAwareContextProvider,
+     domain::{ContextBundle, ContextChunk},
+ };
+ 
+diff --git a/crates/proteus-core/src/process_adapters/sandbox.rs b/crates/proteus-core/src/process_adapters/sandbox.rs
+index d29c2f9f72470ec56b0f24cae8f0e4d28554b7bc..6b7a313251c6aaede327d5d42fcd62ec554d1d8d 100644
+--- a/crates/proteus-core/src/process_adapters/sandbox.rs
++++ b/crates/proteus-core/src/process_adapters/sandbox.rs
+@@ -4,7 +4,7 @@ use anyhow::Result;
+ use proteus_contracts::domain::ProcessSandboxConfig;
+ use proteus_process_host::ProcessSandbox;
+ 
+-use crate::core::expand_user_path;
++use crate::user_path::expand_user_path;
+ 
+ /// Resolves grants against the canonical workspace while preserving logical
+ /// destinations such as /lib64. The process host pins their canonical sources.
+diff --git a/crates/proteus-core/src/tools/mcp.rs b/crates/proteus-core/src/tools/mcp.rs
+index 90c5133b1daf219e056db67dbc63e123399499d5..3d5dbb4f5fc0abb170cb8f1d38b5db2aeda73736 100644
+--- a/crates/proteus-core/src/tools/mcp.rs
++++ b/crates/proteus-core/src/tools/mcp.rs
+@@ -7,8 +7,7 @@ use serde_json::{Value, json};
+ 
+ use crate::{
+     contracts::{Tool, ToolContext, ToolRegistry, ToolSource},
+-    core::ConfiguredMcpServerConfig,
+-    domain::{ToolCall, ToolResult, ToolSpec},
++    domain::{ConfiguredMcpServerConfig, ToolCall, ToolResult, ToolSpec},
+     process_adapters::mcp_server_process_spec,
+ };
+ 
+diff --git a/crates/proteus-core/src/tools/mcp/discovery.rs b/crates/proteus-core/src/tools/mcp/discovery.rs
+index 1bcde14cd1d185823e065310c95f738e8b2fbe96..394a3018c1dae047360fe4ee43d6c0e6fee0047a 100644
+--- a/crates/proteus-core/src/tools/mcp/discovery.rs
++++ b/crates/proteus-core/src/tools/mcp/discovery.rs
+@@ -2,8 +2,7 @@ use anyhow::{Result, anyhow};
+ use serde_json::{Value, json};
+ 
+ use crate::{
+-    core::ConfiguredMcpServerConfig,
+-    domain::{ToolSafety, ToolSpec, ToolSurface, tool_validation::validate_tool_input_schema},
++    domain::{ConfiguredMcpServerConfig, ToolSafety, ToolSpec, ToolSurface, tool_validation::validate_tool_input_schema},
+ };
+ 
+ #[derive(Debug)]
+diff --git a/crates/proteus-core/src/user_path.rs b/crates/proteus-core/src/user_path.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbb60d8388eb0f96c5c899e3b5682991e0589f75
+--- /dev/null
++++ b/crates/proteus-core/src/user_path.rs
+@@ -0,0 +1,30 @@
++use std::{
++    env,
++    path::{Path, PathBuf},
++};
++
++pub fn expand_user_path(path: impl AsRef<Path>) -> PathBuf {
++    expand_user_path_with_home(path.as_ref(), env::var_os("HOME").as_deref())
++}
++
++pub(crate) fn expand_user_path_with_home(path: &Path, home: Option<&std::ffi::OsStr>) -> PathBuf {
++    let Some(path_str) = path.to_str() else {
++        return path.to_path_buf();
++    };
++    let Some(home) = home else {
++        return path.to_path_buf();
++    };
++    if path_str == "~" || path_str == "$HOME" || path_str == "${HOME}" {
++        return PathBuf::from(home);
++    }
++    if let Some(stripped) = path_str.strip_prefix("~/") {
++        return PathBuf::from(home).join(stripped);
++    }
++    if let Some(stripped) = path_str.strip_prefix("$HOME/") {
++        return PathBuf::from(home).join(stripped);
++    }
++    if let Some(stripped) = path_str.strip_prefix("${HOME}/") {
++        return PathBuf::from(home).join(stripped);
++    }
++    path.to_path_buf()
++}
