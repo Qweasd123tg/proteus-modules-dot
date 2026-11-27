@@ -1,0 +1,41 @@
+diff --git a/crates/proteus-core/src/core/config/model_settings.rs b/crates/proteus-core/src/core/config/model_settings.rs
+index 7ee611b0b9c005be6dd301d44f985c2d955f5669..c09d0a7bfa0752f6964964e81ab2b58321cdf676 100644
+--- a/crates/proteus-core/src/core/config/model_settings.rs
++++ b/crates/proteus-core/src/core/config/model_settings.rs
+@@ -249,12 +249,30 @@ pub(super) fn source_view(source: &Value) -> Value {
+         .pointer("/agent_control/roles")
+         .and_then(Value::as_array)
+     {
+-        view.insert("agent_control".into(), serde_json::json!({"roles": roles.iter().map(|role| {
+-            let mut projected = Map::new();
+-            for key in ["name","model"] { if let Some(value) = role.get(key) { projected.insert(key.into(),value.clone()); } }
+-            if let Some(child) = role.get("config") { projected.insert("config".into(), if child.is_object() { source_view(child) } else { Value::Null }); }
+-            Value::Object(projected)
+-        }).collect::<Vec<_>>()}));
++        let roles = roles
++            .iter()
++            .map(|role| {
++                let mut projected = Map::new();
++                for key in ["name", "model"] {
++                    if let Some(value) = role.get(key) {
++                        projected.insert(key.into(), value.clone());
++                    }
++                }
++                if let Some(child) = role.get("config") {
++                    let child = if child.is_object() {
++                        source_view(child)
++                    } else {
++                        Value::Null
++                    };
++                    projected.insert("config".into(), child);
++                }
++                Value::Object(projected)
++            })
++            .collect();
++        view.insert(
++            "agent_control".into(),
++            Value::Object(Map::from_iter([("roles".into(), Value::Array(roles))])),
++        );
+     }
+     Value::Object(view)
+ }
