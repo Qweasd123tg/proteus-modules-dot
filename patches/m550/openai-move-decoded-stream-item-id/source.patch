@@ -1,0 +1,20 @@
+diff --git a/model/model-pack/src/adapters/openai/stream_state.rs b/model/model-pack/src/adapters/openai/stream_state.rs
+index 2e9d51e5d5848635f9b691bf49e8955e0f14cb14..281347226b40cf130214b5ea4c9a2f38cdcaf09e 100644
+--- a/model/model-pack/src/adapters/openai/stream_state.rs
++++ b/model/model-pack/src/adapters/openai/stream_state.rs
+@@ -114,11 +114,10 @@ impl OpenAiStreamState {
+                 let Some(Value::String(text)) = parsed.get_mut(field).map(Value::take) else {
+                     return Vec::new();
+                 };
+-                let key = parsed
+-                    .get("item_id")
+-                    .and_then(Value::as_str)
+-                    .map(str::to_owned)
+-                    .unwrap_or_else(|| format!("output:{index}"));
++                let key = match parsed.get_mut("item_id").map(Value::take) {
++                    Some(Value::String(key)) => key,
++                    _ => format!("output:{index}"),
++                };
+                 let message_id = *self.ids.entry(key.clone()).or_insert_with(new_message_id);
+                 let phase = self.phases.get(&key).copied().flatten();
+                 let part = parsed
