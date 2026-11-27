@@ -1,0 +1,42 @@
+diff --git a/crates/proteus-core/src/core/config/model_settings.rs b/crates/proteus-core/src/core/config/model_settings.rs
+index 7ee611b0b9c005be6dd301d44f985c2d955f5669..e442ec6b6fc0208d4f9dce729f60efbcc187812c 100644
+--- a/crates/proteus-core/src/core/config/model_settings.rs
++++ b/crates/proteus-core/src/core/config/model_settings.rs
+@@ -215,6 +215,14 @@ pub(super) fn remove_outer_choice(source: &mut Value, selection: &[String]) -> R
+     Ok(())
+ }
+ 
++fn source_roles(source: &Value) -> Option<&[Value]> {
++    source
++        .get("agent_control")?
++        .get("roles")?
++        .as_array()
++        .map(Vec::as_slice)
++}
++
+ /// Only the fields needed to retain ownership and exact aliases survive load.
+ /// Never retain or duplicate unrelated component settings/instructions here.
+ pub(super) fn source_view(source: &Value) -> Value {
+@@ -245,10 +253,7 @@ pub(super) fn source_view(source: &Value) -> Value {
+             );
+         }
+     }
+-    if let Some(roles) = source
+-        .pointer("/agent_control/roles")
+-        .and_then(Value::as_array)
+-    {
++    if let Some(roles) = source_roles(source) {
+         view.insert("agent_control".into(), serde_json::json!({"roles": roles.iter().map(|role| {
+             let mut projected = Map::new();
+             for key in ["name","model"] { if let Some(value) = role.get(key) { projected.insert(key.into(),value.clone()); } }
+@@ -277,9 +282,7 @@ pub(super) fn source_choice(
+         return Ok((None, true));
+     };
+     let parent = super::selected_config_value_mut(source, parents)?;
+-    let choice = parent
+-        .pointer("/agent_control/roles")
+-        .and_then(Value::as_array)
++    let choice = source_roles(parent)
+         .and_then(|roles| {
+             roles
+                 .iter()
