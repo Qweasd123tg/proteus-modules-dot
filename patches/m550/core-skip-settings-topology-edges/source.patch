@@ -1,0 +1,85 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+index 1f4a0390f341aa3241625bd16a1ca9a53e80d24e..737ac3c6f8b209051dcd21fc1829e5b4eff750aa 100644
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -26,7 +26,7 @@ use serde_json::Value;
+ use crate::{
+     core::{
+         AppConfig, ModuleCatalogEntrySummary, ModuleSourceTopology, ModuleTopology, ModulesConfig,
+-        TopologyBuildInput, TopologySnapshot, build_topology_snapshot,
++        TopologyBuildInput, TopologySnapshot, build_config_builder_topology,
+         core_slots::{CoreSlotSelection, core_slot_descriptor_by_id},
+     },
+     domain::PermissionMode,
+@@ -44,7 +44,7 @@ impl AppServerHandle {
+     pub async fn config_builder_snapshot(&self) -> ConfigBuilderSnapshot {
+         let (runtime, _, _, mode) = self.runtime.configuration_view().await;
+         let tools = &runtime.registry.tool_inventory;
+-        let topology = build_topology_snapshot(TopologyBuildInput {
++        let topology = build_config_builder_topology(TopologyBuildInput {
+             plan: &runtime.assembly_plan,
+             tools,
+             module_epoch: runtime.epoch,
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 6736e53b6e8d6d13e032c2fde6d4e3602db72d17..122d84930a5b7d8b4311bd77a23254fb8ff76bf8 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -30,7 +30,7 @@ mod session_store;
+ mod tool_orchestrator;
+ mod tool_terminal_binding;
+ mod topology;
+-pub(crate) use topology::tool_safety_label;
++pub(crate) use topology::{build_config_builder_topology, tool_safety_label};
+ mod topology_render;
+ mod user_input;
+ pub(crate) mod workflow_host;
+diff --git a/crates/proteus-core/src/core/topology.rs b/crates/proteus-core/src/core/topology.rs
+index bde13b80e87c4717bf9544cf72176e478698e997..d9dd4f7a259c9eb9ec26f597478d92c2a0fbc412 100644
+--- a/crates/proteus-core/src/core/topology.rs
++++ b/crates/proteus-core/src/core/topology.rs
+@@ -13,6 +13,15 @@ use slots::build_slots;
+ use tools::build_tools;
+ 
+ pub fn build_topology_snapshot(input: TopologyBuildInput<'_>) -> TopologySnapshot {
++    build_topology(input, true)
++}
++
++pub(crate) fn build_config_builder_topology(input: TopologyBuildInput<'_>) -> TopologySnapshot {
++    // The settings projection has no graph field. Inspection still builds it.
++    build_topology(input, false)
++}
++
++fn build_topology(input: TopologyBuildInput<'_>, include_edges: bool) -> TopologySnapshot {
+     let plan = input.plan;
+     let config = plan.config();
+     let model = plan.model.as_ref().map(|model| ModelTopology {
+@@ -39,15 +48,20 @@ pub fn build_topology_snapshot(input: TopologyBuildInput<'_>) -> TopologySnapsho
+         }
+     }
+     let tools = build_tools(config, input.tools, &mut warnings);
+-    let mut edges = build_edges(&active_modules, &modules, &tools);
+-    for (index, id) in plan.hooks.iter().enumerate() {
+-        edges.push(TopologyEdge {
+-            from: "config".to_owned(),
+-            to: format!("module:hook:{id}"),
+-            kind: "ordered_hook".to_owned(),
+-            label: Some(format!("{}", index + 1)),
+-        });
+-    }
++    let edges = if include_edges {
++        let mut edges = build_edges(active_modules, &modules, &tools);
++        for (index, id) in plan.hooks.iter().enumerate() {
++            edges.push(TopologyEdge {
++                from: "config".to_owned(),
++                to: format!("module:hook:{id}"),
++                kind: "ordered_hook".to_owned(),
++                label: Some(format!("{}", index + 1)),
++            });
++        }
++        edges
++    } else {
++        Vec::new()
++    };
+ 
+     TopologySnapshot {
+         profile: plan.profile.clone(),
