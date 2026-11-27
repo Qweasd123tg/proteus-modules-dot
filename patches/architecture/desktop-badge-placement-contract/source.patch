@@ -1,0 +1,141 @@
+diff --git a/src/declarative/badge_place.rs b/src/declarative/badge_place.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..62dab854b6b2b68c8c91b96f58029419ba29f0ab
+--- /dev/null
++++ b/src/declarative/badge_place.rs
+@@ -0,0 +1,59 @@
++//! Placement shared by package declarations and saved user overrides.
++
++use serde::{Deserialize, Serialize};
++
++/// Where the compact icon of an extension is shown: the left or the right
++/// end of the composer row and the top bar, or the top or the bottom of the
++/// rail along the left edge.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum BadgePlace {
++    ComposerStart,
++    ComposerEnd,
++    HeaderStart,
++    HeaderEnd,
++    RailStart,
++    RailEnd,
++    Hidden,
++}
++
++impl BadgePlace {
++    /// Every place where icons are drawn.
++    pub const SHOWN: [BadgePlace; 6] = [
++        BadgePlace::ComposerStart,
++        BadgePlace::ComposerEnd,
++        BadgePlace::HeaderStart,
++        BadgePlace::HeaderEnd,
++        BadgePlace::RailStart,
++        BadgePlace::RailEnd,
++    ];
++
++    /// Icons here stand in a column, so only narrow ones fit.
++    pub fn is_rail(self) -> bool {
++        matches!(self, BadgePlace::RailStart | BadgePlace::RailEnd)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::BadgePlace;
++
++    #[test]
++    fn badge_place_keeps_public_names_visible_order_and_rails() {
++        let places = BadgePlace::SHOWN.into_iter().chain([BadgePlace::Hidden]);
++        for (place, (name, is_rail)) in places.zip([
++            ("composer_start", false),
++            ("composer_end", false),
++            ("header_start", false),
++            ("header_end", false),
++            ("rail_start", true),
++            ("rail_end", true),
++            ("hidden", false),
++        ]) {
++            let serialized = serde_json::to_value(place).unwrap();
++            assert_eq!(serialized.as_str(), Some(name));
++            assert_eq!(serde_json::from_value::<BadgePlace>(serialized).unwrap(), place);
++            assert_eq!(place.is_rail(), is_rail);
++        }
++    }
++}
+diff --git a/src/declarative/manifest.rs b/src/declarative/manifest.rs
+index f9e153b56cce14f734ab15ad754a76745e5278d7..2019c67f3cf5df1a810f3ac49d90b5eb8473060d 100644
+--- a/src/declarative/manifest.rs
++++ b/src/declarative/manifest.rs
+@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
+ use anyhow::{Context as _, Result, bail};
+ use serde::Deserialize;
+ 
+-use crate::preferences::BadgePlace;
++use super::badge_place::BadgePlace;
+ 
+ pub const MANIFEST: &str = "extension.json";
+ const TAGS: &str = "org.proteus/tags";
+diff --git a/src/declarative/mod.rs b/src/declarative/mod.rs
+index 1363d99839be7c36e9877b4a078578919d55b948..f1f4ba3c521b941d7ca31ae9ec02b1c57f01869c 100644
+--- a/src/declarative/mod.rs
++++ b/src/declarative/mod.rs
+@@ -6,6 +6,7 @@
+ //! sends and forwards user actions, so the client stays independent of what
+ //! the extension does.
+ 
++pub mod badge_place;
+ pub mod control;
+ pub mod graph;
+ pub mod icons;
+diff --git a/src/preferences.rs b/src/preferences.rs
+index 9552703b861995662e8ecd9dc08e172c1edd4e19..f26e5dc83a851f1a99a8c862c0fceee1c2a3841f 100644
+--- a/src/preferences.rs
++++ b/src/preferences.rs
+@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
+ use anyhow::{Context as _, Result, anyhow};
+ use serde::{Deserialize, Serialize};
+ 
++pub use crate::declarative::badge_place::BadgePlace;
+ use crate::recent::RecentWorkspaces;
+ use crate::sessions::SessionMarks;
+ use crate::shortcuts::Shortcuts;
+@@ -450,38 +451,6 @@ impl SidebarPreferences {
+     }
+ }
+ 
+-/// Where the compact icon of an extension is shown: the left or the right
+-/// end of the composer row and the top bar, or the top or the bottom of the
+-/// rail along the left edge.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+-#[serde(rename_all = "snake_case")]
+-pub enum BadgePlace {
+-    ComposerStart,
+-    ComposerEnd,
+-    HeaderStart,
+-    HeaderEnd,
+-    RailStart,
+-    RailEnd,
+-    Hidden,
+-}
+-
+-impl BadgePlace {
+-    /// Every place where icons are drawn.
+-    pub const SHOWN: [BadgePlace; 6] = [
+-        BadgePlace::ComposerStart,
+-        BadgePlace::ComposerEnd,
+-        BadgePlace::HeaderStart,
+-        BadgePlace::HeaderEnd,
+-        BadgePlace::RailStart,
+-        BadgePlace::RailEnd,
+-    ];
+-
+-    /// Icons here stand in a column, so only narrow ones fit.
+-    pub fn is_rail(self) -> bool {
+-        matches!(self, BadgePlace::RailStart | BadgePlace::RailEnd)
+-    }
+-}
+-
+ /// Which client extensions are on, and where their icons are.
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(default, deny_unknown_fields)]
