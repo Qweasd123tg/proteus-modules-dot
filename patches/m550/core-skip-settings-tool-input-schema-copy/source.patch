@@ -1,0 +1,89 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+index 1f4a0390f341aa3241625bd16a1ca9a53e80d24e..737ac3c6f8b209051dcd21fc1829e5b4eff750aa 100644
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -26,7 +26,7 @@ use serde_json::Value;
+ use crate::{
+     core::{
+         AppConfig, ModuleCatalogEntrySummary, ModuleSourceTopology, ModuleTopology, ModulesConfig,
+-        TopologyBuildInput, TopologySnapshot, build_topology_snapshot,
++        TopologyBuildInput, TopologySnapshot, build_config_builder_topology,
+         core_slots::{CoreSlotSelection, core_slot_descriptor_by_id},
+     },
+     domain::PermissionMode,
+@@ -44,7 +44,7 @@ impl AppServerHandle {
+     pub async fn config_builder_snapshot(&self) -> ConfigBuilderSnapshot {
+         let (runtime, _, _, mode) = self.runtime.configuration_view().await;
+         let tools = &runtime.registry.tool_inventory;
+-        let topology = build_topology_snapshot(TopologyBuildInput {
++        let topology = build_config_builder_topology(TopologyBuildInput {
+             plan: &runtime.assembly_plan,
+             tools,
+             module_epoch: runtime.epoch,
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 6736e53b6e8d6d13e032c2fde6d4e3602db72d17..122d84930a5b7d8b4311bd77a23254fb8ff76bf8 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -30,7 +30,7 @@ mod session_store;
+ mod tool_orchestrator;
+ mod tool_terminal_binding;
+ mod topology;
+-pub(crate) use topology::tool_safety_label;
++pub(crate) use topology::{build_config_builder_topology, tool_safety_label};
+ mod topology_render;
+ mod user_input;
+ pub(crate) mod workflow_host;
+diff --git a/crates/proteus-core/src/core/topology.rs b/crates/proteus-core/src/core/topology.rs
+index bde13b80e87c4717bf9544cf72176e478698e997..cb47941d8e27d9a34d67d56586760aa67933de25 100644
+--- a/crates/proteus-core/src/core/topology.rs
++++ b/crates/proteus-core/src/core/topology.rs
+@@ -13,6 +13,15 @@ use slots::build_slots;
+ use tools::build_tools;
+ 
+ pub fn build_topology_snapshot(input: TopologyBuildInput<'_>) -> TopologySnapshot {
++    build_topology(input, true)
++}
++
++pub(crate) fn build_config_builder_topology(input: TopologyBuildInput<'_>) -> TopologySnapshot {
++    // Settings project tool metadata, not tool invocation schemas.
++    build_topology(input, false)
++}
++
++fn build_topology(input: TopologyBuildInput<'_>, include_tool_schemas: bool) -> TopologySnapshot {
+     let plan = input.plan;
+     let config = plan.config();
+     let model = plan.model.as_ref().map(|model| ModelTopology {
+@@ -38,7 +47,7 @@ pub fn build_topology_snapshot(input: TopologyBuildInput<'_>) -> TopologySnapsho
+             module.active = plan.hooks.contains(&module.id);
+         }
+     }
+-    let tools = build_tools(config, input.tools, &mut warnings);
++    let tools = build_tools(config, input.tools, &mut warnings, include_tool_schemas);
+     let mut edges = build_edges(&active_modules, &modules, &tools);
+     for (index, id) in plan.hooks.iter().enumerate() {
+         edges.push(TopologyEdge {
+diff --git a/crates/proteus-core/src/core/topology/tools.rs b/crates/proteus-core/src/core/topology/tools.rs
+index 1490076c9df1bb83fc9931bb2fe52910487893a3..885fad61521ddb94fb41d2c8a7bcac30b860b085 100644
+--- a/crates/proteus-core/src/core/topology/tools.rs
++++ b/crates/proteus-core/src/core/topology/tools.rs
+@@ -12,6 +12,7 @@ pub(super) fn build_tools(
+     config: &AppConfig,
+     registered_tools: &[(ToolSource, ToolSpec)],
+     warnings: &mut Vec<TopologyWarning>,
++    include_input_schemas: bool,
+ ) -> Vec<ToolTopology> {
+     let enabled_names = config
+         .tools
+@@ -33,7 +34,11 @@ pub(super) fn build_tools(
+                 enabled: tool_enabled(config, source, &spec.name),
+                 runtime_managed: runtime_managed(source, &spec.name),
+                 registered: true,
+-                input_schema: spec.input_schema.clone(),
++                input_schema: if include_input_schemas {
++                    spec.input_schema.clone()
++                } else {
++                    serde_json::Value::Null
++                },
+             }
+         })
+         .collect::<Vec<_>>();

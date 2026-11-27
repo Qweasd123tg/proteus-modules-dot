@@ -1,0 +1,54 @@
+diff --git a/crates/proteus-core/src/core/topology.rs b/crates/proteus-core/src/core/topology.rs
+index d9dd4f7a259c9eb9ec26f597478d92c2a0fbc412..aec295b8a07cbf2b29e00abbe62eccde95a88f04 100644
+--- a/crates/proteus-core/src/core/topology.rs
++++ b/crates/proteus-core/src/core/topology.rs
+@@ -17,11 +17,11 @@ pub fn build_topology_snapshot(input: TopologyBuildInput<'_>) -> TopologySnapsho
+ }
+ 
+ pub(crate) fn build_config_builder_topology(input: TopologyBuildInput<'_>) -> TopologySnapshot {
+-    // The settings projection has no graph field. Inspection still builds it.
++    // Settings project neither graph edges nor tool invocation schemas.
+     build_topology(input, false)
+ }
+ 
+-fn build_topology(input: TopologyBuildInput<'_>, include_edges: bool) -> TopologySnapshot {
++fn build_topology(input: TopologyBuildInput<'_>, inspection: bool) -> TopologySnapshot {
+     let plan = input.plan;
+     let config = plan.config();
+     let model = plan.model.as_ref().map(|model| ModelTopology {
+@@ -47,8 +47,8 @@ fn build_topology(input: TopologyBuildInput<'_>, include_edges: bool) -> Topolog
+             module.active = plan.hooks.contains(&module.id);
+         }
+     }
+-    let tools = build_tools(config, input.tools, &mut warnings);
+-    let edges = if include_edges {
++    let tools = build_tools(config, input.tools, &mut warnings, inspection);
++    let edges = if inspection {
+         let mut edges = build_edges(active_modules, &modules, &tools);
+         for (index, id) in plan.hooks.iter().enumerate() {
+             edges.push(TopologyEdge {
+diff --git a/crates/proteus-core/src/core/topology/tools.rs b/crates/proteus-core/src/core/topology/tools.rs
+index 1490076c9df1bb83fc9931bb2fe52910487893a3..885fad61521ddb94fb41d2c8a7bcac30b860b085 100644
+--- a/crates/proteus-core/src/core/topology/tools.rs
++++ b/crates/proteus-core/src/core/topology/tools.rs
+@@ -12,6 +12,7 @@ pub(super) fn build_tools(
+     config: &AppConfig,
+     registered_tools: &[(ToolSource, ToolSpec)],
+     warnings: &mut Vec<TopologyWarning>,
++    include_input_schemas: bool,
+ ) -> Vec<ToolTopology> {
+     let enabled_names = config
+         .tools
+@@ -33,7 +34,11 @@ pub(super) fn build_tools(
+                 enabled: tool_enabled(config, source, &spec.name),
+                 runtime_managed: runtime_managed(source, &spec.name),
+                 registered: true,
+-                input_schema: spec.input_schema.clone(),
++                input_schema: if include_input_schemas {
++                    spec.input_schema.clone()
++                } else {
++                    serde_json::Value::Null
++                },
+             }
+         })
+         .collect::<Vec<_>>();
