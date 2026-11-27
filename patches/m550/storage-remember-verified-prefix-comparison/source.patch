@@ -1,0 +1,50 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..40891140d42417aba88bf50735f6f8514956af99 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -83,6 +83,8 @@ pub(crate) struct SnapshotState {
+     // At most one historical boundary, derived inside the same validation
+     // pass as identity. No caller-supplied descriptor or Fold is retained.
+     previous_boundary: Option<(StorageRevision, String)>,
++    // One successful historical comparison, not proof of full semantic replay.
++    compared_boundary: Option<(StorageRevision, String)>,
+     verified: bool,
+     verified_version: Option<crate::backend::SourceVersion>,
+     page_after: Option<u64>,
+@@ -118,6 +120,7 @@ impl SnapshotState {
+             source,
+             verified,
+             previous_boundary,
++            compared_boundary: None,
+             verified_version,
+             page_after: None,
+             pending: None,
+@@ -164,6 +167,14 @@ impl SnapshotState {
+                 return Ok(*revision == prefix.revision && *hash == prefix.content_sha256);
+             }
+         }
++        if self.compared_boundary.as_ref().is_some_and(|(revision, hash)| {
++            *revision == prefix.revision && *hash == prefix.content_sha256
++        }) && matches!(self.source.confirm_verified_data(), Ok(true))
++        {
++            return Ok(true);
++        }
++        // If reauthentication could not prove equality, keep the original
++        // replay (including its precise corruption and I/O errors).
+         let Some(hash) = self
+             .source
+             .prefix_fingerprint(prefix.revision.session_seq)?
+@@ -182,7 +193,12 @@ impl SnapshotState {
+             // The comparison needs the verified revision, not model context or usage.
+             state.apply_validated(self.identity.session.session_id, &record)?;
+         }
+-        Ok(state.revision() == prefix.revision)
++        let revision = state.revision();
++        let matches = revision == prefix.revision;
++        if matches && revision.session_seq < self.identity.revision.session_seq {
++            self.compared_boundary = Some((revision, hash));
++        }
++        Ok(matches)
+     }
+     pub fn fold(&mut self) -> Result<Fold> {
+         Ok(self.fold_with_terminal::<true, true>(false)?.0)
