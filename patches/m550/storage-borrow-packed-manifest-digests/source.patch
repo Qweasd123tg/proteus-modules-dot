@@ -1,0 +1,132 @@
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..fa14c7b8d83cb2a7249fd9552257ddbe79198d6d 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -15,16 +15,19 @@ const MAX_CHUNKS: usize = MAX_PAYLOAD_BYTES / MIN_CHUNK + 1;
+ 
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Manifest {
++struct Manifest<'a> {
+     bytes: usize,
+-    sha256: String,
+-    chunks: Vec<Chunk>,
++    #[serde(borrow)]
++    sha256: Cow<'a, str>,
++    #[serde(borrow)]
++    chunks: Vec<Chunk<'a>>,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Chunk {
+-    sha256: String,
++struct Chunk<'a> {
++    #[serde(borrow)]
++    sha256: Cow<'a, str>,
+     bytes: usize,
+ }
+ 
+@@ -107,7 +110,7 @@ impl<'a> BlobIdentity<'a> {
+ /// descriptors. Other callers cannot manufacture file lists for stored bytes.
+ pub(crate) struct PackedBlob {
+     stored: Vec<u8>,
+-    chunks: Option<Vec<Chunk>>,
++    chunks: Option<Vec<Chunk<'static>>>,
+ }
+ 
+ impl PackedBlob {
+@@ -147,7 +150,7 @@ fn pack_inner(session: &Path, bytes: &[u8], known_sha256: Option<&str>) -> Resul
+     }
+     let manifest = Manifest {
+         bytes: bytes.len(),
+-        sha256: known_sha256.map_or_else(|| sha256_hex(bytes), str::to_owned),
++        sha256: Cow::Owned(known_sha256.map_or_else(|| sha256_hex(bytes), str::to_owned)),
+         chunks,
+     };
+     let mut packed = MAGIC.to_vec();
+@@ -162,7 +165,7 @@ fn pack_inner(session: &Path, bytes: &[u8], known_sha256: Option<&str>) -> Resul
+     })
+ }
+ 
+-fn store_chunk(session: &Path, bytes: &[u8]) -> Result<Chunk> {
++fn store_chunk(session: &Path, bytes: &[u8]) -> Result<Chunk<'static>> {
+     let sha256 = sha256_hex(bytes);
+     let path = chunk_path(session, &sha256)?;
+     if path.try_exists()? {
+@@ -174,7 +177,7 @@ fn store_chunk(session: &Path, bytes: &[u8]) -> Result<Chunk> {
+         atomic_write(&path, bytes)?;
+     }
+     Ok(Chunk {
+-        sha256,
++        sha256: Cow::Owned(sha256),
+         bytes: bytes.len(),
+     })
+ }
+@@ -190,11 +193,11 @@ pub(crate) fn chunk_files(stored: &[u8]) -> Result<Vec<PathBuf>> {
+     let Some(body) = stored.strip_prefix(MAGIC) else {
+         return Ok(Vec::new());
+     };
+-    let manifest: Manifest = serde_json::from_slice(body)?;
++    let manifest: Manifest<'_> = serde_json::from_slice(body)?;
+     files_for_chunks(&manifest.chunks)
+ }
+ 
+-fn files_for_chunks(chunks: &[Chunk]) -> Result<Vec<PathBuf>> {
++fn files_for_chunks(chunks: &[Chunk<'_>]) -> Result<Vec<PathBuf>> {
+     chunks.iter().map(|chunk| chunk_file(&chunk.sha256)).collect()
+ }
+ 
+@@ -223,7 +226,7 @@ fn unpack_checked<'a>(
+         }
+         return Ok(Cow::Borrowed(stored));
+     };
+-    let manifest: Manifest = serde_json::from_slice(body)?;
++    let manifest: Manifest<'_> = serde_json::from_slice(body)?;
+     ensure!(
+         manifest.bytes <= MAX_PAYLOAD_BYTES,
+         "expanded blob exceeds maximum"
+@@ -250,7 +253,7 @@ fn unpack_checked<'a>(
+                 && chunk.bytes <= manifest.bytes.saturating_sub(start),
+             "shared blob chunk exceeds declared payload"
+         );
+-        let vacant = match verified.entry(chunk.sha256.as_str()) {
++        let vacant = match verified.entry(chunk.sha256.as_ref()) {
+             Entry::Occupied(entry) => {
+                 let (offset, len): (usize, usize) = *entry.get();
+                 ensure!(len == chunk.bytes, "shared blob chunk size mismatch");
+@@ -265,14 +268,14 @@ fn unpack_checked<'a>(
+         let count = bounded_read_into(&path, MAX_CHUNK, content)?;
+         ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
+         ensure!(
+-            sha256_hex(content) == chunk.sha256,
++            sha256_hex(content) == chunk.sha256.as_ref(),
+             "shared blob chunk hash mismatch"
+         );
+         vacant.insert((start, chunk.bytes));
+     }
+     ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
+     ensure!(
+-        sha256_hex(&bytes) == manifest.sha256,
++        sha256_hex(&bytes) == manifest.sha256.as_ref(),
+         "shared blob hash mismatch"
+     );
+     Ok(Cow::Owned(bytes))
+@@ -328,7 +331,7 @@ mod tests {
+         let dir = tempfile::tempdir().unwrap();
+         let bytes = [vec![0; MAX_CHUNK], vec![1; MAX_CHUNK], vec![0; MAX_CHUNK]].concat();
+         let packed = pack(dir.path(), &bytes).unwrap();
+-        let mut manifest: Manifest = serde_json::from_slice(&packed[MAGIC.len()..]).unwrap();
++        let mut manifest: Manifest<'_> = serde_json::from_slice(&packed[MAGIC.len()..]).unwrap();
+         assert_eq!(manifest.chunks.len(), 3);
+         assert_eq!(manifest.chunks[0].sha256, manifest.chunks[2].sha256);
+         assert_eq!(unpack(dir.path(), &packed).unwrap(), bytes);
+@@ -393,7 +396,7 @@ mod tests {
+     fn changed_or_missing_chunks_and_expansion_limits_are_rejected() {
+         let dir = tempfile::tempdir().unwrap();
+         let packed = pack(dir.path(), &payload()).unwrap();
+-        let mut manifest: Manifest = serde_json::from_slice(&packed[MAGIC.len()..]).unwrap();
++        let mut manifest: Manifest<'_> = serde_json::from_slice(&packed[MAGIC.len()..]).unwrap();
+         let chunk = chunk_path(dir.path(), &manifest.chunks[0].sha256).unwrap();
+         let original = std::fs::read(&chunk).unwrap();
+         std::fs::write(&chunk, vec![b'!'; original.len()]).unwrap();
