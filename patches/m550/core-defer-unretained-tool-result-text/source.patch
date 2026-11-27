@@ -1,0 +1,112 @@
+diff --git a/crates/proteus-core/src/app_server/turn_progress.rs b/crates/proteus-core/src/app_server/turn_progress.rs
+index dc3b820396d7453ae38da1ddf6be41fd916ae434..a64cebd8ee6f3d42f21833247cc52124815713bd 100644
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -1,6 +1,6 @@
+ use std::borrow::Cow;
+ 
+-use crate::domain::{Event, EventEnvelope, ThreadId, ToolCall};
++use crate::domain::{Event, EventEnvelope, ThreadId, ToolCall, ToolResult};
+ 
+ use super::transcript::{AppTranscriptMessage, AppTranscriptSubagent, AppTranscriptTool};
+ 
+@@ -164,21 +164,15 @@ impl TurnProgress {
+                 }
+             }
+             Event::ApprovalRequested { call_id, .. } => {
+-                self.set_tool_status(call_id, "waiting_approval", None, None);
++                self.set_tool_status(call_id, "waiting_approval", None);
+             }
+             Event::ApprovalResolved { call_id, approved } => {
+                 let status = if *approved { "approved" } else { "denied" };
+-                self.set_tool_status(call_id, status, None, None);
++                self.set_tool_status(call_id, status, None);
+             }
+             Event::ToolFinished { result } => {
+                 let status = if result.ok { "done" } else { "failed" };
+-                let text = tool_result_text(result);
+-                self.set_tool_status(
+-                    &result.call_id,
+-                    status,
+-                    Some(text.as_ref()),
+-                    Some(&result.metadata),
+-                );
++                self.set_tool_status(&result.call_id, status, Some(result));
+             }
+             Event::SubagentStarted {
+                 role,
+@@ -393,27 +387,12 @@ impl TurnProgress {
+         &mut self,
+         call_id: &str,
+         status: &str,
+-        result: Option<&str>,
+-        metadata: Option<&serde_json::Value>,
++        result: Option<&ToolResult>,
+     ) {
+-        if set_tool_status_in(
+-            &mut self.messages,
+-            call_id,
+-            status,
+-            result,
+-            metadata,
+-            false,
+-        ) {
++        if set_tool_status_in(&mut self.messages, call_id, status, result, false) {
+             return;
+         }
+-        set_tool_status_in(
+-            &mut self.background_subagents,
+-            call_id,
+-            status,
+-            result,
+-            metadata,
+-            true,
+-        );
++        set_tool_status_in(&mut self.background_subagents, call_id, status, result, true);
+     }
+ 
+     fn background_agent_parent_is_running(&self, description: Option<&str>) -> bool {
+@@ -505,29 +484,26 @@ fn set_tool_status_in(
+     messages: &mut [AppTranscriptMessage],
+     call_id: &str,
+     status: &str,
+-    result: Option<&str>,
+-    metadata: Option<&serde_json::Value>,
++    result: Option<&ToolResult>,
+     compact: bool,
+ ) -> bool {
+-    for message in messages.iter_mut().rev() {
++    let Some(tool) = messages.iter_mut().rev().find_map(|message| {
+         if let Some(tool) = message.tool.as_mut().filter(|tool| tool.call_id == call_id) {
+-            update_tool(tool, status, result, metadata, compact);
+-            return true;
+-        }
+-        if let Some(tool) = message.subagent.as_mut().and_then(|subagent| {
+-            subagent
+-                .tools
+-                .iter_mut()
+-                .find(|tool| tool.call_id == call_id)
+-        }) {
+-            update_tool(tool, status, result, metadata, compact);
+-            return true;
++            return Some(tool);
+         }
+-    }
+-    false
++        message.subagent.as_mut().and_then(|subagent| {
++            subagent.tools.iter_mut().find(|tool| tool.call_id == call_id)
++        })
++    }) else {
++        return false;
++    };
++    // A late result for an absent card has nowhere to render its text.
++    let text = result.map(tool_result_text);
++    update_tool(tool, status, text.as_deref(), result.map(|r| &r.metadata), compact);
++    true
+ }
+ 
+-fn tool_result_text(result: &crate::domain::ToolResult) -> Cow<'_, str> {
++fn tool_result_text(result: &ToolResult) -> Cow<'_, str> {
+     // Direct text is truncated for display; borrow it instead of cloning
+     // the full result. Keep the same precedence and structured fallback.
+     result
