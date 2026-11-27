@@ -1,0 +1,55 @@
+diff --git a/crates/proteus-core/src/app_server/addons.rs b/crates/proteus-core/src/app_server/addons.rs
+index 048e6cb49559195d8a48bd3e6eb075fde66a878e..39d07263911b95c689932f49754d63d2fd0c1f52 100644
+--- a/crates/proteus-core/src/app_server/addons.rs
++++ b/crates/proteus-core/src/app_server/addons.rs
+@@ -4,14 +4,11 @@ use proteus_contracts::app_protocol::{addons::*, http::SetConfigBuilderRequest};
+ 
+ impl AppServerHandle {
+     pub async fn addons_snapshot(&self) -> AppAddonsSnapshot {
+-        let (config, catalogs, mcp_servers, plugins) = self.runtime.addon_catalogs().await;
++        let (settings, catalogs, mcp_servers, plugins) = self.runtime.addon_catalogs().await;
+         AppAddonsSnapshot {
+             reload_error: self.profile_error.lock().await.clone(),
+             writable: self.config_path.is_some(),
+-            settings: AppAddonsUpdate {
+-                addons: config.addons,
+-                mcp_servers: config.tools.mcp_servers,
+-            },
++            settings,
+             catalogs,
+             mcp_servers,
+             plugins,
+diff --git a/crates/proteus-core/src/core/runtime/addons.rs b/crates/proteus-core/src/core/runtime/addons.rs
+index 390285e95282f98507be7a7eb8a38b58d0ff545b..6c057a1290fd6b29e9a765110e2668d214a171ea 100644
+--- a/crates/proteus-core/src/core/runtime/addons.rs
++++ b/crates/proteus-core/src/core/runtime/addons.rs
+@@ -1,13 +1,13 @@
+ use super::AgentRuntime;
+ use proteus_contracts::app_protocol::addons::{
+-    AppAgentPluginState, AppMcpServerState, AppSkillCatalog,
++    AppAddonsUpdate, AppAgentPluginState, AppMcpServerState, AppSkillCatalog,
+ };
+ 
+ impl AgentRuntime {
+     pub(crate) async fn addon_catalogs(
+         &self,
+     ) -> (
+-        crate::core::AppConfig,
++        AppAddonsUpdate,
+         Vec<AppSkillCatalog>,
+         Vec<AppMcpServerState>,
+         Vec<AppAgentPluginState>,
+@@ -29,8 +29,12 @@ impl AgentRuntime {
+                 },
+             });
+         }
++        let config = snapshot.assembly_plan.config();
+         (
+-            snapshot.assembly_plan.config().clone(),
++            AppAddonsUpdate {
++                addons: config.addons.clone(),
++                mcp_servers: config.tools.mcp_servers.clone(),
++            },
+             catalogs,
+             snapshot.registry.mcp_servers.clone(),
+             snapshot.registry.plugins.clone(),
