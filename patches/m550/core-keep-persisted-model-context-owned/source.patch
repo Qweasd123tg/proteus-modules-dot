@@ -1,0 +1,95 @@
+diff --git a/crates/proteus-core/src/core/runtime.rs b/crates/proteus-core/src/core/runtime.rs
+index 64d95b1c08fbf02b8f8a19fdf90aa2ab1bdf244d..5cc0bb6d0b3d69aab2c91dff3b46f57c4b52e62d 100644
+--- a/crates/proteus-core/src/core/runtime.rs
++++ b/crates/proteus-core/src/core/runtime.rs
+@@ -372,7 +372,8 @@ impl AgentRuntime {
+                             anyhow::anyhow!("{error:#}; additionally failed to recover history after clear: {recovery:#}")
+                         })?;
+                         history::refresh_committed_history(&mut *session.history.lock().await, state.history)?;
+-                        *session.model_context.lock().await = state.model_context;
++                        *session.model_context.lock().await =
++                            super::model_context::ModelContextState::from_snapshot(state.model_context);
+                         *session.history_turn.lock().await = state.last_history_turn;
+                         *session.interrupted_turns.lock().await = state.interrupted_turns;
+                         return Err(error);
+diff --git a/crates/proteus-core/src/core/runtime/resume.rs b/crates/proteus-core/src/core/runtime/resume.rs
+index ff9ca40145b621a484ede1b720df81add9737bed..3c32fdc856ee34d8c8794a53aec8a1fac89b5bfa 100644
+--- a/crates/proteus-core/src/core/runtime/resume.rs
++++ b/crates/proteus-core/src/core/runtime/resume.rs
+@@ -83,7 +83,7 @@ impl AgentRuntime {
+         // The writer owns validation history; this is the sole additional owned
+         // history for execution. No raw projection or third copy is created.
+         *history = state.history;
+-        *model_context = state.model_context;
++        *model_context = ModelContextState::from_snapshot(state.model_context);
+         self.session
+             .history_resident
+             .store(true, std::sync::atomic::Ordering::SeqCst);
+diff --git a/crates/proteus-core/src/core/session_store/remote/snapshot.rs b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+index d95be63560b138bbfd8b8af1715ffdabceb9d326..ff3f39fa3cfcb9cd8f86bc424dff424fdf96699f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/snapshot.rs
++++ b/crates/proteus-core/src/core/session_store/remote/snapshot.rs
+@@ -226,7 +226,7 @@ pub(crate) struct RemoteJournalResumeState {
+     pub history: Vec<CanonicalMessage>,
+     pub history_revision: u64,
+     pub interrupted_turns: Vec<proteus_contracts::contracts::WorkflowHistoryInterruption>,
+-    pub model_context: proteus_session_semantics::ModelContextState,
++    pub model_context: Vec<proteus_contracts::contracts::ModelContextObservation>,
+     pub usage: proteus_contracts::domain::SessionUsageSnapshot,
+     pub last_history_turn: Option<TurnId>,
+ }
+@@ -236,9 +236,7 @@ impl From<proteus_contracts::contracts::StorageResumeState> for RemoteJournalRes
+             history: state.conversation.messages,
+             history_revision: state.conversation.revision.history_revision,
+             interrupted_turns: state.interrupted_turns,
+-            model_context: proteus_session_semantics::ModelContextState::from_snapshot(
+-                state.conversation.model_context,
+-            ),
++            model_context: state.conversation.model_context,
+             usage: state.usage,
+             last_history_turn: state.last_history_turn,
+         }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 5d145873c9302947d0c06a7046d624e933d1cf49..de52c155d5d1c0cf21af0b570dc683097afc7a92 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -72,7 +72,7 @@ impl<T> SessionReadModel<T> {
+             conversation: ConversationSnapshot {
+                 revision: state.history_revision,
+                 messages: state.history,
+-                model_context: state.model_context.snapshot(),
++                model_context: state.model_context,
+             },
+             transcript,
+             usage: state.usage,
+@@ -129,7 +129,7 @@ impl RemoteSessionStore {
+             let mut prefix = snapshot.scan_display_prefix()?;
+             prefix.history = history.fingerprints()?;
+             let summary = cache::summary_with(self, history.len(), || history.preview())?;
+-            let context = state.model_context.snapshot();
++            let context = state.model_context;
+             (
+                 history,
+                 transcript,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/incremental.rs b/crates/proteus-core/src/core/session_store/remote/view/incremental.rs
+index 4e2cb885ef0922c14d879c77e4e9ea6234a8617e..923adfa2daa5a53a131ae33bda3e2a61901dd612 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/incremental.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/incremental.rs
+@@ -53,7 +53,7 @@ impl RemoteSessionStore {
+                 next.transcript =
+                     cache::append_section(self, &source, &next.transcript, &suffix.transcript)?;
+                 next.context =
+-                    cache::write_section(self, &source, &state.model_context.snapshot())?;
++                    cache::write_section(self, &source, &state.model_context)?;
+                 next.cursor = Some(cursor.clone());
+                 next.base = Some(AppTranscriptBase {
+                     revision: previous_source.revision()?,
+@@ -86,7 +86,7 @@ impl RemoteSessionStore {
+             conversation: ConversationSnapshot {
+                 revision: state.history_revision,
+                 messages: state.history,
+-                model_context: state.model_context.snapshot(),
++                model_context: state.model_context,
+             },
+             transcript,
+             usage: state.usage,
