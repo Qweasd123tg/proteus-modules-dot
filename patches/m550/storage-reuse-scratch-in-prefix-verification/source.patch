@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..923078610c73bd5a0c8f049a5a4c58fd8f0480a4 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -175,7 +175,8 @@ impl SnapshotState {
+         }
+         self.source.reset()?;
+         let mut state = Fold::default();
+-        while let Some(record) = self.source.next()? {
++        let mut line = Vec::new();
++        while let Some(record) = self.source.next_with_scratch(&mut line)? {
+             if record.session_seq > prefix.revision.session_seq {
+                 continue;
+             }
