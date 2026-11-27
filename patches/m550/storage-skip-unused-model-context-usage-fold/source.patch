@@ -1,0 +1,29 @@
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 9fb8d87199b69506192b8f37d0dbf6b89c648f96..09be6a012ae81434a33c71840ed41a0d24846be8 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -175,8 +175,7 @@ impl State {
+             fold.model_context.before_turn(turn_id)
+         } else {
+             self.get_snapshot(&snapshot)?
+-                .fold()?
+-                .model_context
++                .fold_model_context()?
+                 .before_turn(turn_id)
+         }
+         .context("model context requested outside the latest admitted turn")?;
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..d00162843119e3e3b41dc4eb23369b14bc1aa5c4 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -184,8 +184,8 @@ impl SnapshotState {
+         }
+         Ok(state.revision() == prefix.revision)
+     }
+-    pub fn fold(&mut self) -> Result<Fold> {
+-        Ok(self.fold_with_terminal::<true, true>(false)?.0)
++    pub fn fold_model_context(&mut self) -> Result<ModelContextProjection> {
++        Ok(self.fold_with_terminal::<true, false>(false)?.0.model_context)
+     }
+ 
+     /// Usage has no dependency on the separate model-context projection.
