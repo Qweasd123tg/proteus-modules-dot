@@ -1,0 +1,45 @@
+diff --git a/crates/proteus-core/src/app_server/config_summary.rs b/crates/proteus-core/src/app_server/config_summary.rs
+index 11940899a6c3ca0fd41069113c06881ea44adb49..2fc07f4496ccd120aabeef6720cc396439c35adf 100644
+--- a/crates/proteus-core/src/app_server/config_summary.rs
++++ b/crates/proteus-core/src/app_server/config_summary.rs
+@@ -14,7 +14,7 @@ pub(super) fn render_config_summary(
+     config_path: Option<&Path>,
+     cwd: &Path,
+     mode: PermissionMode,
+-    tools: &[(ToolSource, crate::domain::ToolSpec)],
++    tools: &[ConfigTool],
+     module_epoch: crate::core::ModuleEpoch,
+ ) -> String {
+     let mut lines = Vec::new();
+@@ -61,13 +61,10 @@ pub(super) fn render_config_summary(
+     if tools.is_empty() {
+         lines.push("  (none)".to_owned());
+     } else {
+-        for (source, spec) in tools {
++        for tool in tools {
+             lines.push(format!(
+-                "  - {} [{} {:?}] {}",
+-                spec.name,
+-                source.label(),
+-                spec.safety,
+-                spec.description
++                "  - {} [{} {}] {}",
++                tool.name, tool.source, tool.safety, tool.description
+             ));
+         }
+     }
+@@ -203,4 +200,4 @@ impl super::AppServerHandle {
+-        let tools = snapshot.registry.tools.entries();
++        let tools = registered_tool_summaries(snapshot.registry.tools.entries());
+         let session_settings =
+             super::session_settings::compose(self, mode, &model_ref, &reasoning, &selection).await;
+         selection.models.extend(inactive_options);
+@@ -247,7 +244,7 @@ impl super::AppServerHandle {
+                 })
+                 .collect(),
+             tools_enabled: config.tools.enabled.clone(),
+-            registered_tools: registered_tool_summaries(tools),
++            registered_tools: tools,
+             components: config
+                 .components
+                 .iter()
