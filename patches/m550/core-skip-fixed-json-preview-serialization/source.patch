@@ -1,0 +1,27 @@
+diff --git a/crates/proteus-core/src/app_server/turn_progress.rs b/crates/proteus-core/src/app_server/turn_progress.rs
+index dc3b820396d7453ae38da1ddf6be41fd916ae434..b691f99d3ae3fae7b0938ab038475adff2158ef8 100644
+--- a/crates/proteus-core/src/app_server/turn_progress.rs
++++ b/crates/proteus-core/src/app_server/turn_progress.rs
+@@ -578,6 +578,22 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+ 
+ fn compact_json(value: &serde_json::Value, max_bytes: usize) -> serde_json::Value {
+     use bytes::BufMut;
++    use serde_json::Value;
++
++    // These values have a fixed compact encoding; no preview buffer is needed
++    // when that encoding already fits. Keep the writer for smaller budgets.
++    let fixed_len = match value {
++        Value::Null | Value::Bool(true) => Some(4),
++        Value::Bool(false) => Some(5),
++        Value::Array(items) if items.is_empty() => Some(2),
++        Value::Object(fields) if fields.is_empty() => Some(2),
++        Value::String(text) if text.is_empty() => Some(2),
++        _ => None,
++    };
++    if fixed_len.is_some_and(|len| len <= max_bytes) {
++        return value.clone();
++    }
++
+     let mut prefix = Vec::new();
+     let writer = (&mut prefix).limit(max_bytes).writer();
+     match serde_json::to_writer(writer, value) {
