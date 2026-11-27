@@ -1,0 +1,61 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal.rs b/crates/proteus-core/src/app_server/transcript/journal.rs
+index d3b2400ab26c1478f76c3999d3faf3058be540d4..ca2a44164635eadab76871e50209d315b54961c9 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal.rs
+@@ -261,9 +261,6 @@ impl TranscriptReplay {
+ #[derive(Default)]
+ struct TranscriptVisibility {
+     root_threads: HashMap<TurnId, ThreadId>,
+-    // A nested call is a display fact, not evidence that its auxiliary model
+-    // response was selected by the workflow. Keep those eligibility sets apart.
+-    workflow_root_calls: HashSet<CallId>,
+     display_tool_calls: HashMap<TurnId, HashSet<CallId>>,
+     visible_model_responses: HashSet<crate::domain::ExchangeId>,
+     certified_text_responses: bool,
+@@ -335,7 +332,6 @@ impl TranscriptVisibility {
+ 
+         Self {
+             root_threads,
+-            workflow_root_calls,
+             display_tool_calls,
+             visible_model_responses,
+             certified_text_responses: false,
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index 40908e9961eaeb79949127e2ac1139adce67dad3..6e661787333b820ccc4c6ed9e74f5e2bc0efb7fb 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -148,6 +148,7 @@ pub(super) fn transcript_from_scan(
+     // Its evidence may precede a reset or follow the response itself.
+     let need_commits = last_response_with_parts.is_some_and(|seq| seq >= start);
+     let mut committed_parts = std::collections::HashSet::new();
++    let mut workflow_root_calls = std::collections::HashSet::new();
+     let mut timestamps = TranscriptTimestamps::default();
+     scan(&mut |record| {
+         match record.entry {
+@@ -156,7 +157,7 @@ pub(super) fn transcript_from_scan(
+                     && visibility.is_root_record(record.thread_id, record.turn_id)
+                 {
+                     if matches!(owner, OperationOwner::Workflow) {
+-                        visibility.workflow_root_calls.insert(tool.call.id.clone());
++                        workflow_root_calls.insert(tool.call.id.clone());
+                     }
+                     visibility
+                         .display_tool_calls
+@@ -206,7 +207,7 @@ pub(super) fn transcript_from_scan(
+             let executed = model
+                 .tool_calls
+                 .iter()
+-                .any(|call| visibility.workflow_root_calls.contains(&call.id));
++                .any(|call| workflow_root_calls.contains(&call.id));
+             if committed || executed {
+                 visibility
+                     .visible_model_responses
+@@ -215,7 +216,7 @@ pub(super) fn transcript_from_scan(
+         }
+         Ok(())
+     })?;
+-    drop(committed_parts);
++    drop((committed_parts, workflow_root_calls));
+ 
+     let mut replay = TranscriptReplay {
+         state: TranscriptProjectionState {
