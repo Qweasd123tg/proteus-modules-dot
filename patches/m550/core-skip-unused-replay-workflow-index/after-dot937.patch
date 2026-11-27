@@ -1,0 +1,50 @@
+diff --git a/crates/proteus-core/src/app_server/transcript/journal/source.rs b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+index eef7fdb57744789e283ebc8120c0e3a31e8f1dae..223a5a8d7ec43a51de26deaed4063a8998c5ef35 100644
+--- a/crates/proteus-core/src/app_server/transcript/journal/source.rs
++++ b/crates/proteus-core/src/app_server/transcript/journal/source.rs
+@@ -73,6 +73,7 @@ pub(super) fn transcript_from_scan(
+     let mut causal_history = true;
+     let mut visibility = TranscriptVisibility::default();
+     let mut last_response_with_parts = None;
++    let mut last_response_with_calls = None;
+     let mut final_results = std::collections::HashSet::new();
+     let mut subagent_bindings = std::collections::HashMap::new();
+     scan(&mut |record| {
+@@ -107,11 +108,15 @@ pub(super) fn transcript_from_scan(
+                     .flat_map(|m| &m.parts)
+                     .any(|p| matches!(p.payload, ContentPart::HostedToolActivity { .. }));
+             }
+-            JournalEntry::ModelResponseRecorded(item)
+-                if let ModelResponseOutcome::Response { response } = &item.outcome
+-                    && response.messages.iter().any(|m| !m.parts.is_empty()) =>
+-            {
+-                last_response_with_parts = Some(record.session_seq);
++            JournalEntry::ModelResponseRecorded(item) => {
++                if let ModelResponseOutcome::Response { response } = item.outcome {
++                    if response.messages.iter().any(|m| !m.parts.is_empty()) {
++                        last_response_with_parts = Some(record.session_seq);
++                    }
++                    if !response.tool_calls.is_empty() {
++                        last_response_with_calls = Some(record.session_seq);
++                    }
++                }
+             }
+             JournalEntry::SubagentSessionBoundRecorded(SubagentSessionBinding {
+                 source_call_id,
+@@ -161,6 +166,7 @@ pub(super) fn transcript_from_scan(
+     // Only a replayed model response can consume the committed-part index.
+     // Its evidence may precede a reset or follow the response itself.
+     let need_commits = last_response_with_parts.is_some_and(|seq| seq >= start);
++    let need_workflow_calls = last_response_with_calls.is_some_and(|seq| seq >= start);
+     let mut committed_parts = std::collections::HashSet::new();
+     let mut workflow_root_calls = std::collections::HashSet::new();
+     let mut timestamps = TranscriptTimestamps::default();
+@@ -170,7 +176,7 @@ pub(super) fn transcript_from_scan(
+                 if let ToolCallRecordPhase::Requested { owner } = tool.phase
+                     && visibility.is_root_record(record.thread_id, record.turn_id)
+                 {
+-                    if matches!(owner, OperationOwner::Workflow) {
++                    if need_workflow_calls && matches!(owner, OperationOwner::Workflow) {
+                         workflow_root_calls.insert(tool.call.id.clone());
+                     }
+                     visibility
