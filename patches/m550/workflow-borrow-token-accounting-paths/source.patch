@@ -1,0 +1,35 @@
+diff --git a/workflow/coding-workflow/src/token_accounting.rs b/workflow/coding-workflow/src/token_accounting.rs
+index 9be42793917d8fa152a3d73b55b8ac5e9dd58f42..5e665e914c128bd1159b9c6a9d981c1909726b2a 100644
+--- a/workflow/coding-workflow/src/token_accounting.rs
++++ b/workflow/coding-workflow/src/token_accounting.rs
+@@ -77,14 +77,14 @@ fn estimate_request_categories(request: &CanonicalModelRequest) -> Vec<TokenUsag
+                     bytes.context += chunk.source.len()
+                         + chunk
+                             .path
+-                            .as_ref()
+-                            .map(|path| path.display().to_string().len())
++                            .as_deref()
++                            .map(displayed_path_bytes)
+                             .unwrap_or_default()
+                         + chunk.content.len()
+                         + chunk.metadata.to_string().len();
+                 }
+                 ContentPart::FileRef { path, content } => {
+-                    bytes.files += path.display().to_string().len()
++                    bytes.files += displayed_path_bytes(path)
+                         + content.as_deref().unwrap_or_default().len();
+                 }
+                 ContentPart::ToolCall { call } => {
+@@ -150,6 +150,12 @@ fn estimate_request_categories(request: &CanonicalModelRequest) -> Vec<TokenUsag
+     .collect()
+ }
+ 
++fn displayed_path_bytes(path: &std::path::Path) -> usize {
++    path.to_str()
++        .map(str::len)
++        .unwrap_or_else(|| path.display().to_string().len())
++}
++
+ fn serialized_json_len(value: &impl serde::Serialize) -> serde_json::Result<usize> {
+     let mut counter = JsonByteCounter(0);
+     serde_json::to_writer(&mut counter, value)?;
