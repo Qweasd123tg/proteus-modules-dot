@@ -1,0 +1,544 @@
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 2c08aa98b0db4810ba59be86c2715be5cf17e392..c68ba622034d24c1198b5488995b64d6e4a9ee5c 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -282,6 +282,78 @@ impl JsonlSnapshot {
+         self.current_hash = hash;
+         Ok(())
+     }
++
++    fn next_decoding(
++        &mut self,
++        line: &mut Vec<u8>,
++        decode_record: impl FnOnce(&Path, SessionId, &[u8]) -> Result<(JournalRecord, bool)>,
++    ) -> Result<Option<JournalRecord>> {
++        let Some(reader) = &mut self.file else {
++            return Ok(None);
++        };
++        let decode = |line: &[u8]| -> Result<Option<JournalRecord>> {
++            ensure!(
++                line.len() <= MAX_PAYLOAD_BYTES * 2,
++                "journal line exceeds maximum"
++            );
++            let Some(payload) = line.strip_suffix(b"\n") else {
++                bail!("journal snapshot lost a complete line");
++            };
++            self.consumed += line.len() as u64;
++            crate::diagnostics::replayed_jsonl(line.len());
++            self.current_hash.update(line);
++            ensure!(
++                !payload.is_empty(),
++                "journal contains an empty complete line"
++            );
++            let (record, external) = decode_record(&self.dir, self.id, payload)?;
++            self.has_external_payloads |= external;
++            Ok(Some(record))
++        };
++
++        // Borrow only complete lines. The buffered file remains the same pinned
++        // source used by read_until, and no extra storage lives on the snapshot.
++        match reader.fill_buf() {
++            Ok(bytes) => {
++                if let Some(end) = memchr::memchr(b'\n', bytes)
++                    && end < MAX_PAYLOAD_BYTES * 2
++                {
++                    let count = end + 1;
++                    let result = decode(&bytes[..count]);
++                    reader.consume(count);
++                    return result;
++                }
++            }
++            // read_until already retries interrupted reads.
++            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
++            Err(err) => return Err(err.into()),
++        }
++        line.clear();
++        // Bound even a malicious unterminated line before allocation reaches file size.
++        let count = reader
++            .by_ref()
++            .take((MAX_PAYLOAD_BYTES * 2 + 1) as u64)
++            .read_until(b'\n', line)?;
++        if count == 0 {
++            ensure!(
++                self.consumed == self.length && reader.get_ref().limit() == 0,
++                "journal shortened during snapshot read"
++            );
++            if let Some(expected) = &self.fingerprint {
++                ensure!(
++                    self.consumed_fingerprint() == *expected,
++                    "journal complete prefix changed during snapshot read"
++                );
++            }
++            self.fully_read = true;
++            return Ok(None);
++        }
++        let result = decode(line);
++        if line.capacity() > MAX_RETAINED_LINE_CAPACITY {
++            *line = Vec::new();
++        }
++        result
++    }
+ }
+ 
+ fn version_from_metadata(metadata: &std::fs::Metadata) -> Result<SourceVersion> {
+@@ -352,71 +424,29 @@ impl RecordSnapshot for JsonlSnapshot {
+         self.next_with_scratch(&mut Vec::new())
+     }
+     fn next_with_scratch(&mut self, line: &mut Vec<u8>) -> Result<Option<JournalRecord>> {
+-        let Some(reader) = &mut self.file else {
+-            return Ok(None);
+-        };
+-        let mut decode = |line: &[u8]| -> Result<Option<JournalRecord>> {
+-            ensure!(
+-                line.len() <= MAX_PAYLOAD_BYTES * 2,
+-                "journal line exceeds maximum"
+-            );
+-            let Some(payload) = line.strip_suffix(b"\n") else {
+-                bail!("journal snapshot lost a complete line");
+-            };
+-            self.consumed += line.len() as u64;
+-            crate::diagnostics::replayed_jsonl(line.len());
+-            self.current_hash.update(line);
+-            ensure!(
+-                !payload.is_empty(),
+-                "journal contains an empty complete line"
+-            );
+-            let (record, external) = codec::decode(&self.dir, self.id, payload)?;
+-            self.has_external_payloads |= external;
+-            Ok(Some(record))
+-        };
+-
+-        // Borrow only complete lines. The buffered file remains the same pinned
+-        // source used by read_until, and no extra storage lives on the snapshot.
+-        match reader.fill_buf() {
+-            Ok(bytes) => {
+-                if let Some(end) = memchr::memchr(b'\n', bytes)
+-                    && end < MAX_PAYLOAD_BYTES * 2
+-                {
+-                    let count = end + 1;
+-                    let result = decode(&bytes[..count]);
+-                    reader.consume(count);
+-                    return result;
+-                }
+-            }
+-            // read_until already retries interrupted reads.
+-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+-            Err(err) => return Err(err.into()),
+-        }
+-        line.clear();
+-        // Bound even a malicious unterminated line before allocation reaches file size.
+-        let count = reader
+-            .by_ref()
+-            .take((MAX_PAYLOAD_BYTES * 2 + 1) as u64)
+-            .read_until(b'\n', line)?;
+-        if count == 0 {
+-            ensure!(
+-                self.consumed == self.length && reader.get_ref().limit() == 0,
+-                "journal shortened during snapshot read"
+-            );
+-            if let Some(expected) = &self.fingerprint {
+-                ensure!(
+-                    self.consumed_fingerprint() == *expected,
+-                    "journal complete prefix changed during snapshot read"
+-                );
++        self.next_decoding(line, codec::decode)
++    }
++    fn next_capturing_external(
++        &mut self,
++        line: &mut Vec<u8>,
++        witness: &mut Option<codec::ExternalWitness>,
++    ) -> Result<Option<JournalRecord>> {
++        self.next_decoding(line, |dir, id, payload| {
++            codec::decode_with_witness(dir, id, payload, Some(witness))
++        })
++    }
++    fn next_reauthenticating_external(
++        &mut self,
++        witness: codec::ExternalWitness,
++        record: JournalRecord,
++    ) -> Result<Option<JournalRecord>> {
++        self.next_decoding(&mut Vec::new(), |dir, id, payload| {
++            if witness.reauthenticate(dir, payload)? {
++                return Ok((record, true));
+             }
+-            self.fully_read = true;
+-            return Ok(None);
+-        }
+-        let result = decode(line);
+-        if line.capacity() > MAX_RETAINED_LINE_CAPACITY {
+-            *line = Vec::new();
+-        }
+-        result
++            drop(record);
++            codec::decode(dir, id, payload)
++        })
+     }
+     fn consumed_fingerprint(&self) -> String {
+         crate::io::digest_hex(self.current_hash.clone().finish())
+@@ -432,7 +462,7 @@ impl RecordSnapshot for JsonlSnapshot {
+     fn fingerprint(&self) -> &str {
+         self.fingerprint.as_deref().expect("sealed JSONL snapshot")
+     }
+-    fn read_hash(&self) -> HashContext {
++    fn read_hash(&self) -> ring::digest::Context {
+         self.current_hash.clone()
+     }
+     fn extent(&self) -> u64 {
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 5f8d403a2d0febe75ea1d7d003a79028188545f6..6601598a04d5f08f281bcf9dc72fc7128d561584 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -68,6 +68,21 @@ pub(crate) trait RecordSnapshot: Send {
+     fn next_with_scratch(&mut self, _line: &mut Vec<u8>) -> Result<Option<JournalRecord>> {
+         self.next()
+     }
++    fn next_capturing_external(
++        &mut self,
++        line: &mut Vec<u8>,
++        _witness: &mut Option<crate::codec::ExternalWitness>,
++    ) -> Result<Option<JournalRecord>> {
++        self.next_with_scratch(line)
++    }
++    fn next_reauthenticating_external(
++        &mut self,
++        _witness: crate::codec::ExternalWitness,
++        record: JournalRecord,
++    ) -> Result<Option<JournalRecord>> {
++        drop(record);
++        self.next()
++    }
+     /// Opt in to a backend-specific validation stream. False means that
+     /// no rows or cursor state have been touched and the caller must replay.
+     fn try_visit_display_rows(
+diff --git a/storage/session-storage/src/blob_codec.rs b/storage/session-storage/src/blob_codec.rs
+index 7359434b21e0a10ffc895eda10f3cf7a297f6eb8..c451445755f81695b165a74b4de153fbc30ccefe 100644
+--- a/storage/session-storage/src/blob_codec.rs
++++ b/storage/session-storage/src/blob_codec.rs
+@@ -207,11 +207,7 @@ pub(crate) fn unpack_expected<'a>(
+     unpack_checked(session, stored, Some((sha256, bytes)))
+ }
+ 
+-fn unpack_checked<'a>(
+-    session: &Path,
+-    stored: &'a [u8],
+-    expected: Option<(&str, u64)>,
+-) -> Result<Cow<'a, [u8]>> {
++fn checked_manifest(stored: &[u8], expected: Option<(&str, u64)>) -> Result<Option<Manifest>> {
+     ensure!(
+         stored.len() <= MAX_PAYLOAD_BYTES,
+         "stored blob exceeds maximum"
+@@ -221,7 +217,7 @@ fn unpack_checked<'a>(
+             ensure!(stored.len() as u64 == length, "journal blob size mismatch");
+             ensure!(sha256_hex(stored) == hash, "journal blob hash mismatch");
+         }
+-        return Ok(Cow::Borrowed(stored));
++        return Ok(None);
+     };
+     let manifest: Manifest = serde_json::from_slice(body)?;
+     ensure!(
+@@ -238,18 +234,90 @@ fn unpack_checked<'a>(
+             "shared manifest differs from journal blob identity"
+         );
+     }
++    Ok(Some(manifest))
++}
++
++fn chunk_end(chunk: &Chunk, start: usize, total: usize) -> Result<usize> {
++    ensure!(
++        chunk.bytes > 0 && chunk.bytes <= MAX_CHUNK && chunk.bytes <= total.saturating_sub(start),
++        "shared blob chunk exceeds declared payload"
++    );
++    Ok(start + chunk.bytes)
++}
++
++fn read_verified_chunk(session: &Path, chunk: &Chunk, content: &mut [u8]) -> Result<()> {
++    let path = chunk_path(session, &chunk.sha256)?;
++    let count = bounded_read_into(&path, MAX_CHUNK, content)?;
++    ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
++    ensure!(
++        sha256_hex(content) == chunk.sha256,
++        "shared blob chunk hash mismatch"
++    );
++    Ok(())
++}
++
++fn check_complete(manifest: &Manifest, bytes: usize, digest: impl FnOnce() -> String) -> Result<()> {
++    ensure!(bytes == manifest.bytes, "shared blob size mismatch");
++    ensure!(digest() == manifest.sha256, "shared blob hash mismatch");
++    Ok(())
++}
++
++/// Verify exactly the same bytes as unpack_expected without keeping the body.
++/// A repeated chunk must use the first observed bytes, even if its file later
++/// changes; keep only chunks with another occurrence, and free after last use.
++pub(crate) fn verify_expected(session: &Path, stored: &[u8], hash: &str, bytes: u64) -> Result<()> {
++    let Some(manifest) = checked_manifest(stored, Some((hash, bytes)))? else {
++        return Ok(());
++    };
++    let mut last = HashMap::new();
++    for (i, chunk) in manifest.chunks.iter().enumerate() {
++        last.insert(chunk.sha256.as_str(), i);
++    }
++    let mut repeating: HashMap<&str, Vec<u8>> = HashMap::new();
++    let mut scratch = vec![0; MAX_CHUNK];
++    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
++    let mut used = 0;
++    for (i, chunk) in manifest.chunks.iter().enumerate() {
++        used = chunk_end(chunk, used, manifest.bytes)?;
++        let key = chunk.sha256.as_str();
++        let later = last[key] != i;
++        match repeating.entry(key) {
++            Entry::Occupied(entry) => {
++                let content = entry.get();
++                ensure!(content.len() == chunk.bytes, "shared blob chunk size mismatch");
++                digest.update(content);
++                if !later {
++                    entry.remove();
++                }
++            }
++            Entry::Vacant(entry) => {
++                let content = &mut scratch[..chunk.bytes];
++                read_verified_chunk(session, chunk, content)?;
++                digest.update(content);
++                if later {
++                    entry.insert(content.to_vec());
++                }
++            }
++        }
++    }
++    check_complete(&manifest, used, || crate::io::digest_hex(digest.finish()))
++}
++
++fn unpack_checked<'a>(
++    session: &Path,
++    stored: &'a [u8],
++    expected: Option<(&str, u64)>,
++) -> Result<Cow<'a, [u8]>> {
++    let Some(manifest) = checked_manifest(stored, expected)? else {
++        return Ok(Cow::Borrowed(stored));
++    };
+     let mut bytes = Vec::with_capacity(manifest.bytes);
+     // A chunk can occur many times in one payload. Index only ranges in our
+     // output; a later unpack verifies its files independently.
+     let mut verified = HashMap::new();
+     for chunk in &manifest.chunks {
+         let start = bytes.len();
+-        ensure!(
+-            chunk.bytes > 0
+-                && chunk.bytes <= MAX_CHUNK
+-                && chunk.bytes <= manifest.bytes.saturating_sub(start),
+-            "shared blob chunk exceeds declared payload"
+-        );
++        let end = chunk_end(chunk, start, manifest.bytes)?;
+         let vacant = match verified.entry(chunk.sha256.as_str()) {
+             Entry::Occupied(entry) => {
+                 let (offset, len): (usize, usize) = *entry.get();
+@@ -259,22 +327,11 @@ fn unpack_checked<'a>(
+             }
+             Entry::Vacant(entry) => entry,
+         };
+-        let path = chunk_path(session, &chunk.sha256)?;
+-        bytes.resize(start + chunk.bytes, 0);
+-        let content = &mut bytes[start..];
+-        let count = bounded_read_into(&path, MAX_CHUNK, content)?;
+-        ensure!(count == chunk.bytes, "shared blob chunk size mismatch");
+-        ensure!(
+-            sha256_hex(content) == chunk.sha256,
+-            "shared blob chunk hash mismatch"
+-        );
++        bytes.resize(end, 0);
++        read_verified_chunk(session, chunk, &mut bytes[start..end])?;
+         vacant.insert((start, chunk.bytes));
+     }
+-    ensure!(bytes.len() == manifest.bytes, "shared blob size mismatch");
+-    ensure!(
+-        sha256_hex(&bytes) == manifest.sha256,
+-        "shared blob hash mismatch"
+-    );
++    check_complete(&manifest, bytes.len(), || sha256_hex(&bytes))?;
+     Ok(Cow::Owned(bytes))
+ }
+ 
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 0da045513f551ef5ca4a91ec04e0b3f982b4c059..3cafc346470120bd91930f2b4f5bcd3938c15542 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -114,6 +114,35 @@ pub(crate) fn decode(
+     session: &Path,
+     session_id: SessionId,
+     line: &[u8],
++) -> Result<(JournalRecord, bool)> {
++    decode_with_witness(session, session_id, line, None)
++}
++
++/// A small exact journal line and the descriptor from its successful decode.
++/// Reuse still has to reopen and authenticate the external body.
++pub(crate) struct ExternalWitness {
++    line: Vec<u8>,
++    sha256: String,
++    bytes: u64,
++    relative_path: PathBuf,
++}
++
++impl ExternalWitness {
++    pub(crate) fn reauthenticate(&self, session: &Path, line: &[u8]) -> Result<bool> {
++        if line != self.line {
++            return Ok(false);
++        }
++        let stored = read_blob(session, &self.sha256, self.bytes, &self.relative_path)?;
++        crate::blob_codec::verify_expected(session, &stored, &self.sha256, self.bytes)?;
++        Ok(true)
++    }
++}
++
++pub(crate) fn decode_with_witness(
++    session: &Path,
++    session_id: SessionId,
++    line: &[u8],
++    witness: Option<&mut Option<ExternalWitness>>,
+ ) -> Result<(JournalRecord, bool)> {
+     crate::diagnostics::decoded();
+     let stored: StoredRecord = serde_json::from_slice(line).context("invalid journal record")?;
+@@ -140,15 +169,19 @@ pub(crate) fn decode(
+             bytes,
+             relative_path,
+         } => {
+-            validate_blob(&sha256, &relative_path)?;
+-            ensure!(
+-                bytes <= MAX_PAYLOAD_BYTES as u64,
+-                "declared blob exceeds maximum"
+-            );
+-            let stored_content = bounded_read(&session.join(relative_path), MAX_PAYLOAD_BYTES)?;
++            let stored_content = read_blob(session, &sha256, bytes, &relative_path)?;
+             let content =
+                 crate::blob_codec::unpack_expected(session, &stored_content, &sha256, bytes)?;
+-            JournalEntry::from_stored_kind_and_bytes(stored.kind, &content)?
++            let entry = JournalEntry::from_stored_kind_and_bytes(stored.kind, &content)?;
++            if let Some(witness) = witness.filter(|_| line.len() <= 1024) {
++                *witness = Some(ExternalWitness {
++                    line: line.to_vec(),
++                    sha256,
++                    bytes,
++                    relative_path,
++                });
++            }
++            entry
+         }
+     };
+     Ok((
+@@ -167,6 +200,12 @@ pub(crate) fn decode(
+     ))
+ }
+ 
++fn read_blob(session: &Path, sha256: &str, bytes: u64, path: &Path) -> Result<Vec<u8>> {
++    validate_blob(sha256, path)?;
++    ensure!(bytes <= MAX_PAYLOAD_BYTES as u64, "declared blob exceeds maximum");
++    bounded_read(&session.join(path), MAX_PAYLOAD_BYTES)
++}
++
+ fn validate_blob(hash: &str, path: &Path) -> Result<()> {
+     ensure!(
+         hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..620fb28f5c38a7b9a0c71ab7d3d9054ab1b8e268 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -1,4 +1,4 @@
+-use crate::{backend::RecordSnapshot, types::*};
++use crate::{backend::RecordSnapshot, codec::ExternalWitness, types::*};
+ use anyhow::{Result, ensure};
+ use proteus_contracts::{domain::SessionId, model_standard::CanonicalMessage};
+ use proteus_session_semantics::{JournalValidationState, ModelContextProjection, UsageProjection};
+@@ -10,6 +10,11 @@ pub(crate) struct Fold {
+     pub usage: UsageProjection,
+     pub session_seq: u64,
+ }
++struct Terminal {
++    record: JournalRecord,
++    external: Option<ExternalWitness>,
++}
++
+ impl Fold {
+     pub fn apply(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
+         self.apply_projected::<true, true>(id, record)
+@@ -197,7 +202,7 @@ impl SnapshotState {
+     fn fold_with_terminal<const MODEL_CONTEXT: bool, const USAGE: bool>(
+         &mut self,
+         capture: bool,
+-    ) -> Result<(Fold, Option<JournalRecord>)> {
++    ) -> Result<(Fold, Option<Terminal>)> {
+         self.reset_page_cursor();
+         self.verified = false;
+         let version = self.source.source_version()?;
+@@ -205,13 +210,21 @@ impl SnapshotState {
+         let mut state = Fold::default();
+         let mut terminal = None;
+         let mut line = Vec::new();
+-        while let Some(record) = self.source.next_with_scratch(&mut line)? {
++        let singleton = capture && self.identity.revision.session_seq == 1;
++        loop {
++            let mut external = None;
++            let next = if singleton {
++                self.source.next_capturing_external(&mut line, &mut external)?
++            } else {
++                self.source.next_with_scratch(&mut line)?
++            };
++            let Some(record) = next else { break };
+             state.apply_projected::<MODEL_CONTEXT, USAGE>(
+                 self.identity.session.session_id,
+                 &record,
+             )?;
+             if capture && record.session_seq == self.identity.revision.session_seq {
+-                terminal = Some(record);
++                terminal = Some(Terminal { record, external });
+             }
+         }
+         drop(line);
+@@ -254,17 +267,22 @@ impl SnapshotState {
+         // For an exact terminal page, the complete fold already decoded the
+         // one result and left the reader at EOF. Only hand it to the existing
+         // page checks after independently authenticating the pinned bytes.
+-        // Blob-bearing JSONL, changed or unknown sources keep the normal scan.
++        // External JSONL still goes through the second physical read below.
++        let mut reuse = None;
+         if terminal.is_some() && before == page_version && self.source.confirm_verified_data()? {
+-            self.pending = terminal.map(|record| PendingPageRecord::Buffered {
+-                record,
++            self.pending = terminal.map(|terminal| PendingPageRecord::Buffered {
++                record: terminal.record,
+                 encoded_bytes: None,
+             });
+         } else if !continuing {
+             if terminal.is_some() && before != page_version {
+                 self.source.verify_fixed_prefix()?;
+             }
+-            drop(terminal);
++            if let Some(Terminal { record, external: Some(external) }) = terminal
++                && before == page_version
++            {
++                reuse = Some((external, record));
++            }
+             self.pending = None;
+             self.source.reset_for_page(after)?;
+         }
+@@ -284,10 +302,16 @@ impl SnapshotState {
+                         .ok_or_else(|| anyhow::anyhow!("missing deferred journal record"))?;
+                     (record, Some(encoded_bytes))
+                 }
+-                None => match self.source.next()? {
+-                    Some(record) => (record, None),
+-                    None => break,
+-                },
++                None => {
++                    let next = match reuse.take() {
++                        Some((external, record)) => {
++                            self.source.next_reauthenticating_external(external, record)?
++                        }
++                        None => self.source.next()?,
++                    };
++                    let Some(record) = next else { break };
++                    (record, None)
++                }
+             };
+             if record.session_seq <= after {
+                 continue;
