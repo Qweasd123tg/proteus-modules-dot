@@ -1,0 +1,144 @@
+diff --git a/crates/proteus-core/src/core/module_catalog/components.rs b/crates/proteus-core/src/core/module_catalog/components.rs
+index a2128b6b4a7ceec6f6e43d15f90bf462d8947b40..dccaefc48379437b0ca327b6574ec9c8605251ef 100644
+--- a/crates/proteus-core/src/core/module_catalog/components.rs
++++ b/crates/proteus-core/src/core/module_catalog/components.rs
+@@ -5,11 +5,11 @@ use proteus_module_protocol::{ProcessExportBinding, current_process_contract_aut
+ 
+ use crate::{
+     contracts::{ContextBuilder, Workflow},
+-    core::AppConfig,
++    core::{AppConfig, workflow_host::ProcessWorkflowAdapter},
+     domain::{ModuleKind, ModuleManifest, SlotId, slot},
+     process_adapters::{
+         ProcessApprovalPolicy, ProcessComponentLauncher, ProcessContextBuilder,
+-        ProcessExportConfig, ProcessModel, ProcessWorkflowAdapter,
++        ProcessExportConfig, ProcessModel,
+     },
+ };
+ 
+diff --git a/crates/proteus-core/src/core/workflow_host.rs b/crates/proteus-core/src/core/workflow_host.rs
+index 187c715c75c44e2104187368b7b2d6261c71e09d..126e08818f4bf077a3f89cde876cfbef80d4c1ef 100644
+--- a/crates/proteus-core/src/core/workflow_host.rs
++++ b/crates/proteus-core/src/core/workflow_host.rs
+@@ -4,6 +4,9 @@
+ //! tool, policy, cancellation, or event semantics.
+ 
+ mod model_stream;
++mod process;
++
++pub(super) use process::ProcessWorkflowAdapter;
+ 
+ use std::{future::Future, path::PathBuf};
+ 
+diff --git a/crates/proteus-core/src/process_adapters/workflow.rs b/crates/proteus-core/src/core/workflow_host/process.rs
+similarity index 97%
+rename from crates/proteus-core/src/process_adapters/workflow.rs
+rename to crates/proteus-core/src/core/workflow_host/process.rs
+index 60444a0e0a1b82fdc11e2c83d94b290a3a21d70f..62a6212bfa33e173d721172b6f1ae23db6b4b051 100644
+--- a/crates/proteus-core/src/process_adapters/workflow.rs
++++ b/crates/proteus-core/src/core/workflow_host/process.rs
+@@ -22,26 +22,26 @@ use crate::{
+         WorkflowInvocationContext, WorkflowOutput, WorkflowPrepareContextRequest,
+         WorkflowRuntimeStatusRequest, WorkflowSelectToolsRequest, WorkflowVisibleToolsRequest,
+     },
+-    core::workflow_host::WorkflowHostRuntime,
+     domain::AgentTask,
+     model_standard::CanonicalMessage,
++    process_adapters::{
++        ProcessExportClient, ProcessExportConfig,
++        host_rpc::{self, decode, encode},
++    },
+ };
+ 
+-use super::{
+-    ProcessExportClient, ProcessExportConfig,
+-    host_rpc::{self, decode, encode},
+-};
++use super::WorkflowHostRuntime;
+ 
+ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+ 
+ /// One persistent external Workflow implementation selected through config.
+-pub struct ProcessWorkflowAdapter {
++pub(in crate::core) struct ProcessWorkflowAdapter {
+     workflow_timeout_ms: u64,
+     client: Arc<ProcessExportClient>,
+ }
+ 
+ impl ProcessWorkflowAdapter {
+-    pub fn new(
++    pub(in crate::core) fn new(
+         config: ProcessExportConfig,
+         workspace: &Path,
+         workflow_timeout_ms: u64,
+diff --git a/crates/proteus-core/src/process_adapters/host_rpc.rs b/crates/proteus-core/src/process_adapters/host_rpc.rs
+index 49cd25af80bc00d07645e3052445e975ac537dfb..df9f9af093d78691de71af22ded9873471e8507b 100644
+--- a/crates/proteus-core/src/process_adapters/host_rpc.rs
++++ b/crates/proteus-core/src/process_adapters/host_rpc.rs
+@@ -7,7 +7,7 @@ use serde_json::Value;
+ 
+ const HOST_CALLBACK_ERROR: i64 = -32_100;
+ 
+-pub(super) fn decode<T: DeserializeOwned>(
++pub(crate) fn decode<T: DeserializeOwned>(
+     params: Value,
+     method: &str,
+ ) -> Result<T, ProcessModuleRpcError> {
+@@ -16,7 +16,7 @@ pub(super) fn decode<T: DeserializeOwned>(
+     })
+ }
+ 
+-pub(super) fn encode<T: Serialize>(value: T, method: &str) -> Result<Value, ProcessModuleRpcError> {
++pub(crate) fn encode<T: Serialize>(value: T, method: &str) -> Result<Value, ProcessModuleRpcError> {
+     serde_json::to_value(value).map_err(|error| {
+         ProcessModuleRpcError::new(
+             -32603,
+@@ -25,6 +25,6 @@ pub(super) fn encode<T: Serialize>(value: T, method: &str) -> Result<Value, Proc
+     })
+ }
+ 
+-pub(super) fn callback_error(method: &str, error: &anyhow::Error) -> ProcessModuleRpcError {
++pub(crate) fn callback_error(method: &str, error: &anyhow::Error) -> ProcessModuleRpcError {
+     ProcessModuleRpcError::new(HOST_CALLBACK_ERROR, format!("{method} failed: {error:#}"))
+ }
+diff --git a/crates/proteus-core/src/process_adapters/mod.rs b/crates/proteus-core/src/process_adapters/mod.rs
+index 72e73dcb111746828239aeeaac1e6f36d7e925f7..ef57617751c3b42cd87da591abdd8999fcca1e1a 100644
+--- a/crates/proteus-core/src/process_adapters/mod.rs
++++ b/crates/proteus-core/src/process_adapters/mod.rs
+@@ -4,7 +4,7 @@ mod client;
+ mod config;
+ mod context;
+ mod hook;
+-mod host_rpc;
++pub(crate) mod host_rpc;
+ mod invocation_error;
+ mod invocation_scope;
+ mod mcp;
+@@ -13,7 +13,6 @@ mod policy;
+ mod sandbox;
+ mod session_storage;
+ mod tool;
+-mod workflow;
+ 
+ pub use config::{ProcessComponentConfig, ProcessExportLaunchConfig};
+ pub use mcp::mcp_server_process_spec;
+@@ -27,6 +26,5 @@ pub(crate) use model::*;
+ pub(crate) use policy::*;
+ pub(crate) use session_storage::*;
+ pub(crate) use tool::*;
+-pub(crate) use workflow::*;
+ 
+ mod operation_host;
+diff --git a/docs/architecture/architecture.md b/docs/architecture/architecture.md
+index c2b53e682ebd560bee0f6680baaa419a66072ccd..d6b72613840bda67cbb95eeeeee61d58d5e03000 100644
+--- a/docs/architecture/architecture.md
++++ b/docs/architecture/architecture.md
+@@ -208,7 +208,7 @@ cancel, invalid response или смерть process классифицирую
+ | Serialized root chain | `crates/proteus-core/src/core/runtime/turn.rs`, `run_reserved_completion`, `run_reserved_chain` | `AgentRuntime`; один `run_lock`, один или несколько sequential Turns |
+ | Durable Turn lifecycle | тот же файл, `run_one_turn`, `run_opened_turn`, `persist_current_user_message` | Один domain Turn: snapshot/open/history/workflow/settlement |
+ | Workflow contract | `crates/proteus-contracts/src/contracts/workflow.rs`, `Workflow::run` | Один controller invocation; в AppServer path — внутри открытого Turn, standalone — с `WorkflowInvocationContext::Execution` |
+-| Process Workflow bridge | `crates/proteus-core/src/process_adapters/workflow.rs`, `ProcessWorkflowAdapter::run` | Один broker root invocation + host callbacks |
++| Process Workflow bridge | `crates/proteus-core/src/core/workflow_host/process.rs`, `ProcessWorkflowAdapter::run` | Один broker root invocation + host callbacks |
+ | Generic host callbacks | `crates/proteus-core/src/core/workflow_host.rs`, `WorkflowHostRuntime` | Один cloned current context на Workflow invocation |
+ | Tool safety path | `crates/proteus-core/src/core/bound_tools.rs`, `BoundTools`; agent adapter — `core/tool_orchestrator.rs` | Один execution-bound tool call; agent wrapper добавляет presentation/control enrichment |
+ | Durable data | `crates/proteus-core/src/core/session_store.rs` и `core/session_journal/` | Append-only session journal + reconstructed projection |
