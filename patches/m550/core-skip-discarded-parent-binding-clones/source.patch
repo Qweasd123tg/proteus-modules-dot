@@ -1,0 +1,38 @@
+diff --git a/crates/proteus-core/src/core/config/models.rs b/crates/proteus-core/src/core/config/models.rs
+index aae4a62158344b5f0854aad22edcb8d8375974a8..c15986441983383f25747e57bdc51cecf8e6524a 100644
+--- a/crates/proteus-core/src/core/config/models.rs
++++ b/crates/proteus-core/src/core/config/models.rs
+@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
+ 
+ use super::{ModelConfig, ProviderProfileConfig};
+ 
+-#[derive(Clone, Default)]
++#[derive(Default)]
+ struct ModelScope {
+     presets: BTreeMap<String, ProviderProfileConfig>,
+     selected: Option<String>,
+@@ -106,11 +106,11 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+         "config must define models or providers, not both"
+     );
+     let legacy_independent = object.contains_key("providers") && explicit;
+-    let mut scope = if legacy_independent {
+-        ModelScope::default()
+-    } else {
+-        parent.cloned().unwrap_or_default()
+-    };
++    let mut scope = ModelScope::default();
++    if let Some(parent) = parent.filter(|_| !legacy_independent) {
++        scope.presets = parent.presets.clone();
++        scope.selected = parent.selected.clone();
++    }
+     let local = if let Some(models) = object.remove("models") {
+         named_presets(models)?
+     } else if let Some(providers) = object.remove("providers") {
+@@ -218,7 +218,6 @@ fn normalize(source: &mut Value, parent: Option<&ModelScope>) -> Result<ModelSco
+ }
+ 
+ fn capture_bindings(object: &Map<String, Value>, scope: &mut ModelScope) {
+-    scope.components.clear();
+     for (name, component) in object
+         .get("components")
+         .and_then(Value::as_object)
