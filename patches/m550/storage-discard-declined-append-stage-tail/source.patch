@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/display.rs b/storage/session-storage/src/display.rs
+index 2d32bdeda79c5d775cea7840edf453f110a16cc8..a56cc40f85ccc773e30767abeb991a98e4310444 100644
+--- a/storage/session-storage/src/display.rs
++++ b/storage/session-storage/src/display.rs
+@@ -84,6 +84,9 @@ impl DisplayWriter {
+         if canonical_has_same_payload
+             && self.budget - self.remaining >= SESSION_STORAGE_PAGE_BYTE_BUDGET as u64
+         {
++            // This private stage is being discarded, not published. Do not
++            // write its remaining buffer just to close the temporary file.
++            drop(self.writer.into_parts());
+             return None;
+         }
+         self.finish()
