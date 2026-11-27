@@ -1,0 +1,14 @@
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index af50e9a7306e5eb615a21dfa4f70eb9ceb0966ae..ad3e2f6a2edd91e633179ccb2a29fb6f9b558267 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -373,7 +373,8 @@ impl SnapshotState {
+             }
+         )
+         .then(|| state.conversation());
+-        while let Some(record) = self.source.next()? {
++        let mut line = Vec::new();
++        while let Some(record) = self.source.next_with_scratch(&mut line)? {
+             if let JournalEntry::HistoryMutated(mutation) = &record.entry {
+                 let compacted = mutation
+                     .compaction
