@@ -1,0 +1,39 @@
+diff --git a/crates/proteus-core/src/app_server/config_summary.rs b/crates/proteus-core/src/app_server/config_summary.rs
+index 11940899a6c3ca0fd41069113c06881ea44adb49..09342ec2016e3aecf41aed0be14cefbce6e2481c 100644
+--- a/crates/proteus-core/src/app_server/config_summary.rs
++++ b/crates/proteus-core/src/app_server/config_summary.rs
+@@ -179,7 +179,7 @@ impl super::AppServerHandle {
+         use proteus_contracts::app_protocol::config::*;
+         let (snapshot, model_ref, reasoning, mode) = self.runtime.configuration_view().await;
+         let module_epoch = snapshot.epoch;
+-        let config = snapshot.assembly_plan.config().clone();
++        let config = snapshot.assembly_plan.config();
+         let (active_catalog, inactive_options) = tokio::join!(
+             async {
+                 if !discover {
+@@ -188,14 +188,14 @@ impl super::AppServerHandle {
+                 snapshot.registry.model_catalog().await
+             },
+             super::model_selection::inactive_model_options(
+-                &config,
++                config,
+                 model_ref.as_ref(),
+                 &snapshot.registry,
+                 discover,
+             ),
+         );
+         let mut selection = super::model_selection::selection_summary(
+-            &config,
++            config,
+             &model_ref,
+             &reasoning,
+             active_catalog,
+@@ -206,7 +206,7 @@ impl super::AppServerHandle {
+         selection.models.extend(inactive_options);
+         let summary = ConfigSummary {
+             display_text: render_config_summary(
+-                &config,
++                config,
+                 self.config_path.as_deref(),
+                 &self.cwd,
+                 mode,
