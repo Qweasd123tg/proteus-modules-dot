@@ -1,0 +1,38 @@
+diff --git a/storage/session-storage/src/archive.rs b/storage/session-storage/src/archive.rs
+index 5c82c88e3889eeec4943802cc85fa14543925d03..bc855dc5293214cea721e663f145d627e3235cf8 100644
+--- a/storage/session-storage/src/archive.rs
++++ b/storage/session-storage/src/archive.rs
+@@ -3,7 +3,7 @@ use std::{
+     collections::BTreeMap,
+     fs::File,
+     io::{BufRead, BufReader, Read},
+-    path::{Path, PathBuf},
++    path::{Component, Path, PathBuf},
+ };
+ 
+ use anyhow::{Context, Result, ensure};
+@@ -41,6 +41,15 @@ enum Payload {
+     },
+ }
+ 
++fn archive_blob_path_matches(path: &Path, hash: &str) -> bool {
++    let mut parts = path.components();
++    matches!(
++        (parts.next(), parts.next(), parts.next()),
++        (Some(Component::Normal(dir)), Some(Component::Normal(file)), None)
++            if dir == "blobs" && file.as_encoded_bytes().strip_suffix(b".json") == Some(hash.as_bytes())
++    )
++}
++
+ /// Rewrite each referenced blob atomically while preserving journal bytes and payload hashes.
+ /// An interrupted invocation can be repeated. Existing unpacked payloads remain readable.
+ pub fn compact_jsonl_archive(session: &Path) -> Result<ArchiveCompaction> {
+@@ -80,7 +89,7 @@ pub fn compact_jsonl_archive(session: &Path) -> Result<ArchiveCompaction> {
+                 "invalid archive payload hash"
+             );
+             ensure!(
+-                relative_path == Path::new("blobs").join(format!("{sha256}.json")),
++                archive_blob_path_matches(&relative_path, &sha256),
+                 "archive payload path differs from its hash"
+             );
+             ensure!(
