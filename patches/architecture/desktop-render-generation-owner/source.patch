@@ -1,0 +1,287 @@
+diff --git a/src/ui/chat/scroller.rs b/src/ui/chat/scroller.rs
+index ba0841d6c33205729a5a8ad866def69e95921e40..77432291ceb9c068538ade48a92693d237c0618e 100644
+--- a/src/ui/chat/scroller.rs
++++ b/src/ui/chat/scroller.rs
+@@ -993,7 +993,7 @@ impl RenderOnce for ChatList {
+                     .on_prepaint(move |bounds, _, cx| {
+                         resized.update(cx, |state, cx| {
+                             state.footer_viewport = bounds;
+-                            let generation = crate::ui::extensions::render_generation(cx);
++                            let generation = crate::ui::render_generation::current(cx);
+                             state.update_viewport(bounds.size, generation, cx);
+                             // The footer itself may be outside native
+                             // overdraw. Start with its real content; visible
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+index 48d80bc4f7731835d751344f2085430b3796d53c..8ba50d022ea53dcb4a9a461ce4db77fc57814b47 100644
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -147,7 +147,7 @@ impl Runtime {
+ 
+     /// Starts the process again, e.g. after the user fixed it.
+     pub(super) fn restart(&mut self, cx: &mut Context<Self>) {
+-        super::super::bump_render_generation(cx);
++        crate::ui::render_generation::bump(cx);
+         self.stop(Reset::Restart, cx);
+         self.error = None;
+         self.start(cx);
+diff --git a/src/ui/extensions/declarative/runtime/invalidation.rs b/src/ui/extensions/declarative/runtime/invalidation.rs
+index 56d80172e27fe6970252693b986c04e044df2984..004bbd63e0dfa764d1f488c7216fd335cbf6d84c 100644
+--- a/src/ui/extensions/declarative/runtime/invalidation.rs
++++ b/src/ui/extensions/declarative/runtime/invalidation.rs
+@@ -21,7 +21,7 @@ pub(super) fn runtimes(extension: &str, cx: &App) -> Vec<Entity<Runtime>> {
+ fn broadcast_kind(extension: &str, all: bool, cx: &mut App) {
+     // Settings can affect a previously visited row whose content surface is
+     // currently unloaded. Active-runtime notifications alone cannot reach it.
+-    crate::ui::extensions::bump_render_generation(cx);
++    crate::ui::render_generation::bump(cx);
+     crate::ui::chat::invalidate_height_cache();
+     for runtime in runtimes(extension, cx) {
+         runtime.update(cx, |runtime, cx| {
+@@ -88,12 +88,12 @@ mod tests {
+     fn settings_invalidation_advances_content_generation_without_a_mounted_runtime() {
+         let cx = ::gpui::TestAppContext::single();
+         cx.update(|cx| {
+-            let before = crate::ui::extensions::render_generation(cx);
++            let before = crate::ui::render_generation::current(cx);
+             super::broadcast("unmounted-fixture-renderer", cx);
+-            let content = crate::ui::extensions::render_generation(cx);
++            let content = crate::ui::render_generation::current(cx);
+             assert_ne!(content, before);
+             super::broadcast_surfaces("unmounted-fixture-renderer", cx);
+-            assert_ne!(crate::ui::extensions::render_generation(cx), content);
++            assert_ne!(crate::ui::render_generation::current(cx), content);
+         });
+     }
+ }
+diff --git a/src/ui/extensions/mod.rs b/src/ui/extensions/mod.rs
+index 6a200b04dfd7c11fa68946c284aed4c86f86bf8d..3968262c5299096ff5395045165aff8b8942a0c3 100644
+--- a/src/ui/extensions/mod.rs
++++ b/src/ui/extensions/mod.rs
+@@ -23,39 +23,6 @@ use super::prefs;
+ use crate::declarative::manifest::Problem;
+ use crate::preferences::BadgePlace;
+ 
+-/// Content-size estimates can outlive their native renderer views. Keep their
+-/// generation separate from process/view lifetime so hidden chats invalidate
+-/// old measurements when a renderer's behavior changes.
+-#[derive(Default)]
+-struct RenderGeneration(u64);
+-impl Global for RenderGeneration {}
+-
+-#[derive(Default, Clone)]
+-struct VisualRenderGeneration(u64);
+-impl Global for VisualRenderGeneration {}
+-
+-pub(in crate::ui) fn register_visual_globals(cx: &mut App) {
+-    cx.set_global(VisualRenderGeneration::default());
+-    cx.register_window_global::<VisualRenderGeneration>();
+-}
+-
+-pub(in crate::ui) fn bump_visual_render_generation(cx: &mut App) {
+-    // A transferred chat must invalidate measurements even if both owners
+-    // performed the same number of edits. Only identity allocation is shared.
+-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+-    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-    cx.set_global(VisualRenderGeneration(next));
+-}
+-
+-pub(in crate::ui) fn render_generation(cx: &App) -> u64 {
+-    cx.try_global::<RenderGeneration>()
+-        .map_or(0, |epoch| epoch.0)
+-        .wrapping_add(
+-            cx.try_global::<VisualRenderGeneration>()
+-                .map_or(0, |epoch| epoch.0.rotate_left(32)),
+-        )
+-}
+-
+ /// Reuses the registry's source revision. No filesystem scan or process launch.
+ pub(in crate::ui) fn scalar_layout_fingerprint(cx: &App) -> Vec<(&'static str, u64)> {
+     ordered(cx)
+@@ -67,13 +34,6 @@ pub(in crate::ui) fn scalar_layout_fingerprint(cx: &App) -> Vec<(&'static str, u
+         .collect()
+ }
+ 
+-pub(in crate::ui) fn bump_render_generation(cx: &mut App) {
+-    let next = cx
+-        .try_global::<RenderGeneration>()
+-        .map_or(1, |generation| generation.0.wrapping_add(1));
+-    cx.set_global(RenderGeneration(next));
+-}
+-
+ /// Builds an icon view. Runs inside a workspace update, so it must not read
+ /// the [`Host`] synchronously.
+ pub(super) type BuildView = fn(Host, &mut Window, &mut App) -> AnyView;
+@@ -250,7 +210,7 @@ pub(super) async fn settle_removal(
+ 
+ /// Rebind native state only after the worker has published/scanned packages.
+ pub(super) fn packages_changed(cx: &mut App) {
+-    bump_render_generation(cx);
++    super::render_generation::bump(cx);
+     declarative::reload_runtimes(cx);
+     cx.refresh_windows();
+ }
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 7cf12ea3bd30b23306e4b3478eca8c02cf307a61..a94908263c5de47be61081c6d4bccde28bae23dd 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -23,6 +23,7 @@ mod panels;
+ mod picker;
+ mod prefs;
+ mod projects;
++mod render_generation;
+ mod render_image;
+ mod reorder;
+ mod search;
+diff --git a/src/ui/prefs.rs b/src/ui/prefs.rs
+index 1d3e452a5276c3dfe05dd33a53107b7865322dc6..a516b6207043d84859903bef379eb04441e2283d 100644
+--- a/src/ui/prefs.rs
++++ b/src/ui/prefs.rs
+@@ -288,7 +288,7 @@ impl Effects {
+ 
+ fn apply(value: &Preferences, effects: Effects, cx: &mut App) {
+     if effects.renderers {
+-        super::extensions::bump_render_generation(cx);
++        super::render_generation::bump(cx);
+     }
+     if effects.theme {
+         super::theme::select(&value.themes, value.fonts.interface.as_deref(), cx);
+@@ -422,25 +422,25 @@ mod tests {
+         cx.update(|cx| {
+             gpui_kit::init(cx);
+             init_in_memory(cx);
+-            let initial = super::super::extensions::render_generation(cx);
++            let initial = super::super::render_generation::current(cx);
+             update(cx, |preferences| {
+                 preferences
+                     .extensions
+                     .set_enabled("fixture-renderer", false)
+             });
+-            let disabled = super::super::extensions::render_generation(cx);
++            let disabled = super::super::render_generation::current(cx);
+             assert_ne!(disabled, initial);
+             update(cx, |preferences| {
+                 preferences.extensions.order.push("fixture-renderer".into())
+             });
+-            let reordered = super::super::extensions::render_generation(cx);
++            let reordered = super::super::render_generation::current(cx);
+             assert_ne!(reordered, disabled);
+             update(cx, |preferences| {
+                 preferences
+                     .extensions
+                     .set_badge_place("fixture-renderer", crate::preferences::BadgePlace::Hidden)
+             });
+-            assert_eq!(super::super::extensions::render_generation(cx), reordered);
++            assert_eq!(super::super::render_generation::current(cx), reordered);
+         });
+     }
+ }
+diff --git a/src/ui/prefs/appearance_tests.rs b/src/ui/prefs/appearance_tests.rs
+index 695f911aa44b06da8f374aa6279f0c44227e747f..9a5fb1b5581c28381e0c3c9a759fbf2020ea5f1b 100644
+--- a/src/ui/prefs/appearance_tests.rs
++++ b/src/ui/prefs/appearance_tests.rs
+@@ -85,7 +85,7 @@ fn late_system_appearance_changes_theme_without_writing_preferences_or_changing_
+         assert_mode(ThemeMode::Light, cx);
+         cx.global::<ClientPreferences>().value.clone()
+     });
+-    let renderer_generation = cx.update(|cx| crate::ui::extensions::render_generation(cx));
++    let renderer_generation = cx.update(|cx| crate::ui::render_generation::current(cx));
+     for (appearance, mode) in [
+         (WindowAppearance::Dark, ThemeMode::Dark),
+         (WindowAppearance::Light, ThemeMode::Light),
+@@ -100,7 +100,7 @@ fn late_system_appearance_changes_theme_without_writing_preferences_or_changing_
+             assert!(Arc::ptr_eq(&saved, &cx.global::<ClientPreferences>().value));
+             assert_eq!(cx.global::<ClientPreferences>().revision, 0);
+             assert_eq!(
+-                crate::ui::extensions::render_generation(cx),
++                crate::ui::render_generation::current(cx),
+                 renderer_generation
+             );
+         });
+diff --git a/src/ui/prefs/visual.rs b/src/ui/prefs/visual.rs
+index c916846cad24668c724d4752bdb312ed6f9b2dc6..d5b03b7a69f65778c1a9e2bdc715cc01b718bab3 100644
+--- a/src/ui/prefs/visual.rs
++++ b/src/ui/prefs/visual.rs
+@@ -63,7 +63,7 @@ pub(super) fn init(cx: &mut App) {
+     });
+     cx.set_global(VisualWriters::default());
+     cx.register_window_global::<WindowVisualPreferences>();
+-    super::super::extensions::register_visual_globals(cx);
++    super::super::render_generation::register_visual(cx);
+     super::appearance::register(cx);
+     super::super::motion::register_window_globals(cx);
+     if cx.has_global::<gpui_kit::component::Theme>() {
+@@ -317,7 +317,7 @@ fn apply(cx: &mut App) {
+     let state = cx.global_mut::<WindowVisualPreferences>();
+     state.chat_font = chat_font;
+     state.user_chat_font = user_chat_font;
+-    super::super::extensions::bump_visual_render_generation(cx);
++    super::super::render_generation::bump_visual(cx);
+     super::apply(
+         &projection,
+         Effects {
+diff --git a/src/ui/prefs/visual_tests.rs b/src/ui/prefs/visual_tests.rs
+index e90c57bd8f11ecd86403630428c0a0839c8bbf16..2aacfb760831e64fa7f78af2e54e51e4bcf68b2b 100644
+--- a/src/ui/prefs/visual_tests.rs
++++ b/src/ui/prefs/visual_tests.rs
+@@ -67,11 +67,11 @@ fn native_windows_keep_independent_visual_values_and_theme_projections() {
+         assert!(!cx.reduce_motion());
+     });
+     let first_revision = first.update(|_, cx| visual_revision(cx));
+-    let first_renderer_epoch = first.update(|_, cx| crate::ui::extensions::render_generation(cx));
++    let first_renderer_epoch = first.update(|_, cx| crate::ui::render_generation::current(cx));
+     second.update(|_, cx| {
+         assert_ne!(visual_revision(cx), first_revision);
+         assert_ne!(
+-            crate::ui::extensions::render_generation(cx),
++            crate::ui::render_generation::current(cx),
+             first_renderer_epoch
+         );
+         let old_window_values = serde_json::Map::new();
+diff --git a/src/ui/render_generation.rs b/src/ui/render_generation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5fbca873c274a54a876a9d6d76a1a7c52e59f5d
+--- /dev/null
++++ b/src/ui/render_generation.rs
+@@ -0,0 +1,42 @@
++//! Layout-cache invalidation epochs shared by preferences and renderers.
++use gpui_kit::{App, Global};
++
++/// Content-size estimates can outlive their native renderer views. Keep their
++/// generation separate from process/view lifetime so hidden chats invalidate
++/// old measurements when a renderer's behavior changes.
++#[derive(Default)]
++struct RenderGeneration(u64);
++impl Global for RenderGeneration {}
++
++#[derive(Default, Clone)]
++struct VisualRenderGeneration(u64);
++impl Global for VisualRenderGeneration {}
++
++pub(in crate::ui) fn register_visual(cx: &mut App) {
++    cx.set_global(VisualRenderGeneration::default());
++    cx.register_window_global::<VisualRenderGeneration>();
++}
++
++pub(in crate::ui) fn bump_visual(cx: &mut App) {
++    // A transferred chat must invalidate measurements even if both owners
++    // performed the same number of edits. Only identity allocation is shared.
++    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    cx.set_global(VisualRenderGeneration(next));
++}
++
++pub(in crate::ui) fn current(cx: &App) -> u64 {
++    cx.try_global::<RenderGeneration>()
++        .map_or(0, |epoch| epoch.0)
++        .wrapping_add(
++            cx.try_global::<VisualRenderGeneration>()
++                .map_or(0, |epoch| epoch.0.rotate_left(32)),
++        )
++}
++
++pub(in crate::ui) fn bump(cx: &mut App) {
++    let next = cx
++        .try_global::<RenderGeneration>()
++        .map_or(1, |generation| generation.0.wrapping_add(1));
++    cx.set_global(RenderGeneration(next));
++}
