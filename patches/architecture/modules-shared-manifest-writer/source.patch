@@ -1,0 +1,288 @@
+diff --git a/package.py b/package.py
+index eb81900ef3584827086c6a7e8e31be4366290372..6d71db114818c162485cd8319e5ba00301017366 100644
+--- a/package.py
++++ b/package.py
+@@ -3,10 +3,10 @@
+ import argparse
+ from dataclasses import dataclass
+ import hashlib
++import importlib.util
+ import json
+ import os
+ from pathlib import Path
+-import re
+ import shutil
+ import subprocess
+ import sys
+@@ -16,6 +16,14 @@ import zipfile
+ 
+ ROOT = Path(__file__).resolve().parent
+ 
++# The packager can also be loaded by absolute file path outside this checkout.
++_manifest_spec = importlib.util.spec_from_file_location(
++    "_proteus_package_manifest", ROOT / "package_manifest.py")
++_package_manifest = importlib.util.module_from_spec(_manifest_spec)
++_manifest_spec.loader.exec_module(_package_manifest)
++atomic_json = _package_manifest.atomic_json
++model_connections = _package_manifest.model_connections
++
+ 
+ @dataclass(frozen=True)
+ class Package:
+@@ -29,44 +37,6 @@ class Package:
+     model_connections: tuple[dict, ...] = ()
+ 
+ 
+-def model_connections(path, exports):
+-    """Author-owned creation presets; packages remain independent of providers."""
+-    if not path.is_file():
+-        return ()
+-    entries = json.loads(path.read_text())
+-    if not isinstance(entries, list):
+-        raise ValueError(f"Invalid model connection presets: {path}")
+-    identities = set()
+-    fields = {"id", "title", "description", "module_id", "module_config", "env_allowlist"}
+-    for entry in entries:
+-        if (not isinstance(entry, dict) or set(entry) - {"auth"} != fields
+-                or not all(isinstance(entry[key], str) and entry[key].strip()
+-                           for key in ("id", "title", "description", "module_id"))
+-                or any(entry[key] != entry[key].strip() or any(ord(char) < 32 or ord(char) == 127 for char in entry[key])
+-                       for key in ("id", "module_id"))
+-                or entry["id"] in identities or entry["module_id"] == "*"
+-                or not isinstance(entry["module_config"], dict)
+-                or not isinstance(entry["env_allowlist"], list)
+-                or not all(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+-                           for name in entry["env_allowlist"])):
+-            raise ValueError(f"Invalid model connection preset: {path}")
+-        auth = entry.get("auth")
+-        if auth is not None:
+-            if (not isinstance(auth, dict) or set(auth) != {"command", "credential_file_key"}
+-                    or not isinstance(auth["command"], list) or not 1 <= len(auth["command"]) <= 16
+-                    or not all(isinstance(arg, str) and arg and len(arg) <= 1024
+-                               and not any(ord(char) < 32 or ord(char) == 127 for char in arg)
+-                               for arg in auth["command"])
+-                    or not isinstance(auth["credential_file_key"], str)
+-                    or not auth["credential_file_key"]
+-                    or any(ord(char) < 32 or ord(char) == 127 for char in auth["credential_file_key"])):
+-                raise ValueError(f"Invalid model connection authentication: {path}")
+-        if not any(value in exports.get("model", []) for value in ("*", entry["module_id"])):
+-            raise ValueError(f"Model connection preset is not exported: {path}")
+-        identities.add(entry["id"])
+-    return tuple(entries)
+-
+-
+ def packages(root=ROOT):
+     found = {}
+     for exports in sorted((root / "components").glob("*/exports.json")):
+@@ -90,18 +60,6 @@ def packages(root=ROOT):
+     return found
+ 
+ 
+-def atomic_json(value, destination):
+-    destination.parent.mkdir(parents=True, exist_ok=True)
+-    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+-    try:
+-        with os.fdopen(descriptor, "w") as stream:
+-            json.dump(value, stream, ensure_ascii=False, indent=2)
+-            stream.write("\n")
+-        os.replace(temporary, destination)
+-    finally:
+-        Path(temporary).unlink(missing_ok=True)
+-
+-
+ def index_path(profile, root=ROOT):
+     return root / "dist/.artifacts" / f"{profile}.json"
+ 
+diff --git a/package_manifest.py b/package_manifest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c87121d0b1a8129ee964cf6f9960faff7a6fd78d
+--- /dev/null
++++ b/package_manifest.py
+@@ -0,0 +1,56 @@
++"""Shared model creation metadata validation and atomic JSON publication."""
++import json
++import os
++from pathlib import Path
++import re
++import tempfile
++
++
++def model_connections(path, exports):
++    """Author-owned creation presets; packages remain independent of providers."""
++    if not path.is_file():
++        return ()
++    entries = json.loads(path.read_text())
++    if not isinstance(entries, list):
++        raise ValueError(f"Invalid model connection presets: {path}")
++    identities = set()
++    fields = {"id", "title", "description", "module_id", "module_config", "env_allowlist"}
++    for entry in entries:
++        if (not isinstance(entry, dict) or set(entry) - {"auth"} != fields
++                or not all(isinstance(entry[key], str) and entry[key].strip()
++                           for key in ("id", "title", "description", "module_id"))
++                or any(entry[key] != entry[key].strip() or any(ord(char) < 32 or ord(char) == 127 for char in entry[key])
++                       for key in ("id", "module_id"))
++                or entry["id"] in identities or entry["module_id"] == "*"
++                or not isinstance(entry["module_config"], dict)
++                or not isinstance(entry["env_allowlist"], list)
++                or not all(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
++                           for name in entry["env_allowlist"])):
++            raise ValueError(f"Invalid model connection preset: {path}")
++        auth = entry.get("auth")
++        if auth is not None:
++            if (not isinstance(auth, dict) or set(auth) != {"command", "credential_file_key"}
++                    or not isinstance(auth["command"], list) or not 1 <= len(auth["command"]) <= 16
++                    or not all(isinstance(arg, str) and arg and len(arg) <= 1024
++                               and not any(ord(char) < 32 or ord(char) == 127 for char in arg)
++                               for arg in auth["command"])
++                    or not isinstance(auth["credential_file_key"], str)
++                    or not auth["credential_file_key"]
++                    or any(ord(char) < 32 or ord(char) == 127 for char in auth["credential_file_key"])):
++                raise ValueError(f"Invalid model connection authentication: {path}")
++        if not any(value in exports.get("model", []) for value in ("*", entry["module_id"])):
++            raise ValueError(f"Model connection preset is not exported: {path}")
++        identities.add(entry["id"])
++    return tuple(entries)
++
++
++def atomic_json(value, destination):
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
++    try:
++        with os.fdopen(descriptor, "w") as stream:
++            json.dump(value, stream, ensure_ascii=False, indent=2)
++            stream.write("\n")
++        os.replace(temporary, destination)
++    finally:
++        Path(temporary).unlink(missing_ok=True)
+diff --git a/tests/test_opencode_install.py b/tests/test_opencode_install.py
+index 1dc4ea206747b4dcd78f19d24d639dea18d20b2a..d3efa33ca714d6b6f7bc5784d342adf9c5cd706c 100644
+--- a/tests/test_opencode_install.py
++++ b/tests/test_opencode_install.py
+@@ -3,6 +3,9 @@ import hashlib
+ import importlib.util
+ import json
+ from pathlib import Path
++import shutil
++import subprocess
++import sys
+ import tempfile
+ import unittest
+ 
+@@ -11,6 +14,16 @@ spec = importlib.util.spec_from_file_location("opencode_runtime_installer", ROOT
+ installer = importlib.util.module_from_spec(spec)
+ spec.loader.exec_module(installer)
+ 
++LOAD_BY_PATH = """\
++import importlib.util
++from pathlib import Path
++import sys
++spec = importlib.util.spec_from_file_location("fixture_module", sys.argv[1])
++module = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = module
++spec.loader.exec_module(module)
++"""
++
+ 
+ class OpenCodeCreationMetadata(unittest.TestCase):
+     def test_manifest_describes_concrete_creation_defaults_and_wildcard_capacity(self):
+@@ -31,3 +44,55 @@ class OpenCodeCreationMetadata(unittest.TestCase):
+             self.assertTrue({"opencode-go", "opencode-zen"} <= {entry["id"] for entry in presets})
+             self.assertTrue(all(entry["module_id"] != "*" and "HOME" in entry["env_allowlist"] for entry in presets))
+             self.assertFalse(any("api_key" in entry["module_config"] for entry in presets))
++
++    def test_standalone_writer_uses_its_code_with_detached_json_only_metadata(self):
++        with tempfile.TemporaryDirectory(prefix="isolated opencode manifest ") as temporary:
++            root = Path(temporary)
++            code = root / "code"
++            relative = Path("workflow/opencode-runtime/install.py")
++            script = code / relative
++            script.parent.mkdir(parents=True)
++            shutil.copy2(ROOT / relative, script)
++            shutil.copy2(ROOT / "package_manifest.py", code / "package_manifest.py")
++            self.assertFalse((code / "package.py").exists())
++
++            source = root / "data" / "metadata"
++            source.mkdir(parents=True)
++            exports = {"model": ["fixture"]}
++            version = "0.1.0-alpha.4"
++            preset = {"id": "creation", "title": "Настройка", "description": "Синтетический пресет",
++                      "module_id": "fixture", "module_config": {"provider": "fixture"},
++                      "env_allowlist": ["HOME"]}
++            (source / "module-exports.json").write_text(json.dumps(exports))
++            (source / "package.json").write_text(json.dumps({"version": version}))
++            presets = source / "model-connections.json"
++            presets.write_text(json.dumps([preset]))
++            prefix = root / "installed"
++            binary = prefix / "bin/proteus-opencode-module"
++            binary.parent.mkdir(parents=True)
++            binary.write_bytes(b"synthetic standalone launcher\n")
++
++            command = [sys.executable, "-I", "-B", "-c",
++                       LOAD_BY_PATH + "module.write_module_manifest(Path(sys.argv[2]), Path(sys.argv[3]))",
++                       str(script), str(prefix), str(source)]
++            subprocess.run(command, cwd=root, check=True, capture_output=True, text=True)
++            manifest = prefix / "share/modules/opencode-runtime/module.json"
++            expected = {"id": "opencode-runtime", "version": version,
++                        "command": ["bin/proteus-opencode-module"], "exports": exports,
++                        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
++                        "model_connections": [preset]}
++            original = (json.dumps(expected, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
++            self.assertEqual(manifest.read_bytes(), original)
++
++            presets.write_text(json.dumps([dict(preset, module_id="not-exported")]))
++            failed = subprocess.run(command, cwd=root, capture_output=True, text=True)
++            self.assertNotEqual(failed.returncode, 0)
++            self.assertIn("Model connection preset is not exported", failed.stderr)
++            self.assertEqual(manifest.read_bytes(), original)
++
++    def test_packager_can_still_load_by_absolute_path_in_isolated_python(self):
++        with tempfile.TemporaryDirectory(prefix="outside packager checkout ") as temporary:
++            command = [sys.executable, "-I", "-B", "-c",
++                       LOAD_BY_PATH + "assert 'model-pack' in module.packages()",
++                       str(ROOT / "package.py")]
++            subprocess.run(command, cwd=temporary, check=True, capture_output=True, text=True)
+diff --git a/workflow/opencode-runtime/install.py b/workflow/opencode-runtime/install.py
+index 80d90e695de32059e6b6136ddad5d0539b8ad84f..6c878a7d683d1526939ea2951b01dd351d8868fd 100644
+--- a/workflow/opencode-runtime/install.py
++++ b/workflow/opencode-runtime/install.py
+@@ -2,19 +2,22 @@
+ """Install the pinned OpenCode adapters into an existing Proteus prefix."""
+ import argparse
+ import hashlib
++import importlib.util
+ import json
+ from pathlib import Path
+ import shutil
+ import subprocess
+-import sys
++
++# Load shared code from this installer's checkout, not the caller's data path.
++_manifest_spec = importlib.util.spec_from_file_location(
++    "_proteus_package_manifest", Path(__file__).resolve().parents[2] / "package_manifest.py")
++_package_manifest = importlib.util.module_from_spec(_manifest_spec)
++_manifest_spec.loader.exec_module(_package_manifest)
+ 
+ 
+ def write_module_manifest(prefix, source=None):
+     """Describe creation options without npm, network or runtime startup."""
+     source = source or Path(__file__).resolve().parent
+-    modules = source.parent.parent
+-    sys.path.insert(0, str(modules))
+-    from package import atomic_json, model_connections
+     prefix = prefix.resolve()
+     binary = prefix / "bin/proteus-opencode-module"
+     exports = json.loads((source / "module-exports.json").read_text())
+@@ -24,9 +27,10 @@ def write_module_manifest(prefix, source=None):
+     manifest = {"id": "opencode-runtime", "version": version,
+                 "command": ["bin/proteus-opencode-module"], "exports": exports,
+                 "sha256": digest,
+-                "model_connections": model_connections(source / "model-connections.json", exports)}
++                "model_connections": _package_manifest.model_connections(
++                    source / "model-connections.json", exports)}
+     destination = prefix / "share/modules/opencode-runtime/module.json"
+-    atomic_json(manifest, destination)
++    _package_manifest.atomic_json(manifest, destination)
+     return destination
+ 
+ 
