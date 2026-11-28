@@ -1,0 +1,362 @@
+diff --git a/packages/git/src/details.rs b/packages/git/src/details.rs
+index 38f1f56794ef9cb410100cf63108fa4fa4e71d7e..0da45f9fd89a2e59c3cb3cace3b6bb2409917049 100644
+--- a/packages/git/src/details.rs
++++ b/packages/git/src/details.rs
+@@ -2,6 +2,7 @@
+ //! Graph document and its selection inspector. Native controls own columns,
+ //! disclosures, tree navigation, scrolling and document preview behavior.
+ use crate::document::icon_button;
++use crate::history_data::{self, LogEntry};
+ use crate::{Git, history, panel};
+ use proteus_extension::ui::{
+     Node, bar, button, disclosure, divider, empty, fill, note, person, search, spacer, split,
+@@ -157,7 +158,7 @@ impl Git {
+         );
+         let added: u64 = files.iter().filter_map(|f| f.at("added").as_u64()).sum();
+         let deleted: u64 = files.iter().filter_map(|f| f.at("deleted").as_u64()).sum();
+-        let mut message = vec![text(history::summary(commit))];
++        let mut message = vec![text(history_data::summary(commit))];
+         if !commit.str("body").is_empty() {
+             message.push(text(commit.str("body")));
+         }
+@@ -227,10 +228,7 @@ impl Git {
+         }
+     }
+ 
+-    fn graph_matches<'a>(
+-        &'a self,
+-        entries: &'a [history::LogEntry],
+-    ) -> impl Iterator<Item = &'a str> {
++    fn graph_matches<'a>(&'a self, entries: &'a [LogEntry]) -> impl Iterator<Item = &'a str> {
+         let query = if self.graph_case {
+             self.graph_query.clone()
+         } else {
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index 7ecc22fb2e66b9f58db6376cdae9140ccdebd7d3..7add787026c5571f9c162cf07a518e732e7bebd8 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -11,7 +11,7 @@ use proteus_extension::ui::{
+ use proteus_extension::{Host, Value, ValueExt, json, local_time};
+ 
+ use crate::model::{self, Staging};
+-use crate::{Git, history};
++use crate::{Git, history_data};
+ 
+ const DIFF: &str = " · diff";
+ const CHANGES: &str = "Все изменения";
+@@ -260,7 +260,7 @@ impl Git {
+                     .with("hint", "Открыть родительский коммит"),
+             );
+         }
+-        let mut header = vec![text(history::summary(&commit)).with("size", "large")];
++        let mut header = vec![text(history_data::summary(&commit)).with("size", "large")];
+         if !commit.str("body").is_empty() {
+             header.push(muted(commit.str("body")));
+         }
+diff --git a/packages/git/src/history.rs b/packages/git/src/history.rs
+index ae4949a232547b53ea1a58495ceb304b9062fb62..adb7d55309fbeb3fe9503dc2a7c6ed6369ec0667 100644
+--- a/packages/git/src/history.rs
++++ b/packages/git/src/history.rs
+@@ -8,80 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ use proteus_extension::ui::{Node, item, lane_row, lane_segment, lanes, list, list_row};
+ use proteus_extension::{Host, Result, Value, ValueExt, json};
+ 
++use crate::Git;
+ use crate::graph::{self, Segment};
+-use crate::{Git, Log};
++use crate::history_data::{Log, LogEntry};
+ 
+ pub const PAGE: usize = 100;
+ 
+-/// The top-level log record has a fixed set of fields used by History and Graph.
+-/// Keep parent/ref elements as received: the HEAD affordance checks raw parents,
+-/// while graph lanes and ref chips apply their own interpretation.
+-#[derive(Debug)]
+-pub struct LogEntry {
+-    pub hash: String,
+-    pub short: String,
+-    pub author: String,
+-    pub email: String,
+-    summary: String,
+-    parents: Vec<Value>,
+-    refs: Vec<Value>,
+-    time: Option<f64>,
+-}
+-
+-impl From<Value> for LogEntry {
+-    fn from(mut entry: Value) -> Self {
+-        fn take(entry: &mut Value, key: &str) -> Value {
+-            entry.get_mut(key).map(Value::take).unwrap_or_default()
+-        }
+-
+-        fn text(entry: &mut Value, key: &str) -> String {
+-            match take(entry, key) {
+-                Value::String(text) => text,
+-                _ => String::new(),
+-            }
+-        }
+-
+-        fn list(entry: &mut Value, key: &str) -> Vec<Value> {
+-            match take(entry, key) {
+-                Value::Array(items) => items,
+-                _ => Vec::new(),
+-            }
+-        }
+-
+-        Self {
+-            hash: text(&mut entry, "hash"),
+-            short: text(&mut entry, "short"),
+-            author: text(&mut entry, "author"),
+-            email: text(&mut entry, "email"),
+-            summary: text(&mut entry, "summary"),
+-            parents: list(&mut entry, "parents"),
+-            refs: list(&mut entry, "refs"),
+-            time: entry.f64("time"),
+-        }
+-    }
+-}
+-
+-impl LogEntry {
+-    pub fn summary(&self) -> &str {
+-        summary_or_placeholder(&self.summary)
+-    }
+-}
+-
+-impl Log {
+-    fn from_page(mut page: Value) -> Self {
+-        let more = page.bool("has_more");
+-        let entries = match page.get_mut("entries").map(Value::take) {
+-            Some(Value::Array(items)) => {
+-                let mut entries = Vec::with_capacity(items.len());
+-                entries.extend(items.into_iter().map(LogEntry::from));
+-                entries
+-            }
+-            _ => Vec::new(),
+-        };
+-        Self { entries, more }
+-    }
+-}
+-
+ pub fn now() -> f64 {
+     SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+@@ -122,18 +54,6 @@ fn segments(segments: &[Segment]) -> Vec<Value> {
+         .collect()
+ }
+ 
+-pub fn summary(entry: &Value) -> &str {
+-    summary_or_placeholder(entry.str("summary"))
+-}
+-
+-fn summary_or_placeholder(summary: &str) -> &str {
+-    if summary.is_empty() {
+-        "(без описания)"
+-    } else {
+-        summary
+-    }
+-}
+-
+ /// Rows of the `lanes` widget for commits newest first.
+ pub fn rows(entries: &[LogEntry], selected: Option<&str>, _now: f64) -> Vec<Value> {
+     let layout = graph::layout(entries.iter().map(|entry| {
+diff --git a/packages/git/src/history_data.rs b/packages/git/src/history_data.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..04ef175cab07ad8fd4b823660f9af85f8b2d2471
+--- /dev/null
++++ b/packages/git/src/history_data.rs
+@@ -0,0 +1,91 @@
++//! Decoded Git history pages and records, shared by state and presentation.
++
++use proteus_extension::{Value, ValueExt};
++
++/// Loaded pages of `/workspace/log`.
++#[derive(Debug, Default)]
++pub struct Log {
++    pub entries: Vec<LogEntry>,
++    pub more: bool,
++}
++
++/// The top-level log record has a fixed set of fields used by History and Graph.
++/// Keep parent/ref elements as received: the HEAD affordance checks raw parents,
++/// while graph lanes and ref chips apply their own interpretation.
++#[derive(Debug)]
++pub struct LogEntry {
++    pub hash: String,
++    pub short: String,
++    pub author: String,
++    pub email: String,
++    summary: String,
++    pub(super) parents: Vec<Value>,
++    pub(super) refs: Vec<Value>,
++    pub(super) time: Option<f64>,
++}
++
++impl From<Value> for LogEntry {
++    fn from(mut entry: Value) -> Self {
++        fn take(entry: &mut Value, key: &str) -> Value {
++            entry.get_mut(key).map(Value::take).unwrap_or_default()
++        }
++
++        fn text(entry: &mut Value, key: &str) -> String {
++            match take(entry, key) {
++                Value::String(text) => text,
++                _ => String::new(),
++            }
++        }
++
++        fn list(entry: &mut Value, key: &str) -> Vec<Value> {
++            match take(entry, key) {
++                Value::Array(items) => items,
++                _ => Vec::new(),
++            }
++        }
++
++        Self {
++            hash: text(&mut entry, "hash"),
++            short: text(&mut entry, "short"),
++            author: text(&mut entry, "author"),
++            email: text(&mut entry, "email"),
++            summary: text(&mut entry, "summary"),
++            parents: list(&mut entry, "parents"),
++            refs: list(&mut entry, "refs"),
++            time: entry.f64("time"),
++        }
++    }
++}
++
++impl LogEntry {
++    pub fn summary(&self) -> &str {
++        summary_or_placeholder(&self.summary)
++    }
++}
++
++impl Log {
++    pub(super) fn from_page(mut page: Value) -> Self {
++        let more = page.bool("has_more");
++        let entries = match page.get_mut("entries").map(Value::take) {
++            Some(Value::Array(items)) => {
++                let mut entries = Vec::with_capacity(items.len());
++                entries.extend(items.into_iter().map(LogEntry::from));
++                entries
++            }
++            _ => Vec::new(),
++        };
++        Self { entries, more }
++    }
++}
++
++pub fn summary(entry: &Value) -> &str {
++    summary_or_placeholder(entry.str("summary"))
++}
++
++fn summary_or_placeholder(summary: &str) -> &str {
++    if summary.is_empty() {
++        "(без описания)"
++    } else {
++        summary
++    }
++}
+diff --git a/packages/git/src/main.rs b/packages/git/src/main.rs
+index ec2f283cb896d29533ad874047c78e1b697ca4ac..ffbcf2201b48a51e8d2d7e2dab5e0da543147334 100644
+--- a/packages/git/src/main.rs
++++ b/packages/git/src/main.rs
+@@ -3,6 +3,7 @@ mod details;
+ mod document;
+ mod graph;
+ mod history;
++mod history_data;
+ mod list;
+ mod model;
+ mod panel;
+@@ -18,19 +19,13 @@ use proteus_extension::ui::{badge_preview, muted, tree};
+ use proteus_extension::{Extension, Host, Result, Surface, Value, ValueExt, json, run};
+ 
+ use document::Document;
++use history_data::Log;
+ use model::Group;
+ 
+ const POLL: Duration = Duration::from_secs(5);
+ const REMOTE: Duration = Duration::from_secs(130);
+ const HOOKS: Duration = Duration::from_secs(120);
+ 
+-/// Loaded pages of `/workspace/log`.
+-#[derive(Debug, Default)]
+-pub struct Log {
+-    pub entries: Vec<history::LogEntry>,
+-    pub more: bool,
+-}
+-
+ #[derive(Default)]
+ pub struct Git {
+     /// The API replaces this immutable status snapshot as a whole. A panel or
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 5fa54d45d364aa3efab1cd57b79f8727730894e7..6d15b0ea0939aadd1a2d8e862848d5c171e28286 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
+ use proteus_extension::{Extension, Host, Server, Value, ValueExt, json};
+ 
+ use crate::Git;
++use crate::history_data::{Log, LogEntry};
+ 
+ fn changes() -> Value {
+     json!({"repository": true, "refs_revision": "refs-1", "branch": "main", "head": {"short": "abc1234", "summary": "Last"}, "upstream": null,
+@@ -196,8 +197,8 @@ fn remote_operations_and_explicit_refresh_reload_branches_with_an_unchanged_head
+         let mut fake = Fake::new();
+         let original = fake.git.branch_list(&fake.host).unwrap();
+         assert_eq!(original.len(), 2);
+-        fake.git.log = Some(crate::Log::default());
+-        fake.git.graph = Some(crate::Log::default());
++        fake.git.log = Some(Log::default());
++        fake.git.graph = Some(Log::default());
+         fake.responses.lock().unwrap().insert(
+             "/workspace/branches".into(),
+             json!({"branches":[{"name":"main"},{"name":"topic"},{"name":"origin/new"}]}),
+@@ -275,8 +276,8 @@ fn branch_catalogue_warm_empty_and_error_retry_keep_request_semantics() {
+ fn external_ref_changes_invalidate_catalog_and_decorations_without_a_head_change() {
+     let mut fake = Fake::new();
+     fake.git.branch_list(&fake.host).unwrap();
+-    fake.git.log = Some(crate::Log::default());
+-    fake.git.graph = Some(crate::Log::default());
++    fake.git.log = Some(Log::default());
++    fake.git.graph = Some(Log::default());
+     // An ordinary status poll with unchanged refs preserves paginated history.
+     fake.git.update(changes());
+     assert!(fake.git.branches.is_some() && fake.git.log.is_some() && fake.git.graph.is_some());
+@@ -627,13 +628,13 @@ fn server_errors_are_shown() {
+ #[test]
+ fn a_changed_graph_query_starts_at_first_match_and_navigation_wraps() {
+     let mut fake = Fake::new();
+-    fake.git.graph = Some(crate::Log {
++    fake.git.graph = Some(Log {
+         entries: [
+             json!({"hash":"a", "summary":"Fix parser"}),
+             json!({"hash":"b", "summary":"Fix picker"}),
+             json!({"hash":"c", "summary":"fix lower"}),
+         ]
+-        .map(crate::history::LogEntry::from)
++        .map(LogEntry::from)
+         .into(),
+         more: false,
+     });
+@@ -975,10 +976,8 @@ fn non_history_action_values_remain_inactive_for_only_the_addressed_view() {
+ 
+ #[test]
+ fn compact_log_preserves_head_parent_presence_and_short_lookup_order() {
+-    use crate::history::LogEntry;
+-
+     let mut fake = Fake::new();
+-    fake.git.log = Some(crate::Log {
++    fake.git.log = Some(Log {
+         entries: [
+             json!({"hash":"duplicate","short":"head","parents":[null]}),
+             json!({"hash":"duplicate","short":"later"}),
+@@ -987,7 +986,7 @@ fn compact_log_preserves_head_parent_presence_and_short_lookup_order() {
+         .into(),
+         more: true,
+     });
+-    fake.git.graph = Some(crate::Log {
++    fake.git.graph = Some(Log {
+         entries: [json!({"hash":"duplicate","short":"graph"})]
+             .map(LogEntry::from)
+             .into(),
