@@ -1,0 +1,276 @@
+diff --git a/storage/session-storage/src/archive.rs b/storage/session-storage/src/archive.rs
+index 74eebe710402283838e2a7b13a5e9e5423d32ccf..e114a1e540173ba8efbdeaafbe598b7e5a06bb98 100644
+--- a/storage/session-storage/src/archive.rs
++++ b/storage/session-storage/src/archive.rs
+@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
++    backend::{JSONL_JOURNAL_FILE, SQLITE_JOURNAL_FILE},
+     blob_codec,
+     io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read},
+     lease::SessionWriteOwnership,
+@@ -77,10 +78,10 @@ pub fn compact_jsonl_archive(session: &Path) -> Result<ArchiveCompaction> {
+     let _ownership = SessionWriteOwnership::acquire_slot(&session)?;
+     crate::identity::resolve_session_identity(&session)?;
+     ensure!(
+-        !session.join("journal.sqlite").try_exists()?,
++        !session.join(SQLITE_JOURNAL_FILE).try_exists()?,
+         "archive compaction requires a JSONL session"
+     );
+-    let journal = session.join(crate::codec::JOURNAL_FILE);
++    let journal = session.join(JSONL_JOURNAL_FILE);
+     let mut reader = BufReader::new(File::open(&journal)?);
+     let mut payloads = BTreeMap::new();
+     let mut line = Vec::new();
+diff --git a/storage/session-storage/src/backend/jsonl.rs b/storage/session-storage/src/backend/jsonl.rs
+index 95efc7812a07acfde1aa46b853893ee96fe517de..1f2e87bccdfb3fd3788175d40b6bdb388461aad9 100644
+--- a/storage/session-storage/src/backend/jsonl.rs
++++ b/storage/session-storage/src/backend/jsonl.rs
+@@ -43,7 +43,7 @@ impl Jsonl {
+         apply: impl Fn(&mut T, &JournalRecord, Option<String>, &dyn RecordSnapshot) -> Result<()>,
+     ) -> Result<(Box<dyn RecordSnapshot>, T)> {
+         ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
++            !dir.join(SQLITE_JOURNAL_FILE).try_exists()?,
+             "session contains a SQLite journal; select its storage implementation or explicitly migrate it"
+         );
+         let (mut source, version) = JsonlSnapshot::pin(dir, id, None)?;
+@@ -89,7 +89,7 @@ impl Jsonl {
+ impl JournalBackend for Jsonl {
+     fn snapshot(&mut self, dir: &Path, id: SessionId) -> Result<Box<dyn RecordSnapshot>> {
+         ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
++            !dir.join(SQLITE_JOURNAL_FILE).try_exists()?,
+             "session contains a SQLite journal; select its storage implementation or explicitly migrate it"
+         );
+         Ok(Box::new(JsonlSnapshot::open(dir, id, None)?))
+@@ -101,17 +101,17 @@ impl JournalBackend for Jsonl {
+         hint: &PrefixHint,
+     ) -> Result<Box<dyn RecordSnapshot>> {
+         ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
++            !dir.join(SQLITE_JOURNAL_FILE).try_exists()?,
+             "session contains a SQLite journal"
+         );
+         Ok(Box::new(JsonlSnapshot::open(dir, id, Some(hint))?))
+     }
+     fn recover(&mut self, dir: &Path, _id: SessionId) -> Result<()> {
+         ensure!(
+-            !dir.join("journal.sqlite").try_exists()?,
++            !dir.join(SQLITE_JOURNAL_FILE).try_exists()?,
+             "session contains a SQLite journal; storage implementations cannot silently replace it"
+         );
+-        let path = dir.join(codec::JOURNAL_FILE);
++        let path = dir.join(JSONL_JOURNAL_FILE);
+         let length = match File::open(&path) {
+             Ok(mut file) => complete_jsonl_offset(&mut file)?,
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+@@ -122,7 +122,7 @@ impl JournalBackend for Jsonl {
+         Ok(())
+     }
+     fn append(&mut self, dir: &Path, record: &JournalRecord) -> Result<Append> {
+-        let path = dir.join(codec::JOURNAL_FILE);
++        let path = dir.join(JSONL_JOURNAL_FILE);
+         let committed = self
+             .committed_offset
+             .context("JSONL writer must recover before append")?;
+@@ -191,7 +191,7 @@ impl JsonlSnapshot {
+         id: SessionId,
+         hint: Option<&PrefixHint>,
+     ) -> Result<(Self, Option<SourceVersion>)> {
+-        let path = dir.join(codec::JOURNAL_FILE);
++        let path = dir.join(JSONL_JOURNAL_FILE);
+         let mut file = match File::open(&path) {
+             Ok(file) => Some(file),
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 2d36e1206a2770985a1ed9ccaeda052813d92bd6..2bd85b0b2dd59f0939f5027c7f34cd9d67131c84 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
+ mod jsonl;
+ mod sqlite;
+ pub(crate) use jsonl::Jsonl;
+-pub(crate) use sqlite::{FILE as SQLITE_JOURNAL_FILE, Sqlite};
++pub(crate) use sqlite::Sqlite;
++
++// Basenames of the canonical records in a session directory.
++pub(crate) const JSONL_JOURNAL_FILE: &str = "journal.jsonl";
++pub(crate) const SQLITE_JOURNAL_FILE: &str = "journal.sqlite";
+ 
+ #[derive(Clone)]
+ pub(crate) struct PrefixHint {
+diff --git a/storage/session-storage/src/backend/sqlite.rs b/storage/session-storage/src/backend/sqlite.rs
+index 9be0a388484e0c89ed4e856fa2b4f10c21cfd26e..8c919a20c3b32284cc83b94c4cd8faa8c5603395 100644
+--- a/storage/session-storage/src/backend/sqlite.rs
++++ b/storage/session-storage/src/backend/sqlite.rs
+@@ -5,7 +5,6 @@ use ring::digest::{Context as HashContext, SHA256};
+ use rusqlite::{Connection, OpenFlags, params};
+ mod record;
+ 
+-pub(crate) const FILE: &str = "journal.sqlite";
+ // Exact schema text of the built-in writer (SQLite drops IF NOT EXISTS).
+ // Anything else, including hand-built compatible tables, uses the seek reader.
+ const WRITER_JOURNAL_SCHEMA: &str = "CREATE TABLE journal (
+@@ -19,10 +18,10 @@ pub(crate) struct Sqlite {
+ 
+ fn open_read(dir: &Path) -> Result<Option<Connection>> {
+     ensure!(
+-        !dir.join(crate::codec::JOURNAL_FILE).try_exists()?,
++        !dir.join(JSONL_JOURNAL_FILE).try_exists()?,
+         "session contains a JSONL journal; select its storage implementation or explicitly migrate it"
+     );
+-    let path = dir.join(FILE);
++    let path = dir.join(SQLITE_JOURNAL_FILE);
+     if !path.try_exists()? {
+         return Ok(None);
+     }
+@@ -252,11 +251,11 @@ impl JournalBackend for Sqlite {
+     }
+     fn recover(&mut self, dir: &Path, id: SessionId) -> Result<()> {
+         ensure!(
+-            !dir.join(crate::codec::JOURNAL_FILE).try_exists()?,
++            !dir.join(JSONL_JOURNAL_FILE).try_exists()?,
+             "session contains a JSONL journal; storage implementations cannot silently replace it"
+         );
+         if self.writer.is_none() {
+-            let conn = Connection::open(dir.join(FILE))?;
++            let conn = Connection::open(dir.join(SQLITE_JOURNAL_FILE))?;
+             conn.execute_batch(
+                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+             )?;
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index f019cbb7e5a0e90ce9f478ba13cca6bfed3fa4e5..dbe6e7b6cf775b5e065fa4da32799dee5111a390 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -10,7 +10,6 @@ use std::path::{Component, Path, PathBuf};
+ 
+ mod payload;
+ 
+-pub(crate) const JOURNAL_FILE: &str = "journal.jsonl";
+ pub(crate) const DEFAULT_BLOB_THRESHOLD: usize = 256 * 1024;
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..6a633f3d4d8373df7b1d1e95036b43e16cdcf952 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -1,6 +1,6 @@
+ //! Typed storage service. No provider-, workflow- or tool-specific dispatch.
+ use crate::{
+-    backend::{JournalBackend, Jsonl, Sqlite},
++    backend::{JSONL_JOURNAL_FILE, JournalBackend, Jsonl, SQLITE_JOURNAL_FILE, Sqlite},
+     identity,
+     lease::SessionWriteOwnership,
+     path_identity::canonicalize_unmaterialized_path,
+@@ -66,8 +66,8 @@ struct Writer {
+ impl BackendKind {
+     fn description_path(self, dir: &Path) -> PathBuf {
+         dir.join(match self {
+-            Self::Jsonl => crate::codec::JOURNAL_FILE,
+-            Self::Sqlite => crate::backend::SQLITE_JOURNAL_FILE,
++            Self::Jsonl => JSONL_JOURNAL_FILE,
++            Self::Sqlite => SQLITE_JOURNAL_FILE,
+         })
+     }
+ 
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index a5c72ed4e6c9a7f5993bd13d2b83ea08ec9d4414..1d01aba8b3e6f05cf34e743d44550a72f6b13bde 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -260,8 +260,8 @@ pub(super) fn load(
+ 
+ fn journal_kind(descriptor: &StorageSessionDescriptor) -> Option<BackendKind> {
+     match descriptor.record_location.as_ref()?.file_name()?.to_str()? {
+-        "journal.jsonl" => Some(BackendKind::Jsonl),
+-        "journal.sqlite" => Some(BackendKind::Sqlite),
++        JSONL_JOURNAL_FILE => Some(BackendKind::Jsonl),
++        SQLITE_JOURNAL_FILE => Some(BackendKind::Sqlite),
+         _ => None,
+     }
+ }
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 8f966691891a5752abe4d19ca480877d96a1d795..b382e85ae5ecdf85abc59281cafc343208efaeed 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -22,7 +22,7 @@ fn check_selected_format(kind: BackendKind, path: &Path) -> Result<()> {
+ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescriptor> {
+     let path = if path
+         .file_name()
+-        .is_some_and(|name| name == "journal.jsonl" || name == "journal.sqlite")
++        .is_some_and(|name| name == JSONL_JOURNAL_FILE || name == SQLITE_JOURNAL_FILE)
+     {
+         path.parent()
+             .context("record location has no session parent")?
+diff --git a/storage/session-storage/src/tests/journal.rs b/storage/session-storage/src/tests/journal.rs
+index 4c15459ad7deca11f12f4a15c596baf07a6653ad..9d132896946baefb618d7dbe7440ecba4180ec29 100644
+--- a/storage/session-storage/src/tests/journal.rs
++++ b/storage/session-storage/src/tests/journal.rs
+@@ -211,7 +211,7 @@ fn jsonl_writer_reopen_reuses_the_bounded_spill_for_multi_buffer_lines() {
+     }
+     let session = f.descriptor.session.clone();
+     let path = f.descriptor.local_path.clone().unwrap();
+-    let journal = path.join(crate::codec::JOURNAL_FILE);
++    let journal = path.join("journal.jsonl");
+     let raw = std::fs::read(&journal).unwrap();
+     let lengths: Vec<_> = raw
+         .split_inclusive(|&byte| byte == b'\n')
+diff --git a/storage/session-storage/src/tests/ownership.rs b/storage/session-storage/src/tests/ownership.rs
+index 86ae256738c019057e3e1f858577703863a4cecc..5a32217b61211ae69cba7bd3be4cbda118f8a548 100644
+--- a/storage/session-storage/src/tests/ownership.rs
++++ b/storage/session-storage/src/tests/ownership.rs
+@@ -140,17 +140,33 @@ fn selecting_another_backend_never_silently_opens_existing_history_as_empty() {
+         f.append(vec![text("must not disappear")]);
+         let session = f.descriptor.session.clone();
+         drop(f.service);
+-        let other = StorageService::new(match kind {
+-            BackendKind::Jsonl => BackendKind::Sqlite,
+-            BackendKind::Sqlite => BackendKind::Jsonl,
+-        });
+-        assert!(
+-            other
+-                .execute(SessionStorageRequest::Open {
+-                    path: f.descriptor.local_path.clone().unwrap(),
+-                })
+-                .is_err()
+-        );
++        let (other_kind, journal_name, other_name) = match kind {
++            BackendKind::Jsonl => (BackendKind::Sqlite, "journal.jsonl", "journal.sqlite"),
++            BackendKind::Sqlite => (BackendKind::Jsonl, "journal.sqlite", "journal.jsonl"),
++        };
++        let dir = f.descriptor.local_path.clone().unwrap();
++        let journal = dir.join(journal_name);
++        let original = std::fs::read(&journal).unwrap();
++        let same = StorageService::new(kind);
++        let other = StorageService::new(other_kind);
++        for path in [dir.clone(), journal.clone()] {
++            let SessionStorageResponse::Session { descriptor } = same
++                .execute(SessionStorageRequest::Open { path: path.clone() })
++                .unwrap()
++            else {
++                panic!("expected session descriptor");
++            };
++            assert_eq!(descriptor.session, session);
++            assert_eq!(descriptor.local_path.as_deref(), Some(dir.as_path()));
++            assert_eq!(descriptor.record_location.as_deref(), Some(journal.as_path()));
++            let error = other
++                .execute(SessionStorageRequest::Open { path })
++                .unwrap_err();
++            assert_eq!(
++                error.to_string(),
++                "session contains another canonical journal format; select its storage implementation or explicitly migrate it"
++            );
++        }
+         assert!(
+             other
+                 .execute(SessionStorageRequest::Create {
+@@ -173,6 +189,8 @@ fn selecting_another_backend_never_silently_opens_existing_history_as_empty() {
+                 .execute(SessionStorageRequest::AcquireWriter { session })
+                 .is_err()
+         );
++        assert!(!dir.join(other_name).exists());
++        assert_eq!(std::fs::read(journal).unwrap(), original);
+     }
+ }
+ 
