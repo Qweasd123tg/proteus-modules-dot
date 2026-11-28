@@ -1,0 +1,200 @@
+diff --git a/src/declarative/process.rs b/src/declarative/process.rs
+index 0f043d64fa4b27feea5ebb1a3bfe7bf555be3fb7..6484524b0f22f06a5bca0e4fe96b12ce28eaf401 100644
+--- a/src/declarative/process.rs
++++ b/src/declarative/process.rs
+@@ -261,7 +261,7 @@ impl Process {
+             thread::spawn(move || {
+                 let mut stdout = BufReader::new(stdout);
+                 loop {
+-                    match io::read_frame(&mut stdout, &state) {
++                    match io::read_frame(&mut stdout, &state.incoming, &state.closed) {
+                         Ok(Some((bytes, reservation))) => {
+                             let line = String::from_utf8_lossy(&bytes);
+                             if line.trim().is_empty() {
+diff --git a/src/declarative/process/io.rs b/src/declarative/process/io.rs
+index 8a47b62d56a51f85c4530eac60e41ba05db9dc3b..a7b7afa7d67ef39ee7aebbdc668d80b0ffa0a13f 100644
+--- a/src/declarative/process/io.rs
++++ b/src/declarative/process/io.rs
+@@ -1,10 +1,13 @@
+ //! Bounded JSONL framing, adapted from crates/codex-client/src/process.rs.
+ 
+-use std::io::{self, BufRead, Write};
++use std::{
++    io::{self, BufRead, Write},
++    sync::{Arc, atomic::AtomicBool},
++};
+ 
+ use anyhow::{Context as _, Result, bail};
+ 
+-use super::{State, budget::Permit};
++use super::budget::{Budget, Permit};
+ 
+ /// This is an encoded frame limit, not an estimate of a parsed widget tree's
+ /// heap. One enormous view fails explicitly instead of bypassing the budget.
+@@ -13,7 +16,8 @@ pub(super) const MAX_LOG_LINE: usize = 8 * 1024;
+ 
+ pub(super) fn read_frame(
+     reader: &mut impl BufRead,
+-    state: &State,
++    incoming: &Arc<Budget>,
++    closed: &AtomicBool,
+ ) -> Result<Option<(Vec<u8>, Permit)>> {
+     // Waiting for an idle child's first bytes holds only BufReader's fixed 8KiB
+     // buffer. Reserve room for a complete frame before growing the line: partial
+@@ -21,7 +25,7 @@ pub(super) fn read_frame(
+     if reader.fill_buf()?.is_empty() {
+         return Ok(None);
+     }
+-    let mut permit = state.incoming.reserve(MAX_FRAME + 1, &state.closed)?;
++    let mut permit = incoming.reserve(MAX_FRAME + 1, closed)?;
+     let mut output = Vec::new();
+     loop {
+         let available = reader.fill_buf()?;
+diff --git a/src/declarative/process/tests.rs b/src/declarative/process/tests.rs
+index 17e66874a2079706197afe7f7f7e1e45318814a1..03595e7b2ba4b3c29ed7b7d2206ee0ca6146a780 100644
+--- a/src/declarative/process/tests.rs
++++ b/src/declarative/process/tests.rs
+@@ -65,63 +65,59 @@ fn action(sequence: u64, bytes: usize) -> Outgoing {
+     }
+ }
+ 
+-/// Framing tests have no child or reader thread: arbitrary chunk boundaries
+-/// come from a real BufReader, while the normal transport budget stays active.
+-fn reader_state() -> State {
+-    let (messages, queued_messages) = async_channel::bounded(QUEUE_COUNT);
+-    let (writer, queued_writes) = async_channel::bounded(QUEUE_COUNT);
+-    let (failure, _errors) = async_channel::bounded(1);
+-    State {
+-        child: Mutex::new(None),
+-        closed: AtomicBool::new(false),
+-        incoming: Budget::new(QUEUE_COUNT, INCOMING_BYTES),
+-        outgoing: Budget::new(QUEUE_COUNT, OUTGOING_BYTES),
+-        messages,
+-        queued_messages,
+-        writer,
+-        queued_writes,
+-        failure,
+-    }
+-}
+-
+ #[test]
+ fn framing_reassembles_utf8_json_across_single_byte_chunks() {
+     let source = "{\"type\":\"clipboard\",\"text\":\"кофе ☕😀\\nготово\"}\n";
+-    let state = reader_state();
++    let incoming = Budget::new(QUEUE_COUNT, INCOMING_BYTES);
++    let closed = AtomicBool::new(false);
+     let mut reader = BufReader::with_capacity(1, source.as_bytes());
+-    let (bytes, permit) = io::read_frame(&mut reader, &state).unwrap().unwrap();
+-    assert_eq!(state.incoming.usage(), (1, source.len()));
++    let (bytes, permit) = io::read_frame(&mut reader, &incoming, &closed)
++        .unwrap()
++        .unwrap();
++    assert_eq!(incoming.usage(), (1, source.len()));
+     assert_eq!(bytes, source.as_bytes()[..source.len() - 1]);
+     assert!(matches!(
+         protocol::parse(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+         Incoming::Clipboard { text } if text == "кофе ☕😀\nготово"
+     ));
+     drop((bytes, permit));
+-    assert_eq!(state.incoming.usage(), (0, 0));
+-    assert!(io::read_frame(&mut reader, &state).unwrap().is_none());
+-    assert_eq!(state.incoming.usage(), (0, 0));
++    assert_eq!(incoming.usage(), (0, 0));
++    assert!(
++        io::read_frame(&mut reader, &incoming, &closed)
++            .unwrap()
++            .is_none()
++    );
++    assert_eq!(incoming.usage(), (0, 0));
+ }
+ 
+ #[test]
+ fn framing_accepts_a_complete_final_json_message_without_line_feed() {
+     let source = br#"{"type":"clipboard","text":"last message"}"#;
+-    let state = reader_state();
++    let incoming = Budget::new(QUEUE_COUNT, INCOMING_BYTES);
++    let closed = AtomicBool::new(false);
+     let mut reader = BufReader::with_capacity(3, source.as_slice());
+-    let (bytes, permit) = io::read_frame(&mut reader, &state).unwrap().unwrap();
+-    assert_eq!(state.incoming.usage(), (1, source.len()));
++    let (bytes, permit) = io::read_frame(&mut reader, &incoming, &closed)
++        .unwrap()
++        .unwrap();
++    assert_eq!(incoming.usage(), (1, source.len()));
+     assert_eq!(bytes, source);
+     assert!(matches!(
+         protocol::parse(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+         Incoming::Clipboard { text } if text == "last message"
+     ));
+     drop((bytes, permit));
+-    assert!(io::read_frame(&mut reader, &state).unwrap().is_none());
+-    assert_eq!(state.incoming.usage(), (0, 0));
++    assert!(
++        io::read_frame(&mut reader, &incoming, &closed)
++            .unwrap()
++            .is_none()
++    );
++    assert_eq!(incoming.usage(), (0, 0));
+ }
+ 
+ #[test]
+ fn framing_accepts_exact_byte_limit_plus_newline_and_releases_rejected_frame() {
+-    let state = reader_state();
++    let incoming = Budget::new(QUEUE_COUNT, INCOMING_BYTES);
++    let closed = AtomicBool::new(false);
+     for extra in [0, 1] {
+         let mut source = br#"{"type":"clipboard","text":""#.to_vec();
+         source.resize(io::MAX_FRAME + extra - 2, b'x');
+@@ -130,24 +126,48 @@ fn framing_accepts_exact_byte_limit_plus_newline_and_releases_rejected_frame() {
+         // Odd-sized chunks exercise the byte boundary independently from
+         // both the frame limit and BufReader's ordinary power-of-two size.
+         let mut reader = BufReader::with_capacity(8191, source.as_slice());
+-        let result = io::read_frame(&mut reader, &state);
++        let result = io::read_frame(&mut reader, &incoming, &closed);
+         if extra == 0 {
+             let (bytes, permit) = result.unwrap().unwrap();
+             assert_eq!(bytes.len(), io::MAX_FRAME);
+-            assert_eq!(state.incoming.usage(), (1, io::MAX_FRAME + 1));
++            assert_eq!(incoming.usage(), (1, io::MAX_FRAME + 1));
+             assert!(bytes.ends_with(b"\"}"));
+             drop((bytes, permit));
+-            assert!(io::read_frame(&mut reader, &state).unwrap().is_none());
++            assert!(
++                io::read_frame(&mut reader, &incoming, &closed)
++                    .unwrap()
++                    .is_none()
++            );
+         } else {
+             assert!(
+                 result.is_err(),
+                 "one excess content byte must fail before LF"
+             );
+         }
+-        assert_eq!(state.incoming.usage(), (0, 0));
++        assert_eq!(incoming.usage(), (0, 0));
+     }
+ }
+ 
++#[test]
++fn framing_closed_transport_still_reports_empty_eof_before_reserving() {
++    let incoming = Budget::new(QUEUE_COUNT, INCOMING_BYTES);
++    let closed = AtomicBool::new(true);
++    let mut empty = std::io::Cursor::new(b"");
++    assert!(
++        io::read_frame(&mut empty, &incoming, &closed)
++            .unwrap()
++            .is_none()
++    );
++
++    let mut frame = std::io::Cursor::new(b"{}\n");
++    let Err(error) = io::read_frame(&mut frame, &incoming, &closed) else {
++        panic!("closed transport must reject a nonempty frame");
++    };
++    assert_eq!(error.to_string(), "транспорт расширения закрыт");
++    assert_eq!(frame.position(), 0);
++    assert_eq!(incoming.usage(), (0, 0));
++}
++
+ #[test]
+ fn incoming_backpressure_preserves_every_message_and_current_delivery() {
+     let limits = budgets(2);
