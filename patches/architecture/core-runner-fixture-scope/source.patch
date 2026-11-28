@@ -1,0 +1,254 @@
+diff --git a/scripts/test.py b/scripts/test.py
+index cb006174d7b6eceef819dd6913ab53467585c5ea..a40cbcb7ac4c8468c69eab5fb421dfc8165adc6a 100755
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -36,2 +36,52 @@ def selected_packages(args):
+ 
++# These targets use repository-local workers or explicitly bound reference/storage
++# fixtures. New integration targets default to the full package set.
++NAMED_FIXTURE_TESTS = {
++    "acp_server",
++    "cli_dispatch",
++    "execution_boundary",
++    "hook_runtime",
++    "mcp_client",
++    "model_process",
++    "permission_modes",
++    "process_agent_control",
++    "process_agent_pool",
++    "session_ownership_slice",
++    "session_storage_swap",
++    "session_writer_lock",
++}
++
++
++def named_integration_only(args):
++    """Recognize a single verified integration target without widening Cargo selection."""
++    flags = {"--offline", "--locked", "--frozen", "--release", "--no-run", "--no-fail-fast"}
++    package = target = filter_seen = False
++    cargo = iter(args)
++    for arg in cargo:
++        if arg in ("-p", "--package"):
++            arg = "--package=" + next(cargo, "")
++        elif arg == "-pproteus-core":
++            arg = "--package=proteus-core"
++        if arg == "--package=proteus-core":
++            if package:
++                return False
++            package = True
++        elif arg == "--test" or arg.startswith("--test="):
++            spaced = arg == "--test"
++            name = next(cargo, "") if spaced else arg.partition("=")[2]
++            # Preserve the documented spaced command. Its profile still resolves
++            # session-storage through PATH, so do not narrow the existing equals form.
++            legacy = spaced and name == "component_sandbox"
++            if target or (name not in NAMED_FIXTURE_TESTS and not legacy):
++                return False
++            target = True
++        elif arg in flags:
++            continue
++        elif arg and not arg.startswith("-") and not filter_seen:
++            filter_seen = True
++        else:
++            return False
++    return package and target
++
++
+ def main(args):
+@@ -44,2 +94,4 @@ def main(args):
+     full = args[0] == "full"
++    cargo_args = args[:args.index("--")] if "--" in args else args
++    packages = selected_packages(cargo_args)
+     if full:
+@@ -47,3 +99,3 @@ def main(args):
+                 "--features", "proteus-module-protocol/conformance-cli", *args[1:]]
+-    elif not selected_packages(args):
++    elif not packages:
+         raise SystemExit("Select -p PACKAGE, or full for the harness workspace gate")
+@@ -51,6 +103,5 @@ def main(args):
+     start = time.monotonic()
+-    core = full or "proteus-core" in selected_packages(args)
++    core = full or "proteus-core" in packages
+     if core:
+-        if full or "--test" not in args or any(target in args for target in
+-                                              ("config_profiles", "capability_environment", "module_swap")):
++        if full or not named_integration_only(cargo_args):
+             binaries = build_packages(env=env)
+diff --git a/scripts/test_conformance_selection.py b/scripts/test_conformance_selection.py
+index 434bc4ab40e4c972cfa5f54bf4cf3330961c0d04..5f41448d47b71203c58b1c3b28bc3d0f86a74961 100644
+--- a/scripts/test_conformance_selection.py
++++ b/scripts/test_conformance_selection.py
+@@ -10,2 +10,3 @@ import test as runner
+ STORAGE = str(Path("/fixture/session-storage").resolve())
++MODULES = Path("/fixture/modules")
+ 
+@@ -13,4 +14,4 @@ STORAGE = str(Path("/fixture/session-storage").resolve())
+ class ConformanceSelection(unittest.TestCase):
+-    def invoke(self, arguments):
+-        with (patch.object(runner, "test_env", return_value={}),
++    def invoke(self, arguments, env=None):
++        with (patch.object(runner, "test_env", return_value=dict(env or {})),
+               patch.object(runner, "build_packages",
+@@ -18,9 +19,26 @@ class ConformanceSelection(unittest.TestCase):
+               patch.object(runner, "build", return_value="/fixture/reference") as reference,
+-              patch.object(runner.subprocess, "call", return_value=0) as cargo):
++              patch.object(runner, "resolve", return_value=MODULES) as resolver,
++              patch.object(runner.subprocess, "check_output",
++                           return_value=json.dumps({"session-storage": STORAGE})) as storage,
++              patch.object(runner.subprocess, "call", return_value=0) as cargo,
++              patch.object(runner.subprocess, "run", side_effect=AssertionError("unexpected run")),
++              patch.object(runner.subprocess, "Popen", side_effect=AssertionError("unexpected Popen"))):
+             self.assertEqual(runner.main(arguments), 0)
+-        return (cargo.call_args.args[0], packages.call_count, reference.call_count,
+-                cargo.call_args.kwargs["env"])
++        cargo.assert_called_once()
++        self.assertEqual(cargo.call_args.kwargs["cwd"], runner.ROOT)
++        cargo_env = cargo.call_args.kwargs["env"]
++        if storage.called:
++            resolver.assert_called_once_with("modules")
++            storage.assert_called_once_with(
++                [runner.sys.executable, str(MODULES / "package.py"), "--profile", "dev",
++                 "--package", "session-storage", "--print-artifacts"],
++                cwd=MODULES, env=cargo_env, text=True,
++            )
++        else:
++            resolver.assert_not_called()
++        return (cargo.call_args.args[0], (packages.call_count, reference.call_count, storage.call_count),
++                cargo_env)
+ 
+     def test_full_preserves_conformance_binary_coverage(self):
+-        command, packages, reference, env = self.invoke(["full", "--", "--nocapture"])
++        command, builds, env = self.invoke(["full", "--", "--nocapture"])
+         self.assertEqual(command, [
+@@ -30,3 +48,3 @@ class ConformanceSelection(unittest.TestCase):
+         ])
+-        self.assertEqual((packages, reference), (1, 1))
++        self.assertEqual(builds, (1, 1, 0))
+         self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
+@@ -36,3 +54,3 @@ class ConformanceSelection(unittest.TestCase):
+     def test_selected_protocol_stays_library_only_by_default(self):
+-        command, packages, reference, env = self.invoke(["-p", "proteus-module-protocol"])
++        command, builds, env = self.invoke(["-p", "proteus-module-protocol"])
+         self.assertEqual(command, [
+@@ -40,3 +58,3 @@ class ConformanceSelection(unittest.TestCase):
+         ])
+-        self.assertEqual((packages, reference), (0, 0))
++        self.assertEqual(builds, (0, 0, 0))
+         self.assertNotIn("PROTEUS_TEST_SESSION_STORAGE_MODULE", env)
+@@ -45,7 +63,114 @@ class ConformanceSelection(unittest.TestCase):
+         arguments = ["-p", "proteus-module-protocol", "--features", "conformance-cli"]
+-        command, packages, reference, env = self.invoke(arguments)
++        command, builds, env = self.invoke(arguments)
+         self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
+-        self.assertEqual((packages, reference), (0, 0))
++        self.assertEqual(builds, (0, 0, 0))
+         self.assertNotIn("PROTEUS_TEST_SESSION_STORAGE_MODULE", env)
+ 
++    def test_stock_core_library_keeps_the_existing_package_set(self):
++        arguments = ["-p", "proteus-core", "--lib", "--", "--skip", "module_swap"]
++        command, builds, env = self.invoke(arguments)
++        self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++        self.assertEqual(builds, (1, 1, 0))
++        self.assertIn("PROTEUS_TEST_MODULE_BINARIES", env)
++
++    def test_session_storage_swap_spellings_use_only_named_fixtures(self):
++        for prefix in (
++            ["-p", "proteus-core", "--test", "session_storage_swap"],
++            ["--test=session_storage_swap", "--package=proteus-core", "--offline"],
++            ["--package", "proteus-core", "--test=session_storage_swap"],
++            ["-pproteus-core", "--test", "session_storage_swap"],
++        ):
++            with self.subTest(prefix=prefix):
++                arguments = [*prefix, "--", "--skip", "module_swap", "--test=config_profiles"]
++                command, builds, env = self.invoke(arguments, {"PATH": "/bin"})
++                self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                self.assertEqual(builds, (0, 1, 1))
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
++                self.assertEqual(env["PROTEUS_TEST_REFERENCE_MODULE"], "/fixture/reference")
++                self.assertNotIn("PROTEUS_TEST_MODULE_BINARIES", env)
++                self.assertEqual(env["PATH"], "/bin")
++
++    def test_session_storage_swap_preserves_inherited_map_and_explicit_paths(self):
++        mapping = json.dumps({"session-storage": STORAGE})
++        for selector in (["--test", "session_storage_swap"], ["--test=session_storage_swap"]):
++            with self.subTest(selector=selector):
++                arguments = ["-p", "proteus-core", *selector]
++                given = {"PATH": "/bin", "PROTEUS_TEST_MODULE_BINARIES": mapping}
++                command, builds, env = self.invoke(arguments, given)
++                self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                self.assertEqual(builds, (0, 1, 0))
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], STORAGE)
++                self.assertEqual(env["PROTEUS_TEST_MODULE_BINARIES"], mapping)
++                self.assertEqual(env["PATH"], "/bin")
++
++                overrides = {
++                    **given,
++                    "PROTEUS_TEST_SESSION_STORAGE_MODULE": "/explicit/storage",
++                    "PROTEUS_TEST_REFERENCE_MODULE": "/explicit/reference",
++                }
++                with patch.object(runner.Path, "is_file", autospec=True, return_value=True) as exists:
++                    _, builds, env = self.invoke(arguments, overrides)
++                exists.assert_called_once_with(runner.Path("/explicit/reference"))
++                self.assertEqual(builds, (0, 0, 0))
++                self.assertEqual(env, overrides)
++
++    def test_known_integration_targets_accept_one_positional_filter(self):
++        for target in (
++            "acp_server", "cli_dispatch", "execution_boundary", "hook_runtime", "mcp_client",
++            "model_process", "permission_modes", "process_agent_control", "process_agent_pool",
++            "session_ownership_slice", "session_storage_swap", "session_writer_lock",
++        ):
++            for selector in (["--test", target], [f"--test={target}"]):
++                with self.subTest(selector=selector):
++                    arguments = ["-p", "proteus-core", *selector, "module_swap", "--", "--nocapture"]
++                    command, builds, env = self.invoke(arguments, {"PATH": "/bin"})
++                    self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                    self.assertEqual(builds, (0, 1, 1))
++                    self.assertNotIn("PROTEUS_TEST_MODULE_BINARIES", env)
++                    self.assertEqual(env["PATH"], "/bin")
++
++    def test_component_sandbox_keeps_legacy_spaced_and_full_equals_preparation(self):
++        for selector, builds in (
++            (["--test", "component_sandbox"], (0, 1, 1)),
++            (["--test", "component_sandbox", "restricted_profile"], (0, 1, 1)),
++            (["--test=component_sandbox"], (1, 1, 0)),
++            (["--test=component_sandbox", "restricted_profile"], (1, 1, 0)),
++        ):
++            with self.subTest(selector=selector):
++                arguments = ["-p", "proteus-core", *selector]
++                command, observed, env = self.invoke(arguments, {"PATH": "/bin"})
++                self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                self.assertEqual(observed, builds)
++                expected_path = (
++                    runner.os.pathsep.join([str(Path(STORAGE).parent), "/bin"]) if builds[0] else "/bin"
++                )
++                self.assertEqual(env["PATH"], expected_path)
++
++    def test_only_the_verified_integration_target_uses_narrow_preparation(self):
++        for options in (
++            ["--test=session_storage_swap", "--lib"],
++            ["--all-targets", "--test", "session_storage_swap"],
++            ["--manifest-path", "/other/Cargo.toml", "--test=session_storage_swap"],
++            ["--test", "session_storage_swap", "-p", "proteus-module-protocol"],
++            ["--test", "session_storage_swap", "--test=module_swap"],
++            ["--test=session_storage_swap", "--test", "session_storage_swap"],
++            ["--test", "*"], ["--test=session_*"], ["--test"], ["--test="],
++            ["--test", "unknown_test"], ["--test=unknown_test"],
++            ["--test", "unknown_test", "session_storage_swap"],
++            ["--test=session_storage_swap", "first", "second"],
++            ["--test", "session_storage_swap", "--unknown-option", "filter"],
++            ["--test", "session_storage_swap", "--features", "feature"],
++            ["--test", "config_profiles"], ["--test=capability_environment"],
++            ["--test", "module_swap"], ["--test=module_swap"],
++            ["--test=session_storage_swap", "--unknown-option"],
++            ["--", "--test=session_storage_swap"],
++        ):
++            with self.subTest(options=options):
++                arguments = ["-p", "proteus-core", *options]
++                command, builds, env = self.invoke(arguments, {"PATH": "/bin"})
++                self.assertEqual(command, ["cargo", "test", "--locked", *arguments])
++                self.assertEqual(builds, (1, 1, 0))
++                self.assertEqual(json.loads(env["PROTEUS_TEST_MODULE_BINARIES"]), {"session-storage": STORAGE})
++                self.assertEqual(env["PATH"], runner.os.pathsep.join([str(Path(STORAGE).parent), "/bin"]))
++
+ 
