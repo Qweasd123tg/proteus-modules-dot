@@ -1,0 +1,295 @@
+diff --git a/crates/proteus-contracts/src/domain/events.rs b/crates/proteus-contracts/src/domain/events.rs
+index b06a96feb390111292af236dfadffe52be6ea3f4..c0eb6580795dd6950c9f0f8f2ad2da226e2d0950 100644
+--- a/crates/proteus-contracts/src/domain/events.rs
++++ b/crates/proteus-contracts/src/domain/events.rs
+@@ -9,3 +9,3 @@ use crate::domain::{
+ };
+-use crate::model_standard::{FinishReason, MessagePhase, TokenUsage};
++use super::model_outcome::{FinishReason, MessagePhase, TokenUsage};
+ 
+diff --git a/crates/proteus-contracts/src/domain/mod.rs b/crates/proteus-contracts/src/domain/mod.rs
+index 8fb0eb11381db5b83b8de44c437f5c0851909619..8df5f9a0d48db3908ec221756bc61ab726884985 100644
+--- a/crates/proteus-contracts/src/domain/mod.rs
++++ b/crates/proteus-contracts/src/domain/mod.rs
+@@ -21,2 +21,3 @@ pub mod memory;
+ pub mod model;
++pub(crate) mod model_outcome;
+ pub mod module_manifest;
+diff --git a/crates/proteus-contracts/src/domain/model_outcome.rs b/crates/proteus-contracts/src/domain/model_outcome.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..075ea85ea201b3b7b7679a22178a0b9ba2ffda8a
+--- /dev/null
++++ b/crates/proteus-contracts/src/domain/model_outcome.rs
+@@ -0,0 +1,148 @@
++//! Outcome and usage values shared by events and canonical model responses.
++use serde::{Deserialize, Serialize};
++
++#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum MessagePhase {
++    Commentary,
++    FinalAnswer,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[non_exhaustive]
++pub enum FinishReason {
++    Stop,
++    ToolCalls,
++    Length,
++    ContentFilter,
++    Error,
++    Unknown,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++#[non_exhaustive]
++pub struct TokenUsage {
++    pub input_tokens: u32,
++    pub output_tokens: u32,
++    pub cached_input_tokens: Option<u32>,
++    pub cache_creation_input_tokens: Option<u32>,
++    pub reasoning_output_tokens: Option<u32>,
++}
++
++impl TokenUsage {
++    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
++        Self {
++            input_tokens,
++            output_tokens,
++            cached_input_tokens: None,
++            cache_creation_input_tokens: None,
++            reasoning_output_tokens: None,
++        }
++    }
++
++    pub fn with_cached_input_tokens(mut self, tokens: Option<u32>) -> Self {
++        self.cached_input_tokens = tokens;
++        self
++    }
++
++    pub fn with_cache_creation_input_tokens(mut self, tokens: Option<u32>) -> Self {
++        self.cache_creation_input_tokens = tokens;
++        self
++    }
++
++    pub fn with_reasoning_output_tokens(mut self, tokens: Option<u32>) -> Self {
++        self.reasoning_output_tokens = tokens;
++        self
++    }
++
++    /// Прибавляет usage другого model-запроса к аккумулятору. Единый сумматор
++    /// для всех потребителей: опциональные
++    /// категории суммируются, если хотя бы одна сторона их знает.
++    pub fn accumulate(&mut self, other: &TokenUsage) {
++        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
++        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
++        self.cached_input_tokens =
++            sum_optional_tokens(self.cached_input_tokens, other.cached_input_tokens);
++        self.cache_creation_input_tokens = sum_optional_tokens(
++            self.cache_creation_input_tokens,
++            other.cache_creation_input_tokens,
++        );
++        self.reasoning_output_tokens =
++            sum_optional_tokens(self.reasoning_output_tokens, other.reasoning_output_tokens);
++    }
++
++    /// Суммарный spend запроса: input + output. Основа token-бюджетов.
++    pub fn total_tokens(&self) -> u64 {
++        u64::from(self.input_tokens) + u64::from(self.output_tokens)
++    }
++}
++
++fn sum_optional_tokens(left: Option<u32>, right: Option<u32>) -> Option<u32> {
++    match (left, right) {
++        (None, None) => None,
++        (some, None) => some,
++        (None, some) => some,
++        (Some(left), Some(right)) => Some(left.saturating_add(right)),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::{from_value, json, to_value};
++
++    use crate::{
++        domain::{Event, MessageId},
++        model_standard::{self, canonical_response, content_part},
++    };
++
++    #[test]
++    fn legacy_model_outcome_paths_preserve_event_and_usage_wire() {
++        let finish_reason: model_standard::FinishReason =
++            canonical_response::FinishReason::ToolCalls;
++        assert_eq!(
++            to_value(Event::ModelResponseReceived { finish_reason }).unwrap(),
++            json!({"ModelResponseReceived": {"finish_reason": "ToolCalls"}})
++        );
++        let phase: model_standard::MessagePhase = content_part::MessagePhase::FinalAnswer;
++        let message_id = MessageId::nil();
++        assert_eq!(
++            to_value(Event::AssistantMessageCompleted {
++                message_id,
++                phase: Some(phase),
++                text: "done".into(),
++            })
++            .unwrap(),
++            json!({"AssistantMessageCompleted": {
++                "message_id": message_id,
++                "phase": "final_answer",
++                "text": "done"
++            }})
++        );
++
++        let mut usage: model_standard::TokenUsage = canonical_response::TokenUsage::new(u32::MAX, 2)
++            .with_cache_creation_input_tokens(Some(u32::MAX));
++        usage.accumulate(
++            &canonical_response::TokenUsage::new(1, 3)
++                .with_cached_input_tokens(Some(0))
++                .with_cache_creation_input_tokens(Some(1)),
++        );
++        assert_eq!(usage.total_tokens(), u64::from(u32::MAX) + 5);
++        let wire = json!({
++            "input_tokens": u32::MAX,
++            "output_tokens": 5,
++            "cached_input_tokens": 0,
++            "cache_creation_input_tokens": u32::MAX,
++            "reasoning_output_tokens": null,
++        });
++        assert_eq!(to_value(&usage).unwrap(), wire);
++        assert_eq!(from_value::<canonical_response::TokenUsage>(wire).unwrap(), usage);
++        for invalid in [
++            json!({"input_tokens": 1}),
++            json!({"output_tokens": 1}),
++            json!({"input_tokens": 1, "output_tokens": 1, "unknown": 0}),
++        ] {
++            assert!(from_value::<model_standard::TokenUsage>(invalid).is_err());
++        }
++    }
++}
+diff --git a/crates/proteus-contracts/src/domain/usage.rs b/crates/proteus-contracts/src/domain/usage.rs
+index 5f7062190a0da0ab457519494b2a9f971a727351..f189fefaad4ab20338d63c11f345dab08ad02e82 100644
+--- a/crates/proteus-contracts/src/domain/usage.rs
++++ b/crates/proteus-contracts/src/domain/usage.rs
+@@ -3,6 +3,5 @@ use serde::{Deserialize, Serialize};
+ 
+-use crate::{
+-    domain::{ExchangeId, ModelRef, SessionId, TurnId},
+-    model_standard::{FinishReason, TokenUsage},
+-};
++use crate::domain::{ExchangeId, ModelRef, SessionId, TurnId};
++
++use super::model_outcome::{FinishReason, TokenUsage};
+ 
+diff --git a/crates/proteus-contracts/src/model_standard/canonical_response.rs b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+index e9ac4799a4350174ccbd97fe5a225d27068e1225..04287886511193996026cdfa52f00d3c2c09317c 100644
+--- a/crates/proteus-contracts/src/model_standard/canonical_response.rs
++++ b/crates/proteus-contracts/src/model_standard/canonical_response.rs
+@@ -4,2 +4,4 @@ use serde::{Deserialize, Serialize};
+ 
++pub use crate::domain::model_outcome::{FinishReason, TokenUsage};
++
+ use crate::{
+@@ -252,81 +254,2 @@ fn validate_declared_surface(
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+-#[non_exhaustive]
+-pub enum FinishReason {
+-    Stop,
+-    ToolCalls,
+-    Length,
+-    ContentFilter,
+-    Error,
+-    Unknown,
+-}
+-
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+-#[serde(deny_unknown_fields)]
+-#[non_exhaustive]
+-pub struct TokenUsage {
+-    pub input_tokens: u32,
+-    pub output_tokens: u32,
+-    pub cached_input_tokens: Option<u32>,
+-    pub cache_creation_input_tokens: Option<u32>,
+-    pub reasoning_output_tokens: Option<u32>,
+-}
+-
+-impl TokenUsage {
+-    pub fn new(input_tokens: u32, output_tokens: u32) -> Self {
+-        Self {
+-            input_tokens,
+-            output_tokens,
+-            cached_input_tokens: None,
+-            cache_creation_input_tokens: None,
+-            reasoning_output_tokens: None,
+-        }
+-    }
+-
+-    pub fn with_cached_input_tokens(mut self, tokens: Option<u32>) -> Self {
+-        self.cached_input_tokens = tokens;
+-        self
+-    }
+-
+-    pub fn with_cache_creation_input_tokens(mut self, tokens: Option<u32>) -> Self {
+-        self.cache_creation_input_tokens = tokens;
+-        self
+-    }
+-
+-    pub fn with_reasoning_output_tokens(mut self, tokens: Option<u32>) -> Self {
+-        self.reasoning_output_tokens = tokens;
+-        self
+-    }
+-
+-    /// Прибавляет usage другого model-запроса к аккумулятору. Единый сумматор
+-    /// для всех потребителей: опциональные
+-    /// категории суммируются, если хотя бы одна сторона их знает.
+-    pub fn accumulate(&mut self, other: &TokenUsage) {
+-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+-        self.cached_input_tokens =
+-            sum_optional_tokens(self.cached_input_tokens, other.cached_input_tokens);
+-        self.cache_creation_input_tokens = sum_optional_tokens(
+-            self.cache_creation_input_tokens,
+-            other.cache_creation_input_tokens,
+-        );
+-        self.reasoning_output_tokens =
+-            sum_optional_tokens(self.reasoning_output_tokens, other.reasoning_output_tokens);
+-    }
+-
+-    /// Суммарный spend запроса: input + output. Основа token-бюджетов.
+-    pub fn total_tokens(&self) -> u64 {
+-        u64::from(self.input_tokens) + u64::from(self.output_tokens)
+-    }
+-}
+-
+-fn sum_optional_tokens(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+-    match (left, right) {
+-        (None, None) => None,
+-        (some, None) => some,
+-        (None, some) => some,
+-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+-    }
+-}
+-
+ #[cfg(test)]
+diff --git a/crates/proteus-contracts/src/model_standard/content_part.rs b/crates/proteus-contracts/src/model_standard/content_part.rs
+index 06dba5cbb5066ab98e5dde63f212b63c09132673..97feb68cabb541e0c034954a5e8f83f7d9b75dc4 100644
+--- a/crates/proteus-contracts/src/model_standard/content_part.rs
++++ b/crates/proteus-contracts/src/model_standard/content_part.rs
+@@ -4,2 +4,4 @@ use serde::{Deserialize, Serialize};
+ 
++pub use crate::domain::model_outcome::MessagePhase;
++
+ use crate::domain::{
+@@ -19,9 +21,2 @@ pub enum MessageRole {
+ 
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+-#[serde(rename_all = "snake_case")]
+-pub enum MessagePhase {
+-    Commentary,
+-    FinalAnswer,
+-}
+-
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
