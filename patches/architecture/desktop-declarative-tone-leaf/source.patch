@@ -1,0 +1,232 @@
+diff --git a/src/ui/extensions/declarative/badge.rs b/src/ui/extensions/declarative/badge.rs
+index a4672310f0e05f7c22b31f40fa2a3c0721fd93eb..301d2b0fbc71f239e0e9bacf6d9d98ec24a115b5 100644
+--- a/src/ui/extensions/declarative/badge.rs
++++ b/src/ui/extensions/declarative/badge.rs
+@@ -241,7 +241,7 @@ fn render_face(face: &Face, style: FaceStyle, cx: &App) -> Rc<dyn Fn() -> AnyEle
+     let icon_size = icon_size(rail);
+     match face {
+         Face::Icon { tone, count } => {
+-            let tone = super::render::icon_tone(*tone);
++            let tone = super::tone::icon_tone(*tone);
+             let count = *count;
+             Rc::new(move || {
+                 div()
+@@ -277,7 +277,7 @@ fn render_face(face: &Face, style: FaceStyle, cx: &App) -> Rc<dyn Fn() -> AnyEle
+             // Default is ordinary readable text, as in Node::Text.
+             // Only an explicitly muted face inherits the badge tint.
+             let color =
+-                (!matches!(tone, Tone::Muted)).then(|| super::render::tone_color(*tone, cx));
++                (!matches!(tone, Tone::Muted)).then(|| super::tone::tone_color(*tone, cx));
+             let text = text.clone();
+             let chevron_color = cx.theme().muted_foreground;
+             let animate_chevron = crate::ui::motion::moves(cx);
+@@ -305,9 +305,9 @@ fn render_face(face: &Face, style: FaceStyle, cx: &App) -> Rc<dyn Fn() -> AnyEle
+         } => {
+             let (percent, display) = (*percent, *display);
+             let color = if display == RingDisplay::Number {
+-                super::render::tone_color(*tone, cx)
++                super::tone::tone_color(*tone, cx)
+             } else {
+-                crate::ui::theme::glyph_color(super::render::icon_tone(*tone), cx.theme())
++                crate::ui::theme::glyph_color(super::tone::icon_tone(*tone), cx.theme())
+             };
+             Rc::new(move || metric_face(id.clone(), title.clone(), percent, color, display))
+         }
+diff --git a/src/ui/extensions/declarative/cells.rs b/src/ui/extensions/declarative/cells.rs
+index 3f2e431a7228edbe7d392464609bac874f2769b4..4c4e020c3ba94d4405e31b0f4df910cd7a35ece2 100644
+--- a/src/ui/extensions/declarative/cells.rs
++++ b/src/ui/extensions/declarative/cells.rs
+@@ -4,7 +4,7 @@
+ use gpui_kit::component::*;
+ use gpui_kit::*;
+ 
+-use super::render::tone_color;
++use super::tone::tone_color;
+ use crate::declarative::widget::{Segment, hex_color};
+ use crate::ui::fade::faded;
+ use crate::ui::prefs;
+diff --git a/src/ui/extensions/declarative/graph.rs b/src/ui/extensions/declarative/graph.rs
+index 6bf2a4d6a14c9bf32b6ad87d9b8cb3e219172eaf..6c9aed8698fdd40947794087e58772aab2bde605 100644
+--- a/src/ui/extensions/declarative/graph.rs
++++ b/src/ui/extensions/declarative/graph.rs
+@@ -173,7 +173,7 @@ impl Render for Graph {
+             .map(|node| {
+                 let at = self.position(node);
+                 let (select, drag) = (node.id.clone(), node.id.clone());
+-                let accent = super::render::tone_color(node.tone, cx);
++                let accent = super::tone::tone_color(node.tone, cx);
+                 h_flex()
+                     .id(SharedString::from(format!("graph-node-{}", node.id)))
+                     .absolute()
+diff --git a/src/ui/extensions/declarative/lanes.rs b/src/ui/extensions/declarative/lanes.rs
+index 80f2c11f1ea1a1ea7283058bb49291f7a65b201a..6033d503ceda816e041837cb03aced842e3ef7f5 100644
+--- a/src/ui/extensions/declarative/lanes.rs
++++ b/src/ui/extensions/declarative/lanes.rs
+@@ -91,7 +91,7 @@ impl LaneRows {
+                     .gap_1()
+                     .overflow_hidden()
+                     .children(row.refs.iter().enumerate().map(|(i, chip)| {
+-                        let color = super::render::tone_color(chip.tone, cx);
++                        let color = super::tone::tone_color(chip.tone, cx);
+                         div()
+                             .id(("lane-ref", i))
+                             .min_w_0()
+diff --git a/src/ui/extensions/declarative/mod.rs b/src/ui/extensions/declarative/mod.rs
+index 77d86925fa03e308f267b89cb049b3f844ad231a..bcdbf3c339f3ad305530f720fa9dfb688383c949 100644
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -32,6 +32,7 @@ mod runtime;
+ mod steps;
+ mod terminal;
+ mod toggle;
++mod tone;
+ mod tree;
+ mod tree_row;
+ mod view;
+diff --git a/src/ui/extensions/declarative/render.rs b/src/ui/extensions/declarative/render.rs
+index dea8229b4c3458d4f137025061c3529a35d1f0be..05802f3c13b0cc88470e0137777202874a6fcfdb 100644
+--- a/src/ui/extensions/declarative/render.rs
++++ b/src/ui/extensions/declarative/render.rs
+@@ -9,6 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+ use super::button::Fit;
++use super::tone::{icon_tone, tone_color};
+ use super::view::DeclarativeView;
+ use crate::declarative::widget::{Direction, Gap, Node, TextSize, Tone};
+ use crate::ui::fade::faded;
+@@ -16,31 +17,6 @@ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::prefs;
+ 
+-pub(super) fn icon_tone(tone: Tone) -> IconTone {
+-    match tone {
+-        Tone::Default => IconTone::Normal,
+-        Tone::Muted => IconTone::Muted,
+-        Tone::Accent => IconTone::Accent,
+-        Tone::Success => IconTone::Success,
+-        Tone::Warning => IconTone::Warning,
+-        Tone::Danger => IconTone::Danger,
+-        Tone::Color(value) => IconTone::Custom(rgb(value).into()),
+-    }
+-}
+-
+-pub(super) fn tone_color(tone: Tone, cx: &App) -> Hsla {
+-    let theme = cx.theme();
+-    match tone {
+-        Tone::Default => theme.foreground,
+-        Tone::Muted => theme.muted_foreground,
+-        Tone::Accent => theme.primary,
+-        Tone::Success => theme.success,
+-        Tone::Warning => theme.warning,
+-        Tone::Danger => theme.danger,
+-        Tone::Color(color) => rgb(color).into(),
+-    }
+-}
+-
+ impl DeclarativeView {
+     /// `path` is the position in the tree; it keys element ids and the
+     /// selected tab, so they survive a new tree of the same shape.
+diff --git a/src/ui/extensions/declarative/tone.rs b/src/ui/extensions/declarative/tone.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..accb80d7ecb321a9ec786322064bc031f7d37e16
+--- /dev/null
++++ b/src/ui/extensions/declarative/tone.rs
+@@ -0,0 +1,76 @@
++//! Native color projections shared by extension widgets.
++
++use crate::declarative::widget::Tone;
++use gpui_kit::component::{ActiveTheme as _, IconTone};
++use gpui_kit::{App, Hsla, rgb};
++
++pub(super) fn icon_tone(tone: Tone) -> IconTone {
++    match tone {
++        Tone::Default => IconTone::Normal,
++        Tone::Muted => IconTone::Muted,
++        Tone::Accent => IconTone::Accent,
++        Tone::Success => IconTone::Success,
++        Tone::Warning => IconTone::Warning,
++        Tone::Danger => IconTone::Danger,
++        Tone::Color(value) => IconTone::Custom(rgb(value).into()),
++    }
++}
++
++pub(super) fn tone_color(tone: Tone, cx: &App) -> Hsla {
++    let theme = cx.theme();
++    match tone {
++        Tone::Default => theme.foreground,
++        Tone::Muted => theme.muted_foreground,
++        Tone::Accent => theme.primary,
++        Tone::Success => theme.success,
++        Tone::Warning => theme.warning,
++        Tone::Danger => theme.danger,
++        Tone::Color(color) => rgb(color).into(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use gpui_kit::component::Theme;
++
++    #[::core::prelude::v1::test]
++    fn semantic_tones_follow_active_theme_and_custom_rgb_stays_literal() {
++        let app = ::gpui::TestAppContext::single();
++        app.update(|cx| {
++            cx.set_global(Theme::default());
++            let cases: [(Tone, IconTone, Hsla); 6] = [
++                (Tone::Default, IconTone::Normal, rgb(0x102030).into()),
++                (Tone::Muted, IconTone::Muted, rgb(0x203040).into()),
++                (Tone::Accent, IconTone::Accent, rgb(0x304050).into()),
++                (Tone::Success, IconTone::Success, rgb(0x405060).into()),
++                (Tone::Warning, IconTone::Warning, rgb(0x506070).into()),
++                (Tone::Danger, IconTone::Danger, rgb(0x607080).into()),
++            ];
++            {
++                let theme = Theme::global_mut(cx);
++                theme.foreground = cases[0].2;
++                theme.muted_foreground = cases[1].2;
++                theme.primary = cases[2].2;
++                theme.success = cases[3].2;
++                theme.warning = cases[4].2;
++                theme.danger = cases[5].2;
++            }
++            for (tone, icon, color) in cases {
++                assert_eq!(icon_tone(tone), icon);
++                assert_eq!(tone_color(tone, cx), color);
++            }
++
++            let custom: Tone = serde_json::from_value(serde_json::json!("#335577")).unwrap();
++            let literal: Hsla = rgb(0x335577).into();
++            assert_eq!(custom, Tone::Color(0x335577));
++            assert_eq!(icon_tone(custom), IconTone::Custom(literal));
++            assert_eq!(tone_color(custom, cx), literal);
++
++            let changed: Hsla = rgb(0x556677).into();
++            Theme::global_mut(cx).primary = changed;
++            assert_eq!(tone_color(Tone::Accent, cx), changed);
++            assert_eq!(tone_color(custom, cx), literal);
++        });
++    }
++}
+diff --git a/src/ui/extensions/declarative/tree_row.rs b/src/ui/extensions/declarative/tree_row.rs
+index 122b740b48bba28f04e213190c263fcb82cf70b1..69d1685124bde066e3668b3e6a4c82e670ff4c82 100644
+--- a/src/ui/extensions/declarative/tree_row.rs
++++ b/src/ui/extensions/declarative/tree_row.rs
+@@ -173,7 +173,7 @@ impl Tree {
+     fn item(&self, row: &Row, anchor: &TooltipAnchor, cx: &App) -> Div {
+         let muted = cx.theme().muted_foreground;
+         let color = tree_ink(row.tone, cx);
+-        let icon_tone = super::render::icon_tone(row.icon_tone.unwrap_or(match row.expanded {
++        let icon_tone = super::tone::icon_tone(row.icon_tone.unwrap_or(match row.expanded {
+             Some(false) => Tone::Muted,
+             _ => row.tone,
+         }));
+@@ -255,6 +255,6 @@ fn tree_ink(tone: Tone, cx: &App) -> Hsla {
+         Tone::Success => cx.theme().green,
+         Tone::Warning => cx.theme().yellow,
+         Tone::Danger => cx.theme().red,
+-        _ => super::render::tone_color(tone, cx),
++        _ => super::tone::tone_color(tone, cx),
+     }
+ }
