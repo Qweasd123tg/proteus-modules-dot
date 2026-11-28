@@ -1,0 +1,130 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1b929a03812812a28ecbbb9fe158182fd47b960b..e682fe70a5c69dcb153b94cb4908d43289082eb3 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -786,3 +786,3 @@ impl AgentAppServer {
+         if let Some(source) = cached_display_source {
+-            read_model::refresh_in_background(&handle, source);
++            startup::refresh_in_background(&handle, source);
+         }
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 7e9362ec7940bd1dfe5f0d4fa6ca2747b3b33625..4e339102542875d5e0c30281a728eb700c870ca5 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -1,7 +1,4 @@
+-//! Stale display state refreshes independently, without acquiring write ownership.
+-use super::{
+-    AppServerEvent, AppServerHandle, journal_transcript_append_from_source,
+-    journal_transcript_from_source,
+-};
+-use crate::core::{SessionReadModel, SessionStore};
++//! Session display projections and caches, independent of live event publication.
++use super::{journal_transcript_append_from_source, journal_transcript_from_source};
++use crate::core::{SessionReadModel, SessionStore, ValidatedJournalRead};
+ 
+@@ -170,38 +167,13 @@ pub(super) fn project_completed_transcript(
+ 
+-pub(super) fn refresh_in_background(
+-    server: &AppServerHandle,
+-    cached_source: crate::core::session_read_cache::SourceFingerprint,
+-) {
+-    let server = server.clone();
+-    let Some(baseline) = server.events.completed_history() else {
+-        return;
+-    };
+-    tokio::spawn(async move {
+-        let result: anyhow::Result<()> = async {
+-            let Some(store) = server.runtime.session_store().cloned() else {
+-                return Ok(());
+-            };
+-            let Some(read) = server.runtime.refresh_cached_resume(cached_source).await? else {
+-                return Ok(());
+-            };
+-            let transcript = tokio::task::spawn_blocking(move || {
+-                let view = store.project_validated_view(read, cfg!(unix), |source| {
+-                    journal_transcript_from_source(source, None)
+-                })?;
+-                Ok::<_, anyhow::Error>(CompletedTranscript {
+-                    messages: view.transcript,
+-                    cursor: view.cursor,
+-                })
+-            })
+-            .await??;
+-            server.events.refresh_history(&baseline, transcript)?;
+-            Ok(())
+-        }
+-        .await;
+-        if let Err(error) = result {
+-            let message = format!("Не удалось обновить сохранённую историю: {error:#}");
+-            eprintln!("warning: {message}");
+-            let _ = server.events.send(AppServerEvent::Error { message });
+-        }
+-    });
++pub(super) fn project_refreshed_transcript(
++    store: &SessionStore,
++    read: ValidatedJournalRead,
++) -> anyhow::Result<CompletedTranscript> {
++    let view = store.project_validated_view(read, cfg!(unix), |source| {
++        journal_transcript_from_source(source, None)
++    })?;
++    Ok(CompletedTranscript {
++        messages: view.transcript,
++        cursor: view.cursor,
++    })
+ }
+diff --git a/crates/proteus-core/src/app_server/startup.rs b/crates/proteus-core/src/app_server/startup.rs
+index 50ae756cbc6433d72b7a26780e8d62fbd117a7c8..98a7dc95a5dff4de400477905e92ee6c3a1a9c8c 100644
+--- a/crates/proteus-core/src/app_server/startup.rs
++++ b/crates/proteus-core/src/app_server/startup.rs
+@@ -5,3 +5,3 @@ use std::{
+ 
+-use super::{AgentAppServer, AppServerHandle};
++use super::{AgentAppServer, AppServerEvent, AppServerHandle, read_model};
+ use crate::core::AppConfig;
+@@ -87,2 +87,35 @@ pub(super) async fn launch_http_selected(
+ 
++/// Replace provisional startup history without taking write ownership.
++pub(super) fn refresh_in_background(
++    server: &AppServerHandle,
++    cached_source: crate::core::session_read_cache::SourceFingerprint,
++) {
++    let server = server.clone();
++    let Some(baseline) = server.events.completed_history() else {
++        return;
++    };
++    tokio::spawn(async move {
++        let result: anyhow::Result<()> = async {
++            let Some(store) = server.runtime.session_store().cloned() else {
++                return Ok(());
++            };
++            let Some(read) = server.runtime.refresh_cached_resume(cached_source).await? else {
++                return Ok(());
++            };
++            let transcript = tokio::task::spawn_blocking(move || {
++                read_model::project_refreshed_transcript(&store, read)
++            })
++            .await??;
++            server.events.refresh_history(&baseline, transcript)?;
++            Ok(())
++        }
++        .await;
++        if let Err(error) = result {
++            let message = format!("Не удалось обновить сохранённую историю: {error:#}");
++            eprintln!("warning: {message}");
++            let _ = server.events.send(AppServerEvent::Error { message });
++        }
++    });
++}
++
+ #[cfg(test)]
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 122d84930a5b7d8b4311bd77a23254fb8ff76bf8..48938f1c677031e453e3dc0fe0451d17d9554c23 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -86,3 +86,5 @@ pub use session_journal::{
+ };
+-pub(crate) use session_journal::{JournalReadCursor, JournalReadSnapshot, history_message_sha256};
++pub(crate) use session_journal::{
++    JournalReadCursor, JournalReadSnapshot, ValidatedJournalRead, history_message_sha256,
++};
+ pub(crate) use session_store::read_cache as session_read_cache;
