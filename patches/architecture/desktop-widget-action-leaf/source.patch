@@ -1,0 +1,141 @@
+diff --git a/src/ui/extensions/declarative/fields.rs b/src/ui/extensions/declarative/fields.rs
+index ae636c1e790f35c4135bc6195d35da62f53f3145..388965b6b01323cd21040fa234cc44ad076eed2c 100644
+--- a/src/ui/extensions/declarative/fields.rs
++++ b/src/ui/extensions/declarative/fields.rs
+@@ -3,6 +3,7 @@
+ use super::lanes::Lanes;
+ use super::list::List;
+ use super::tree::{Layout, Tree};
++use super::widget_action::WidgetAction;
+ use super::{terminal::TerminalView, view::DeclarativeView};
+ use crate::declarative::widget::Node;
+ use gpui_kit::component::input::{EditorState, InputEvent, InputState, TextareaState};
+@@ -15,38 +16,6 @@ pub(super) mod textarea;
+ #[cfg(test)]
+ mod tests;
+ 
+-/// A retained widget keeps its event sink, but its current declaration names the action.
+-pub(super) struct WidgetAction {
+-    name: String,
+-    send: Box<dyn Fn(String, serde_json::Value, &mut App)>,
+-}
+-
+-impl WidgetAction {
+-    pub(super) fn new(
+-        name: &str,
+-        send: impl Fn(String, serde_json::Value, &mut App) + 'static,
+-    ) -> Self {
+-        Self {
+-            name: name.to_owned(),
+-            send: Box::new(send),
+-        }
+-    }
+-
+-    fn rebind(&mut self, name: &str) {
+-        if self.name != name {
+-            name.clone_into(&mut self.name);
+-        }
+-    }
+-
+-    pub(super) fn emit(&self, value: serde_json::Value, cx: &mut App) {
+-        (self.send)(self.name.clone(), value, cx);
+-    }
+-
+-    pub(super) fn row(&self, id: &str, event: &'static str, cx: &mut App) {
+-        self.emit(serde_json::json!({"id": id, "event": event}), cx);
+-    }
+-}
+-
+ pub(super) enum Text {
+     Line(Entity<InputState>),
+     Area(Entity<TextareaState>),
+diff --git a/src/ui/extensions/declarative/graph.rs b/src/ui/extensions/declarative/graph.rs
+index 6bf2a4d6a14c9bf32b6ad87d9b8cb3e219172eaf..af5b4108ad2fc68797f577b2dbe48152e17218e8 100644
+--- a/src/ui/extensions/declarative/graph.rs
++++ b/src/ui/extensions/declarative/graph.rs
+@@ -1,6 +1,6 @@
+ //! Generic interactive graph: local pan, zoom and node dragging.
+ 
+-use super::fields::WidgetAction;
++use super::widget_action::WidgetAction;
+ use crate::declarative::graph::{Edge, Node};
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::{fade::faded, kit, kit::Pressable as _, prefs};
+diff --git a/src/ui/extensions/declarative/mod.rs b/src/ui/extensions/declarative/mod.rs
+index 77d86925fa03e308f267b89cb049b3f844ad231a..0769c0f47a4f1ce973e0d4a605ac44848379c245 100644
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -35,6 +35,7 @@ mod toggle;
+ mod tree;
+ mod tree_row;
+ mod view;
++mod widget_action;
+ 
+ use std::collections::HashMap;
+ use std::path::Path;
+diff --git a/src/ui/extensions/declarative/rows.rs b/src/ui/extensions/declarative/rows.rs
+index 5912efe1de366ca4792a74c09647b3fcebc53fe8..779ded9f0009b46f44c850fa6c3dc290e102193a 100644
+--- a/src/ui/extensions/declarative/rows.rs
++++ b/src/ui/extensions/declarative/rows.rs
+@@ -2,7 +2,7 @@
+ //! cursor that survives new rows, the keyboard, focus, clicks and the row
+ //! menu. Each kind draws its own rows and says what the keys and clicks send.
+ 
+-use super::fields::WidgetAction;
++use super::widget_action::WidgetAction;
+ use crate::declarative::control::MenuItem;
+ use crate::ui::context::RightClickMenu as _;
+ use gpui_kit::component::*;
+diff --git a/src/ui/extensions/declarative/tree.rs b/src/ui/extensions/declarative/tree.rs
+index e415ffc57625a72d08924b0e870a6306982c34e8..679d58f56bd7fbfc2f1ddaa0b9fa7bddd108dbff 100644
+--- a/src/ui/extensions/declarative/tree.rs
++++ b/src/ui/extensions/declarative/tree.rs
+@@ -2,8 +2,8 @@
+ //! A branch that opens or closes draws its children as one block that grows
+ //! or shrinks, like every other disclosure.
+ 
+-use super::fields::WidgetAction;
+ use super::tree_row::ROW_HEIGHT;
++use super::widget_action::WidgetAction;
+ use crate::declarative::tree::Row;
+ use crate::ui::{motion, prefs};
+ use gpui_kit::component::v_flex;
+diff --git a/src/ui/extensions/declarative/widget_action.rs b/src/ui/extensions/declarative/widget_action.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..eaa7e94a8fb16fe2b7cbcc5e4927dff23303ae90
+--- /dev/null
++++ b/src/ui/extensions/declarative/widget_action.rs
+@@ -0,0 +1,33 @@
++use gpui_kit::App;
++
++/// A retained widget keeps its event sink, but its current declaration names the action.
++pub(super) struct WidgetAction {
++    name: String,
++    send: Box<dyn Fn(String, serde_json::Value, &mut App)>,
++}
++
++impl WidgetAction {
++    pub(super) fn new(
++        name: &str,
++        send: impl Fn(String, serde_json::Value, &mut App) + 'static,
++    ) -> Self {
++        Self {
++            name: name.to_owned(),
++            send: Box::new(send),
++        }
++    }
++
++    pub(super) fn rebind(&mut self, name: &str) {
++        if self.name != name {
++            name.clone_into(&mut self.name);
++        }
++    }
++
++    pub(super) fn emit(&self, value: serde_json::Value, cx: &mut App) {
++        (self.send)(self.name.clone(), value, cx);
++    }
++
++    pub(super) fn row(&self, id: &str, event: &'static str, cx: &mut App) {
++        self.emit(serde_json::json!({"id": id, "event": event}), cx);
++    }
++}
