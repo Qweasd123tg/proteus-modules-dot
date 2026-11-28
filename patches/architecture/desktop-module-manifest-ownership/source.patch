@@ -1,0 +1,340 @@
+diff --git a/src/catalog/connections.rs b/src/catalog/connections.rs
+index 745a649d6f0537416c0b0807085c3ad5de02e79d..58f04e2cb3be65862d1ba3610a172c0595701ea7 100644
+--- a/src/catalog/connections.rs
++++ b/src/catalog/connections.rs
+@@ -12,95 +12,14 @@ use proteus_contracts::app_protocol::{
+     config_builder::ConfigBuilderSnapshot,
+     http::{ComponentPackageInstall, SetConfigBuilderRequest},
+ };
+-use serde::Deserialize;
+-use serde_json::Value;
+ use sha2::{Digest, Sha256};
+ 
+-use super::{Installed, Target, inventory::Inventory, schema};
+-
+-#[derive(Clone, Debug, Deserialize)]
+-#[serde(deny_unknown_fields)]
+-pub struct Template {
+-    pub id: String,
+-    pub title: String,
+-    pub description: String,
+-    pub module_id: String,
+-    pub module_config: Value,
+-    pub env_allowlist: Vec<String>,
+-    #[serde(default)]
+-    pub auth: Option<Authentication>,
+-}
+-
+-/// Management argv owned by the installed module, outside the model protocol.
+-#[derive(Clone, Debug, Deserialize)]
+-#[serde(deny_unknown_fields)]
+-pub struct Authentication {
+-    pub command: Vec<String>,
+-    pub credential_file_key: String,
+-}
+-
+-impl Authentication {
+-    fn validate(&self) -> Result<()> {
+-        ensure!(
+-            !self.command.is_empty()
+-                && self.command.len() <= 16
+-                && self.command.iter().all(|arg| {
+-                    !arg.is_empty() && arg.len() <= 1024 && !arg.chars().any(char::is_control)
+-                })
+-                && !self.credential_file_key.is_empty()
+-                && !self.credential_file_key.chars().any(char::is_control),
+-            "Неверная команда авторизации модуля"
+-        );
+-        Ok(())
+-    }
+-}
+-
+-#[derive(Deserialize)]
+-#[serde(deny_unknown_fields)]
+-pub(crate) struct ModuleManifest {
+-    pub id: String,
+-    pub version: String,
+-    pub command: Vec<String>,
+-    pub exports: BTreeMap<String, Vec<String>>,
+-    pub sha256: String,
+-    #[serde(default)]
+-    pub icon: Option<String>,
+-    #[serde(default)]
+-    pub model_connections: Vec<Template>,
+-}
+-
+-impl ModuleManifest {
+-    pub(crate) fn validate_connections(&self) -> Result<()> {
+-        let mut seen = BTreeSet::new();
+-        for template in &self.model_connections {
+-            identity(&template.id)?;
+-            identity(&template.module_id)?;
+-            ensure!(
+-                seen.insert(&template.id),
+-                "Повтор варианта подключения: {}",
+-                template.id
+-            );
+-            if let Some(auth) = &template.auth {
+-                auth.validate()?;
+-            }
+-            ensure!(
+-                !template.title.trim().is_empty(),
+-                "У варианта подключения нет названия"
+-            );
+-            ensure!(
+-                template.module_config.is_object(),
+-                "Параметры подключения должны быть объектом"
+-            );
+-            ensure!(
+-                self.exports
+-                    .get("model")
+-                    .is_some_and(|ids| ids.iter().any(|id| id == "*" || id == &template.module_id)),
+-                "Вариант подключения не объявлен в экспортах пакета"
+-            );
+-        }
+-        Ok(())
+-    }
+-}
++use super::{
++    Installed, Target,
++    inventory::Inventory,
++    module_manifest::{ModuleManifest, Template, identity, module_icon},
++    schema,
++};
+ 
+ #[derive(Clone, Debug)]
+ pub struct Choice {
+@@ -189,14 +108,6 @@ impl Choice {
+     }
+ }
+ 
+-fn identity(id: &str) -> Result<()> {
+-    ensure!(
+-        !id.is_empty() && id.trim() == id && id != "*" && !id.chars().any(char::is_control),
+-        "Укажите непустое имя подключения без управляющих символов"
+-    );
+-    Ok(())
+-}
+-
+ pub fn connection_exists(snapshot: &ConfigBuilderSnapshot, id: &str) -> bool {
+     snapshot.model_modules.iter().any(|module| module.id == id)
+         || snapshot
+@@ -325,20 +236,5 @@ fn read_choices(manifest_path: &Path, root: &Path) -> Result<Vec<Choice>> {
+         .collect())
+ }
+ 
+-/// Relative author artwork belongs to the module package. Persist its stable
+-/// location with the executable; plain Lucide names and bundled assets stay IDs.
+-pub(crate) fn module_icon(value: Option<&str>, directory: &Path) -> Option<String> {
+-    let value = value.filter(|value| !value.is_empty())?;
+-    let path = Path::new(value);
+-    if !path.is_absolute()
+-        && !value.contains(':')
+-        && (value.contains('/') || value.ends_with(".svg") || value.ends_with(".png"))
+-    {
+-        Some(directory.join(path).to_string_lossy().into_owned())
+-    } else {
+-        Some(value.to_owned())
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests;
+diff --git a/src/catalog/install/component.rs b/src/catalog/install/component.rs
+index 6161278d9f389424bb48c5002f9e7b4ff0f0cff6..4034ca0a5d48c44e34e9597e2fb20cdabfcdec84 100644
+--- a/src/catalog/install/component.rs
++++ b/src/catalog/install/component.rs
+@@ -7,12 +7,11 @@ use sha2::{Digest, Sha256};
+ 
+ use super::super::{
+     Locations, Target,
++    module_manifest::{ModuleManifest as Manifest, module_icon},
+     schema::{self, Entry},
+ };
+ use crate::packages::Contents;
+ 
+-use crate::catalog::connections::ModuleManifest as Manifest;
+-
+ pub(super) fn prepare(locations: &Locations, entry: &Entry, files: &Contents) -> Result<Target> {
+     let manifest: Manifest =
+         serde_json::from_str(files.text(&format!("share/modules/{}/module.json", entry.id))?)
+@@ -68,7 +67,7 @@ pub(super) fn prepare(locations: &Locations, entry: &Entry, files: &Contents) ->
+         .context("Путь модуля не в UTF-8")?
+         .to_owned();
+     Ok(Target::Component {
+-        icon: crate::catalog::connections::module_icon(
++        icon: module_icon(
+             manifest.icon.as_deref(),
+             &path.join("share/modules").join(&manifest.id),
+         ),
+diff --git a/src/catalog/module_manifest.rs b/src/catalog/module_manifest.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..19b86b0b8df9e421ba73b980356c193123323488
+--- /dev/null
++++ b/src/catalog/module_manifest.rs
+@@ -0,0 +1,117 @@
++//! The packaged module metadata shared by the installer and provider discovery.
++
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    path::Path,
++};
++
++use anyhow::{Result, ensure};
++use serde::Deserialize;
++use serde_json::Value;
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Template {
++    pub id: String,
++    pub title: String,
++    pub description: String,
++    pub module_id: String,
++    pub module_config: Value,
++    pub env_allowlist: Vec<String>,
++    #[serde(default)]
++    pub auth: Option<Authentication>,
++}
++
++/// Management argv owned by the installed module, outside the model protocol.
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Authentication {
++    pub command: Vec<String>,
++    pub credential_file_key: String,
++}
++
++impl Authentication {
++    fn validate(&self) -> Result<()> {
++        ensure!(
++            !self.command.is_empty()
++                && self.command.len() <= 16
++                && self.command.iter().all(|arg| {
++                    !arg.is_empty() && arg.len() <= 1024 && !arg.chars().any(char::is_control)
++                })
++                && !self.credential_file_key.is_empty()
++                && !self.credential_file_key.chars().any(char::is_control),
++            "Неверная команда авторизации модуля"
++        );
++        Ok(())
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct ModuleManifest {
++    pub id: String,
++    pub version: String,
++    pub command: Vec<String>,
++    pub exports: BTreeMap<String, Vec<String>>,
++    pub sha256: String,
++    #[serde(default)]
++    pub icon: Option<String>,
++    #[serde(default)]
++    pub model_connections: Vec<Template>,
++}
++
++impl ModuleManifest {
++    pub(crate) fn validate_connections(&self) -> Result<()> {
++        let mut seen = BTreeSet::new();
++        for template in &self.model_connections {
++            identity(&template.id)?;
++            identity(&template.module_id)?;
++            ensure!(
++                seen.insert(&template.id),
++                "Повтор варианта подключения: {}",
++                template.id
++            );
++            if let Some(auth) = &template.auth {
++                auth.validate()?;
++            }
++            ensure!(
++                !template.title.trim().is_empty(),
++                "У варианта подключения нет названия"
++            );
++            ensure!(
++                template.module_config.is_object(),
++                "Параметры подключения должны быть объектом"
++            );
++            ensure!(
++                self.exports
++                    .get("model")
++                    .is_some_and(|ids| ids.iter().any(|id| id == "*" || id == &template.module_id)),
++                "Вариант подключения не объявлен в экспортах пакета"
++            );
++        }
++        Ok(())
++    }
++}
++
++pub(super) fn identity(id: &str) -> Result<()> {
++    ensure!(
++        !id.is_empty() && id.trim() == id && id != "*" && !id.chars().any(char::is_control),
++        "Укажите непустое имя подключения без управляющих символов"
++    );
++    Ok(())
++}
++
++/// Relative author artwork belongs to the module package. Persist its stable
++/// location with the executable; plain Lucide names and bundled assets stay IDs.
++pub(crate) fn module_icon(value: Option<&str>, directory: &Path) -> Option<String> {
++    let value = value.filter(|value| !value.is_empty())?;
++    let path = Path::new(value);
++    if !path.is_absolute()
++        && !value.contains(':')
++        && (value.contains('/') || value.ends_with(".svg") || value.ends_with(".png"))
++    {
++        Some(directory.join(path).to_string_lossy().into_owned())
++    } else {
++        Some(value.to_owned())
++    }
++}
+diff --git a/src/ui/settings/provider_auth.rs b/src/ui/settings/provider_auth.rs
+index 005042908bec557497a3a85498dac9d3ac0cdf05..518ca55a0c1748bbdddf03bb13f2c84613810d32 100644
+--- a/src/ui/settings/provider_auth.rs
++++ b/src/ui/settings/provider_auth.rs
+@@ -21,7 +21,7 @@ use serde_json::Value;
+ use super::{SettingsView, widgets::hashed_id};
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::{
+-    catalog::connections,
++    catalog::{connections, module_manifest::Authentication},
+     settings::catalog::PageId,
+     ui::{kit, prefs},
+ };
+@@ -29,7 +29,7 @@ use crate::{
+ #[derive(Clone)]
+ struct Connection {
+     command: Vec<String>,
+-    auth: connections::Authentication,
++    auth: Authentication,
+     credential_file: Option<String>,
+     cwd: PathBuf,
+ }
+@@ -409,7 +409,7 @@ print(json.dumps({'authenticated': True}))
+         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+         let connection = Connection {
+             command: vec![script.to_str().unwrap().into()],
+-            auth: connections::Authentication {
++            auth: Authentication {
+                 command: vec!["custom-auth".into()],
+                 credential_file_key: "credentials".into(),
+             },
+@@ -448,7 +448,7 @@ print(json.dumps({'authenticated': True}))
+     fn cancellation_never_starts_the_module() {
+         let connection = Connection {
+             command: vec!["/must-not-run".into()],
+-            auth: connections::Authentication {
++            auth: Authentication {
+                 command: vec!["auth".into()],
+                 credential_file_key: "file".into(),
+             },
+diff --git a/src/catalog/mod.rs b/src/catalog/mod.rs
+index 04ea8105d41f6a4f78aef6cfdd8b7c11b23d515b..616f6ed2dbaa97fbaa4861c8744786ec23768301 100644
+--- a/src/catalog/mod.rs
++++ b/src/catalog/mod.rs
+@@ -9,2 +9,3 @@ pub mod install;
+ pub mod inventory;
++pub(crate) mod module_manifest;
+ pub mod open;
