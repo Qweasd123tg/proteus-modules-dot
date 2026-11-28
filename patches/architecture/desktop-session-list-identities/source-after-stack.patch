@@ -1,0 +1,109 @@
+diff --git a/src/ui/panels/session_list.rs b/src/ui/panels/session_list.rs
+index 963f5a053ac86db3f81b2718798e9dcda7bf5497..3f15dd9679e9b6c02c00f2cd0c22234097269c42 100644
+--- a/src/ui/panels/session_list.rs
++++ b/src/ui/panels/session_list.rs
+@@ -4,13 +4,12 @@
+ 
+ use proteus_tabs::ChatKey;
+ use std::collections::HashSet;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ 
+ use gpui_kit::component::input::{InputEvent, InputState};
+ use gpui_kit::*;
+ 
+-use super::sessions::ItemId;
+ use crate::ui::kit;
+ use crate::ui::workspace::Workspace;
+ 
+@@ -47,6 +46,27 @@ pub(in crate::ui) fn bind_keys(cx: &mut App) {
+     ]);
+ }
+ 
++#[derive(Clone, PartialEq, Eq)]
++pub(super) enum ItemId {
++    Heading(&'static str),
++    Project(Rc<Path>),
++    More(Rc<Path>),
++    Archive,
++    Session(Rc<ChatKey>),
++    Empty,
++}
++
++#[derive(PartialEq, Eq)]
++pub(super) enum OrderGroup {
++    Pinned,
++    Project(Rc<Path>),
++    Children(Rc<ChatKey>),
++}
++
++pub(super) fn branch_key(path: &ChatKey) -> SharedString {
++    format!("session-branch-{path}").into()
++}
++
+ #[derive(PartialEq, Eq)]
+ pub(super) struct LayoutSlot {
+     pub id: ItemId,
+diff --git a/src/ui/panels/session_row.rs b/src/ui/panels/session_row.rs
+index 46cd9dc668f5c9a957db329945c961f0e00c2645..5538e72183bb0a08ae304f6cbee72011964d3e5a 100644
+--- a/src/ui/panels/session_row.rs
++++ b/src/ui/panels/session_row.rs
+@@ -4,8 +4,8 @@
+ use std::rc::Rc;
+ 
+ use super::{
++    session_list::{OrderGroup, branch_key},
+     session_menu,
+-    sessions::{OrderGroup, branch_key},
+ };
+ use crate::conversations::ConversationSummary;
+ use crate::sessions::SessionMark;
+diff --git a/src/ui/panels/sessions.rs b/src/ui/panels/sessions.rs
+index ad85b8ca8a3309a960acb658fa6b013f544a611b..19f12d31b26325f7b7482ba5c12b117fd6860c05 100644
+--- a/src/ui/panels/sessions.rs
++++ b/src/ui/panels/sessions.rs
+@@ -12,7 +12,7 @@ use gpui_kit::component::*;
+ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+-use super::session_list::LayoutSlot;
++use super::session_list::{ItemId, LayoutSlot, OrderGroup, branch_key};
+ use super::session_row::Look;
+ use crate::sessions::{Row, View};
+ use crate::ui::fade::faded;
+@@ -31,23 +31,6 @@ const ENTRANCE: Duration = Duration::from_millis(600);
+ /// Motion key of the archived chats.
+ const ARCHIVE: &str = "sessions-archive";
+ 
+-#[derive(Clone, PartialEq, Eq)]
+-pub(super) enum ItemId {
+-    Heading(&'static str),
+-    Project(Rc<Path>),
+-    More(Rc<Path>),
+-    Archive,
+-    Session(Rc<ChatKey>),
+-    Empty,
+-}
+-
+-#[derive(PartialEq, Eq)]
+-pub(super) enum OrderGroup {
+-    Pinned,
+-    Project(Rc<Path>),
+-    Children(Rc<ChatKey>),
+-}
+-
+ struct Item {
+     content: Content,
+     fold: Option<Fold>,
+@@ -751,10 +734,6 @@ impl Workspace {
+     }
+ }
+ 
+-pub(super) fn branch_key(path: &ChatKey) -> SharedString {
+-    format!("session-branch-{path}").into()
+-}
+-
+ /// Motion keys of a project folder's chats and of its chats past the first.
+ fn fold_key(path: &Path) -> SharedString {
+     format!("sessions-fold-{}", path.display()).into()
