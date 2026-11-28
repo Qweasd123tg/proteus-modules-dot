@@ -1,0 +1,194 @@
+diff --git a/src/ui/chrome/mod.rs b/src/ui/chrome/mod.rs
+index 6a85ef4e33322cb00539dc72cd09516c51331141..0b286901eded1ff3a7585aa976fbed0daa7379a9 100644
+--- a/src/ui/chrome/mod.rs
++++ b/src/ui/chrome/mod.rs
+@@ -10,6 +10,6 @@ mod top;
+ /// Height of the top bar before zoom.
+ const BAR_HEIGHT: f32 = 34.;
+ 
+-pub(super) use projects::{Projects, WorkspaceRequest, folder_name};
++pub(super) use projects::Projects;
+ pub(super) use rail::RAIL_WIDTH;
+ pub(super) use top::picker_top_bar;
+diff --git a/src/ui/chrome/projects.rs b/src/ui/chrome/projects.rs
+index 789a5f6bc9f1824b971b70e443fada8ce4af9c36..1484a7db93c72ad89bb1d5c3c810cd58617e9164 100644
+--- a/src/ui/chrome/projects.rs
++++ b/src/ui/chrome/projects.rs
+@@ -9,18 +9,11 @@ use gpui_kit::component::Icon;
+ use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+ use gpui_kit::*;
+ 
+-use crate::ui::prefs;
++use crate::ui::{format::folder_name, prefs};
+ 
+ /// Recent folders listed in a menu; the picker screen shows all of them.
+ const RECENT_SHOWN: usize = 8;
+ 
+-/// The workspace asks the window to show another folder in its place.
+-pub(in crate::ui) enum WorkspaceRequest {
+-    Open(PathBuf),
+-    ChooseFolder,
+-    OpenConfig(Option<PathBuf>),
+-}
+-
+ type OpenFolder = Rc<dyn Fn(PathBuf, &mut Window, &mut App)>;
+ type ChooseFolder = Rc<dyn Fn(&mut Window, &mut App)>;
+ 
+@@ -75,12 +68,6 @@ impl Projects {
+     }
+ }
+ 
+-pub(in crate::ui) fn folder_name(path: &Path) -> String {
+-    path.file_name()
+-        .map(|name| name.to_string_lossy().into_owned())
+-        .unwrap_or_else(|| path.display().to_string())
+-}
+-
+ /// Use the shortest parent suffix that separates each namesake from its peers.
+ /// Only compare the rows in this menu; callbacks still receive their original paths.
+ fn recent_labels(paths: &[&Path]) -> Vec<String> {
+diff --git a/src/ui/format.rs b/src/ui/format.rs
+index c49ab1fab0cd14a81a19121269299b310d71e3a0..0db55f90633de77f242875fad01e7fa8cc5f1f6d 100644
+--- a/src/ui/format.rs
++++ b/src/ui/format.rs
+@@ -1,8 +1,16 @@
++use std::path::Path;
++
+ use chrono::Utc;
+ 
+ use crate::conversations::ConversationSummary;
+ use crate::settings::catalog::plural;
+ 
++pub(in crate::ui) fn folder_name(path: &Path) -> String {
++    path.file_name()
++        .map(|name| name.to_string_lossy().into_owned())
++        .unwrap_or_else(|| path.display().to_string())
++}
++
+ pub fn session_title(session: &ConversationSummary) -> String {
+     clip(crate::sessions::preview_title(session), 80)
+ }
+diff --git a/src/ui/launcher.rs b/src/ui/launcher.rs
+index f8751f361182a13eb5cbf8b41a7ad03883c7333a..a15675a4b473c1ae23dc9d7cd2014b7f0c5a2adc 100644
+--- a/src/ui/launcher.rs
++++ b/src/ui/launcher.rs
+@@ -11,9 +11,9 @@ use gpui_kit::component::*;
+ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+-use super::chrome::{self, Projects, WorkspaceRequest};
++use super::chrome::{self, Projects};
+ use super::prefs;
+-use super::workspace::{Status, Workspace};
++use super::workspace::{Status, Workspace, WorkspaceRequest};
+ use crate::launch::{LaunchOptions, StartupIntent, Target};
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index fa084310543a4570ed5a42467883598de0f40217..cc0113bc5a408498ea1b10337a06aa27a411a95c 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -43,11 +43,10 @@ use gpui_kit::*;
+ 
+ use crate::preferences::SESSIONS_PANEL;
+ use crate::tabs::Edge;
+-use crate::ui::chrome::WorkspaceRequest;
+ use crate::ui::motion::Spinner;
+ pub use launcher::Launcher;
+ use workspace::Status;
+-use workspace::Workspace;
++use workspace::{Workspace, WorkspaceRequest};
+ pub(crate) use workspace::startup::Preparation;
+ 
+ gpui_kit::actions!(
+@@ -323,7 +322,7 @@ impl Workspace {
+     }
+ 
+     fn sync_window_title(&mut self, window: &mut Window, cx: &App) {
+-        let project = chrome::folder_name(self.active_project_path());
++        let project = format::folder_name(self.active_project_path());
+         let title = match self.space_root_key() {
+             Some(dir) => format!("{} — {project} — Proteus", self.session_title(&dir, cx)),
+             None => format!("{project} — Proteus"),
+diff --git a/src/ui/panels/header.rs b/src/ui/panels/header.rs
+index 3ef9f8c9a04d6d40e40291c0ace7058cb610de56..8aaad61220d8a6b54ac8bbbd35b4c7409dd642ad 100644
+--- a/src/ui/panels/header.rs
++++ b/src/ui/panels/header.rs
+@@ -13,7 +13,7 @@ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::kit::Hint as _;
+ use crate::ui::search;
+-use crate::ui::workspace::Workspace;
++use crate::ui::workspace::{Workspace, WorkspaceRequest};
+ 
+ impl Workspace {
+     pub(super) fn render_panel_header(
+@@ -56,7 +56,7 @@ impl Workspace {
+                             .small()
+                             .hint("Открыть папку…", cx)
+                             .on_click(cx.listener(|_, _, _, cx| {
+-                                cx.emit(crate::ui::chrome::WorkspaceRequest::ChooseFolder);
++                                cx.emit(WorkspaceRequest::ChooseFolder);
+                             })),
+                     )
+                     .child(crate::ui::context::menu_button(
+diff --git a/src/ui/panels/sessions.rs b/src/ui/panels/sessions.rs
+index b88a5dc4ebee43bee39c7af6860f42d0a8d47029..ad85b8ca8a3309a960acb658fa6b013f544a611b 100644
+--- a/src/ui/panels/sessions.rs
++++ b/src/ui/panels/sessions.rs
+@@ -15,8 +15,8 @@ use gpui_kit::*;
+ use super::session_list::LayoutSlot;
+ use super::session_row::Look;
+ use crate::sessions::{Row, View};
+-use crate::ui::chrome::folder_name;
+ use crate::ui::fade::faded;
++use crate::ui::format::folder_name;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::tip::Tip as _;
+diff --git a/src/ui/settings/configurations.rs b/src/ui/settings/configurations.rs
+index c18d24bfa60f058e901a7e6fc869c87a69b8e90d..49d44af5a50c26e5b6cc39b03593a04558d34a90 100644
+--- a/src/ui/settings/configurations.rs
++++ b/src/ui/settings/configurations.rs
+@@ -11,7 +11,6 @@ use gpui_kit::*;
+ 
+ use super::SettingsView;
+ use super::widgets::{card, row, section};
+-use crate::ui::chrome::WorkspaceRequest;
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+@@ -19,6 +18,7 @@ use crate::ui::launcher::config::config_selector;
+ use crate::ui::launcher::visual::{self, Action};
+ use crate::ui::prefs::{self, WindowVisualPreferences};
+ use crate::ui::tip::Tip as _;
++use crate::ui::workspace::WorkspaceRequest;
+ use crate::visual_config::SelectionOrigin;
+ 
+ pub(in crate::ui) type OpenAgent = Rc<dyn Fn(Option<PathBuf>, &mut Window, &mut App)>;
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index c8743d1b670e42e157678c482baccc620ff834c4..00c11a133ba79cc717e83f53347161cbbe94c16c 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -11,7 +11,6 @@ use gpui_kit::*;
+ 
+ use super::chat::Chat;
+ use super::chats::OpenChat;
+-use super::chrome::WorkspaceRequest;
+ use super::panels::{Renaming, SessionList};
+ use super::settings::SettingsView;
+ use super::tabs::{SplitResize, TabDrop, TabMotion};
+@@ -56,6 +55,13 @@ pub(super) enum Status {
+     Failed(SharedString),
+ }
+ 
++/// The workspace asks the window to show another folder in its place.
++pub(in crate::ui) enum WorkspaceRequest {
++    Open(PathBuf),
++    ChooseFolder,
++    OpenConfig(Option<PathBuf>),
++}
++
+ impl EventEmitter<WorkspaceRequest> for Workspace {}
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
