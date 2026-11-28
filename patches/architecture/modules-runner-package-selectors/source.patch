@@ -1,0 +1,247 @@
+diff --git a/scripts/test.py b/scripts/test.py
+index cc024e2cc77face09980d808072104713716e44f..3d10dbeb48069795a5bd79c293fcc95a787f64e1 100755
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -9,6 +9,56 @@ import sys
+ ROOT = Path(__file__).resolve().parent.parent
+ 
+ 
++def package_scope(args):
++    """Read explicit Cargo package options, never test filters or libtest args."""
++    flags = {"--lib", "--tests", "--no-run", "--no-fail-fast", "--release", "--locked",
++             "--frozen", "--offline", "-q", "--quiet", "-v", "-vv", "--verbose"}
++    package_options = {"-p", "--package"}
++    valued = package_options | {"-j", "--jobs", "--profile", "--test", "--color",
++                                "--message-format"}
++    # Consume these values without treating a different workspace or a wider
++    # Cargo selection as the narrowly verified standalone storage scope.
++    other_valued = {"--manifest-path", "--exclude", "--config", "--target-dir",
++                    "--target", "--features", "-F", "--bin", "--example", "--bench"}
++    packages = set()
++    narrow = True
++    filter_seen = False
++    cargo = iter(args)
++    for arg in cargo:
++        if arg == "--":
++            break
++        if arg.startswith(("-q", "-v", "-r")):
++            short = arg[1:].lstrip("qvr")
++            if short.startswith("p"):
++                # Cargo can combine quiet/verbose/release flags with a short selector.
++                arg = "-" + short
++                narrow = False
++        option, equals, value = arg.partition("=")
++        if option in valued or option in other_valued:
++            value = value if equals else next(cargo, "")
++            if option in ("-j", "--jobs") and value.startswith("-") and value[1:].isdigit():
++                narrow = False
++                continue
++            if equals and option not in package_options and (not value or value.startswith("-")):
++                narrow = False
++                continue
++            if not value or value.startswith("-"):
++                return packages, False
++            if option in package_options:
++                packages.add(value)
++            if option in other_valued:
++                narrow = False
++        elif arg.startswith("-p"):
++            packages.add(arg[2:])
++        elif arg in flags or (arg.startswith("-j") and arg[2:].isdigit()):
++            continue
++        elif not arg.startswith("-") and arg and not filter_seen:
++            filter_seen = True
++        else:
++            narrow = False
++    return packages, narrow
++
++
+ def main(args):
+     if not args or args == ["--help"]:
+         print("Usage: scripts/test.py full [Cargo options]\n       scripts/test.py -p PACKAGE [Cargo options]")
+@@ -23,6 +73,7 @@ def main(args):
+     for key in ("NO_PROXY", "no_proxy"):
+         values = [value for value in env.get(key, "").split(",") if value]
+         env[key] = ",".join(dict.fromkeys([*values, "localhost", "127.0.0.1", "::1"]))
++    selected, _ = package_scope(args)
+     metadata = json.loads(subprocess.check_output(
+         ["cargo", "metadata", "--locked", "--format-version=1"],
+         cwd=ROOT, env=env, text=True,
+@@ -30,7 +81,7 @@ def main(args):
+     package = next(package for package in metadata["packages"] if package["name"] == "proteus-core")
+     harness = Path(package["manifest_path"]).parents[2]
+     env["PROTEUS_TEST_HARNESS_ROOT"] = str(harness)
+-    if full or "proteus-reference-module" in args:
++    if full or "proteus-reference-module" in selected:
+         binaries = json.loads(subprocess.check_output(
+             [sys.executable, str(ROOT / "package.py"), "--profile", "dev", "--print-artifacts"],
+             cwd=ROOT, env=env, text=True,
+@@ -48,7 +99,7 @@ def main(args):
+         env["PROTEUS_HOOK_SDK_ROOT"] = str(harness / "examples/modules/hook-process")
+         hook_tests = sorted((ROOT / "hook/claude-command-hooks/tests").glob("*.test.mjs"))
+         subprocess.run(["node", "--test", *map(str, hook_tests)], cwd=ROOT, env=env, check=True)
+-    elif any(arg in ("model-pack", "-pmodel-pack", "--package=model-pack") for arg in args):
++    elif "model-pack" in selected:
+         if not env.get("PROTEUS_TEST_SESSION_STORAGE_MODULE"):
+             binaries = json.loads(subprocess.check_output(
+                 [sys.executable, str(ROOT / "package.py"), "--profile", "dev",
+diff --git a/tests/test_runner_selection.py b/tests/test_runner_selection.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c362287079ee01e453bec6fc84e3645a1a77eef
+--- /dev/null
++++ b/tests/test_runner_selection.py
+@@ -0,0 +1,154 @@
++"""Runner fixture selection, without compiling or starting any worker."""
++import importlib.util
++import json
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++
++SPEC = importlib.util.spec_from_file_location(
++    "module_test_runner", Path(__file__).resolve().parents[1] / "scripts" / "test.py")
++runner = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(runner)
++
++HARNESS = Path("/pinned/harness")
++METADATA = json.dumps({"packages": [
++    {"name": "proteus-core", "manifest_path": str(HARNESS / "crates/proteus-core/Cargo.toml")},
++]})
++WORKER = "/fixture/session-storage"
++ARTIFACTS = json.dumps({"session-storage": WORKER})
++
++
++class RunnerSelection(unittest.TestCase):
++    def invoke(self, args, environ=None):
++        def prepare_output(command, **_):
++            if command[0] == "cargo":
++                return METADATA
++            return ARTIFACTS
++        with (patch.dict(runner.os.environ, environ or {}, clear=True),
++              patch.object(runner.subprocess, "check_output",
++                           side_effect=prepare_output) as prepare,
++              patch.object(runner.subprocess, "run") as setup,
++              patch.object(runner.subprocess, "call", return_value=0) as cargo):
++            self.assertEqual(runner.main(args), 0)
++        return (cargo.call_args.args[0], cargo.call_args.kwargs["env"],
++                [call.args[0] for call in prepare.call_args_list],
++                [call.args[0] for call in setup.call_args_list])
++
++    def test_explicit_storage_keeps_stock_harness_resolution(self):
++        for args in (
++            ["-p", "session-storage", "--lib", "paging", "--", "--nocapture"],
++            ["--package=proteus-session-storage-module", "--test", "process", "--offline"],
++            ["-psession-storage", "-p", "proteus-session-storage-module", "--release", "-j3",
++             "--", "--skip", "proteus-reference-module"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(prepare, [["cargo", "metadata", "--locked", "--format-version=1"]])
++                self.assertEqual(setup, [])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++
++    def test_uncertain_or_mixed_scopes_keep_the_pinned_harness(self):
++        for args in (
++            ["-p", "rg-search", "--lib"],
++            ["-p", "session-storage", "-p", "rg-search"],
++            ["-p", "session-storage", "--workspace"],
++            ["-p", "session-storage", "--manifest-path", "/other/Cargo.toml"],
++            ["--jobs=-1", "-p", "session-storage"],
++            ["-rp", "session-storage"],
++            ["--target-dir=-local-target", "-p", "session-storage"],
++            ["-j", "-1", "-p", "session-storage"],
++            ["--", "-p", "session-storage"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(prepare, [["cargo", "metadata", "--locked", "--format-version=1"]])
++                self.assertEqual(setup, [])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++
++    def test_interop_and_full_keep_their_existing_preparation(self):
++        for args, selected in (
++            (["full", "--", "--nocapture"], ["--workspace", "--no-fail-fast", "--", "--nocapture"]),
++            *((args, args) for args in (
++                ["-p", "proteus-reference-module", "--test", "context_preparation_interop"],
++                ["--package", "proteus-reference-module"],
++                ["-pproteus-reference-module"],
++                ["-p=proteus-reference-module"],
++                ["-vp", "proteus-reference-module"],
++                ["-rp", "proteus-reference-module"],
++                ["--jobs=-1", "-p", "proteus-reference-module"],
++                ["--package=proteus-reference-module"],
++                ["--package=proteus-reference-module", "--features", "fixture"],
++            )),
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *selected])
++                self.assertEqual(len(prepare), 2)
++                self.assertEqual(prepare[1][2:], ["--profile", "dev", "--print-artifacts"])
++                self.assertEqual([command[:2] for command in setup],
++                                 [["npm", "ci"], ["npm", "ci"],
++                                  [runner.sys.executable, "-m"], ["node", "--test"]])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], WORKER)
++                self.assertEqual(env["PROTEUS_TEST_MODULE_ARTIFACTS"],
++                                 str(runner.ROOT / "dist/.artifacts/dev.json"))
++                self.assertEqual(env["PROTEUS_HOOK_SDK_ROOT"],
++                                 str(HARNESS / "examples/modules/hook-process"))
++
++    def test_filters_and_libtest_args_are_not_package_selectors(self):
++        for args in (
++            ["-p", "rg-search", "model-pack"],
++            ["-p", "rg-search", "--test", "proteus-reference-module"],
++            ["-p", "rg-search", "--", "--skip", "proteus-reference-module",
++             "--skip", "model-pack"],
++            ["-p", "rg-search", "--", "--package=proteus-reference-module"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(prepare, [["cargo", "metadata", "--locked", "--format-version=1"]])
++                self.assertEqual(setup, [])
++                self.assertNotIn("PROTEUS_TEST_SESSION_STORAGE_MODULE", env)
++                self.assertNotIn("PROTEUS_TEST_MODULE_ARTIFACTS", env)
++
++    def test_model_pack_still_prepares_its_storage_fixture(self):
++        for args in (
++            ["-p", "model-pack", "--lib"],
++            ["-pmodel-pack", "--lib"],
++            ["-qp", "model-pack", "--lib"],
++            ["-j", "-1", "-p", "model-pack", "--lib"],
++            ["--target-dir=-local-target", "-p=model-pack"],
++            ["--package=model-pack", "--lib"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(len(prepare), 2)
++                self.assertEqual(prepare[1][2:], ["--profile", "dev", "--package", "session-storage",
++                                                 "--print-artifacts"])
++                self.assertEqual(setup, [])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], WORKER)
++
++
++    def test_model_storage_override_avoids_a_rebuild_for_all_package_forms(self):
++        for args in (
++            ["-p", "model-pack", "--lib"],
++            ["-pmodel-pack", "--lib"],
++            ["--package=model-pack", "--lib"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(
++                    args, {"PROTEUS_TEST_SESSION_STORAGE_MODULE": "/existing/storage"},
++                )
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(prepare, [["cargo", "metadata", "--locked", "--format-version=1"]])
++                self.assertEqual(setup, [])
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], "/existing/storage")
++
++
++if __name__ == "__main__":
++    unittest.main()
