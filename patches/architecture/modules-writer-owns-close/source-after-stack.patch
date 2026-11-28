@@ -1,0 +1,78 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index e9bb44136515480aa5a22eed07c9ab95b7f76881..b1f3920332bbbe2137a1cd6db6d60b3716ab3d74 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -352,6 +352,33 @@ impl State {
+         checked_path(session)
+     }
+ 
++    fn close_writer(&mut self, session: &SessionLocator, writer: Writer) {
++        let Writer {
++            backend,
++            _ownership,
++            ..
++        } = writer;
++        // SQLite may checkpoint and remove its WAL when the last writer
++        // connection closes. Rebind an already verified head while the
++        // session lease still excludes another writer.
++        let head = self.catalog_before_sqlite_close(session);
++        drop(backend);
++        if let Some((dir, mut prefix, summary)) = head
++            && let Ok(stamps) = source::source_stamp(&dir, self.kind)
++            && stamps != prefix.stamps
++            && stamps[2] == prefix.stamps[2]
++            && stamps[0]
++                .as_ref()
++                .zip(prefix.stamps[0].as_ref())
++                .is_some_and(|(new, old)| new.same_file(old))
++            && let Some(blobs) = source::blob_stamps(&dir)
++            && Some(source::blob_stamp_digest(&blobs)) == prefix.blob_digest
++        {
++            prefix.stamps = stamps;
++            self.save_catalog_head(&dir, summary, &prefix, blobs);
++        }
++    }
++
+     fn writer(&mut self, lease: &StorageWriterLease) -> Result<&mut Writer> {
+         let writer = self
+             .writers
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 74bb21f9e53ac46840e70880de0fc90fa7e96ee4..b9ab6a3f6099c6915694f39003ab681d4de64098 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -40,34 +40,7 @@ impl State {
+         remember_catalog_entry(&mut self.prefixes, &mut self.prefix_order, session, cache);
+     }
+ 
+-    pub(super) fn close_writer(&mut self, session: &SessionLocator, writer: Writer) {
+-        let Writer {
+-            backend,
+-            _ownership,
+-            ..
+-        } = writer;
+-        // SQLite may checkpoint and remove its WAL when the last writer
+-        // connection closes. Rebind an already verified head while the
+-        // session lease still excludes another writer.
+-        let head = self.catalog_before_sqlite_close(session);
+-        drop(backend);
+-        if let Some((dir, mut prefix, summary)) = head
+-            && let Ok(stamps) = source_stamp(&dir, self.kind)
+-            && stamps != prefix.stamps
+-            && stamps[2] == prefix.stamps[2]
+-            && stamps[0]
+-                .as_ref()
+-                .zip(prefix.stamps[0].as_ref())
+-                .is_some_and(|(new, old)| new.same_file(old))
+-            && let Some(blobs) = blob_stamps(&dir)
+-            && Some(blob_stamp_digest(&blobs)) == prefix.blob_digest
+-        {
+-            prefix.stamps = stamps;
+-            self.save_catalog_head(&dir, summary, &prefix, blobs);
+-        }
+-    }
+-
+-    fn catalog_before_sqlite_close(
++    pub(super) fn catalog_before_sqlite_close(
+         &self,
+         session: &SessionLocator,
+     ) -> Option<(PathBuf, PrefixCache, StorageSessionSummary)> {
