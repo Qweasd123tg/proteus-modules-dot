@@ -1,0 +1,139 @@
+diff --git a/src/settings/addons.rs b/src/settings/addons.rs
+index a5b81f6fdf44dba455bcfc9b45d9c246f00013c5..7ef1391a520aa6dea0768a27007a1d2597afe4ba 100644
+--- a/src/settings/addons.rs
++++ b/src/settings/addons.rs
+@@ -4,26 +4,13 @@
+ use std::path::{Path, PathBuf};
+ 
+ use proteus_contracts::app_protocol::addons::{
+-    AppAddonsSnapshot, AppAddonsUpdate, AppAgentPluginState, AppMcpServerState,
++    AppAddonsSnapshot, AppAgentPluginState, AppMcpServerState,
+ };
+ use proteus_contracts::app_protocol::config_builder::ConfigBuilderTool;
+ use proteus_contracts::domain::{AgentPluginConfig, ConfiguredMcpServerConfig, SkillDescriptor};
+ 
+ use super::draft::Draft;
+ 
+-/// Disabled lists are sets: kept sorted so switching an entry back and forth
+-/// leaves the draft equal to its baseline.
+-pub fn normalized(mut addons: AppAddonsUpdate) -> AppAddonsUpdate {
+-    for list in [
+-        &mut addons.addons.disabled_skills,
+-        &mut addons.addons.disabled_mcp_servers,
+-    ] {
+-        list.sort();
+-        list.dedup();
+-    }
+-    addons
+-}
+-
+ pub(super) fn set_listed(list: &mut Vec<String>, item: &str, listed: bool) {
+     match (
+         list.binary_search_by(|entry| entry.as_str().cmp(item)),
+@@ -240,6 +227,7 @@ pub fn tool_origin<'a>(
+ #[cfg(test)]
+ mod tool_origin_tests {
+     use super::*;
++    use proteus_contracts::app_protocol::addons::AppAddonsUpdate;
+     use proteus_contracts::contracts::ProcessToolOwner;
+ 
+     fn snapshot() -> AppAddonsSnapshot {
+diff --git a/src/settings/draft.rs b/src/settings/draft.rs
+index 485c90dd10ed5731479afe69ac4db8687664d4fc..bcb5a1c121c56a395a8272bf3bfc3b75dda8bb65 100644
+--- a/src/settings/draft.rs
++++ b/src/settings/draft.rs
+@@ -97,7 +97,7 @@ impl Draft {
+                 .map(|role| (role.name.clone(), role.model.clone()))
+                 .collect(),
+             mode: snapshot.permission_mode.clone(),
+-            addons: super::addons::normalized(snapshot.addon_settings.clone()),
++            addons: normalized_addons(snapshot.addon_settings.clone()),
+         }
+     }
+ 
+@@ -315,6 +315,19 @@ impl Draft {
+     }
+ }
+ 
++/// Disabled lists are sets: kept sorted so switching an entry back and forth
++/// leaves the draft equal to its baseline.
++fn normalized_addons(mut addons: AppAddonsUpdate) -> AppAddonsUpdate {
++    for list in [
++        &mut addons.addons.disabled_skills,
++        &mut addons.addons.disabled_mcp_servers,
++    ] {
++        list.sort();
++        list.dedup();
++    }
++    addons
++}
++
+ fn is_empty_object(value: &Value) -> bool {
+     value.as_object().is_some_and(Map::is_empty)
+ }
+diff --git a/src/settings/tests.rs b/src/settings/tests.rs
+index 664f5750535a396d1c2d6c7a2ce3053b486d5625..480ac9a6ae45db97c3faa079111c8febffb7b70f 100644
+--- a/src/settings/tests.rs
++++ b/src/settings/tests.rs
+@@ -8,9 +8,7 @@ use proteus_contracts::app_protocol::config_builder::{
+ use proteus_contracts::domain::{ConfigField, ConfigValueSchema, ModuleConfigSchema};
+ use serde_json::json;
+ 
+-use super::addons::{
+-    mcp_servers, normalized, package_contents, package_state, skills, tool_server,
+-};
++use super::addons::{mcp_servers, package_contents, package_state, skills, tool_server};
+ use super::catalog::{
+     CLIENT_PAGES, CONNECTION_PAGES, CONTEXT_PROVIDER_SLOT, HOOK_SLOT, MODEL_SLOT, POLICY_SLOT,
+     PROFILE_PAGES, PackState, PageId, TOOL_SLOT, area_page, missing_tools, module_info,
+@@ -323,27 +321,44 @@ fn addons_snapshot() -> AppAddonsSnapshot {
+ 
+ #[test]
+ fn addon_switches_stay_sets_and_mark_their_pages() {
+-    let mut baseline = Draft::default();
+-    baseline.addons = normalized(
+-        serde_json::from_value(json!({
++    let baseline = Draft::from_snapshot(&ConfigBuilderSnapshot {
++        addon_settings: serde_json::from_value(json!({
+             "addons": {
+                 "disabled_skills": ["b", "a", "b"],
+-                "disabled_mcp_servers": [],
++                "disabled_mcp_servers": ["z", "team:x", "a", "team:x"],
+                 "plugins": [{ "path": "pkg", "enabled": true }],
+             },
+             "mcp_servers": [{ "name": "db", "command": "db-mcp", "enabled": false }],
+         }))
+         .expect("addon settings"),
+-    );
++        ..Default::default()
++    });
+     assert_eq!(baseline.addons.addons.disabled_skills, ["a", "b"]);
++    assert_eq!(
++        baseline.addons.addons.disabled_mcp_servers,
++        ["a", "team:x", "z"]
++    );
+     let mut draft = baseline.clone();
+     draft.set_skill("a", true);
+     draft.set_skill("a", false);
+     assert!(!draft.is_dirty(&baseline));
+ 
++    // The package server has no configured entry; only the disable list changes.
++    assert!(draft.configured_mcp("team:x").is_none());
++    draft.set_mcp("team:x", false);
++    assert!(!draft.mcp_enabled("team:x"));
++    draft.set_mcp("team:x", true);
++    assert!(draft.mcp_enabled("team:x"));
++    assert!(draft.changes(&baseline).addon_settings.is_some());
++    draft.set_mcp("team:x", false);
++    assert!(!draft.mcp_enabled("team:x"));
++    assert_eq!(draft, baseline);
++    assert!(!draft.is_dirty(&baseline));
++    assert!(draft.changes(&baseline).addon_settings.is_none());
++
+     assert!(!draft.mcp_enabled("db"));
+     draft.set_mcp("db", true);
+-    draft.set_mcp("team:x", false);
++    assert!(draft.configured_mcp("db").unwrap().enabled);
+     draft.set_skill("c", false);
+     draft.set_package(Path::new("pkg"), false);
+     assert!(draft.mcp_enabled("db") && !draft.mcp_enabled("team:x"));
