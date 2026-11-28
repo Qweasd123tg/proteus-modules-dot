@@ -1,0 +1,319 @@
+diff --git a/context/context-pack/src/codex.rs b/context/context-pack/src/codex.rs
+index 42f8337a43dd2f99f7cdc104af10e648f643036b..864a9d78c72713265b2fceb58c9dbc6e8d43978d 100644
+--- a/context/context-pack/src/codex.rs
++++ b/context/context-pack/src/codex.rs
+@@ -5,19 +5,37 @@ pub(super) fn build_codex_context(
+     host: &mut ContextBuilderModuleHostMut<'_>,
+     config: CodexContextConfig,
+ ) -> anyhow::Result<ContextBundle> {
+-    let repo_config = RepoAwareContextConfig::from(&config);
+     let mut chunks = Vec::new();
+ 
+     for provider in &config.providers {
+         let mut provider_chunks = match provider.as_str() {
+             "project_instructions" => codex_project_instruction_chunks(&input, &config)?,
+             "environment" => environment_chunks(&input),
+-            "manifest" => manifest_chunks(&input, &repo_config)?,
++            "manifest" => manifest_chunks(
++                &input.task.cwd,
++                &config.manifest_files,
++                config.max_bytes_per_file,
++            )?,
+             "git_status" => git_status_chunks(&input)?,
+             "git_diff" => git_diff_chunks(&input, &config)?,
+-            "repo_tree" => repo_tree_chunks(&input, &repo_config)?,
+-            "memory" => memory_chunks(&input, host, &repo_config)?,
+-            "search" => search_chunks(&input, host, &repo_config)?,
++            "repo_tree" => repo_tree_chunks(
++                &input.task.cwd,
++                config.repo_tree_max_entries,
++                config.repo_tree_max_depth,
++                &config.repo_tree_skip_entries,
++            )?,
++            "memory" => memory_chunks(
++                &input,
++                host,
++                config.memory_provider.as_deref(),
++                config.memory_limit,
++            )?,
++            "search" => search_chunks(
++                &input,
++                host,
++                config.search_provider.as_deref(),
++                config.max_search_results,
++            )?,
+             external => external_provider_chunks(&input, host, external)?,
+         };
+         if provider == "project_instructions" {
+diff --git a/context/context-pack/src/config.rs b/context/context-pack/src/config.rs
+index f845a2b00699d0de6995e9b7cacc1a3ac6844fb0..847b9850fd602892297023f222b07226dbd64cdb 100644
+--- a/context/context-pack/src/config.rs
++++ b/context/context-pack/src/config.rs
+@@ -123,25 +123,6 @@ impl Default for CodexContextConfig {
+     }
+ }
+ 
+-impl From<&CodexContextConfig> for RepoAwareContextConfig {
+-    fn from(config: &CodexContextConfig) -> Self {
+-        Self {
+-            search_provider: config.search_provider.clone(),
+-            memory_provider: config.memory_provider.clone(),
+-            providers: config.providers.clone(),
+-            max_context_bytes: config.max_context_bytes,
+-            max_bytes_per_file: config.max_bytes_per_file,
+-            max_search_results: config.max_search_results,
+-            memory_limit: config.memory_limit,
+-            repo_tree_max_entries: config.repo_tree_max_entries,
+-            repo_tree_max_depth: config.repo_tree_max_depth,
+-            repo_tree_skip_entries: config.repo_tree_skip_entries.clone(),
+-            project_instruction_files: config.project_instruction_files.clone(),
+-            manifest_files: config.manifest_files.clone(),
+-        }
+-    }
+-}
+-
+ fn default_max_context_search_results() -> usize {
+     50
+ }
+diff --git a/context/context-pack/src/lib.rs b/context/context-pack/src/lib.rs
+index 9feaafefbcca1d00a8049dcfbcbc1075d468ecd0..019ec2bafd44099c7c15330e146b20205cedcb64 100644
+--- a/context/context-pack/src/lib.rs
++++ b/context/context-pack/src/lib.rs
+@@ -166,11 +166,30 @@ fn build_repo_aware_context(
+         match provider.as_str() {
+             "project_instructions" => chunks.extend(project_instruction_chunks(&input, &config)?),
+             "environment" => chunks.extend(environment_chunks(&input)),
+-            "manifest" => chunks.extend(manifest_chunks(&input, &config)?),
++            "manifest" => chunks.extend(manifest_chunks(
++                &input.task.cwd,
++                &config.manifest_files,
++                config.max_bytes_per_file,
++            )?),
+             "git_status" => chunks.extend(git_status_chunks(&input)?),
+-            "repo_tree" => chunks.extend(repo_tree_chunks(&input, &config)?),
+-            "memory" => chunks.extend(memory_chunks(&input, host, &config)?),
+-            "search" => chunks.extend(search_chunks(&input, host, &config)?),
++            "repo_tree" => chunks.extend(repo_tree_chunks(
++                &input.task.cwd,
++                config.repo_tree_max_entries,
++                config.repo_tree_max_depth,
++                &config.repo_tree_skip_entries,
++            )?),
++            "memory" => chunks.extend(memory_chunks(
++                &input,
++                host,
++                config.memory_provider.as_deref(),
++                config.memory_limit,
++            )?),
++            "search" => chunks.extend(search_chunks(
++                &input,
++                host,
++                config.search_provider.as_deref(),
++                config.max_search_results,
++            )?),
+             external => chunks.extend(external_provider_chunks(&input, host, external)?),
+         }
+     }
+@@ -272,17 +291,17 @@ fn project_instruction_chunk_for_dir(
+ }
+ 
+ fn manifest_chunks(
+-    input: &ContextBuilderModuleInput,
+-    config: &RepoAwareContextConfig,
++    cwd: &Path,
++    manifest_files: &[String],
++    max_bytes_per_file: usize,
+ ) -> anyhow::Result<Vec<ContextChunk>> {
+     let mut chunks = Vec::new();
+-    for file in &config.manifest_files {
++    for file in manifest_files {
+         let Some(relative_path) = safe_relative_path(file) else {
+             continue;
+         };
+-        let path = input.task.cwd.join(&relative_path);
+-        let Some(content) =
+-            read_bounded_workspace_utf8_file(&input.task.cwd, &path, config.max_bytes_per_file)?
++        let path = cwd.join(&relative_path);
++        let Some(content) = read_bounded_workspace_utf8_file(cwd, &path, max_bytes_per_file)?
+         else {
+             continue;
+         };
+@@ -389,18 +408,13 @@ fn git_diff_chunks(
+ }
+ 
+ fn repo_tree_chunks(
+-    input: &ContextBuilderModuleInput,
+-    config: &RepoAwareContextConfig,
++    cwd: &Path,
++    max_entries: usize,
++    max_depth: usize,
++    skip_entries: &[String],
+ ) -> anyhow::Result<Vec<ContextChunk>> {
+     let mut entries = Vec::new();
+-    collect_tree_entries(
+-        &input.task.cwd,
+-        &input.task.cwd,
+-        config.repo_tree_max_entries,
+-        config.repo_tree_max_depth,
+-        &config.repo_tree_skip_entries,
+-        &mut entries,
+-    )?;
++    collect_tree_entries(cwd, cwd, max_entries, max_depth, skip_entries, &mut entries)?;
+     if entries.is_empty() {
+         return Ok(Vec::new());
+     }
+diff --git a/context/context-pack/src/retrieval.rs b/context/context-pack/src/retrieval.rs
+index 55cd3a3cf8908e989d472a54edc826ee73ee4a14..a5f0b6b0b112347f8407855e51174d37331902c6 100644
+--- a/context/context-pack/src/retrieval.rs
++++ b/context/context-pack/src/retrieval.rs
+@@ -4,13 +4,14 @@ use crate::search_queries::extract_search_queries;
+ pub(super) fn memory_chunks(
+     input: &ContextBuilderModuleInput,
+     host: &mut ContextBuilderModuleHostMut<'_>,
+-    config: &RepoAwareContextConfig,
++    provider_id: Option<&str>,
++    limit: usize,
+ ) -> anyhow::Result<Vec<ContextChunk>> {
+     let mut chunks = recall_memory(
+         input,
+         host,
+-        config.memory_provider.as_deref(),
+-        MemoryQuery::new(input.task.text.clone(), config.memory_limit),
++        provider_id,
++        MemoryQuery::new(input.task.text.clone(), limit),
+     )?;
+     for chunk in &mut chunks {
+         chunk.source = format!("repo_aware:{}", chunk.source);
+@@ -23,23 +24,24 @@ pub(super) fn memory_chunks(
+ pub(super) fn search_chunks(
+     input: &ContextBuilderModuleInput,
+     host: &mut ContextBuilderModuleHostMut<'_>,
+-    config: &RepoAwareContextConfig,
++    provider_id: Option<&str>,
++    max_results: usize,
+ ) -> anyhow::Result<Vec<ContextChunk>> {
+-    if config.max_search_results == 0 || config.search_provider.is_none() {
++    if max_results == 0 || provider_id.is_none() {
+         return Ok(Vec::new());
+     }
+     let queries = extract_search_queries(&input.task.text);
+     if queries.is_empty() {
+         return Ok(Vec::new());
+     }
+-    let per_query_limit = config.max_search_results.div_ceil(queries.len()).max(1);
++    let per_query_limit = max_results.div_ceil(queries.len()).max(1);
+     let mut chunks = Vec::new();
+     let mut seen = std::collections::HashSet::new();
+     for query in queries {
+         let results = search_best_effort(
+             input,
+             host,
+-            config.search_provider.as_deref(),
++            provider_id,
+             SearchQuery::new(query.clone(), input.task.cwd.clone(), per_query_limit)
+                 .with_use_case("repo_aware_context"),
+             "repo_aware_context",
+@@ -66,7 +68,7 @@ pub(super) fn search_chunks(
+                 metadata_with(chunk.metadata.take(), "query", json!(query)),
+             );
+             chunks.push(chunk);
+-            if chunks.len() >= config.max_search_results {
++            if chunks.len() >= max_results {
+                 return Ok(chunks);
+             }
+         }
+diff --git a/context/context-pack/src/tests.rs b/context/context-pack/src/tests.rs
+index 01c969037d7d06ec67a1e8c884c2b1065b11e9f0..ddf8616f2fa18bd9cb1c0eba2b48325f7635c71c 100644
+--- a/context/context-pack/src/tests.rs
++++ b/context/context-pack/src/tests.rs
+@@ -122,19 +122,80 @@ fn zero_search_limit_skips_host_search_in_simple_and_repo_aware() {
+     )
+     .unwrap();
+     assert_eq!(simple.chunks.len(), 1);
+-    let repo = search_chunks(
+-        &input,
+-        &mut host,
+-        &RepoAwareContextConfig {
+-            max_search_results: 0,
+-            search_provider: Some("search-fixture".into()),
+-            ..Default::default()
+-        },
+-    )
+-    .unwrap();
++    let repo = search_chunks(&input, &mut host, Some("search-fixture"), 0).unwrap();
+     assert!(repo.is_empty());
+ }
+ 
++#[test]
++fn context_profiles_send_their_own_retrieval_limits_in_provider_order() {
++    use proteus_contracts::process_module::{ContextBuilderModuleHost, ProcessModuleResult};
++
++    #[derive(Default)]
++    struct FixtureHost(std::sync::Mutex<Vec<(&'static str, usize)>>);
++
++    impl ContextBuilderModuleHost for FixtureHost {
++        fn context_provider_json(
++            &self,
++            provider_id: String,
++            request: String,
++        ) -> ProcessModuleResult<String> {
++            let request: ProcessContextProviderInput = serde_json::from_str(&request).unwrap();
++            assert_eq!(request.provider_id, provider_id);
++            let call = match provider_id.as_str() {
++                "memory-fixture" => {
++                    let query: MemoryQuery = serde_json::from_value(request.metadata).unwrap();
++                    assert_eq!(query.text, "needle");
++                    ("memory", query.limit)
++                }
++                "search-fixture" => {
++                    let query: SearchQuery = serde_json::from_value(request.metadata).unwrap();
++                    assert_eq!(query.text, "needle");
++                    assert_eq!(query.cwd, request.task.cwd);
++                    assert_eq!(query.use_case.as_deref(), Some("repo_aware_context"));
++                    ("search", query.max_results)
++                }
++                _ => panic!("unexpected fixture provider {provider_id}"),
++            };
++            self.0.lock().unwrap().push(call);
++            Ok("[]".to_owned())
++        }
++    }
++
++    let run = |builder: &dyn ContextBuilderModule, providers, memory_limit, max_search_results| {
++        let input = ContextBuilderModuleInput {
++            task: proteus_contracts::domain::AgentTask::new("needle", "fixture-root".into()),
++            attribution: proteus_contracts::contracts::ExecutionAttribution::detached(
++                proteus_contracts::domain::new_execution_id(),
++            ),
++            config: json!({
++                "providers": providers,
++                "memory_provider": "memory-fixture",
++                "search_provider": "search-fixture",
++                "memory_limit": memory_limit,
++                "max_search_results": max_search_results,
++            }),
++        };
++        let mut host = FixtureHost::default();
++        builder
++            .build_json(serde_json::to_string(&input).unwrap(), &mut host)
++            .unwrap();
++        host.0.into_inner().unwrap()
++    };
++    let repo = &RepoAwareContextBuilderModule as &dyn ContextBuilderModule;
++    let codex = &CodexContextBuilderModule as &dyn ContextBuilderModule;
++    assert_eq!(
++        run(repo, ["search", "memory"], 7, 3),
++        [("search", 3), ("memory", 7)],
++    );
++    assert_eq!(
++        run(codex, ["memory", "search"], 11, 5),
++        [("memory", 11), ("search", 5)],
++    );
++    for builder in [repo, codex] {
++        assert_eq!(run(builder, ["search", "memory"], 0, 0), [("memory", 0)]);
++    }
++}
++
+ #[test]
+ fn exact_byte_budget_keeps_every_chunk_in_provider_order() {
+     let chunks = vec![
