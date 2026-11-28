@@ -1,0 +1,255 @@
+diff --git a/package.py b/package.py
+index 40df98a66da97efad9815b38160d9f0f95472210..5a440b59bd567de118d2d2c985862d4b3a938884 100644
+--- a/package.py
++++ b/package.py
+@@ -141,7 +141,8 @@ def cargo_lines(text):
+     yield from text[start:].splitlines()
+ 
+ 
+-def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *, digests=None):
++def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
++          digests=None, artifact_report=None):
+     command = ["cargo", "build", "--locked", "--profile", profile,
+                "--message-format=json-render-diagnostics"]
+     for package in selected:
+@@ -208,6 +209,8 @@ def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
+                for package in selected}
+     index["packages"].update(records)
+     atomic_json(index, destination)
++    if artifact_report is not None:
++        artifact_report.update(records)
+     if digests is not None:
+         digests.update({identity: record["sha256"] for identity, record in records.items()})
+     return resolved
+@@ -383,8 +386,11 @@ def main(argv=None, *, root=ROOT):
+     modes.add_argument("--bundle", type=Path, help="install selected packages into a runtime root")
+     modes.add_argument("--install", type=Path, help="update exactly one package in an existing runtime root")
+     modes.add_argument("--print-artifacts", action="store_true", help="print selected binary paths as JSON; do not package")
++    modes.add_argument("--print-artifact-report", action="store_true", help="print this fresh build's artifact records as JSON")
+     modes.add_argument("--output", type=Path, help="ZIP directory (default: dist)")
+     args = parser.parse_args(argv)
++    if args.print_artifact_report and args.no_build:
++        parser.error("--print-artifact-report requires a fresh build")
+     available = package_index(root)
+     requested = args.package or list(available)
+     if len(set(requested)) != len(requested) or any(name not in available for name in requested):
+@@ -393,10 +399,14 @@ def main(argv=None, *, root=ROOT):
+         parser.error("--install requires exactly one --package")
+     selected = [load_package(name, available[name]) for name in requested]
+     digests = {}
++    artifact_report = {} if args.print_artifact_report else None
+     outputs = (reuse(selected, args.profile, root=root, digests=digests) if args.no_build else
+-               build(selected, args.profile, args.target_dir, root=root, digests=digests))
++               build(selected, args.profile, args.target_dir, root=root, digests=digests,
++                     artifact_report=artifact_report))
+     if args.print_artifacts:
+         print(json.dumps({identity: str(path) for identity, path in outputs.items()}))
++    elif args.print_artifact_report:
++        print(json.dumps({"packages": artifact_report}))
+     elif args.bundle or args.install:
+         for package in selected:
+             install(package, outputs[package.identity], args.bundle or args.install,
+diff --git a/scripts/test.py b/scripts/test.py
+index f7f6f0cd63bb79a700242af599d4ec16db7cb4cd..68b8f220e7ccc986e90d1c05d2d9715b5db9c283 100755
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -1,10 +1,12 @@
+ #!/usr/bin/env python3
+ """Test implementations against their pinned harness dependency."""
++from contextlib import ExitStack
+ import json
+ import os
+ from pathlib import Path
+ import subprocess
+ import sys
++from tempfile import TemporaryDirectory
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+ STORAGE_TARGETS = {"session-storage", "proteus-session-storage-module"}
+@@ -40,7 +42,7 @@ def storage_only(args):
+     return bool(packages) and all(package in STORAGE_TARGETS for package in packages)
+ 
+ 
+-def prepare_harness(args, env, full):
++def prepare_harness(args, env, full, cleanup):
+     metadata = json.loads(subprocess.check_output(
+         ["cargo", "metadata", "--locked", "--format-version=1"],
+         cwd=ROOT, env=env, text=True,
+@@ -49,12 +51,16 @@ def prepare_harness(args, env, full):
+     harness = Path(package["manifest_path"]).parents[2]
+     env["PROTEUS_TEST_HARNESS_ROOT"] = str(harness)
+     if full or "proteus-reference-module" in args:
+-        binaries = json.loads(subprocess.check_output(
+-            [sys.executable, str(ROOT / "package.py"), "--profile", "dev", "--print-artifacts"],
++        directory = cleanup.enter_context(TemporaryDirectory(prefix="proteus-test-artifacts-"))
++        report = Path(directory) / "artifacts.json"
++        receipt = subprocess.check_output(
++            [sys.executable, str(ROOT / "package.py"), "--profile", "dev", "--print-artifact-report"],
+             cwd=ROOT, env=env, text=True,
+-        ))
+-        env["PROTEUS_TEST_SESSION_STORAGE_MODULE"] = binaries["session-storage"]
+-        env["PROTEUS_TEST_MODULE_ARTIFACTS"] = str(ROOT / "dist/.artifacts/dev.json")
++        )
++        packages = json.loads(receipt)["packages"]
++        env["PROTEUS_TEST_SESSION_STORAGE_MODULE"] = packages["session-storage"]["executable"]
++        report.write_text(receipt, encoding="utf-8")
++        env["PROTEUS_TEST_MODULE_ARTIFACTS"] = str(report)
+         # Installer integration tests use the real pinned dependency trees.
+         # Fresh CI checkouts have no node_modules to copy into the fixture.
+         for relative, options in (("tool/pi-tools", ["--omit=dev"]),
+@@ -90,9 +96,10 @@ def main(args):
+     for key in ("NO_PROXY", "no_proxy"):
+         values = [value for value in env.get(key, "").split(",") if value]
+         env[key] = ",".join(dict.fromkeys([*values, "localhost", "127.0.0.1", "::1"]))
+-    if full or not storage_only(args):
+-        prepare_harness(args, env, full)
+-    return subprocess.call(["cargo", "test", "--locked", *args], cwd=ROOT, env=env)
++    with ExitStack() as cleanup:
++        if full or not storage_only(args):
++            prepare_harness(args, env, full, cleanup)
++        return subprocess.call(["cargo", "test", "--locked", *args], cwd=ROOT, env=env)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_package.py b/tests/test_package.py
+index bccef4b427a62b8c8df42737e0197d844fa2434d..8c9c50276024255e38c44905c6d798003eba243f 100644
+--- a/tests/test_package.py
++++ b/tests/test_package.py
+@@ -1,5 +1,7 @@
+ """Build scope, recorded Cargo outputs and independent package publication."""
++from contextlib import redirect_stderr, redirect_stdout
+ import importlib.util
++from io import StringIO
+ import json
+ from pathlib import Path
+ import subprocess
+@@ -68,6 +70,38 @@ class PackageTests(unittest.TestCase):
+         self.assertEqual(after["packages"]["two"], before)
+         self.assertEqual(after["last_build"]["selected"], ["one"])
+ 
++    def test_fresh_report_excludes_previous_artifacts_without_changing_reuse_or_stdout(self):
++        self.build(["two"])
++        record = json.loads(package.index_path("release", self.root).read_text())["packages"]["two"]
++        manifest, executable = self.packages["one"].manifest, self.outputs["one"]
++        result = subprocess.CompletedProcess(["cargo"], 0, "\n".join(map(json.dumps, [
++            {"reason": "compiler-artifact", "manifest_path": str(manifest),
++             "target": {"name": self.packages["one"].binary, "kind": ["bin"]},
++             "profile": {"test": False}, "executable": str(executable)},
++            {"reason": "build-finished", "success": True},
++        ])))
++        stdout = StringIO()
++        with patch.object(package.subprocess, "run", return_value=result), redirect_stdout(stdout):
++            package.main(["--package", "one", "--print-artifact-report"], root=self.root)
++        saved = json.loads(package.index_path("release", self.root).read_text())["packages"]
++        self.assertEqual(json.loads(stdout.getvalue()), {"packages": {"one": saved["one"]}})
++        self.assertEqual(saved["two"], record)
++        stdout = StringIO()
++        with patch.object(package.subprocess, "run") as run, redirect_stdout(stdout):
++            package.main(["--package", "two", "--print-artifacts", "--no-build",
++                          "--target-dir", str(self.root / "different target")], root=self.root)
++        run.assert_not_called()
++        self.assertEqual(json.loads(stdout.getvalue()), {"two": str(self.outputs["two"])})
++
++    def test_report_is_fresh_only_and_exclusive_with_legacy_output(self):
++        for args in (["--print-artifact-report", "--no-build"],
++                     ["--print-artifact-report", "--print-artifacts"]):
++            with self.subTest(args=args), patch.object(package, "build") as build, \
++                 redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
++                package.main(args)
++            self.assertEqual(caught.exception.code, 2)
++            build.assert_not_called()
++
+     def test_failed_build_never_replaces_recorded_outputs(self):
+         self.build(["one"])
+         path = package.index_path("release", self.root)
+diff --git a/tests/test_reference_artifacts.py b/tests/test_reference_artifacts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..929b35919d9642a5696a83191563ee03ff750295
+--- /dev/null
++++ b/tests/test_reference_artifacts.py
+@@ -0,0 +1,41 @@
++"""Conformance tests consume a private receipt from their own package build."""
++import importlib.util
++import json
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
++spec = importlib.util.spec_from_file_location("reference_test_runner", SCRIPTS / "test.py")
++runner = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(runner)
++
++
++class ReferenceArtifactsTest(unittest.TestCase):
++    def test_fresh_receipt_lives_until_the_test_process_returns(self):
++        receipt = {"packages": {"session-storage": {"executable": "/fresh/storage"}}}
++        report = None
++
++        def check_output(command, **_):
++            if command[:2] == ["cargo", "metadata"]:
++                return json.dumps({"packages": [{"name": "proteus-core",
++                    "manifest_path": "/fixture/core/crates/proteus-core/Cargo.toml"}]})
++            self.assertEqual(command[1:],
++                             [str(runner.ROOT / "package.py"), "--profile", "dev", "--print-artifact-report"])
++            return json.dumps(receipt)
++
++        def cargo_test(command, *, cwd, env):
++            nonlocal report
++            self.assertEqual(command[:3], ["cargo", "test", "--locked"])
++            self.assertEqual(cwd, runner.ROOT)
++            report = Path(env["PROTEUS_TEST_MODULE_ARTIFACTS"])
++            self.assertEqual(json.loads(report.read_text()), receipt)
++            self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], "/fresh/storage")
++            return 17
++
++        with patch.object(runner.subprocess, "check_output", side_effect=check_output), \
++             patch.object(runner.subprocess, "run"), \
++             patch.object(runner.subprocess, "call", side_effect=cargo_test):
++            self.assertEqual(runner.main(["-p", "proteus-reference-module"]), 17)
++        self.assertIsNotNone(report)
++        self.assertFalse(report.parent.exists())
+diff --git a/tests/test_runner_selection.py b/tests/test_runner_selection.py
+index 2a2711ebbc3a541f81a486f55633c793536d7d6a..4349a07656d068bab09c89d9239ad1bdd4c81e0b 100644
+--- a/tests/test_runner_selection.py
++++ b/tests/test_runner_selection.py
+@@ -17,16 +17,28 @@ METADATA = json.dumps({"packages": [
+ ]})
+ WORKER = "/fixture/session-storage"
+ ARTIFACTS = json.dumps({"session-storage": WORKER})
++REPORT = {"packages": {"session-storage": {"executable": WORKER}}}
+ 
+ 
+ class RunnerSelection(unittest.TestCase):
+     def invoke(self, args):
++        observed = []
++        def prepare_output(command, **_):
++            if command[0] == "cargo":
++                return METADATA
++            return json.dumps(REPORT) if "--print-artifact-report" in command else ARTIFACTS
++        def test_process(_command, *, env, **_):
++            if report := env.get("PROTEUS_TEST_MODULE_ARTIFACTS"):
++                self.assertEqual(json.loads(Path(report).read_text()), REPORT)
++                observed.append(Path(report))
++            return 0
+         with (patch.dict(runner.os.environ, {}, clear=True),
+               patch.object(runner.subprocess, "check_output",
+-                           side_effect=[METADATA, ARTIFACTS]) as prepare,
++                           side_effect=prepare_output) as prepare,
+               patch.object(runner.subprocess, "run") as setup,
+-              patch.object(runner.subprocess, "call", return_value=0) as cargo):
++              patch.object(runner.subprocess, "call", side_effect=test_process) as cargo):
+             self.assertEqual(runner.main(args), 0)
++        self.assertTrue(all(not report.exists() for report in observed))
+         return (cargo.call_args.args[0], cargo.call_args.kwargs["env"],
+                 [call.args[0] for call in prepare.call_args_list],
+                 [call.args[0] for call in setup.call_args_list])
+@@ -69,7 +81,7 @@ class RunnerSelection(unittest.TestCase):
+                 command, env, prepare, setup = self.invoke(args)
+                 self.assertEqual(command, ["cargo", "test", "--locked", *selected])
+                 self.assertEqual(len(prepare), 2)
+-                self.assertEqual(prepare[1][2:], ["--profile", "dev", "--print-artifacts"])
++                self.assertEqual(prepare[1][2:], ["--profile", "dev", "--print-artifact-report"])
+                 self.assertEqual([command[:2] for command in setup],
+                                  [["npm", "ci"], ["npm", "ci"],
+                                   [runner.sys.executable, "-m"], ["node", "--test"]])
