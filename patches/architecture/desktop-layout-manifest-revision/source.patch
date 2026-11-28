@@ -1,0 +1,42 @@
+diff --git a/src/ui/extensions/declarative/mod.rs b/src/ui/extensions/declarative/mod.rs
+index 77d86925fa03e308f267b89cb049b3f844ad231a..5d8a77de119172eab23a6dab38e12e4c181af3b8 100644
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -127,6 +127,7 @@ fn entry(extension: Installed) -> Entry {
+         tool_dependencies: manifest.dependencies.tools.as_slice(),
+         agent_instructions: &manifest.agent_instructions,
+         package_dir: &installed.dir,
++        source_revision: installed.revision,
+         panel: surfaces.panel.as_ref().map(|panel| PanelSurface {
+             title: &panel.title,
+             build: build_panel,
+diff --git a/src/ui/extensions/mod.rs b/src/ui/extensions/mod.rs
+index 6a200b04dfd7c11fa68946c284aed4c86f86bf8d..f43e138c1aa4179ebd42a8bb71cb6c51a44df305 100644
+--- a/src/ui/extensions/mod.rs
++++ b/src/ui/extensions/mod.rs
+@@ -56,14 +56,12 @@ pub(in crate::ui) fn render_generation(cx: &App) -> u64 {
+         )
+ }
+ 
+-/// Reuses the registry's source revision. No filesystem scan or process launch.
++/// Uses source revisions from the same registry snapshot as the order.
+ pub(in crate::ui) fn scalar_layout_fingerprint(cx: &App) -> Vec<(&'static str, u64)> {
+     ordered(cx)
+         .into_iter()
+         .filter(|manifest| is_enabled(manifest.id, cx))
+-        .filter_map(|manifest| {
+-            declarative::installed(manifest.id).map(|installed| (manifest.id, installed.revision))
+-        })
++        .map(|manifest| (manifest.id, manifest.source_revision))
+         .collect()
+ }
+ 
+@@ -151,6 +149,8 @@ pub(super) struct Manifest {
+     pub agent_instructions: &'static [crate::declarative::manifest::AgentInstruction],
+     /// Source of both bundled and user-installed package resources.
+     pub package_dir: &'static Path,
++    /// Source stamp captured together with this catalog entry.
++    source_revision: u64,
+     pub panel: Option<PanelSurface>,
+     pub document: Option<DocumentSurface>,
+     /// Borrowed language/media registrations; settings display these without a runtime.
