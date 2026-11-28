@@ -1,0 +1,166 @@
+diff --git a/crates/proteus-core/src/cli_doctor.rs b/crates/proteus-core/src/cli_doctor.rs
+index 25e47a9ff01ca2ff3bcef653fa70e9bd42c07436..167221f985e52b2d6a77923326ea961af1381c71 100644
+--- a/crates/proteus-core/src/cli_doctor.rs
++++ b/crates/proteus-core/src/cli_doctor.rs
+@@ -11,3 +11,5 @@ use crate::cli_init::{mixed_config_files_warning, single_config_file_for_warning
+ 
++mod findings;
+ mod session_storage;
++pub(crate) use findings::DoctorFindings;
+ pub(crate) use session_storage::SessionScope;
+@@ -512,24 +514,3 @@ fn first_existing_ancestor(path: &Path) -> Option<PathBuf> {
+ 
+-#[derive(Default)]
+-pub(crate) struct DoctorFindings {
+-    pub(crate) entries: Vec<DoctorFinding>,
+-}
+-
+ impl DoctorFindings {
+-    fn ok(&mut self, message: impl Into<String>) {
+-        self.entries.push(DoctorFinding::new("ok", message));
+-    }
+-
+-    fn warn(&mut self, message: impl Into<String>) {
+-        self.entries.push(DoctorFinding::new("warn", message));
+-    }
+-
+-    fn error(&mut self, message: impl Into<String>) {
+-        self.entries.push(DoctorFinding::new("error", message));
+-    }
+-
+-    pub(crate) fn has_errors(&self) -> bool {
+-        self.entries.iter().any(|entry| entry.level == "error")
+-    }
+-
+     fn print(&self) {
+@@ -543,15 +524 @@ impl DoctorFindings {
+ }
+-
+-pub(crate) struct DoctorFinding {
+-    pub(crate) level: &'static str,
+-    pub(crate) message: String,
+-}
+-
+-impl DoctorFinding {
+-    fn new(level: &'static str, message: impl Into<String>) -> Self {
+-        Self {
+-            level,
+-            message: message.into(),
+-        }
+-    }
+-}
+diff --git a/crates/proteus-core/src/cli_doctor/findings.rs b/crates/proteus-core/src/cli_doctor/findings.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f87b1d799025eb4219d34d728cfd4258994b97cf
+--- /dev/null
++++ b/crates/proteus-core/src/cli_doctor/findings.rs
+@@ -0,0 +1,68 @@
++//! Ordered findings shared by the doctor command and its checks.
++
++#[derive(Default)]
++pub(crate) struct DoctorFindings {
++    pub(crate) entries: Vec<DoctorFinding>,
++}
++
++impl DoctorFindings {
++    pub(super) fn ok(&mut self, message: impl Into<String>) {
++        self.entries.push(DoctorFinding::new("ok", message));
++    }
++
++    pub(super) fn warn(&mut self, message: impl Into<String>) {
++        self.entries.push(DoctorFinding::new("warn", message));
++    }
++
++    pub(super) fn error(&mut self, message: impl Into<String>) {
++        self.entries.push(DoctorFinding::new("error", message));
++    }
++
++    pub(crate) fn has_errors(&self) -> bool {
++        self.entries.iter().any(|entry| entry.level == "error")
++    }
++}
++
++pub(crate) struct DoctorFinding {
++    pub(crate) level: &'static str,
++    pub(crate) message: String,
++}
++
++impl DoctorFinding {
++    fn new(level: &'static str, message: impl Into<String>) -> Self {
++        Self {
++            level,
++            message: message.into(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn preserves_finding_order_and_reports_only_errors_as_errors() {
++        let mut findings = DoctorFindings::default();
++        findings.ok("first check");
++        findings.warn("warning check");
++        assert!(!findings.has_errors());
++
++        findings.error("failing check");
++        findings.ok("last check");
++        assert!(findings.has_errors());
++        assert_eq!(
++            findings
++                .entries
++                .iter()
++                .map(|entry| (entry.level, entry.message.as_str()))
++                .collect::<Vec<_>>(),
++            [
++                ("ok", "first check"),
++                ("warn", "warning check"),
++                ("error", "failing check"),
++                ("ok", "last check"),
++            ]
++        );
++    }
++}
+diff --git a/crates/proteus-core/src/cli_doctor/session_storage.rs b/crates/proteus-core/src/cli_doctor/session_storage.rs
+index 94c7452f163898cfdd62e80a097b5f77ab557493..d8a6e478bdad04b29ffa5a16100814a61d16bb05 100644
+--- a/crates/proteus-core/src/cli_doctor/session_storage.rs
++++ b/crates/proteus-core/src/cli_doctor/session_storage.rs
+@@ -9,3 +9,3 @@ use proteus_core::core::{SessionStore, config_store_root, list_session_summaries
+ 
+-use super::DoctorFindings;
++use super::findings::DoctorFindings;
+ 
+@@ -96,2 +96,31 @@ mod tests {
+ 
++    #[test]
++    fn disabled_or_unselected_storage_produces_exact_ordered_findings() {
++        let mut config = proteus_core::core::AppConfig::default();
++        config.modules.session_storage = None;
++        let mut findings = DoctorFindings::default();
++        let cwd = Path::new(".");
++        check_session_storage(&mut findings, &config, None, cwd, SessionScope::Workspace);
++        check_session_storage(
++            &mut findings,
++            &config,
++            Some(Path::new("unused-config.toml")),
++            cwd,
++            SessionScope::All,
++        );
++
++        assert!(!findings.has_errors());
++        assert_eq!(
++            findings
++                .entries
++                .iter()
++                .map(|entry| (entry.level, entry.message.as_str()))
++                .collect::<Vec<_>>(),
++            [
++                ("ok", "session storage: disabled without a config path"),
++                ("ok", "session storage: no module selected"),
++            ]
++        );
++    }
++
+     #[tokio::test]
