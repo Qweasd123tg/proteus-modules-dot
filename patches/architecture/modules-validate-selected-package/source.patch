@@ -1,0 +1,146 @@
+diff --git a/package.py b/package.py
+index eb81900ef3584827086c6a7e8e31be4366290372..40df98a66da97efad9815b38160d9f0f95472210 100644
+--- a/package.py
++++ b/package.py
+@@ -67,7 +67,8 @@ def model_connections(path, exports):
+     return tuple(entries)
+ 
+ 
+-def packages(root=ROOT):
++def package_index(root):
++    """Validate the workspace package identities without reading their payloads."""
+     found = {}
+     for exports in sorted((root / "components").glob("*/exports.json")):
+         manifest = exports.with_name("Cargo.toml")
+@@ -80,16 +81,25 @@ def packages(root=ROOT):
+         if (not isinstance(requirements, list)
+                 or not all(isinstance(value, str) and value.strip() for value in requirements)):
+             raise SystemExit(f"Invalid build requirements for module package: {identity}")
+-        declared_exports = json.loads(exports.read_text())
+-        found[identity] = Package(identity, spec["name"], spec["version"], manifest.resolve(),
+-                                  root / metadata["implementation"], declared_exports,
+-                                  tuple(dict.fromkeys(requirements)),
+-                                  model_connections(exports.with_name("model-connections.json"), declared_exports))
++        found[identity] = (manifest, spec["name"], spec["version"],
++                           root / metadata["implementation"], tuple(dict.fromkeys(requirements)))
+     if not found:
+         raise SystemExit(f"No module packages in {root}")
+     return found
+ 
+ 
++def load_package(identity, indexed):
++    manifest, binary, version, implementation, requirements = indexed
++    exports = json.loads(manifest.with_name("exports.json").read_text())
++    return Package(identity, binary, version, manifest.resolve(), implementation, exports,
++                   requirements, model_connections(manifest.with_name("model-connections.json"), exports))
++
++
++def packages(root=ROOT):
++    return {identity: load_package(identity, indexed)
++            for identity, indexed in package_index(root).items()}
++
++
+ def atomic_json(value, destination):
+     destination.parent.mkdir(parents=True, exist_ok=True)
+     descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+@@ -363,7 +373,7 @@ def archive(package, binary, output, root=ROOT, *, expected_sha256=None):
+         return destination
+ 
+ 
+-def main(argv=None):
++def main(argv=None, *, root=ROOT):
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--package", action="append", metavar="ID", help="select only this package (repeatable)")
+     parser.add_argument("--profile", default="release", help="Cargo profile (default: release)")
+@@ -375,26 +385,26 @@ def main(argv=None):
+     modes.add_argument("--print-artifacts", action="store_true", help="print selected binary paths as JSON; do not package")
+     modes.add_argument("--output", type=Path, help="ZIP directory (default: dist)")
+     args = parser.parse_args(argv)
+-    available = packages()
++    available = package_index(root)
+     requested = args.package or list(available)
+     if len(set(requested)) != len(requested) or any(name not in available for name in requested):
+         parser.error("--package must name distinct known packages: " + ", ".join(available))
+     if args.install and (not args.package or len(requested) != 1):
+         parser.error("--install requires exactly one --package")
+-    selected = [available[name] for name in requested]
++    selected = [load_package(name, available[name]) for name in requested]
+     digests = {}
+-    outputs = (reuse(selected, args.profile, digests=digests) if args.no_build else
+-               build(selected, args.profile, args.target_dir, digests=digests))
++    outputs = (reuse(selected, args.profile, root=root, digests=digests) if args.no_build else
++               build(selected, args.profile, args.target_dir, root=root, digests=digests))
+     if args.print_artifacts:
+         print(json.dumps({identity: str(path) for identity, path in outputs.items()}))
+     elif args.bundle or args.install:
+         for package in selected:
+             install(package, outputs[package.identity], args.bundle or args.install,
+-                    expected_sha256=digests[package.identity])
++                    root=root, expected_sha256=digests[package.identity])
+     else:
+         for package in selected:
+-            print(archive(package, outputs[package.identity], args.output or ROOT / "dist",
+-                          expected_sha256=digests[package.identity]))
++            print(archive(package, outputs[package.identity], args.output or root / "dist",
++                          root=root, expected_sha256=digests[package.identity]))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_package.py b/tests/test_package.py
+index 87f56451a200e29a7f944f60d31f0cd3d4353bf6..bccef4b427a62b8c8df42737e0197d844fa2434d 100644
+--- a/tests/test_package.py
++++ b/tests/test_package.py
+@@ -111,6 +111,38 @@ class PackageTests(unittest.TestCase):
+         self.assertEqual(manifest["exports"], {"tool": ["one"]})
+         self.assertEqual(manifest["command"], ["bin/proteus-one-module"])
+ 
++    def test_selected_install_does_not_read_unrelated_package_payloads(self):
++        self.build(["one"])
++        unrelated = self.root / "components/two"
++        for filename, invalid in (
++            ("exports.json", "{"),
++            ("model-connections.json", "{}"),
++        ):
++            path = unrelated / filename
++            original = path.read_bytes() if path.exists() else None
++            path.write_text(invalid)
++            with self.subTest(filename=filename):
++                destination = self.root / f"runtime-{filename}"
++                package.main(["--package", "one", "--no-build", "--install", str(destination)],
++                             root=self.root)
++                self.assertEqual((destination / "bin/proteus-one-module").read_bytes(), b"new one")
++                self.assertFalse((destination / "share/modules/two").exists())
++                for args in (["--package", "two"], []):
++                    with self.assertRaises(ValueError):
++                        package.main([*args, "--no-build", "--print-artifacts"], root=self.root)
++                with self.assertRaises(ValueError):
++                    package.packages(self.root)
++            if original is None:
++                path.unlink()
++            else:
++                path.write_bytes(original)
++
++    def test_selected_package_still_rejects_duplicate_workspace_ids(self):
++        manifest = self.root / "components/two/Cargo.toml"
++        manifest.write_text(manifest.read_text().replace('id = "two"', 'id = "one"'))
++        with self.assertRaisesRegex(SystemExit, "Duplicate module package: one"):
++            package.main(["--package", "one", "--no-build", "--print-artifacts"], root=self.root)
++
+     def test_author_owned_model_creation_presets_survive_package_delivery(self):
+         component = self.root / "components/one"
+         (component / "exports.json").write_text(json.dumps({"model": ["*"]}))
+@@ -258,12 +290,11 @@ class PackageTests(unittest.TestCase):
+         self.assertFalse((self.root / "zip/one.zip").exists())
+ 
+     def test_invalid_selection_fails_before_cargo(self):
+-        with patch.object(package, "packages", return_value=self.packages), \
+-             patch.object(package, "build") as build:
++        with patch.object(package, "build") as build:
+             for args in (["--package", "missing"], ["--package", "one", "--package", "one"],
+                          ["--install", str(self.root)]):
+                 with self.subTest(args=args), self.assertRaises(SystemExit):
+-                    package.main(args)
++                    package.main(args, root=self.root)
+             build.assert_not_called()
+ 
+ 
