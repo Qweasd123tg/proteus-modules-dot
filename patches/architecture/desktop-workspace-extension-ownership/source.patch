@@ -1,0 +1,432 @@
+diff --git a/src/ui/chats.rs b/src/ui/chats.rs
+index 2aee869152f03f28ed5f8447bd155856ec9aa0cc..02624a9ee45980f5e40b378383557c95b82d29fa 100644
+--- a/src/ui/chats.rs
++++ b/src/ui/chats.rs
+@@ -8,9 +8,8 @@ use std::rc::Rc;
+ use gpui_kit::*;
+ 
+ use super::chat::{Chat, ChatEvent, ComposerExtras, ComposerSlot};
+-use super::extensions::{HostEvent, OpenDocument};
+ use super::format;
+-use super::workspace::Workspace;
++use super::workspace::{HostEvent, OpenDocument, Workspace};
+ use crate::conversations::AgentKind;
+ use crate::preferences::BadgePlace;
+ use crate::tabs::{self, ChatKey, PaneId, TabLayout};
+diff --git a/src/ui/chats/subagent.rs b/src/ui/chats/subagent.rs
+index ba9fbf7c87624e47dfc50e52dd26176cf487b2bd..698ac8c0b95629be9a8261233a06e2ca2461b6af 100644
+--- a/src/ui/chats/subagent.rs
++++ b/src/ui/chats/subagent.rs
+@@ -6,8 +6,7 @@ use gpui_kit::*;
+ use proteus_contracts::app_protocol::AppSubagentSession;
+ 
+ use super::super::chat::{Chat, readonly::Target};
+-use super::super::extensions::SurfaceView;
+-use super::super::workspace::Workspace;
++use super::super::workspace::{SurfaceView, Workspace};
+ use crate::tabs::{ChatKey, Edge, PaneId, TabLayout};
+ 
+ fn catalog_target(
+diff --git a/src/ui/extensions/declarative/activity.rs b/src/ui/extensions/declarative/activity.rs
+index 3fd1b721c2b890e9d0d1ba7adde46fa07825852a..ff970446108750f27d0ea9866080c12df6eb5af2 100644
+--- a/src/ui/extensions/declarative/activity.rs
++++ b/src/ui/extensions/declarative/activity.rs
+@@ -8,7 +8,7 @@ use gpui_kit::*;
+ use super::view::DeclarativeView;
+ use super::{Host, SurfaceKind, embedded_surface, installed, runtime};
+ use crate::declarative::presentation::Face;
+-use crate::ui::extensions::SurfaceView;
++use crate::ui::workspace::SurfaceView;
+ 
+ pub(in crate::ui) struct ActivitySummary {
+     pub label: String,
+diff --git a/src/ui/extensions/declarative/badge.rs b/src/ui/extensions/declarative/badge.rs
+index a4672310f0e05f7c22b31f40fa2a3c0721fd93eb..eab461a7eabef2f28975766a4a8f485ca635326e 100644
+--- a/src/ui/extensions/declarative/badge.rs
++++ b/src/ui/extensions/declarative/badge.rs
+@@ -17,13 +17,14 @@ use crate::declarative::presentation::{Face, RingDisplay};
+ use crate::declarative::widget::Tone;
+ use crate::preferences::BadgePlace;
+ use crate::ui::kit::MetricText as _;
++use crate::ui::workspace::SurfaceView;
+ use crate::ui::{motion::Number, prefs};
+ use std::cell::Cell;
+ 
+ pub(super) struct DeclarativeBadge {
+     pub(super) host: Host,
+     pub(super) view: Entity<DeclarativeView>,
+-    pub(super) popup: crate::ui::motion::Popup<super::super::SurfaceView>,
++    pub(super) popup: crate::ui::motion::Popup<SurfaceView>,
+     pub(super) last_popup: Option<(
+         Rc<crate::declarative::widget::Node>,
+         std::collections::HashMap<String, String>,
+diff --git a/src/ui/extensions/declarative/mod.rs b/src/ui/extensions/declarative/mod.rs
+index 77d86925fa03e308f267b89cb049b3f844ad231a..33b03ec95f2ea84aa9df6771cac1a9eb68293779 100644
+--- a/src/ui/extensions/declarative/mod.rs
++++ b/src/ui/extensions/declarative/mod.rs
+@@ -43,9 +43,10 @@ use std::sync::RwLock;
+ use gpui_kit::assets::IconName as Lucide;
+ use gpui_kit::*;
+ 
+-use super::{BadgeSurface, DocumentSurface, Host, Manifest, PanelSurface, SurfaceView};
++use super::{BadgeSurface, DocumentSurface, Host, Manifest, PanelSurface};
+ use crate::declarative::manifest::{self, Installed, Problem};
+ use crate::declarative::protocol::SurfaceKind;
++use crate::ui::workspace::SurfaceView;
+ use runtime::Lifetime;
+ use runtime::Runtime;
+ use view::DeclarativeView;
+diff --git a/src/ui/extensions/declarative/runtime.rs b/src/ui/extensions/declarative/runtime.rs
+index 48d80bc4f7731835d751344f2085430b3796d53c..01817bf1c0a6f7e05d2d00ac62abf639a13a31c7 100644
+--- a/src/ui/extensions/declarative/runtime.rs
++++ b/src/ui/extensions/declarative/runtime.rs
+@@ -23,7 +23,8 @@ use crate::declarative::process::{Process, Signal};
+ use crate::declarative::protocol::{
+     Content, HostEventKind, Incoming, Outgoing, PROTOCOL, Server, SurfaceKind,
+ };
+-use crate::ui::extensions::host::{Host, HostEvent, OpenDocument};
++use crate::ui::extensions::host::Host;
++use crate::ui::workspace::{HostEvent, OpenDocument};
+ 
+ pub(super) struct Runtime {
+     generation: u64,
+diff --git a/src/ui/extensions/declarative/runtime/documents.rs b/src/ui/extensions/declarative/runtime/documents.rs
+index 5fd1a7e33a5a21eff66b57ce9c262c0993670379..d4e18300aa450199bba0fbada29d9219dde598f8 100644
+--- a/src/ui/extensions/declarative/runtime/documents.rs
++++ b/src/ui/extensions/declarative/runtime/documents.rs
+@@ -124,11 +124,10 @@ mod tests {
+     use super::*;
+     use crate::api::Api;
+     use crate::tabs::ChatKey;
+-    use crate::ui::workspace::Workspace;
++    use crate::ui::workspace::{SurfaceView, Workspace};
+ 
+     #[::core::prelude::v1::test]
+     fn production_root_retargets_the_native_tab_caption_and_retains_document_entity() {
+-        use crate::ui::extensions::SurfaceView;
+         use crate::ui::launcher::Launcher;
+         struct Document;
+         impl Render for Document {
+diff --git a/src/ui/extensions/host.rs b/src/ui/extensions/host.rs
+index 57a8b6ef7efa397b1b729de33c80e3f54fb90833..613d71882b8f6bfc7e5a93f34ae981d38ab1b701 100644
+--- a/src/ui/extensions/host.rs
++++ b/src/ui/extensions/host.rs
+@@ -9,7 +9,7 @@ use crate::preferences::BadgePlace;
+ use crate::tabs::ChatKey;
+ use crate::ui::chat::{Chat, Session};
+ use crate::ui::motion::PopupPanel;
+-use crate::ui::workspace::Workspace;
++use crate::ui::workspace::{HostEvent, OpenDocument, Workspace};
+ 
+ mod scope;
+ pub(in crate::ui) use scope::{Lifetime, RuntimeScope, ViewOwner};
+@@ -38,20 +38,6 @@ pub(in crate::ui) struct Host {
+     runtime_scope: RuntimeScope,
+ }
+ 
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(in crate::ui) enum HostEvent {
+-    /// Another chat became active, or the last one closed.
+-    SessionOpened,
+-    /// Session summaries arrived; the addressed folder may now be known.
+-    /// This does not change the session or its transcript projection.
+-    ContextChanged,
+-    /// A run of the active chat finished; files and quotas may differ.
+-    RunSettled,
+-    NavigationChanged,
+-}
+-
+-impl EventEmitter<HostEvent> for Workspace {}
+-
+ impl Host {
+     pub(in crate::ui) fn document_title(&self, argument: &str, title: String, cx: &mut App) {
+         if !self.runtime_scope.lifetime.session() {
+@@ -539,15 +525,6 @@ fn nonempty_session(session: PathBuf) -> Option<PathBuf> {
+ #[cfg(test)]
+ mod tests;
+ 
+-/// How [`Host::open_document`] shows a document.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(in crate::ui) struct OpenDocument {
+-    /// Temporary tab, replaced by the next preview.
+-    pub preview: bool,
+-    /// Move keyboard focus to the document.
+-    pub focus: bool,
+-}
+-
+ /// Read-only view of the workspace for one call of [`Host::read`].
+ pub(in crate::ui) struct HostView<'a> {
+     workspace: &'a Workspace,
+diff --git a/src/ui/extensions/mod.rs b/src/ui/extensions/mod.rs
+index 6a200b04dfd7c11fa68946c284aed4c86f86bf8d..d9b1479f1f05fc5a25a224af32bb02c89567c3c9 100644
+--- a/src/ui/extensions/mod.rs
++++ b/src/ui/extensions/mod.rs
+@@ -17,9 +17,10 @@ use std::path::Path;
+ pub(super) use badge::DraggedBadge;
+ pub(in crate::ui) use declarative::content;
+ pub(in crate::ui) use declarative::{ActivityContribution, ActivitySummary};
+-pub(super) use host::{Host, HostEvent, OpenDocument};
++pub(super) use host::Host;
+ 
+ use super::prefs;
++use super::workspace::SurfaceView;
+ use crate::declarative::manifest::Problem;
+ use crate::preferences::BadgePlace;
+ 
+@@ -108,27 +109,6 @@ pub(super) struct BadgeSurface {
+     pub narrow: bool,
+ }
+ 
+-/// A built view and the focus it takes when shown, so its own keyboard
+-/// shortcuts work right away.
+-#[derive(Clone)]
+-pub(super) struct SurfaceView {
+-    pub view: AnyView,
+-    pub focus: FocusHandle,
+-    pub rehost:
+-        std::rc::Rc<dyn Fn(WeakEntity<crate::ui::workspace::Workspace>, &mut Window, &mut App)>,
+-}
+-
+-impl SurfaceView {
+-    pub(in crate::ui) fn rehost(
+-        &self,
+-        workspace: WeakEntity<crate::ui::workspace::Workspace>,
+-        window: &mut Window,
+-        cx: &mut App,
+-    ) {
+-        (self.rehost)(workspace, window, cx);
+-    }
+-}
+-
+ pub(super) struct Manifest {
+     /// Human-readable metadata; never used for permissions or dispatch.
+     pub tags: Vec<&'static str>,
+diff --git a/src/ui/navigation.rs b/src/ui/navigation.rs
+index fc12621c4d8207633ef5a7e2804323abe438b05e..47357b0efa7032265f1dee2e82a430cbc119e7da 100644
+--- a/src/ui/navigation.rs
++++ b/src/ui/navigation.rs
+@@ -3,8 +3,8 @@
+ 
+ use gpui_kit::*;
+ 
+-use super::extensions::{self, OpenDocument};
+-use super::workspace::{Status, Workspace};
++use super::extensions;
++use super::workspace::{OpenDocument, Status, Workspace};
+ use crate::settings::catalog::PageId;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+diff --git a/src/ui/notifications.rs b/src/ui/notifications.rs
+index e348ac68a0c9489088c25b2baeee8805fbc6d497..dd4a1040a863cda64a8c35d57232f1e281c9f0f9 100644
+--- a/src/ui/notifications.rs
++++ b/src/ui/notifications.rs
+@@ -6,9 +6,8 @@ use std::path::{Path, PathBuf};
+ use gpui_kit::*;
+ use proteus_contracts::app_protocol::AppSessionActivityStatus;
+ 
+-use super::extensions::OpenDocument;
+ use super::prefs;
+-use super::workspace::Workspace;
++use super::workspace::{OpenDocument, Workspace};
+ use crate::notify;
+ use crate::preferences::Notifications;
+ 
+diff --git a/src/ui/panels/mod.rs b/src/ui/panels/mod.rs
+index 9ffd271dc671ac2839a9cd6487830498a7e5a3ea..28330ae635257ebfcbf236879c7212bc3f232665 100644
+--- a/src/ui/panels/mod.rs
++++ b/src/ui/panels/mod.rs
+@@ -16,9 +16,9 @@ use gpui_kit::assets::IconName as Lucide;
+ use gpui_kit::component::*;
+ use gpui_kit::*;
+ 
+-use super::extensions::{self, Host, SurfaceView};
++use super::extensions::{self, Host};
+ use super::prefs;
+-use super::workspace::Workspace;
++use super::workspace::{SurfaceView, Workspace};
+ use crate::preferences::SESSIONS_PANEL;
+ 
+ /// What the rail shows for a panel.
+diff --git a/src/ui/projects.rs b/src/ui/projects.rs
+index 35be0757220a170687e548056190af51982cc782..373c40d8d49d7b505b81a114803870336897878e 100644
+--- a/src/ui/projects.rs
++++ b/src/ui/projects.rs
+@@ -1,7 +1,8 @@
+ //! Project navigation used by the sessions sidebar and folder launcher.
+ //! A new chat inherits the latest session settings for its chosen project.
+ 
+-use super::{prefs, workspace::Workspace};
++use super::prefs;
++use super::workspace::{OpenDocument, Workspace};
+ use crate::conversations::{AgentKind, ConversationSummary};
+ use crate::tabs::{self, ChatKey};
+ use gpui_kit::*;
+@@ -225,8 +226,8 @@ impl Workspace {
+     }
+ }
+ 
+-fn project_open() -> super::extensions::OpenDocument {
+-    super::extensions::OpenDocument {
++fn project_open() -> OpenDocument {
++    OpenDocument {
+         preview: false,
+         focus: true,
+     }
+diff --git a/src/ui/settings/audit_tests.rs b/src/ui/settings/audit_tests.rs
+index dae66c3aabe1c1938b4d8752d5d1c5a9ddae0a16..a8113fda7b020943d1e3497aaa0a79228d35af71 100644
+--- a/src/ui/settings/audit_tests.rs
++++ b/src/ui/settings/audit_tests.rs
+@@ -1,8 +1,7 @@
+ use super::*;
+ use crate::conversations::AgentKind;
+ use crate::tabs::{ChatKey, PaneId};
+-use crate::ui::extensions::OpenDocument;
+-use crate::ui::workspace::Workspace;
++use crate::ui::workspace::{OpenDocument, Workspace};
+ 
+ mod catalog_save;
+ mod mode_edits;
+diff --git a/src/ui/settings/mod.rs b/src/ui/settings/mod.rs
+index c1d16ff5d33a1d382a571e3b43ae5b325e212f3e..778300a47ab05e6ec5a92a7ff8c871926e2b6dee 100644
+--- a/src/ui/settings/mod.rs
++++ b/src/ui/settings/mod.rs
+@@ -55,6 +55,7 @@ use gpui_kit::*;
+ use proteus_contracts::app_protocol::config_builder::ConfigBuilderSnapshot;
+ 
+ use crate::ui::kit::WorkspaceSurface as _;
++use crate::ui::workspace::SurfaceView;
+ 
+ use crate::settings::Draft;
+ use crate::settings::catalog::PageId;
+@@ -122,9 +123,9 @@ pub struct SettingsView {
+     fonts: fonts::Fonts,
+     catalogs: catalog::State,
+     workspace: WeakEntity<crate::ui::workspace::Workspace>,
+-    extension_view: Option<(String, crate::ui::extensions::SurfaceView)>,
++    extension_view: Option<(String, SurfaceView)>,
+     /// On-demand, synthetic preview; dropped after collapse or navigation.
+-    extension_preview: Option<(String, crate::ui::extensions::SurfaceView)>,
++    extension_preview: Option<(String, SurfaceView)>,
+     /// One packaged skill, read only after an explicit settings action.
+     extension_instructions: Option<extension_instructions::Instructions>,
+     /// Result of the last extension install or removal.
+diff --git a/src/ui/tabs/mod.rs b/src/ui/tabs/mod.rs
+index ed117a59a5d1b790aeae34dbe50a84bf543b4035..a7d0f2055083dafbbbab2da7bb9832663fff3ecb 100644
+--- a/src/ui/tabs/mod.rs
++++ b/src/ui/tabs/mod.rs
+@@ -22,9 +22,9 @@ pub(super) use tab::BAR_HEIGHT;
+ 
+ use gpui_kit::*;
+ 
+-use super::extensions::{self, Host, HostEvent, OpenDocument, SurfaceView};
++use super::extensions::{self, Host};
+ use super::prefs;
+-use super::workspace::Workspace;
++use super::workspace::{HostEvent, OpenDocument, SurfaceView, Workspace};
+ use crate::tabs::{self, Edge, PaneId, TabLayout};
+ 
+ /// Width a pane needs before a new tab may split it.
+diff --git a/src/ui/terminal/mod.rs b/src/ui/terminal/mod.rs
+index d78c251775e0c3ccc92c5f3101de9f098b8ad02a..bb21d2ab07237701c236e36c7c7d1fc56ad74a11 100644
+--- a/src/ui/terminal/mod.rs
++++ b/src/ui/terminal/mod.rs
+@@ -8,7 +8,7 @@ mod pending;
+ mod tests;
+ mod view;
+ 
+-use crate::ui::{extensions::SurfaceView, workspace::Workspace};
++use crate::ui::workspace::{SurfaceView, Workspace};
+ use crate::{
+     api::Api,
+     terminal::{Display, Grid},
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index be78aa9b96ff3f829d2099026b2674a6987f7bc7..389d22f9b3d334fc82a35885072e3243f0d8caeb 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -12,7 +12,6 @@ use gpui_kit::*;
+ use super::chat::Chat;
+ use super::chats::OpenChat;
+ use super::chrome::WorkspaceRequest;
+-use super::extensions::{OpenDocument, SurfaceView};
+ use super::panels::{Renaming, SessionList};
+ use super::settings::SettingsView;
+ use super::tabs::{SplitResize, TabDrop, TabMotion};
+@@ -59,6 +58,49 @@ pub(super) enum Status {
+ 
+ impl EventEmitter<WorkspaceRequest> for Workspace {}
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::ui) enum HostEvent {
++    /// Another chat became active, or the last one closed.
++    SessionOpened,
++    /// Session summaries arrived; the addressed folder may now be known.
++    /// This does not change the session or its transcript projection.
++    ContextChanged,
++    /// A run of the active chat finished; files and quotas may differ.
++    RunSettled,
++    NavigationChanged,
++}
++
++impl EventEmitter<HostEvent> for Workspace {}
++
++/// How the workspace shows a document or chat tab.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(in crate::ui) struct OpenDocument {
++    /// Temporary tab, replaced by the next preview.
++    pub preview: bool,
++    /// Move keyboard focus to the document.
++    pub focus: bool,
++}
++
++/// A built view and the focus it takes when shown, so its own keyboard
++/// shortcuts work right away.
++#[derive(Clone)]
++pub(super) struct SurfaceView {
++    pub view: AnyView,
++    pub focus: FocusHandle,
++    pub rehost: Rc<dyn Fn(WeakEntity<Workspace>, &mut Window, &mut App)>,
++}
++
++impl SurfaceView {
++    pub(in crate::ui) fn rehost(
++        &self,
++        workspace: WeakEntity<Workspace>,
++        window: &mut Window,
++        cx: &mut App,
++    ) {
++        (self.rehost)(workspace, window, cx);
++    }
++}
++
+ pub struct Workspace {
+     pub(super) workspace_path: PathBuf,
+     pub(super) status: Status,
+diff --git a/src/ui/workspace/documents.rs b/src/ui/workspace/documents.rs
+index be494492eee57711191c63bb05353717939a6b75..3d8a4d2dc7dbc1e8446bee9129aa5f7c0b5343fa 100644
+--- a/src/ui/workspace/documents.rs
++++ b/src/ui/workspace/documents.rs
+@@ -87,7 +87,7 @@ impl Workspace {
+         if collision_focused && self.settings.is_none() {
+             self.focus_active(window, cx);
+         }
+-        cx.emit(super::super::extensions::HostEvent::NavigationChanged);
++        cx.emit(HostEvent::NavigationChanged);
+         cx.notify();
+     }
+ }
+diff --git a/src/ui/workspace/spaces.rs b/src/ui/workspace/spaces.rs
+index 0bc7a7a113bc7dc6bbba9620551c459515e86e55..7909b37796493a2f02411fb445ab3e2e63c4cee8 100644
+--- a/src/ui/workspace/spaces.rs
++++ b/src/ui/workspace/spaces.rs
+@@ -6,10 +6,9 @@ use std::collections::{HashMap, HashSet};
+ 
+ use gpui_kit::*;
+ 
+-use super::Workspace;
++use super::{HostEvent, SurfaceView, Workspace};
+ use crate::conversations::ConversationSummary;
+ use crate::tabs::{self, ChatKey};
+-use crate::ui::extensions::{HostEvent, SurfaceView};
+ 
+ #[derive(Default)]
+ pub(super) struct SpaceViews {
