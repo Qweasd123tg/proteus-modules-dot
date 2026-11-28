@@ -1,0 +1,196 @@
+diff --git a/sdk/src/host.rs b/sdk/src/host.rs
+index 996e4478c1b0eb955ecd5c9e0abdf537be0f20a1..f4b6684d9f4355a934897d05c5153dad65338d4f 100644
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -628,18 +628,9 @@ impl Host {
+     /// An action changes shared data, so other retained views still
+     /// refresh, after the surface the user is currently interacting with.
+     fn render_all_from(&mut self, extension: &mut dyn Extension, first: Option<&str>) {
+-        let mut views: Vec<String> = self
+-            .views
+-            .keys()
+-            .filter(|view| self.view_session(view) == self.session.as_deref())
+-            .cloned()
+-            .collect();
+-        if let Some(index) = first.and_then(|first| views.iter().position(|view| view == first)) {
+-            views[..=index].rotate_right(1);
+-        }
+-        for view in views {
+-            self.render_view(extension, &view);
+-        }
++        self.render_matching_views(extension, first, |host, view| {
++            host.view_session(view) == host.session.as_deref()
++        });
+     }
+ 
+     fn change_session(&mut self, extension: &mut dyn Extension, session: Option<String>) -> bool {
+diff --git a/sdk/src/host/scopes.rs b/sdk/src/host/scopes.rs
+index 02cbe016d2eecb1f22ac98210dd6eaa09c024a83..44e805b857c942f342b23ce72169d2a0f3cea843 100644
+--- a/sdk/src/host/scopes.rs
++++ b/sdk/src/host/scopes.rs
+@@ -213,10 +213,8 @@ impl Host {
+     }
+ 
+     pub(super) fn render_every_context(&mut self, extension: &mut dyn Extension) {
+-        let views: Vec<_> = self.views.keys().cloned().collect();
+-        for view in views {
+-            self.render_view(extension, &view);
+-        }
++        let views = self.views.keys().cloned().collect();
++        self.render_view_ids(extension, views, None);
+     }
+ }
+ 
+diff --git a/sdk/src/host/tests.rs b/sdk/src/host/tests.rs
+index c7649292f0e1d432a61a3f3d67089d97c50eff57..fc0b95dafc3c9e17bf391894de8327cac33766ae 100644
+--- a/sdk/src/host/tests.rs
++++ b/sdk/src/host/tests.rs
+@@ -902,6 +902,72 @@ fn scoped_message(host: &mut Host, extension: &mut dyn Extension, value: Value)
+     host.handle(extension, value).unwrap();
+ }
+ 
++#[test]
++fn retained_render_fanout_preserves_scope_and_freezes_membership_before_callbacks() {
++    #[derive(Default)]
++    struct Probe(Vec<(String, Option<String>, Option<String>)>);
++
++    impl Probe {
++        fn rendered(&self) -> Vec<(&str, Option<&str>, Option<&str>)> {
++            self.0
++                .iter()
++                .map(|(view, context, session)| {
++                    (view.as_str(), context.as_deref(), session.as_deref())
++                })
++                .collect()
++        }
++    }
++
++    impl Extension for Probe {
++        fn render(&mut self, host: &mut Host, view: &str, _: Surface, _: Option<&str>) -> Result {
++            self.0.push((
++                view.into(),
++                host.current_context.clone(),
++                host.session.clone(),
++            ));
++            if self.0.len() == 1 {
++                host.activate_context("e");
++            }
++            Ok(())
++        }
++    }
++
++    let mut host = Host::default();
++    let mut probe = Probe::default();
++    for (context, session) in [("a", "/one"), ("b", "/one"), ("e", "/two")] {
++        host.contexts.insert(
++            context.into(),
++            Scope {
++                session: Some(session.into()),
++                ..Scope::default()
++            },
++        );
++    }
++    for (view, context) in [("e", "e"), ("d", "a"), ("c", "b"), ("b", "b"), ("a", "a")] {
++        host.views.insert(view.into(), (Surface::Page, None));
++        host.view_contexts.insert(view.into(), context.into());
++    }
++
++    host.activate_context("a");
++    host.render_all_from(&mut probe, Some("c"));
++    let a = ("a", Some("a"), Some("/one"));
++    let b = ("b", Some("b"), Some("/one"));
++    let c = ("c", Some("b"), Some("/one"));
++    let d = ("d", Some("a"), Some("/one"));
++    assert_eq!(probe.rendered(), [c, a, b, d]);
++
++    probe.0.clear();
++    host.activate_context("a");
++    host.render_visual_context(&mut probe, "a", Some("c"));
++    assert_eq!(probe.rendered(), [a, d]);
++
++    probe.0.clear();
++    host.activate_context("a");
++    host.render_every_context(&mut probe);
++    let e = ("e", Some("e"), Some("/two"));
++    assert_eq!(probe.rendered(), [a, b, c, d, e]);
++}
++
+ #[test]
+ fn two_windows_keep_session_instances_and_move_the_original_entries_buffer() {
+     let mut host = Host::default();
+diff --git a/sdk/src/host/views.rs b/sdk/src/host/views.rs
+index fdef44a3b531461f44743dd10de727e3e608f05d..8a03e0e1f69f1c997a047c5db8ce60da46f985e6 100644
+--- a/sdk/src/host/views.rs
++++ b/sdk/src/host/views.rs
+@@ -5,6 +5,7 @@ use serde::{Serialize, Serializer, ser::SerializeSeq};
+ use serde_json::Value;
+ 
+ use super::Host;
++use crate::Extension;
+ use crate::ui::SharedColumn;
+ 
+ #[derive(Serialize)]
+@@ -76,6 +77,37 @@ impl Serialize for ErrorChildren<'_> {
+ }
+ 
+ impl Host {
++    pub(super) fn render_matching_views(
++        &mut self,
++        extension: &mut dyn Extension,
++        first: Option<&str>,
++        matches: impl Fn(&Self, &str) -> bool,
++    ) {
++        // Callbacks can change the active scope. Freeze only membership and
++        // order here; render_view still resolves the live view and context.
++        let views = self
++            .views
++            .keys()
++            .filter(|view| matches(self, view.as_str()))
++            .cloned()
++            .collect();
++        self.render_view_ids(extension, views, first);
++    }
++
++    pub(super) fn render_view_ids(
++        &mut self,
++        extension: &mut dyn Extension,
++        mut views: Vec<String>,
++        first: Option<&str>,
++    ) {
++        if let Some(index) = first.and_then(|first| views.iter().position(|view| view == first)) {
++            views[..=index].rotate_right(1);
++        }
++        for view in views {
++            self.render_view(extension, &view);
++        }
++    }
++
+     pub(super) fn show_root(
+         &mut self,
+         view: &str,
+diff --git a/sdk/src/host/visual_preferences.rs b/sdk/src/host/visual_preferences.rs
+index a746e96c359974896eecc7a7a037ff76638ccdef..c665a9a99148b00c11b9026f2a982404505ec6d8 100644
+--- a/sdk/src/host/visual_preferences.rs
++++ b/sdk/src/host/visual_preferences.rs
+@@ -232,18 +232,9 @@ impl Host {
+         context: &str,
+         first: Option<&str>,
+     ) {
+-        let mut views: Vec<_> = self
+-            .views
+-            .keys()
+-            .filter(|view| self.view_contexts.get(*view).map(String::as_str) == Some(context))
+-            .cloned()
+-            .collect();
+-        if let Some(at) = first.and_then(|first| views.iter().position(|view| view == first)) {
+-            views[..=at].rotate_right(1);
+-        }
+-        for view in views {
+-            self.render_view(extension, &view);
+-        }
++        self.render_matching_views(extension, first, |host, view| {
++            host.view_contexts.get(view).map(String::as_str) == Some(context)
++        });
+     }
+ }
+ 
