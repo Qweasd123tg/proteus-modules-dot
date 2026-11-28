@@ -1,0 +1,420 @@
+diff --git a/crates/proteus-core/src/app_server/context_map/telemetry.rs b/crates/proteus-core/src/app_server/context_map/telemetry.rs
+index de0336436d539b52c50a9c43b1b0160e9f027682..c310ff893c25ad16b13a3af1a0d884eeba16fb61 100644
+--- a/crates/proteus-core/src/app_server/context_map/telemetry.rs
++++ b/crates/proteus-core/src/app_server/context_map/telemetry.rs
+@@ -1,19 +1,8 @@
+-use std::{
+-    collections::BTreeSet,
+-    fs::File,
+-    io::{BufRead, BufReader},
+-    path::Path,
+-    sync::Arc,
+-};
++use std::{fs::File, io::BufReader, path::Path, sync::Arc};
+ 
+ use anyhow::{Context, Result};
+-use serde::Serialize;
+-use serde_json::Value;
+ 
+ use crate::{
+-    app_server::{
+-        AppContextBuildSnapshot, AppContextCompactionSnapshot, AppContextToolSummary,
+-        AppContextUsageCategory, AppContextUsageSnapshot, paths_equal,
+-    },
+-    domain::{Event, EventEnvelope, SessionId, TokenUsageSnapshot, TokenUsageSource, TurnId},
++    app_server::paths_equal,
++    domain::{Event, EventEnvelope, SessionId},
+ };
+@@ -21,12 +10,5 @@ use crate::{
+ mod cache;
++mod projection;
+ 
+-/// Only log-derived state is reusable: callers supply current history and activity.
+-#[derive(Default, Serialize)]
+-pub(super) struct Telemetry {
+-    pub tools: AppContextToolSummary,
+-    pub latest_usage: Option<AppContextUsageSnapshot>,
+-    pub latest_context: Option<AppContextBuildSnapshot>,
+-    pub latest_compaction: Option<AppContextCompactionSnapshot>,
+-    pub diagnostics: Vec<String>,
+-}
++use projection::{Telemetry, parse};
+ 
+@@ -61,4 +43,6 @@ pub(super) fn read(
+     let telemetry = Arc::new(
+-        parse(BufReader::new(file), session_id, session_dir)
+-            .with_context(|| format!("failed to read {}", path.display()))?,
++        parse(BufReader::new(file), |envelope| {
++            matches_session(envelope, session_id, session_dir)
++        })
++        .with_context(|| format!("failed to read {}", path.display()))?,
+     );
+@@ -74,35 +58,2 @@ pub(super) fn read(
+ 
+-fn parse(
+-    mut reader: impl BufRead,
+-    session_id: Option<SessionId>,
+-    session_dir: Option<&Path>,
+-) -> Result<Telemetry> {
+-    let mut telemetry = Telemetry::default();
+-    let mut names = BTreeSet::new();
+-    let mut latest_usage = None;
+-    let mut skipped = 0usize;
+-    let mut line = String::new();
+-    while reader.read_line(&mut line)? != 0 {
+-        if !line.trim().is_empty() {
+-            match serde_json::from_str::<EventEnvelope>(&line) {
+-                Ok(envelope) if matches_session(&envelope, session_id, session_dir) => {
+-                    telemetry.apply(envelope, &mut names, &mut latest_usage);
+-                }
+-                Ok(_) => {}
+-                Err(_) => skipped += 1,
+-            }
+-        }
+-        line.clear();
+-    }
+-    // Only the last matching usage event contributes categories to the response.
+-    telemetry.latest_usage = latest_usage.map(UsageSample::into_snapshot);
+-    telemetry.tools.names = names.into_iter().collect();
+-    if skipped > 0 {
+-        telemetry
+-            .diagnostics
+-            .push(format!("skipped {skipped} malformed event log lines"));
+-    }
+-    Ok(telemetry)
+-}
+-
+ fn matches_session(
+@@ -126,109 +77 @@ fn matches_session(
+ }
+-
+-impl Telemetry {
+-    fn apply(
+-        &mut self,
+-        envelope: EventEnvelope,
+-        names: &mut BTreeSet<String>,
+-        latest_usage: &mut Option<UsageSample>,
+-    ) {
+-        match envelope.event {
+-            Event::ToolCallRequested { call } => {
+-                self.tools.requested += 1;
+-                names.insert(call.name);
+-            }
+-            Event::ToolFinished { result } => {
+-                self.tools.finished += 1;
+-                if !result.ok {
+-                    self.tools.failed += 1;
+-                }
+-            }
+-            Event::ContextBuilt {
+-                chunks,
+-                token_estimate,
+-            } => {
+-                let mut context = AppContextBuildSnapshot::new(chunks);
+-                context.token_estimate = token_estimate;
+-                context.turn_id = envelope.turn_id;
+-                context.timestamp_ms = Some(envelope.timestamp_ms);
+-                self.latest_context = Some(context);
+-            }
+-            Event::TokenUsageUpdated { usage } => {
+-                *latest_usage = Some(UsageSample {
+-                    usage,
+-                    turn_id: envelope.turn_id,
+-                    timestamp_ms: envelope.timestamp_ms,
+-                });
+-            }
+-            Event::HistoryCompactionStarted { .. } => {
+-                self.compaction("started", envelope.turn_id, envelope.timestamp_ms);
+-            }
+-            Event::HistoryCompactionCompleted { mut report } => {
+-                let summary_present = report.summary.is_some();
+-                report.summary = None;
+-                report.metadata = Value::Null;
+-                self.compaction("completed", envelope.turn_id, envelope.timestamp_ms);
+-                let snapshot = self.latest_compaction.as_mut().unwrap();
+-                snapshot.report = Some(report);
+-                snapshot.summary_present = summary_present;
+-            }
+-            Event::HistoryCompactionFailed { .. } => {
+-                self.compaction("failed", envelope.turn_id, envelope.timestamp_ms);
+-            }
+-            _ => {}
+-        }
+-    }
+-
+-    fn compaction(&mut self, status: &str, turn_id: Option<crate::domain::TurnId>, timestamp: i64) {
+-        let mut snapshot = AppContextCompactionSnapshot::new(status);
+-        snapshot.turn_id = turn_id;
+-        snapshot.timestamp_ms = Some(timestamp);
+-        self.latest_compaction = Some(snapshot);
+-    }
+-}
+-
+-struct UsageSample {
+-    usage: TokenUsageSnapshot,
+-    turn_id: Option<TurnId>,
+-    timestamp_ms: i64,
+-}
+-
+-impl UsageSample {
+-    fn into_snapshot(self) -> AppContextUsageSnapshot {
+-        let Self {
+-            usage,
+-            turn_id,
+-            timestamp_ms,
+-        } = self;
+-        let mut snapshot = AppContextUsageSnapshot::new(
+-            usage.model.provider,
+-            usage.model.model,
+-            usage.estimated_input_tokens,
+-            source_label(usage.source),
+-        );
+-        snapshot.phase = usage.phase;
+-        snapshot.max_input_tokens = usage.max_input_tokens;
+-        snapshot.compaction_trigger_tokens = usage.compaction_trigger_tokens;
+-        snapshot.categories = usage
+-            .categories
+-            .into_iter()
+-            .map(|category| {
+-                AppContextUsageCategory::new(category.name, category.tokens)
+-                    .with_source(source_label(category.source))
+-            })
+-            .collect();
+-        snapshot.actual = usage.actual;
+-        snapshot.turn_id = turn_id;
+-        snapshot.timestamp_ms = Some(timestamp_ms);
+-        snapshot
+-    }
+-}
+-
+-fn source_label(source: TokenUsageSource) -> &'static str {
+-    match source {
+-        TokenUsageSource::Estimated => "estimated",
+-        TokenUsageSource::Provider => "provider",
+-        TokenUsageSource::Mixed => "mixed",
+-        _ => "unknown",
+-    }
+-}
+diff --git a/crates/proteus-core/src/app_server/context_map/telemetry/cache.rs b/crates/proteus-core/src/app_server/context_map/telemetry/cache.rs
+index 4c3430aa0b7065d80a713f2e93b04ceaaeaa0375..aa954dab8297442a3064a81e4ae7daa9de9ac6e1 100644
+--- a/crates/proteus-core/src/app_server/context_map/telemetry/cache.rs
++++ b/crates/proteus-core/src/app_server/context_map/telemetry/cache.rs
+@@ -8,3 +8,3 @@ use std::{
+ 
+-use super::Telemetry;
++use super::projection::Telemetry;
+ use crate::domain::SessionId;
+diff --git a/crates/proteus-core/src/app_server/context_map/telemetry/projection.rs b/crates/proteus-core/src/app_server/context_map/telemetry/projection.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c919d42ac79be7903b1ed86ae4aa19500f31b945
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/context_map/telemetry/projection.rs
+@@ -0,0 +1,162 @@
++//! Reduce an event stream into a reusable context-map projection.
++use std::{collections::BTreeSet, io::BufRead};
++
++use anyhow::Result;
++use proteus_contracts::app_protocol::{
++    AppContextBuildSnapshot, AppContextCompactionSnapshot, AppContextToolSummary,
++    AppContextUsageCategory, AppContextUsageSnapshot,
++};
++use serde::Serialize;
++use serde_json::Value;
++
++use crate::domain::{Event, EventEnvelope, TokenUsageSnapshot, TokenUsageSource, TurnId};
++
++/// Only log-derived state is reusable: callers supply current history and activity.
++#[derive(Default, Serialize)]
++pub(in crate::app_server::context_map) struct Telemetry {
++    pub tools: AppContextToolSummary,
++    pub latest_usage: Option<AppContextUsageSnapshot>,
++    pub latest_context: Option<AppContextBuildSnapshot>,
++    pub latest_compaction: Option<AppContextCompactionSnapshot>,
++    pub diagnostics: Vec<String>,
++}
++
++pub(super) fn parse(
++    mut reader: impl BufRead,
++    matches_session: impl Fn(&EventEnvelope) -> bool,
++) -> Result<Telemetry> {
++    let mut telemetry = Telemetry::default();
++    let mut names = BTreeSet::new();
++    let mut latest_usage = None;
++    let mut skipped = 0usize;
++    let mut line = String::new();
++    while reader.read_line(&mut line)? != 0 {
++        if !line.trim().is_empty() {
++            match serde_json::from_str::<EventEnvelope>(&line) {
++                Ok(envelope) if matches_session(&envelope) => {
++                    telemetry.apply(envelope, &mut names, &mut latest_usage);
++                }
++                Ok(_) => {}
++                Err(_) => skipped += 1,
++            }
++        }
++        line.clear();
++    }
++    // Only the last matching usage event contributes categories to the response.
++    telemetry.latest_usage = latest_usage.map(UsageSample::into_snapshot);
++    telemetry.tools.names = names.into_iter().collect();
++    if skipped > 0 {
++        telemetry
++            .diagnostics
++            .push(format!("skipped {skipped} malformed event log lines"));
++    }
++    Ok(telemetry)
++}
++
++impl Telemetry {
++    fn apply(
++        &mut self,
++        envelope: EventEnvelope,
++        names: &mut BTreeSet<String>,
++        latest_usage: &mut Option<UsageSample>,
++    ) {
++        match envelope.event {
++            Event::ToolCallRequested { call } => {
++                self.tools.requested += 1;
++                names.insert(call.name);
++            }
++            Event::ToolFinished { result } => {
++                self.tools.finished += 1;
++                if !result.ok {
++                    self.tools.failed += 1;
++                }
++            }
++            Event::ContextBuilt {
++                chunks,
++                token_estimate,
++            } => {
++                let mut context = AppContextBuildSnapshot::new(chunks);
++                context.token_estimate = token_estimate;
++                context.turn_id = envelope.turn_id;
++                context.timestamp_ms = Some(envelope.timestamp_ms);
++                self.latest_context = Some(context);
++            }
++            Event::TokenUsageUpdated { usage } => {
++                *latest_usage = Some(UsageSample {
++                    usage,
++                    turn_id: envelope.turn_id,
++                    timestamp_ms: envelope.timestamp_ms,
++                });
++            }
++            Event::HistoryCompactionStarted { .. } => {
++                self.compaction("started", envelope.turn_id, envelope.timestamp_ms);
++            }
++            Event::HistoryCompactionCompleted { mut report } => {
++                let summary_present = report.summary.is_some();
++                report.summary = None;
++                report.metadata = Value::Null;
++                self.compaction("completed", envelope.turn_id, envelope.timestamp_ms);
++                let snapshot = self.latest_compaction.as_mut().unwrap();
++                snapshot.report = Some(report);
++                snapshot.summary_present = summary_present;
++            }
++            Event::HistoryCompactionFailed { .. } => {
++                self.compaction("failed", envelope.turn_id, envelope.timestamp_ms);
++            }
++            _ => {}
++        }
++    }
++
++    fn compaction(&mut self, status: &str, turn_id: Option<crate::domain::TurnId>, timestamp: i64) {
++        let mut snapshot = AppContextCompactionSnapshot::new(status);
++        snapshot.turn_id = turn_id;
++        snapshot.timestamp_ms = Some(timestamp);
++        self.latest_compaction = Some(snapshot);
++    }
++}
++
++struct UsageSample {
++    usage: TokenUsageSnapshot,
++    turn_id: Option<TurnId>,
++    timestamp_ms: i64,
++}
++
++impl UsageSample {
++    fn into_snapshot(self) -> AppContextUsageSnapshot {
++        let Self {
++            usage,
++            turn_id,
++            timestamp_ms,
++        } = self;
++        let mut snapshot = AppContextUsageSnapshot::new(
++            usage.model.provider,
++            usage.model.model,
++            usage.estimated_input_tokens,
++            source_label(usage.source),
++        );
++        snapshot.phase = usage.phase;
++        snapshot.max_input_tokens = usage.max_input_tokens;
++        snapshot.compaction_trigger_tokens = usage.compaction_trigger_tokens;
++        snapshot.categories = usage
++            .categories
++            .into_iter()
++            .map(|category| {
++                AppContextUsageCategory::new(category.name, category.tokens)
++                    .with_source(source_label(category.source))
++            })
++            .collect();
++        snapshot.actual = usage.actual;
++        snapshot.turn_id = turn_id;
++        snapshot.timestamp_ms = Some(timestamp_ms);
++        snapshot
++    }
++}
++
++fn source_label(source: TokenUsageSource) -> &'static str {
++    match source {
++        TokenUsageSource::Estimated => "estimated",
++        TokenUsageSource::Provider => "provider",
++        TokenUsageSource::Mixed => "mixed",
++        _ => "unknown",
++    }
++}
+diff --git a/crates/proteus-core/src/app_server/context_map/tests.rs b/crates/proteus-core/src/app_server/context_map/tests.rs
+index bee538edb822f2b1bc28c8657267b6b4b1f1c6cd..901b1bab2ed915fbe00e84e81273bca87227989e 100644
+--- a/crates/proteus-core/src/app_server/context_map/tests.rs
++++ b/crates/proteus-core/src/app_server/context_map/tests.rs
+@@ -280,2 +280,41 @@ fn telemetry_cache_detects_same_size_rewrite_even_with_restored_mtime() {
+ 
++#[test]
++fn telemetry_invalid_utf8_aborts_the_read_without_caching_a_partial_projection() {
++    let directory = tempfile::tempdir().unwrap();
++    let path = directory.path().join("events.jsonl");
++    let session = new_session_id();
++    let valid = [event(
++        session,
++        1,
++        Event::ContextBuilt {
++            chunks: 7,
++            token_estimate: None,
++        },
++    )];
++    write_events(&path, &valid, false);
++    OpenOptions::new()
++        .append(true)
++        .open(&path)
++        .unwrap()
++        .write_all(b"\xff\n")
++        .unwrap();
++
++    // A cache hit on the unchanged input would hide the second read error.
++    for _ in 0..2 {
++        let Err(error) = telemetry::read(&path, Some(session), None) else {
++            panic!("invalid UTF-8 must not return even a partial projection");
++        };
++        assert_eq!(error.to_string(), format!("failed to read {}", path.display()));
++        assert_eq!(
++            error.downcast_ref::<std::io::Error>().unwrap().kind(),
++            std::io::ErrorKind::InvalidData
++        );
++    }
++
++    write_events(&path, &valid, false);
++    let clean = telemetry::read(&path, Some(session), None).unwrap();
++    assert_eq!(clean.latest_context.as_ref().unwrap().chunks, 7);
++    assert!(clean.diagnostics.is_empty());
++}
++
+ #[test]
