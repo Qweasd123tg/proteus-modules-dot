@@ -1,0 +1,220 @@
+diff --git a/package.py b/package.py
+index 2187f869103d165c54f1a3c25d46e97283fa4cc8..feb1bd240b15993bc8a73d1228818e75a5d3e0f3 100644
+--- a/package.py
++++ b/package.py
+@@ -1,7 +1,6 @@
+ #!/usr/bin/env python3
+ """Build and deliver independent backend processes, without Core or Desktop."""
+ import argparse
+-from dataclasses import dataclass
+ import hashlib
+ import importlib.util
+ import json
+@@ -11,7 +10,6 @@ import shutil
+ import subprocess
+ import sys
+ import tempfile
+-import tomllib
+ import zipfile
+ 
+ ROOT = Path(__file__).resolve().parent
+@@ -21,54 +19,12 @@ _manifest_spec = importlib.util.spec_from_file_location(
+     "_proteus_package_manifest", ROOT / "package_manifest.py")
+ _package_manifest = importlib.util.module_from_spec(_manifest_spec)
+ _manifest_spec.loader.exec_module(_package_manifest)
++Package = _package_manifest.Package
+ atomic_json = _package_manifest.atomic_json
+ model_connections = _package_manifest.model_connections
+-
+-
+-
+-@dataclass(frozen=True)
+-class Package:
+-    identity: str
+-    binary: str
+-    version: str
+-    manifest: Path
+-    implementation: Path
+-    exports: dict
+-    requirements: tuple[str, ...] = ()
+-    model_connections: tuple[dict, ...] = ()
+-
+-
+-def package_index(root):
+-    """Validate the workspace package identities without reading their payloads."""
+-    found = {}
+-    for exports in sorted((root / "components").glob("*/exports.json")):
+-        manifest = exports.with_name("Cargo.toml")
+-        spec = tomllib.loads(manifest.read_text())["package"]
+-        metadata = spec["metadata"]["proteus"]
+-        identity = metadata["id"]
+-        if identity in found:
+-            raise SystemExit(f"Duplicate module package: {identity}")
+-        requirements = metadata.get("requirements", [])
+-        if (not isinstance(requirements, list)
+-                or not all(isinstance(value, str) and value.strip() for value in requirements)):
+-            raise SystemExit(f"Invalid build requirements for module package: {identity}")
+-        found[identity] = (manifest, spec["name"], spec["version"],
+-                           root / metadata["implementation"], tuple(dict.fromkeys(requirements)))
+-    if not found:
+-        raise SystemExit(f"No module packages in {root}")
+-    return found
+-
+-
+-def load_package(identity, indexed):
+-    manifest, binary, version, implementation, requirements = indexed
+-    exports = json.loads(manifest.with_name("exports.json").read_text())
+-    return Package(identity, binary, version, manifest.resolve(), implementation, exports,
+-                   requirements, model_connections(manifest.with_name("model-connections.json"), exports))
+-
+-
+-def packages(root=ROOT):
+-    return {identity: load_package(identity, indexed)
+-            for identity, indexed in package_index(root).items()}
++packages = _package_manifest.packages
++package_index = _package_manifest.package_index
++load_package = _package_manifest.load_package
+ 
+ 
+ def index_path(profile, root=ROOT):
+diff --git a/package_manifest.py b/package_manifest.py
+index c87121d0b1a8129ee964cf6f9960faff7a6fd78d..b44c79afa52eea72c16c9cbf0caad8813e511071 100644
+--- a/package_manifest.py
++++ b/package_manifest.py
+@@ -1,9 +1,26 @@
+-"""Shared model creation metadata validation and atomic JSON publication."""
++"""Shared source-package metadata, validation and atomic JSON publication."""
++from dataclasses import dataclass
+ import json
+ import os
+ from pathlib import Path
+ import re
+ import tempfile
++import tomllib
++
++
++ROOT = Path(__file__).resolve().parent
++
++
++@dataclass(frozen=True)
++class Package:
++    identity: str
++    binary: str
++    version: str
++    manifest: Path
++    implementation: Path
++    exports: dict
++    requirements: tuple[str, ...] = ()
++    model_connections: tuple[dict, ...] = ()
+ 
+ 
+ def model_connections(path, exports):
+@@ -54,3 +71,36 @@ def atomic_json(value, destination):
+         os.replace(temporary, destination)
+     finally:
+         Path(temporary).unlink(missing_ok=True)
++
++
++def package_index(root):
++    """Validate the workspace package identities without reading their payloads."""
++    found = {}
++    for exports in sorted((root / "components").glob("*/exports.json")):
++        manifest = exports.with_name("Cargo.toml")
++        spec = tomllib.loads(manifest.read_text())["package"]
++        metadata = spec["metadata"]["proteus"]
++        identity = metadata["id"]
++        if identity in found:
++            raise SystemExit(f"Duplicate module package: {identity}")
++        requirements = metadata.get("requirements", [])
++        if (not isinstance(requirements, list)
++                or not all(isinstance(value, str) and value.strip() for value in requirements)):
++            raise SystemExit(f"Invalid build requirements for module package: {identity}")
++        found[identity] = (manifest, spec["name"], spec["version"],
++                           root / metadata["implementation"], tuple(dict.fromkeys(requirements)))
++    if not found:
++        raise SystemExit(f"No module packages in {root}")
++    return found
++
++
++def load_package(identity, indexed):
++    manifest, binary, version, implementation, requirements = indexed
++    exports = json.loads(manifest.with_name("exports.json").read_text())
++    return Package(identity, binary, version, manifest.resolve(), implementation, exports,
++                   requirements, model_connections(manifest.with_name("model-connections.json"), exports))
++
++
++def packages(root=ROOT):
++    return {identity: load_package(identity, indexed)
++            for identity, indexed in package_index(root).items()}
+diff --git a/scripts/catalog.py b/scripts/catalog.py
+index 2c9a8d5d6af9dd3e075f30629d909afd4fa29a43..f0266b333fcfeae9057db1e794bd861ef7a3d35c 100644
+--- a/scripts/catalog.py
++++ b/scripts/catalog.py
+@@ -1,13 +1,16 @@
+ #!/usr/bin/env python3
+ """Generate the Git source catalog from the independent package manifests."""
+ import argparse
++import importlib.util
+ import json
+ from pathlib import Path
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+-sys.path.insert(0, str(ROOT))
+-import package
++_manifest_spec = importlib.util.spec_from_file_location(
++    "_proteus_package_manifest", ROOT / "package_manifest.py")
++_package_manifest = importlib.util.module_from_spec(_manifest_spec)
++_manifest_spec.loader.exec_module(_package_manifest)
+ 
+ 
+ CATEGORIES = {
+@@ -63,7 +66,7 @@ def catalog(root=ROOT):
+     root = Path(root).resolve()
+     entries = []
+     categories = set()
+-    for identity, selected in sorted(package.packages(root).items()):
++    for identity, selected in sorted(_package_manifest.packages(root).items()):
+         slot = selected.implementation.relative_to(root).parts[0]
+         category = slot.replace("_", "-")
+         categories.add((category, CATEGORIES.get(slot, slot)))
+@@ -102,7 +105,7 @@ def main(argv=None, *, root=ROOT):
+     value = catalog(root)
+     destination = Path(root) / "proteus-catalog.json"
+     if args.write:
+-        package.atomic_json(value, destination)
++        _package_manifest.atomic_json(value, destination)
+         print(f"{destination}: {len(value['entries'])} модулей")
+         return 0
+     expected = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+diff --git a/tests/test_catalog.py b/tests/test_catalog.py
+index a9e95af790d17704f097b6185c55d713c83a5819..96297503d8701477f076b8904bf529dbbb980383 100644
+--- a/tests/test_catalog.py
++++ b/tests/test_catalog.py
+@@ -33,7 +33,7 @@ class CatalogTests(unittest.TestCase):
+ 
+     def test_catalog_contains_exactly_the_independent_delivery_packages(self):
+         value = catalog.catalog()
+-        available = catalog.package.packages()
++        available = catalog._package_manifest.packages(ROOT)
+         self.assertTrue(available)
+         self.assertEqual({entry["id"] for entry in value["entries"]}, set(available))
+         self.assertNotIn("process-module", {entry["id"] for entry in value["entries"]})
+@@ -57,7 +57,7 @@ class CatalogTests(unittest.TestCase):
+         # The shared aggregate fixture has no independent package export manifest.
+         (self.root / "components/process-module").mkdir()
+         (self.root / "components/process-module/Cargo.toml").write_text("[package]\nname='fixture'\n")
+-        with patch.object(catalog.package.subprocess, "run", side_effect=AssertionError("must not build")):
++        with patch("subprocess.run", side_effect=AssertionError("must not build")):
+             value = catalog.catalog(self.root)
+         self.assertEqual(len(value["entries"]), 1)
+         entry = value["entries"][0]
+@@ -71,7 +71,7 @@ class CatalogTests(unittest.TestCase):
+     def test_check_reports_stale_metadata_and_write_never_builds(self):
+         component = self.add_package("example")
+         with (contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()),
+-              patch.object(catalog.package.subprocess, "run", side_effect=AssertionError("must not build"))):
++              patch("subprocess.run", side_effect=AssertionError("must not build"))):
+             self.assertEqual(catalog.main(["--check"], root=self.root), 1)
+             self.assertEqual(catalog.main(["--write"], root=self.root), 0)
+             self.assertEqual(catalog.main(["--check"], root=self.root), 0)
