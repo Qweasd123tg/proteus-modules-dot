@@ -1,0 +1,201 @@
+diff --git a/storage/session-storage/src/codec.rs b/storage/session-storage/src/codec.rs
+index 859fa06d3170b5349c83c8b4c2d81a2b4f1b4748..97d3c0680a9b7ab6e69be9d6db1218599f627649 100644
+--- a/storage/session-storage/src/codec.rs
++++ b/storage/session-storage/src/codec.rs
+@@ -1,6 +1,8 @@
+ //! Schema-21 JSONL encoding. Kept byte-format compatible with existing sessions.
+ use crate::{
+-    io::{MAX_PAYLOAD_BYTES, atomic_write, bounded_read, bounded_read_with_size_hint},
++    io::{
++        MAX_PAYLOAD_BYTES, atomic_write, bounded_read, bounded_read_with_size_hint, compact_json_len,
++    },
+     types::*,
+ };
+ use anyhow::{Context, Result, bail, ensure};
+@@ -42,18 +44,6 @@ enum StoredPayload {
+     },
+ }
+ 
+-pub(crate) fn canonicalize_entry(entry: JournalEntry) -> Result<JournalEntry> {
+-    let kind = entry.kind();
+-    let mut payload = entry.payload_value()?;
+-    drop(entry);
+-    proteus_session_semantics::redact_sensitive_values(&mut payload);
+-    ensure!(
+-        encoded_bytes(&payload)? <= MAX_PAYLOAD_BYTES,
+-        "journal payload exceeds maximum"
+-    );
+-    JournalEntry::from_kind_and_payload(kind, payload).map_err(Into::into)
+-}
+-
+ pub(crate) fn encode(
+     session: &Path,
+     record: &JournalRecord,
+@@ -160,7 +150,7 @@ pub(crate) fn decode_with_witness(
+             // and structural tokens cannot grow. The whole line also bounds
+             // the payload source. Larger lines keep the exact size check.
+             ensure!(
+-                line.len() <= MAX_PAYLOAD_BYTES / 32 || encoded_bytes(&value)? <= MAX_PAYLOAD_BYTES,
++                line.len() <= MAX_PAYLOAD_BYTES / 32 || compact_json_len(&value)? <= MAX_PAYLOAD_BYTES,
+                 "inline payload exceeds maximum"
+             );
+             JournalEntry::from_stored_kind_and_payload(stored.kind, value)?
+@@ -233,42 +223,6 @@ fn validate_blob(hash: &str, path: &Path) -> Result<()> {
+     bail!("journal blob path must be blobs/<sha256>.json")
+ }
+ 
+-pub(crate) fn encoded_bytes(value: &impl serde::Serialize) -> Result<usize> {
+-    struct Counter(usize);
+-    impl std::io::Write for Counter {
+-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            self.0 = self
+-                .0
+-                .checked_add(bytes.len())
+-                .ok_or_else(|| std::io::Error::other("encoded record size overflow"))?;
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> std::io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    let mut count = Counter(0);
+-    serde_json::to_writer(&mut count, value)?;
+-    Ok(count.0)
+-}
+-
+-#[cfg(test)]
+-#[test]
+-fn encoded_bytes_matches_compact_json_after_deserialization() {
+-    for raw in [
+-        r#" { "name" : "\u3053\u3093", "a": null, "name" : "é" } "#,
+-        r#"[1e1, -0.0, 1e-300, 18446744073709551615]"#,
+-        r#""\u0000\t\r\b\f\n\"\\\/😺""#,
+-        r#"{"empty":{},"array":[[],true,null,false]}"#,
+-    ] {
+-        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+-        assert_eq!(
+-            encoded_bytes(&value).unwrap(),
+-            serde_json::to_vec(&value).unwrap().len()
+-        );
+-    }
+-}
+-
+ #[cfg(test)]
+ #[test]
+ fn fresh_and_reused_canonical_blob_have_identical_journal_bytes_and_touched_paths() {
+diff --git a/storage/session-storage/src/io.rs b/storage/session-storage/src/io.rs
+index de26dee476f19a35bf854d48a7059f0be570007e..eb018ca5390b6690a491599d7b9332c85a43d628 100644
+--- a/storage/session-storage/src/io.rs
++++ b/storage/session-storage/src/io.rs
+@@ -9,6 +9,25 @@ use std::{
+ 
+ pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+ 
++pub(crate) fn compact_json_len(value: &impl serde::Serialize) -> Result<usize> {
++    struct Counter(usize);
++    impl std::io::Write for Counter {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            self.0 = self
++                .0
++                .checked_add(bytes.len())
++                .ok_or_else(|| std::io::Error::other("encoded record size overflow"))?;
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    let mut count = Counter(0);
++    serde_json::to_writer(&mut count, value)?;
++    Ok(count.0)
++}
++
+ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+     digest_hex(digest(&SHA256, bytes))
+ }
+@@ -220,6 +239,23 @@ fn read_bounded(file: File, maximum: usize, capacity: usize) -> Result<Vec<u8>>
+     Ok(bytes)
+ }
+ 
++#[cfg(test)]
++#[test]
++fn encoded_bytes_matches_compact_json_after_deserialization() {
++    for raw in [
++        r#" { "name" : "\u3053\u3093", "a": null, "name" : "é" } "#,
++        r#"[1e1, -0.0, 1e-300, 18446744073709551615]"#,
++        r#""\u0000\t\r\b\f\n\"\\\/😺""#,
++        r#"{"empty":{},"array":[[],true,null,false]}"#,
++    ] {
++        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
++        assert_eq!(
++            compact_json_len(&value).unwrap(),
++            serde_json::to_vec(&value).unwrap().len()
++        );
++    }
++}
++
+ #[cfg(test)]
+ #[test]
+ fn bounded_read_small_hint_preserves_empty_limits_and_object_checks() {
+diff --git a/storage/session-storage/src/service/cache.rs b/storage/session-storage/src/service/cache.rs
+index a66cffce08d7b6a2378b09b87ac36fbfc9fc868c..c4bd0ebd2f8b0a83ac86f118cf69a2aa59f92162 100644
+--- a/storage/session-storage/src/service/cache.rs
++++ b/storage/session-storage/src/service/cache.rs
+@@ -98,9 +98,9 @@ impl State {
+             source: &cache.source,
+             value: (),
+         };
+-        if crate::codec::encoded_bytes(&header)? > CACHE_ENVELOPE_ALLOWANCE {
++        if crate::io::compact_json_len(&header)? > CACHE_ENVELOPE_ALLOWANCE {
+             ensure!(
+-                crate::codec::encoded_bytes(&cache)? <= MAX_CACHE_FILE_BYTES,
++                crate::io::compact_json_len(&cache)? <= MAX_CACHE_FILE_BYTES,
+                 "cache value exceeds maximum"
+             );
+         }
+diff --git a/storage/session-storage/src/service/commits.rs b/storage/session-storage/src/service/commits.rs
+index b050c43e730b06adfa3e3375c5d7a75203f6dfee..29a448d27987538f316de24405d7be1df2b3df2b 100644
+--- a/storage/session-storage/src/service/commits.rs
++++ b/storage/session-storage/src/service/commits.rs
+@@ -1,5 +1,19 @@
+ use super::*;
++use crate::io::{MAX_PAYLOAD_BYTES, compact_json_len};
+ use proteus_contracts::domain::RecordId;
++
++fn canonicalize_entry(entry: JournalEntry) -> Result<JournalEntry> {
++    let kind = entry.kind();
++    let mut payload = entry.payload_value()?;
++    drop(entry);
++    proteus_session_semantics::redact_sensitive_values(&mut payload);
++    ensure!(
++        compact_json_len(&payload)? <= MAX_PAYLOAD_BYTES,
++        "journal payload exceeds maximum"
++    );
++    JournalEntry::from_kind_and_payload(kind, payload).map_err(Into::into)
++}
++
+ impl State {
+     pub(super) fn commit(&mut self, commit: StorageCommit) -> Result<SessionStorageResponse> {
+         let mut record = JournalRecord {
+@@ -20,7 +34,7 @@ impl State {
+         if let JournalEntry::HookInvoked(trace) = &record.entry {
+             proteus_session_semantics::journal::hooks::validate_raw_trace(&record, trace)?;
+         }
+-        record.entry = crate::codec::canonicalize_entry(record.entry)?;
++        record.entry = canonicalize_entry(record.entry)?;
+         let fold = self.writer_fold(&commit.lease)?;
+         let actual = fold.revision();
+         if actual != commit.expected || fold.validation.contains_record_id(&record.record_id) {
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index bac02fefef3aac7061b472e8f026f4dd33725404..dbac4cde8a1fc1500144b30ea085765e585ce5f7 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -347,7 +347,7 @@ impl SnapshotState {
+             }
+             let record_bytes = match known_bytes {
+                 Some(bytes) => bytes,
+-                None => crate::codec::encoded_bytes(&record)?,
++                None => crate::io::compact_json_len(&record)?,
+             };
+             ensure!(
+                 record_bytes <= SESSION_STORAGE_MAX_RECORD_BYTES,
