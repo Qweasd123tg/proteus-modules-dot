@@ -1,0 +1,91 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1b929a03812812a28ecbbb9fe158182fd47b960b..7e34ffa029419a9ec533345b3ab1c6c17fd6410f 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -718,3 +718,3 @@ impl AgentAppServer {
+             );
+-            Some(read_model::CompletedTranscript {
++            Some(events::CompletedTranscript {
+                 messages: model.transcript,
+@@ -797,3 +797,3 @@ async fn completed_transcript(
+     runtime: Arc<AgentRuntime>,
+-) -> Result<read_model::CompletedTranscript> {
++) -> Result<events::CompletedTranscript> {
+     completed_transcript_from_commit(runtime, None).await
+@@ -804,3 +804,3 @@ async fn completed_transcript_from_commit(
+     committed: Option<crate::core::CommittedDisplay>,
+-) -> Result<read_model::CompletedTranscript> {
++) -> Result<events::CompletedTranscript> {
+     if runtime.session_dir().is_none() {
+diff --git a/crates/proteus-core/src/app_server/events.rs b/crates/proteus-core/src/app_server/events.rs
+index 1353023a25454467f175f198bc820c706b8fd7e5..4a004d0964d328d7a7388e4ee615be1644627691 100644
+--- a/crates/proteus-core/src/app_server/events.rs
++++ b/crates/proteus-core/src/app_server/events.rs
+@@ -5,2 +5,3 @@ use std::sync::{Arc, Mutex};
+ 
++use proteus_contracts::app_protocol::{AppTranscriptCursor, AppTranscriptMessage};
+ use tokio::sync::{broadcast, mpsc, watch};
+@@ -16,2 +17,17 @@ pub(super) use session::{RuntimeEventSink, SequencedEvent};
+ 
++#[derive(Default)]
++pub(super) struct CompletedTranscript {
++    pub messages: Vec<AppTranscriptMessage>,
++    pub cursor: Option<AppTranscriptCursor>,
++}
++
++impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
++    fn from(messages: Vec<AppTranscriptMessage>) -> Self {
++        Self {
++            messages,
++            cursor: None,
++        }
++    }
++}
++
+ #[derive(Clone)]
+@@ -271,3 +287,3 @@ impl AppEventPublisher {
+         event: AppServerEvent,
+-        history: Option<super::read_model::CompletedTranscript>,
++        history: Option<CompletedTranscript>,
+     ) -> Result<usize, broadcast::error::SendError<AppServerEvent>> {
+diff --git a/crates/proteus-core/src/app_server/events/session.rs b/crates/proteus-core/src/app_server/events/session.rs
+index a7c90102f7ab7dda95b212bb64d80b12f1355a6e..71b75234194e11f2baf4c37273e1a31cdeb42f7d 100644
+--- a/crates/proteus-core/src/app_server/events/session.rs
++++ b/crates/proteus-core/src/app_server/events/session.rs
+@@ -2,4 +2,3 @@
+ //! on. A subscription snapshot and its sequence are sampled under that same lock.
+-use super::{AppEventPublisher, AppServerEvent};
+-use crate::app_server::read_model::CompletedTranscript;
++use super::{AppEventPublisher, AppServerEvent, CompletedTranscript};
+ use crate::app_server::{AppTranscriptMessage, TurnProgress};
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index 7e9362ec7940bd1dfe5f0d4fa6ca2747b3b33625..b610a9c69190b428c2047b77009bb91e4abd87b7 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -2,4 +2,4 @@
+ use super::{
+-    AppServerEvent, AppServerHandle, journal_transcript_append_from_source,
+-    journal_transcript_from_source,
++    AppServerEvent, AppServerHandle, events::CompletedTranscript,
++    journal_transcript_append_from_source, journal_transcript_from_source,
+ };
+@@ -7,18 +7,3 @@ use crate::core::{SessionReadModel, SessionStore};
+ 
+-use proteus_contracts::app_protocol::{AppTranscriptCursor, AppTranscriptMessage};
+-
+-#[derive(Default)]
+-pub(super) struct CompletedTranscript {
+-    pub messages: Vec<AppTranscriptMessage>,
+-    pub cursor: Option<AppTranscriptCursor>,
+-}
+-
+-impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
+-    fn from(messages: Vec<AppTranscriptMessage>) -> Self {
+-        Self {
+-            messages,
+-            cursor: None,
+-        }
+-    }
+-}
++use proteus_contracts::app_protocol::AppTranscriptMessage;
+ 
