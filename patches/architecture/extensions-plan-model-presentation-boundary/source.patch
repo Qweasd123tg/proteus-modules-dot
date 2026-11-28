@@ -1,0 +1,148 @@
+diff --git a/packages/plan/src/main.rs b/packages/plan/src/main.rs
+index 0632551c3ea45edfee8b5c583081192e3c0b8ff2..826d896ac164e8435c512e3fff68efee07cea51a 100644
+--- a/packages/plan/src/main.rs
++++ b/packages/plan/src/main.rs
+@@ -1,5 +1,6 @@
+ mod cache;
+ mod model;
++mod presentation;
+ mod settings;
+ 
+ use proteus_extension::{
+@@ -39,7 +40,7 @@ impl Extension for Plan {
+         if surface == Surface::Preview {
+             // The host opens this only on demand. It owns no retained data and
+             // never reads entries, session state, preferences, or the server.
+-            host.show(view, model::details(&model::demo()));
++            host.show(view, presentation::details(&presentation::demo()));
+             return Ok(());
+         }
+         let visibility = settings::visibility(host.preferences());
+@@ -92,7 +93,7 @@ impl Extension for Plan {
+                         );
+                     }
+                     (Surface::Badge, None) => host.hide_badge(view, "План"),
+-                    (_, Some(plan)) => host.show(view, model::details(&plan)),
++                    (_, Some(plan)) => host.show(view, presentation::details(&plan)),
+                     (_, None) => host.show(view, ui::stack(Vec::new())),
+                 }
+             }
+diff --git a/packages/plan/src/model.rs b/packages/plan/src/model.rs
+index 5a109f4f2dd73a2eb2c9a72b6ad731fe07252d27..fc6c6075184127f134d3fcaa6f35bcf0408cf3a1 100644
+--- a/packages/plan/src/model.rs
++++ b/packages/plan/src/model.rs
+@@ -1,7 +1,6 @@
+ use std::borrow::Cow;
+ 
+-use proteus_extension::{Value, ValueExt, json, ui};
+-use ui::Node as _;
++use proteus_extension::{Value, ValueExt};
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub enum Visibility {
+@@ -133,38 +132,3 @@ pub fn latest(entries: &[Value], visibility: Visibility, running: bool) -> Optio
+     }
+     Some(plan)
+ }
+-
+-/// Real details and the opt-in settings example share every rendering rule.
+-pub fn details(plan: &Snapshot<'_>) -> Value {
+-    ui::stack(
+-        plan.steps
+-            .iter()
+-            .map(|step| {
+-                let (icon, tone) = match step.status {
+-                    Status::Completed => ("circle-check", "success"),
+-                    Status::InProgress => ("circle-dot", "warning"),
+-                    Status::Pending => ("minus", "muted"),
+-                };
+-                ui::row(vec![
+-                    ui::icon(icon).with("tone", tone),
+-                    ui::text(&step.text).with(
+-                        "tone",
+-                        if step.status == Status::Completed {
+-                            "muted"
+-                        } else {
+-                            "default"
+-                        },
+-                    ),
+-                ])
+-            })
+-            .collect(),
+-    )
+-}
+-
+-pub fn demo() -> Snapshot<'static> {
+-    Snapshot::from_tool_owned(&json!({"args":{"plan":[
+-        {"step":"Изучить задачу", "status":"completed"},
+-        {"step":"Подготовить изменения", "status":"in_progress"},
+-        {"step":"Проверить результат", "status":"pending"}
+-    ]}}))
+-}
+diff --git a/packages/plan/src/presentation.rs b/packages/plan/src/presentation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..23a8662ce6be9676332d2b5c692c1eaefbf91854
+--- /dev/null
++++ b/packages/plan/src/presentation.rs
+@@ -0,0 +1,39 @@
++use proteus_extension::{Value, json, ui};
++use ui::Node as _;
++
++use super::model::{Snapshot, Status};
++
++/// Real details and the opt-in settings example share every rendering rule.
++pub fn details(plan: &Snapshot<'_>) -> Value {
++    ui::stack(
++        plan.steps
++            .iter()
++            .map(|step| {
++                let (icon, tone) = match step.status {
++                    Status::Completed => ("circle-check", "success"),
++                    Status::InProgress => ("circle-dot", "warning"),
++                    Status::Pending => ("minus", "muted"),
++                };
++                ui::row(vec![
++                    ui::icon(icon).with("tone", tone),
++                    ui::text(&step.text).with(
++                        "tone",
++                        if step.status == Status::Completed {
++                            "muted"
++                        } else {
++                            "default"
++                        },
++                    ),
++                ])
++            })
++            .collect(),
++    )
++}
++
++pub fn demo() -> Snapshot<'static> {
++    Snapshot::from_tool_owned(&json!({"args":{"plan":[
++        {"step":"Изучить задачу", "status":"completed"},
++        {"step":"Подготовить изменения", "status":"in_progress"},
++        {"step":"Проверить результат", "status":"pending"}
++    ]}}))
++}
+diff --git a/packages/plan/src/tests.rs b/packages/plan/src/tests.rs
+index ea1406b98f859ed1a6d035e705e91fac75ae310b..e6269aa88ed58ec9eee0cb10867c25e2b98d29b7 100644
+--- a/packages/plan/src/tests.rs
++++ b/packages/plan/src/tests.rs
+@@ -206,7 +206,7 @@ fn options_and_individual_reset_follow_the_effective_mode() {
+ fn example_has_no_session_or_retained_state_and_uses_real_details() {
+     let settings = settings::page(Visibility::Current);
+     assert_eq!(settings["children"].as_array().unwrap().len(), 1);
+-    let details = model::details(&model::demo());
++    let details = presentation::details(&presentation::demo());
+     assert_eq!(
+         details["children"][0]["children"][0]["name"],
+         "circle-check"
+@@ -218,7 +218,7 @@ fn example_has_no_session_or_retained_state_and_uses_real_details() {
+     let mut host = Host::default();
+     host.entries.push(plan("private chat data", "pending"));
+     extension.closed(&mut host, "preview");
+-    assert_eq!(model::demo().steps[0].text, "Изучить задачу");
++    assert_eq!(presentation::demo().steps[0].text, "Изучить задачу");
+ }
+ 
+ #[test]
