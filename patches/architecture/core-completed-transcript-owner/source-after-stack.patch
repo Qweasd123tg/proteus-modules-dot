@@ -1,0 +1,136 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 68d0fca37c12804aa408b71861930ef1ab923b62..aec482c8a7eee7b2720a74fdffba39e10a9e7206 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -73,3 +73,3 @@ pub(crate) use transcript::{
+ };
+-use transcript::{journal_transcript_for_startup, transcript_messages};
++use transcript::{CompletedTranscript, journal_transcript_for_startup, transcript_messages};
+ use turn_progress::TurnProgress;
+@@ -721,3 +721,3 @@ impl AgentAppServer {
+             );
+-            Some(events::CompletedTranscript {
++            Some(CompletedTranscript {
+                 messages: model.transcript,
+@@ -800,3 +800,3 @@ async fn completed_transcript(
+     runtime: Arc<AgentRuntime>,
+-) -> Result<events::CompletedTranscript> {
++) -> Result<CompletedTranscript> {
+     completed_transcript_from_commit(runtime, None).await
+@@ -807,3 +807,3 @@ async fn completed_transcript_from_commit(
+     committed: Option<crate::core::CommittedDisplay>,
+-) -> Result<events::CompletedTranscript> {
++) -> Result<CompletedTranscript> {
+     if runtime.session_dir().is_none() {
+diff --git a/crates/proteus-core/src/app_server/events.rs b/crates/proteus-core/src/app_server/events.rs
+index 4a004d0964d328d7a7388e4ee615be1644627691..8a2b4ca118cf6914eeb569f6d1c57c976def9e2e 100644
+--- a/crates/proteus-core/src/app_server/events.rs
++++ b/crates/proteus-core/src/app_server/events.rs
+@@ -5,3 +5,2 @@ use std::sync::{Arc, Mutex};
+ 
+-use proteus_contracts::app_protocol::{AppTranscriptCursor, AppTranscriptMessage};
+ use tokio::sync::{broadcast, mpsc, watch};
+@@ -9,3 +8,6 @@ use uuid::Uuid;
+ 
+-use super::{AppPendingRequests, AppQueuedUserMessage, AppServerEvent, StdioOutput};
++use super::{
++    AppPendingRequests, AppQueuedUserMessage, AppServerEvent, StdioOutput,
++    transcript::CompletedTranscript,
++};
+ 
+@@ -17,17 +19,2 @@ pub(super) use session::{RuntimeEventSink, SequencedEvent};
+ 
+-#[derive(Default)]
+-pub(super) struct CompletedTranscript {
+-    pub messages: Vec<AppTranscriptMessage>,
+-    pub cursor: Option<AppTranscriptCursor>,
+-}
+-
+-impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
+-    fn from(messages: Vec<AppTranscriptMessage>) -> Self {
+-        Self {
+-            messages,
+-            cursor: None,
+-        }
+-    }
+-}
+-
+ #[derive(Clone)]
+diff --git a/crates/proteus-core/src/app_server/events/session.rs b/crates/proteus-core/src/app_server/events/session.rs
+index 71b75234194e11f2baf4c37273e1a31cdeb42f7d..b32528b7f84434449e60b28e6020c9654d6f6cae 100644
+--- a/crates/proteus-core/src/app_server/events/session.rs
++++ b/crates/proteus-core/src/app_server/events/session.rs
+@@ -2,4 +2,4 @@
+ //! on. A subscription snapshot and its sequence are sampled under that same lock.
+-use super::{AppEventPublisher, AppServerEvent, CompletedTranscript};
+-use crate::app_server::{AppTranscriptMessage, TurnProgress};
++use super::{AppEventPublisher, AppServerEvent};
++use crate::app_server::{AppTranscriptMessage, TurnProgress, transcript::CompletedTranscript};
+ use crate::{
+diff --git a/crates/proteus-core/src/app_server/events/tests.rs b/crates/proteus-core/src/app_server/events/tests.rs
+index bb294ed088fe6fd7b9ab3842cfdeed420a912d96..c94b41facfac9408f915ec0a75539c6bc2a000d7 100644
+--- a/crates/proteus-core/src/app_server/events/tests.rs
++++ b/crates/proteus-core/src/app_server/events/tests.rs
+@@ -344,2 +344,5 @@ async fn subscription_snapshot_covers_buffered_events_and_recovers_after_overflo
+ async fn reconnect_snapshot_replaces_live_progress_with_committed_transcript_once() {
++    use crate::app_server::transcript::CompletedTranscript;
++    use proteus_contracts::app_protocol::{AppTranscriptBase, AppTranscriptCursor};
++
+     let (events, _) = test_event_channel(8);
+@@ -382,3 +385,14 @@ async fn reconnect_snapshot_replaces_live_progress_with_committed_transcript_onc
+         )]);
+-    events.finish_progress(Ok(committed.into()));
++    let mut committed = CompletedTranscript::from(committed);
++    assert!(committed.cursor.is_none());
++    let cursor = AppTranscriptCursor {
++        revision: "committed-revision".into(),
++        before: 7,
++        base: Some(AppTranscriptBase {
++            revision: "prior-revision".into(),
++            common_prefix: 4,
++        }),
++    };
++    committed.cursor = Some(cursor.clone());
++    events.finish_progress(Ok(committed));
+     events.publish_snapshot().unwrap();
+@@ -398,2 +412,3 @@ async fn reconnect_snapshot_replaces_live_progress_with_committed_transcript_onc
+     assert_eq!(snapshot.transcript[0].text, "committed");
++    assert_eq!(snapshot.history, Some(cursor));
+     // Every buffered live delta and the published snapshot are covered by the
+diff --git a/crates/proteus-core/src/app_server/read_model.rs b/crates/proteus-core/src/app_server/read_model.rs
+index ba759719de882d65f957e7c46fffc5860801e6b5..a461e312c4355d6378201f4b61979bcad5f7816d 100644
+--- a/crates/proteus-core/src/app_server/read_model.rs
++++ b/crates/proteus-core/src/app_server/read_model.rs
+@@ -2,4 +2,4 @@
+ use super::{
+-    events::CompletedTranscript, journal_transcript_append_from_source,
+-    journal_transcript_from_source,
++    journal_transcript_append_from_source, journal_transcript_from_source,
++    transcript::CompletedTranscript,
+ };
+diff --git a/crates/proteus-core/src/app_server/transcript.rs b/crates/proteus-core/src/app_server/transcript.rs
+index c399da3189e08cb465ef17e37d85362210c77d1e..74e20b355d130edabc42420205eb66f45f2e4128 100644
+--- a/crates/proteus-core/src/app_server/transcript.rs
++++ b/crates/proteus-core/src/app_server/transcript.rs
+@@ -20,2 +20,3 @@ pub(crate) use journal::{
+ 
++use proteus_contracts::app_protocol::AppTranscriptCursor;
+ pub use proteus_contracts::app_protocol::{
+@@ -24,2 +25,17 @@ pub use proteus_contracts::app_protocol::{
+ 
++#[derive(Default)]
++pub(super) struct CompletedTranscript {
++    pub messages: Vec<AppTranscriptMessage>,
++    pub cursor: Option<AppTranscriptCursor>,
++}
++
++impl From<Vec<AppTranscriptMessage>> for CompletedTranscript {
++    fn from(messages: Vec<AppTranscriptMessage>) -> Self {
++        Self {
++            messages,
++            cursor: None,
++        }
++    }
++}
++
+ pub(super) fn transcript_messages(messages: &[CanonicalMessage]) -> Vec<AppTranscriptMessage> {
