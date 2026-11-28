@@ -1,0 +1,172 @@
+diff --git a/storage/session-storage/src/backend/kind.rs b/storage/session-storage/src/backend/kind.rs
+index 1cae5642a42f22fcb4b381939ec3ac4136b7778c..7456e6e9d67432e98b4872d9a100e28aa1fd68bd 100644
+--- a/storage/session-storage/src/backend/kind.rs
++++ b/storage/session-storage/src/backend/kind.rs
+@@ -68,4 +68,52 @@ impl BackendKind {
+             }
+         }
+     }
++
++    /// Initialization receives a byte extent for JSONL, never SQLite's row count.
++    pub(crate) fn replay_display<T>(
++        self,
++        dir: &Path,
++        id: SessionId,
++        cut: Option<u64>,
++        initialize: impl Fn(Option<u64>) -> T,
++        apply: impl Fn(&mut T, &JournalRecord, Option<String>, Option<&dyn RecordSnapshot>) -> Result<()>,
++    ) -> Result<(Box<dyn RecordSnapshot>, T)> {
++        match self {
++            Self::Jsonl if cfg!(unix) => Jsonl::replay_snapshot_with(
++                dir,
++                id,
++                cut,
++                |extent| initialize(Some(extent)),
++                |fold, record, hash, source| apply(fold, record, hash, Some(source)),
++            ),
++            Self::Sqlite => Sqlite::replay_display(
++                dir,
++                id,
++                cut,
++                || initialize(None),
++                |fold, record, hash| apply(fold, record, hash, None),
++            ),
++            Self::Jsonl => {
++                let mut source = self.backend().snapshot(dir, id)?;
++                let version = source.source_version()?;
++                let mut staged = initialize(Some(source.extent()));
++                if !source.try_visit_display_rows(cut, &mut |record, hash| {
++                    apply(&mut staged, record, hash, None)
++                })? {
++                    let mut line = Vec::new();
++                    while let Some(record) = source.next_with_scratch(&mut line)? {
++                        let boundary = (cut == Some(record.session_seq)).then(|| {
++                            source.remember_page_boundary(record.session_seq);
++                            source.consumed_fingerprint()
++                        });
++                        apply(&mut staged, &record, boundary, None)?;
++                    }
++                }
++                if source.source_version()? != version {
++                    source.verify_fixed_prefix()?;
++                }
++                Ok((source, staged))
++            }
++        }
++    }
+ }
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 0754ec8f6ab60f6549e419815f26e91c1a3756a1..129b3889d5a815228642677792965a0a054995b9 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -1,6 +1,6 @@
+ //! Capture display state in the same strict pass that validates its source.
+ use super::*;
+-use crate::backend::{Jsonl, RecordSnapshot, Sqlite};
++use crate::backend::RecordSnapshot;
+ use crate::display::{DisplayWriter, MAX_STAGING_BYTES, state_fits};
+ use proteus_contracts::model_standard::ContentPart;
+ 
+@@ -63,44 +63,22 @@ impl State {
+             }
+             Ok(())
+         };
+-        let (source, (state, previous_boundary, display)) = match self.kind {
+-            BackendKind::Jsonl if cfg!(unix) => Jsonl::replay_snapshot_with(
+-                &dir,
+-                session.session_id,
+-                cut,
+-                |extent| (Fold::default(), None, DisplayWriter::for_jsonl(budget, extent)),
+-                |fold, record, hash, source| apply(fold, record, hash, Some(source)),
+-            )?,
+-            BackendKind::Sqlite => Sqlite::replay_display(
+-                &dir,
+-                session.session_id,
+-                cut,
+-                || (Fold::default(), None, DisplayWriter::new(budget)),
+-                |fold, record, hash| apply(fold, record, hash, None),
+-            )?,
+-            BackendKind::Jsonl => {
+-                let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+-                let version = source.source_version()?;
+-                let writer = DisplayWriter::for_jsonl(budget, source.extent());
+-                let mut staged = (Fold::default(), None, writer);
+-                if !source.try_visit_display_rows(cut, &mut |record, hash| {
+-                    apply(&mut staged, record, hash, None)
+-                })? {
+-                    let mut line = Vec::new();
+-                    while let Some(record) = source.next_with_scratch(&mut line)? {
+-                        let boundary = (cut == Some(record.session_seq)).then(|| {
+-                            source.remember_page_boundary(record.session_seq);
+-                            source.consumed_fingerprint()
+-                        });
+-                        apply(&mut staged, &record, boundary, None)?;
+-                    }
+-                }
+-                if source.source_version()? != version {
+-                    source.verify_fixed_prefix()?;
+-                }
+-                (source, staged)
+-            }
+-        };
++        let (source, (state, previous_boundary, display)) = self.kind.replay_display(
++            &dir,
++            session.session_id,
++            cut,
++            |source_bytes| {
++                (
++                    Fold::default(),
++                    None,
++                    match source_bytes {
++                        Some(bytes) => DisplayWriter::for_jsonl(budget, bytes),
++                        None => DisplayWriter::new(budget),
++                    },
++                )
++            },
++            apply,
++        )?;
+         let previous_boundary = previous_boundary.or_else(|| {
+             (cut == Some(0)).then(|| (StorageRevision::default(), crate::io::sha256_hex(b"")))
+         });
+diff --git a/storage/session-storage/src/tests/display.rs b/storage/session-storage/src/tests/display.rs
+index 662b8fb4ecd2efcfcb765d3a4575f3a03af72103..7c013ca6ef2a27c0fadf976efa69b1dea9c57985 100644
+--- a/storage/session-storage/src/tests/display.rs
++++ b/storage/session-storage/src/tests/display.rs
+@@ -74,6 +74,37 @@ fn page(f: &Fixture, snapshot: &StorageSnapshot, after_seq: u64) -> StorageRecor
+     page
+ }
+ 
++#[test]
++fn display_replay_uses_byte_extent_and_pinned_source_for_the_right_backend() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        let commit = f.append(vec![text("one display message")]);
++        let is_jsonl = matches!(kind, BackendKind::Jsonl);
++        let expected_extent = is_jsonl.then(|| {
++            let journal = f.descriptor.record_location.as_ref().unwrap();
++            std::fs::metadata(journal).unwrap().len()
++        });
++        let extents = std::cell::RefCell::new(Vec::new());
++        let (_source, seen) = kind
++            .replay_display(
++                f.descriptor.local_path.as_ref().unwrap(),
++                f.descriptor.session.session_id,
++                None,
++                |bytes| {
++                    extents.borrow_mut().push(bytes);
++                    Vec::new()
++                },
++                |seen, record, _, source| {
++                    seen.push((record.record_id, source.is_some()));
++                    Ok(())
++                },
++            )
++            .unwrap();
++        assert_eq!(extents.into_inner(), [expected_extent]);
++        assert_eq!(seen, [(commit.operation_id, is_jsonl && cfg!(unix))]);
++    }
++}
++
+ #[test]
+ fn one_large_history_mutation_uses_canonical_paging_without_duplicating_the_payload() {
+     for kind in backends() {
