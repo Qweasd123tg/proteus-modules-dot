@@ -1,0 +1,101 @@
+diff --git a/context/context-pack/src/codex.rs b/context/context-pack/src/codex.rs
+index 42f8337a43dd2f99f7cdc104af10e648f643036b..57689e9024eb5b48c82739b241338ce31746019b 100644
+--- a/context/context-pack/src/codex.rs
++++ b/context/context-pack/src/codex.rs
+@@ -10,7 +10,11 @@ pub(super) fn build_codex_context(
+ 
+     for provider in &config.providers {
+         let mut provider_chunks = match provider.as_str() {
+-            "project_instructions" => codex_project_instruction_chunks(&input, &config)?,
++            "project_instructions" => codex_project_instruction_chunks(
++                &input.task.cwd,
++                &config,
++                project_instruction_root,
++            )?,
+             "environment" => environment_chunks(&input),
+             "manifest" => manifest_chunks(&input, &repo_config)?,
+             "git_status" => git_status_chunks(&input)?,
+@@ -20,12 +24,7 @@ pub(super) fn build_codex_context(
+             "search" => search_chunks(&input, host, &repo_config)?,
+             external => external_provider_chunks(&input, host, external)?,
+         };
+-        if provider == "project_instructions" {
+-            let root = project_instruction_root(&input.task.cwd)?;
+-            for chunk in &mut provider_chunks {
+-                shape_codex_project_instructions(chunk, &root);
+-            }
+-        } else if provider == "environment" {
++        if provider == "environment" {
+             for chunk in &mut provider_chunks {
+                 chunk.render_mode = ContextRenderMode::Verbatim;
+             }
+@@ -48,11 +47,16 @@ pub(super) fn build_codex_context(
+ }
+ 
+ fn codex_project_instruction_chunks(
+-    input: &ContextBuilderModuleInput,
++    cwd: &Path,
+     config: &CodexContextConfig,
++    resolve_root: impl FnOnce(&Path) -> anyhow::Result<PathBuf>,
+ ) -> anyhow::Result<Vec<ContextChunk>> {
+-    let root = project_instruction_root(&input.task.cwd)?;
+-    codex_project_instruction_chunks_from_root(&input.task.cwd, &root, config)
++    let root = resolve_root(cwd)?;
++    let mut chunks = codex_project_instruction_chunks_from_root(cwd, &root, config)?;
++    for chunk in &mut chunks {
++        shape_codex_project_instructions(chunk, &root);
++    }
++    Ok(chunks)
+ }
+ 
+ fn codex_project_instruction_chunks_from_root(
+@@ -149,6 +153,49 @@ mod tests {
+         assert_eq!(instructions.render_mode, ContextRenderMode::Verbatim);
+     }
+ 
++    #[test]
++    fn codex_project_instruction_load_and_render_share_one_resolved_root() {
++        let workspace = tempfile::tempdir().expect("workspace");
++        let root = workspace.path().canonicalize().expect("resolved root");
++        let cwd = root.join("nested");
++        std::fs::create_dir(&cwd).expect("nested cwd");
++        std::fs::write(root.join("AGENTS.md"), "root rules\n").expect("root instructions");
++        std::fs::write(cwd.join("AGENTS.override.md"), "child rules\n").expect("child instructions");
++        let mut resolutions = 0;
++        let chunks = codex_project_instruction_chunks(
++            &cwd,
++            &CodexContextConfig::default(),
++            |requested_cwd| {
++                resolutions += 1;
++                assert_eq!(requested_cwd, cwd.as_path());
++                Ok(root.clone())
++            },
++        )
++        .expect("instructions");
++
++        assert_eq!(resolutions, 1);
++        assert_eq!(chunks.len(), 2);
++        for (chunk, directory, path, text) in [
++            (&chunks[0], root.join(""), "AGENTS.md", "root rules"),
++            (
++                &chunks[1],
++                cwd.clone(),
++                "nested/AGENTS.override.md",
++                "child rules",
++            ),
++        ] {
++            assert_eq!(chunk.path.as_deref(), Some(Path::new(path)));
++            assert_eq!(
++                chunk.content,
++                format!(
++                    "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>",
++                    directory.display()
++                )
++            );
++            assert_eq!(chunk.render_mode, ContextRenderMode::Verbatim);
++        }
++    }
++
+     #[test]
+     fn codex_project_instruction_default_budget_is_32_kib() {
+         assert_eq!(
