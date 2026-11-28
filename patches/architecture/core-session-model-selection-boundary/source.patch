@@ -1,0 +1,179 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1b929a03812812a28ecbbb9fe158182fd47b960b..3e4750a2d5c145e7f25a8586429408adb61bea6a 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -46,6 +46,7 @@ mod runs;
+ mod session_behavior;
+ mod session_model;
+ mod session_selection;
++mod session_metadata;
+ mod session_settings;
+ pub mod stdio;
+ mod transcript;
+diff --git a/crates/proteus-core/src/app_server/session_behavior.rs b/crates/proteus-core/src/app_server/session_behavior.rs
+index 42d7ed86335932f26f0438d2a76d13d9792dba6a..bd8795b11686e30f3fa30242f9f2d11fe755434a 100644
+--- a/crates/proteus-core/src/app_server/session_behavior.rs
++++ b/crates/proteus-core/src/app_server/session_behavior.rs
+@@ -292,7 +292,7 @@ pub(super) async fn restore(server: &AppServerHandle, fresh: bool) -> Result<()>
+     let Some(store) = server.runtime.session_store() else {
+         return Ok(());
+     };
+-    let stored: Option<Stored> = super::session_selection::read_session(store, FILE).await?;
++    let stored: Option<Stored> = super::session_metadata::read_session(store, FILE).await?;
+     if let Some(stored) = stored {
+         let baseline = server.config.read().await.clone();
+         if stored.binding == binding(server)? {
+diff --git a/crates/proteus-core/src/app_server/session_metadata.rs b/crates/proteus-core/src/app_server/session_metadata.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1f80da70453e8640a4350862d6dc6f10857ac36
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/session_metadata.rs
+@@ -0,0 +1,33 @@
++//! Bounded reads of per-session application preferences.
++
++use std::io::Write;
++
++use anyhow::Result;
++
++pub(super) const MAX_BYTES: u64 = 16 * 1024;
++
++pub(super) async fn read_session<T: serde::de::DeserializeOwned>(
++    store: &crate::core::SessionStore,
++    key: &str,
++) -> Result<Option<T>> {
++    let Some(document) = store.read_metadata_document(key).await? else {
++        return Ok(None);
++    };
++    // Session preferences retain their small application-level limit even if
++    // the selected storage supports larger generic metadata documents.
++    struct Bound(usize);
++    impl Write for Bound {
++        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++            if bytes.len() > MAX_BYTES as usize - self.0 {
++                return Err(std::io::Error::other("selection exceeds its size limit"));
++            }
++            self.0 += bytes.len();
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    serde_json::to_writer(Bound(0), &document.value)?;
++    Ok(Some(serde_json::from_value(document.value)?))
++}
+diff --git a/crates/proteus-core/src/app_server/session_model.rs b/crates/proteus-core/src/app_server/session_model.rs
+index 2d3145b022a722045153c1b523b4dffa6cc95dba..8669387c0a846628a4cb9159ccc66e45386573a5 100644
+--- a/crates/proteus-core/src/app_server/session_model.rs
++++ b/crates/proteus-core/src/app_server/session_model.rs
+@@ -67,7 +67,7 @@ pub(super) async fn stored(server: &AppServerHandle, baseline: &AppConfig) -> Re
+         return Ok(Stored::Absent);
+     };
+     let selected: Option<Configuration> =
+-        super::session_selection::read_session(store, FILE).await?;
++        super::session_metadata::read_session(store, FILE).await?;
+     match selected {
+         None => Ok(Stored::Absent),
+         Some(selected) if selected.binding == binding(baseline, &selected.model)? => {
+@@ -247,23 +247,8 @@ impl AppServerHandle {
+     }
+ }
+ 
+-/// The picker sends the full model reference so identical IDs can coexist
+-/// across providers. Keep same-provider changes on the ordinary settings path.
+-pub(super) async fn select(server: &AppServerHandle, model: ModelRef) -> Result<()> {
+-    if server
+-        .runtime
+-        .model_ref()
+-        .await
+-        .is_some_and(|active| active.provider == model.provider)
+-    {
+-        return server
+-            .update_selection(super::session_selection::SelectionUpdate::Model {
+-                model: model.model,
+-                expected_provider: Some(model.provider),
+-            })
+-            .await;
+-    }
+-
++/// Pick an exact model on the provider chosen by the settings handler.
++pub(super) async fn select_provider(server: &AppServerHandle, model: ModelRef) -> Result<()> {
+     let server = server.clone();
+     tokio::spawn(async move {
+         let baseline = server.config.read().await.clone();
+diff --git a/crates/proteus-core/src/app_server/session_selection.rs b/crates/proteus-core/src/app_server/session_selection.rs
+index 990b82e8006029887f96258f0d3c7097b0980fe4..1a86ba71b8a3099ff5fe9bd2c12a0f6f3a92ef85 100644
+--- a/crates/proteus-core/src/app_server/session_selection.rs
++++ b/crates/proteus-core/src/app_server/session_selection.rs
+@@ -14,8 +14,9 @@ use crate::{
+     domain::{ModelRef, ReasoningConfig},
+ };
+ 
++use super::session_metadata::{MAX_BYTES, read_session};
++
+ const FILE: &str = "model-selection.json";
+-const MAX_BYTES: u64 = 16 * 1024;
+ 
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -126,32 +127,6 @@ pub(super) fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+     Ok(Some(bytes))
+ }
+ 
+-pub(super) async fn read_session<T: serde::de::DeserializeOwned>(
+-    store: &crate::core::SessionStore,
+-    key: &str,
+-) -> Result<Option<T>> {
+-    let Some(document) = store.read_metadata_document(key).await? else {
+-        return Ok(None);
+-    };
+-    // Session preferences retain their small application-level limit even if
+-    // the selected storage supports larger generic metadata documents.
+-    struct Bound(usize);
+-    impl Write for Bound {
+-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+-            if bytes.len() > MAX_BYTES as usize - self.0 {
+-                return Err(std::io::Error::other("selection exceeds its size limit"));
+-            }
+-            self.0 += bytes.len();
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> std::io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    serde_json::to_writer(Bound(0), &document.value)?;
+-    Ok(Some(serde_json::from_value(document.value)?))
+-}
+-
+ fn read_selection(path: &Path, expected: &str) -> Result<Option<Selection>> {
+     let Some(bytes) = read_bytes(path)? else {
+         return Ok(None);
+diff --git a/crates/proteus-core/src/app_server/session_settings.rs b/crates/proteus-core/src/app_server/session_settings.rs
+index 8c7ede28830394512e0865b82c4cb609ec576c34..0f389cb4d350fef56b2c3368bcb909a8c479c45d 100644
+--- a/crates/proteus-core/src/app_server/session_settings.rs
++++ b/crates/proteus-core/src/app_server/session_settings.rs
+@@ -170,7 +170,22 @@ impl super::AppServerHandle {
+                 )
+                 .into());
+             }
+-            return super::session_model::select(self, model).await;
++            // The typed picker distinguishes equal model IDs across providers.
++            // Keep same-provider changes on the ordinary settings path.
++            if self
++                .runtime
++                .model_ref()
++                .await
++                .is_some_and(|active| active.provider == model.provider)
++            {
++                return self
++                    .update_selection(super::session_selection::SelectionUpdate::Model {
++                        model: model.model,
++                        expected_provider: Some(model.provider),
++                    })
++                    .await;
++            }
++            return super::session_model::select_provider(self, model).await;
+         }
+         let settings = self.session_settings().await;
+         let setting = settings
