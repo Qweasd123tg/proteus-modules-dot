@@ -1,0 +1,105 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..a35a538137ba18b64512f1a89db84875850fbbb5 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -13,6 +13,7 @@ use proteus_contracts::domain::SessionId;
+ use serde::{Deserialize, Serialize};
+ use std::{
+     collections::{HashMap, HashSet, VecDeque},
++    ffi::OsStr,
+     path::{Path, PathBuf},
+     sync::Mutex,
+ };
+@@ -64,6 +65,16 @@ struct Writer {
+     _ownership: SessionWriteOwnership,
+ }
+ impl BackendKind {
++    pub(crate) fn from_journal_file_name(name: &OsStr) -> Option<Self> {
++        if name == crate::codec::JOURNAL_FILE {
++            Some(Self::Jsonl)
++        } else if name == crate::backend::SQLITE_JOURNAL_FILE {
++            Some(Self::Sqlite)
++        } else {
++            None
++        }
++    }
++
+     fn description_path(self, dir: &Path) -> PathBuf {
+         dir.join(match self {
+             Self::Jsonl => crate::codec::JOURNAL_FILE,
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 25fe1344c8fd6bbc36533bd0d54db442b4577d55..4833ae10aab35a302fbb53d1f7697b27fb75b7f4 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -259,11 +259,7 @@ pub(super) fn load(
+ }
+ 
+ fn journal_kind(descriptor: &StorageSessionDescriptor) -> Option<BackendKind> {
+-    match descriptor.record_location.as_ref()?.file_name()?.to_str()? {
+-        "journal.jsonl" => Some(BackendKind::Jsonl),
+-        "journal.sqlite" => Some(BackendKind::Sqlite),
+-        _ => None,
+-    }
++    BackendKind::from_journal_file_name(descriptor.record_location.as_ref()?.file_name()?)
+ }
+ 
+ /// Write the compact v1 envelope in field order, leaving room to backfill
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index 8f966691891a5752abe4d19ca480877d96a1d795..c816d57636de7bb1ce416efe8357886a6499b882 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -22,7 +22,8 @@ fn check_selected_format(kind: BackendKind, path: &Path) -> Result<()> {
+ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescriptor> {
+     let path = if path
+         .file_name()
+-        .is_some_and(|name| name == "journal.jsonl" || name == "journal.sqlite")
++        .and_then(BackendKind::from_journal_file_name)
++        .is_some()
+     {
+         path.parent()
+             .context("record location has no session parent")?
+diff --git a/storage/session-storage/src/tests/ownership.rs b/storage/session-storage/src/tests/ownership.rs
+index 86ae256738c019057e3e1f858577703863a4cecc..a14229425ba287a69751f887530f37338fb66863 100644
+--- a/storage/session-storage/src/tests/ownership.rs
++++ b/storage/session-storage/src/tests/ownership.rs
+@@ -1,6 +1,40 @@
+ use super::*;
+ use uuid::Uuid;
+ 
++#[test]
++fn journal_backend_classifies_only_exact_os_basenames() {
++    use std::ffi::OsStr;
++
++    assert!(matches!(
++        BackendKind::from_journal_file_name(OsStr::new("journal.jsonl")),
++        Some(BackendKind::Jsonl)
++    ));
++    assert!(matches!(
++        BackendKind::from_journal_file_name(OsStr::new("journal.sqlite")),
++        Some(BackendKind::Sqlite)
++    ));
++    for name in [
++        "",
++        "journal",
++        "Journal.jsonl",
++        "journal.SQLITE",
++        "journal.jsonl.bak",
++        "journal.sqlite.bak",
++        "prefix-journal.jsonl",
++        "nested/journal.sqlite",
++    ] {
++        assert!(BackendKind::from_journal_file_name(OsStr::new(name)).is_none(), "{name:?}");
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::ffi::OsStrExt;
++
++        for name in [b"journal.jsonl\xff".as_slice(), b"journal.sqlite\xff".as_slice()] {
++            assert!(BackendKind::from_journal_file_name(OsStr::from_bytes(name)).is_none());
++        }
++    }
++}
++
+ #[test]
+ fn independent_writer_handles_share_lease_until_last_release() {
+     for kind in backends() {
