@@ -1,0 +1,181 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1b929a03812812a28ecbbb9fe158182fd47b960b..f775fbad5724e615de8640987104a0f6469d8cca 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -26,6 +26,7 @@ mod approval_preview;
+ mod approvals;
+ mod commands;
+ mod config_builder;
++mod config_path_lock;
+ mod handle;
+ mod profile;
+ mod profile_watch;
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+index 1f4a0390f341aa3241625bd16a1ca9a53e80d24e..416d70ed80375d89f5b07246628a833aba64eb2e 100644
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -7,12 +7,10 @@ mod persistence;
+ mod plugins;
+ #[cfg(test)]
+ mod tests;
+-mod transaction;
+ pub(super) use persistence::config_builder_target_path;
+ #[cfg(test)]
+ use persistence::persist_config_builder;
+ use persistence::{persist_config_builder_with_components, validate_module_config_toml};
+-pub(super) use transaction::path_lock;
+ 
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+@@ -32,7 +30,7 @@ use crate::{
+     domain::PermissionMode,
+ };
+ 
+-use super::{AppServerHandle, prepare_assembly};
++use super::{AppServerHandle, config_path_lock::path_lock, prepare_assembly};
+ 
+ pub use proteus_contracts::app_protocol::config_builder::{
+     ConfigBuilderModelPreset, ConfigBuilderModelRole, ConfigBuilderModule,
+@@ -165,7 +163,7 @@ impl AppServerHandle {
+             .config_path
+             .as_deref()
+             .ok_or_else(|| anyhow!("config path is not available; cannot persist config"))?;
+-        let path_lock = transaction::path_lock(config_path)?;
++        let path_lock = path_lock(config_path)?;
+         let _path_guard = path_lock.lock_owned().await;
+         let current_plan = self.runtime.assembly_plan().await;
+         validate_config_builder_modules(&modules, current_plan.catalog_entries())?;
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs b/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
+index db564945bb133eb8e8e5f853f630842d29a43547..f1d664955733458f465b574fa0ed1b166d34bee1 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::app_server::config_path_lock::path_lock;
+ 
+ fn source() -> Value {
+     serde_json::json!({
+diff --git a/crates/proteus-core/src/app_server/config_builder/transaction.rs b/crates/proteus-core/src/app_server/config_path_lock.rs
+similarity index 95%
+rename from crates/proteus-core/src/app_server/config_builder/transaction.rs
+rename to crates/proteus-core/src/app_server/config_path_lock.rs
+index 3c95c95f44510ee2761861e8f6f824a00a4a0fe0..cf258ab7c72cf27fd7e2237a7e62eef5acd911f3 100644
+--- a/crates/proteus-core/src/app_server/config_builder/transaction.rs
++++ b/crates/proteus-core/src/app_server/config_path_lock.rs
+@@ -1,8 +1,10 @@
+-use super::*;
+ use std::{
+     collections::HashMap,
++    path::{Path, PathBuf},
+     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+ };
++
++use anyhow::{Result, anyhow};
+ use tokio::sync::Mutex;
+ 
+ pub(in crate::app_server) fn path_lock(path: &Path) -> Result<Arc<Mutex<()>>> {
+diff --git a/crates/proteus-core/src/app_server/profile.rs b/crates/proteus-core/src/app_server/profile.rs
+index c94937a4a6c51ca44bff23e033c390650e882182..125cebbbb553f608aaf4f0f1871db8c4a0813751 100644
+--- a/crates/proteus-core/src/app_server/profile.rs
++++ b/crates/proteus-core/src/app_server/profile.rs
+@@ -1,5 +1,5 @@
+ //! Profile publication shared by UI saves, explicit reload and file refresh.
+-use super::{AppServerEvent, AppServerHandle, prepare_assembly};
++use super::{AppServerEvent, AppServerHandle, config_path_lock::path_lock, prepare_assembly};
+ use crate::{
+     core::{PreparedAssembly, RuntimeReloadReport, SessionConfigSnapshot},
+     domain::PermissionMode,
+@@ -136,7 +136,7 @@ impl AppServerHandle {
+         let lock = self
+             .config_path
+             .as_deref()
+-            .map(super::config_builder::path_lock)
++            .map(path_lock)
+             .transpose()?;
+         let _guard = match lock {
+             Some(lock) => Some(lock.lock_owned().await),
+diff --git a/crates/proteus-core/src/app_server/profile_watch.rs b/crates/proteus-core/src/app_server/profile_watch.rs
+index 413709988fc7805f427d712d3f8b2bc96576a45c..5852d26c31c087960ef308d0a47ac3ed853d3071 100644
+--- a/crates/proteus-core/src/app_server/profile_watch.rs
++++ b/crates/proteus-core/src/app_server/profile_watch.rs
+@@ -1,5 +1,5 @@
+ //! Cheap metadata polling with bounded-age semantic revalidation.
+-use super::{AppServerHandle, prepare_assembly};
++use super::{AppServerHandle, config_path_lock::path_lock, prepare_assembly};
+ use crate::core::{AppConfig, ConfigInputs};
+ use anyhow::Result;
+ use ring::digest::{Context as Digest, SHA256, digest};
+@@ -188,7 +188,7 @@ async fn start_with_polling(handle: &AppServerHandle, path: PathBuf, mut polling
+ }
+ 
+ async fn refresh(handle: &AppServerHandle, path: &Path, expected: &Fingerprint) -> Result<bool> {
+-    let lock = super::config_builder::path_lock(path)?;
++    let lock = path_lock(path)?;
+     let _guard = lock.lock_owned().await;
+     let config = AppConfig::load(Some(path)).await?;
+     if &Fingerprint::new(&config, &handle.cwd)? != expected {
+diff --git a/crates/proteus-core/src/app_server/session_behavior.rs b/crates/proteus-core/src/app_server/session_behavior.rs
+index 42d7ed86335932f26f0438d2a76d13d9792dba6a..aac715b10c6d40375af0463d05898b6f10ac6f25 100644
+--- a/crates/proteus-core/src/app_server/session_behavior.rs
++++ b/crates/proteus-core/src/app_server/session_behavior.rs
+@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
+ use serde::{Deserialize, Serialize};
+ use std::sync::Arc;
+ 
+-use super::{AppServerEvent, AppServerHandle, prepare_assembly};
++use super::{AppServerEvent, AppServerHandle, config_path_lock::path_lock, prepare_assembly};
+ use crate::{
+     core::{AppConfig, InstructionSourceConfig, PreparedAssembly, SessionConfigSnapshot},
+     domain::PermissionMode,
+@@ -179,7 +179,7 @@ async fn apply(server: &AppServerHandle, selected: Selection, write: bool) -> Re
+     let path_lock = server
+         .config_path
+         .as_deref()
+-        .map(super::config_builder::path_lock)
++        .map(path_lock)
+         .transpose()?;
+     let _path_guard = match path_lock {
+         Some(lock) => Some(lock.lock_owned().await),
+diff --git a/crates/proteus-core/src/app_server/session_model.rs b/crates/proteus-core/src/app_server/session_model.rs
+index 2d3145b022a722045153c1b523b4dffa6cc95dba..aff3ee8e5d6ccbe8bf7dbe1cc57902de4a555eee 100644
+--- a/crates/proteus-core/src/app_server/session_model.rs
++++ b/crates/proteus-core/src/app_server/session_model.rs
+@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
+ use ring::digest::{SHA256, digest};
+ use serde::{Deserialize, Serialize};
+ 
+-use super::{AppServerEvent, AppServerHandle, prepare_assembly};
++use super::{AppServerEvent, AppServerHandle, config_path_lock::path_lock, prepare_assembly};
+ use crate::{
+     core::{AppConfig, ModelConfig, PreparedAssembly, RuntimeRegistry, SessionConfigSnapshot},
+     domain::{ModelRef, ReasoningConfig},
+@@ -303,7 +303,7 @@ async fn apply(
+     let lock = server
+         .config_path
+         .as_deref()
+-        .map(super::config_builder::path_lock)
++        .map(path_lock)
+         .transpose()?;
+     let _guard = match lock {
+         Some(lock) => Some(lock.lock_owned().await),
+diff --git a/crates/proteus-core/src/app_server/session_selection.rs b/crates/proteus-core/src/app_server/session_selection.rs
+index 990b82e8006029887f96258f0d3c7097b0980fe4..56fe49d16318588c97d586864a89078a876aad7d 100644
+--- a/crates/proteus-core/src/app_server/session_selection.rs
++++ b/crates/proteus-core/src/app_server/session_selection.rs
+@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
+ use ring::digest::{SHA256, digest};
+ use serde::{Deserialize, Serialize};
+ 
++use super::config_path_lock::path_lock;
+ use crate::{
+     core::{AgentRuntime, AppConfig, config_store_root},
+     domain::{ModelRef, ReasoningConfig},
+@@ -320,7 +321,7 @@ impl super::AppServerHandle {
+             reasoning,
+         };
+         let last = last_path(&config, path)?;
+-        let lock = super::config_builder::path_lock(&last)?;
++        let lock = path_lock(&last)?;
+         let guard = lock.lock_owned().await;
+         let store = store.clone();
+         tokio::spawn(async move {
