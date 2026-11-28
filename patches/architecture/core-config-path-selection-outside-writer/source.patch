@@ -1,0 +1,182 @@
+diff --git a/crates/proteus-core/src/app_server/config_builder.rs b/crates/proteus-core/src/app_server/config_builder.rs
+index ec142d6252fcb41c03c585059e7607e40fa3a2fb..65960a412fd5e46fcd3895e0f549939e94fab51f 100644
+--- a/crates/proteus-core/src/app_server/config_builder.rs
++++ b/crates/proteus-core/src/app_server/config_builder.rs
+@@ -10,3 +10,2 @@ mod tests;
+ mod transaction;
+-pub(super) use persistence::config_builder_target_path;
+ #[cfg(test)]
+@@ -34,3 +33,3 @@ use crate::{
+ 
+-use super::{AppServerHandle, prepare_assembly};
++use super::{AppServerHandle, path_utils::config_builder_target_path, prepare_assembly};
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/component_packages/tests.rs b/crates/proteus-core/src/app_server/config_builder/component_packages/tests.rs
+index 1a5c64cc6e0ae084cacf418a53d1ec170b04a632..707261625cae41dbba5b4f7240798a09d8c96a52 100644
+--- a/crates/proteus-core/src/app_server/config_builder/component_packages/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/component_packages/tests.rs
+@@ -1,3 +1,3 @@
+ use super::*;
+-use crate::app_server::AgentAppServer;
++use crate::app_server::{AgentAppServer, path_utils::config_builder_target_path};
+ use proteus_contracts::app_protocol::http::{ComponentReplacement, SetConfigBuilderRequest};
+diff --git a/crates/proteus-core/src/app_server/config_builder/model_connections.rs b/crates/proteus-core/src/app_server/config_builder/model_connections.rs
+index 26f87cdd176d3cbfa0f4488f2fbb676701c8986a..64af53dfc7a93a32154e29430e054de9c5243592 100644
+--- a/crates/proteus-core/src/app_server/config_builder/model_connections.rs
++++ b/crates/proteus-core/src/app_server/config_builder/model_connections.rs
+@@ -2,2 +2,3 @@
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/persistence.rs b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+index 547811658dedfdc91578b69049bb88b81e34974b..5b6bbe2c1e9b1062744bb25927a22179f05c66a7 100644
+--- a/crates/proteus-core/src/app_server/config_builder/persistence.rs
++++ b/crates/proteus-core/src/app_server/config_builder/persistence.rs
+@@ -30,22 +30,2 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+ 
+-pub(in crate::app_server) fn config_builder_target_path(
+-    config_path: Option<&Path>,
+-) -> Option<PathBuf> {
+-    let path = config_path?;
+-    let selection = crate::core::config_selection(path).ok()?;
+-    let physical = crate::core::physical_config_path(path);
+-    let mut target = if physical.is_dir() {
+-        if !selection.is_empty() {
+-            return None;
+-        }
+-        physical.join(crate::core::CONFIG_BUILDER_OVERLAY)
+-    } else {
+-        std::fs::canonicalize(&physical).unwrap_or(physical)
+-    };
+-    for role in selection {
+-        target = crate::core::config_reference(&target, &role).ok()?;
+-    }
+-    Some(target)
+-}
+-
+ #[derive(serde::Serialize)]
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests.rs b/crates/proteus-core/src/app_server/config_builder/tests.rs
+index 884e0b9d58eaa236a2e0e332eb05ccc9a02967a0..b34021bbd373c418552ea6a8cc7ece70a64d4783 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests.rs
+@@ -7,2 +7,3 @@ use super::super::AgentAppServer;
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs b/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
+index db564945bb133eb8e8e5f853f630842d29a43547..8b169ccc5a6d49ba29babf729093aa60ab6dca57 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/inline_roles.rs
+@@ -1,2 +1,3 @@
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs b/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
+index 55fa2310dd96f7a4855b45b5c1544a528ddfd460..fb724608261cd1b518ac05208af791e77a2c6ee3 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/instruction_bootstrap.rs
+@@ -1,2 +1,3 @@
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+index b101e1d4cf64276a2a06cdd2bf0f9cd74d413c1e..1f47df4ac65a8a5bb339cc083d82e727e92a3fba 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/model_names.rs
+@@ -1,2 +1,3 @@
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ 
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs b/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs
+index 890c43676a32cb546985b2eb8be50bd5d870930b..e4aaa86ff5da9f9204a73d9b6c46def3dc78a685 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/provider_inheritance.rs
+@@ -3,2 +3,3 @@
+ use super::*;
++use crate::app_server::path_utils::config_builder_target_path;
+ use serde_json::json;
+diff --git a/crates/proteus-core/src/app_server/config_builder/tests/validation.rs b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+index c05845299f9285740a316ce6c188878f3261b6e6..d77da7c957d022b252acc041c97c2ff9e7deeb67 100644
+--- a/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
++++ b/crates/proteus-core/src/app_server/config_builder/tests/validation.rs
+@@ -1,3 +1,3 @@
+ use super::*;
+-use crate::app_server::AppServerEvent;
++use crate::app_server::{AppServerEvent, path_utils::config_builder_target_path};
+ use proteus_contracts::app_protocol::http::SetConfigBuilderRequest;
+diff --git a/crates/proteus-core/src/app_server/path_utils.rs b/crates/proteus-core/src/app_server/path_utils.rs
+index 7a0b989d11dfccf7bb24c1277d929c29118756b6..eb2d901fe6e8c72a8485f28430659a4f8d393080 100644
+--- a/crates/proteus-core/src/app_server/path_utils.rs
++++ b/crates/proteus-core/src/app_server/path_utils.rs
+@@ -1,2 +1,2 @@
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ 
+@@ -8 +8,67 @@ pub(super) fn paths_equal(left: &Path, right: &Path) -> bool {
+ }
++
++pub(super) fn config_builder_target_path(config_path: Option<&Path>) -> Option<PathBuf> {
++    let path = config_path?;
++    let selection = crate::core::config_selection(path).ok()?;
++    let physical = crate::core::physical_config_path(path);
++    let mut target = if physical.is_dir() {
++        if !selection.is_empty() {
++            return None;
++        }
++        physical.join(crate::core::CONFIG_BUILDER_OVERLAY)
++    } else {
++        std::fs::canonicalize(&physical).unwrap_or(physical)
++    };
++    for role in selection {
++        target = crate::core::config_reference(&target, &role).ok()?;
++    }
++    Some(target)
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++    use std::{fs, os::unix::fs::symlink};
++
++    #[test]
++    fn config_builder_target_preserves_alias_and_role_path_semantics() {
++        const NESTED_ROLES: &str = "#agent=/outer~1role/inner~0stage";
++        let temp = tempfile::tempdir().unwrap();
++        let file = temp.path().join("agent.toml");
++        let file_alias = temp.path().join("alias.toml");
++        fs::write(&file, b"").unwrap();
++        symlink(&file, &file_alias).unwrap();
++        let canonical_file = file.canonicalize().unwrap();
++
++        assert_eq!(
++            config_builder_target_path(Some(&file_alias)),
++            Some(canonical_file.clone())
++        );
++        let with_roles =
++            |path: &Path| PathBuf::from(format!("{}{NESTED_ROLES}", path.to_str().unwrap()));
++        assert_eq!(
++            config_builder_target_path(Some(&with_roles(&file_alias))),
++            Some(with_roles(&canonical_file))
++        );
++
++        let dir = temp.path().join("fragments");
++        let dir_alias = temp.path().join("fragments-alias");
++        fs::create_dir(&dir).unwrap();
++        symlink(&dir, &dir_alias).unwrap();
++        assert_eq!(
++            config_builder_target_path(Some(&dir_alias)),
++            Some(dir_alias.join("config-builder.toml"))
++        );
++        assert_eq!(config_builder_target_path(Some(&with_roles(&dir_alias))), None);
++
++        let unavailable = dir_alias.join("missing/../new.toml");
++        assert_eq!(
++            config_builder_target_path(Some(&unavailable)),
++            Some(unavailable.clone())
++        );
++
++        let malformed = PathBuf::from(format!("{}#agent=/bad~2role", file_alias.display()));
++        assert_eq!(config_builder_target_path(Some(&malformed)), None);
++        assert_eq!(config_builder_target_path(None), None);
++    }
++}
