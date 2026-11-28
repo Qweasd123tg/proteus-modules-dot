@@ -1,0 +1,60 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6fa9a1af3af741a2ba4597e74496670a3dc07e2e..764fe8b7b026a0fe8e61d77ad7a57ecb917328c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2084,7 +2084,6 @@ version = "0.1.0-alpha.3"
+ dependencies = [
+  "anyhow",
+  "proteus-contracts",
+- "proteus-module-protocol",
+  "proteus-module-sdk",
+  "serde",
+  "serde_json",
+diff --git a/components/module-runtime/Cargo.toml b/components/module-runtime/Cargo.toml
+index be412a4a40ba83bb4bb5e51d8dcec7d356f7a1bc..15b4652d3a907e16561bd8f6115e69d8603665d4 100644
+--- a/components/module-runtime/Cargo.toml
++++ b/components/module-runtime/Cargo.toml
+@@ -8,7 +8,6 @@ publish = false
+ [dependencies]
+ anyhow = "1"
+ proteus-contracts = { workspace = true }
+-proteus-module-protocol = { workspace = true }
+ proteus-module-sdk = { workspace = true }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+diff --git a/components/module-runtime/src/exports.rs b/components/module-runtime/src/exports.rs
+index e320da856b943e6fe0d8169acd429e040db24e0f..84fbe2b7f74d62b41102853d3d408876d59f51d5 100644
+--- a/components/module-runtime/src/exports.rs
++++ b/components/module-runtime/src/exports.rs
+@@ -15,7 +15,7 @@ use proteus_contracts::{
+         ToolModuleInvocationContext, WorkflowModuleInput, WorkflowModuleOutput,
+     },
+ };
+-use proteus_module_protocol::process_contract_authority;
++use proteus_module_sdk::protocol::process_contract_authority;
+ use serde_json::Value;
+ 
+ use crate::{
+diff --git a/components/process-module/Cargo.toml b/components/process-module/Cargo.toml
+index 6b565d4a4ae936cd1cf2d16e5e6284205f4a6079..73bfedc53b6df8ca02c86cff318f7488d9b2faf4 100644
+--- a/components/process-module/Cargo.toml
++++ b/components/process-module/Cargo.toml
+@@ -12,9 +12,7 @@ path = "src/main.rs"
+ proteus-module-runtime = { path = "../module-runtime" }
+ anyhow = "1"
+ proteus-contracts = { workspace = true }
+-proteus-module-protocol = { workspace = true }
+ proteus-module-sdk = { workspace = true }
+-serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ 
+ codex-patch = { path = "../../tool/codex-patch" }
+@@ -41,6 +39,8 @@ hook-pack = { path = "../../hook/hook-pack" }
+ [dev-dependencies]
+ async-trait = "0.1"
+ proteus-core = { workspace = true }
++proteus-module-protocol = { workspace = true }
+ proteus-process-host = { workspace = true }
++serde = { version = "1", features = ["derive"] }
+ tempfile = "3"
+ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
