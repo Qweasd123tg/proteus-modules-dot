@@ -1,0 +1,126 @@
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 1f85cf1b8825f3906fffee0ab1ed6bd1546da7c3..0ea25ab724d529799fbe68c03f00704b34827716 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -20,2 +20,3 @@ mod committed;
+ mod incremental;
++mod preview;
+ pub(crate) use committed::CommittedDisplay;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache.rs b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+index f8b2f8693104c4fb6a7cb3f768ee58847676cd97..8204d8bd2102b78bf64f3bd2fbe921739afe2b00 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/cache.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/cache.rs
+@@ -15,6 +15,5 @@ use serde_json::Value;
+ 
+-use super::super::plain_history::PlainHistoryMessage;
++use super::preview::session_preview;
+ use super::*;
+ use crate::core::session_store::remote::snapshot::RemoteJournalCursor;
+-pub(super) use preview::{plain_preview, session_preview};
+ 
+@@ -26,3 +25,2 @@ const PREFIX: &str = "display-view-v1-prefix";
+ mod pages;
+-mod preview;
+ pub(super) use pages::{
+@@ -518,10 +516,2 @@ pub(super) fn save_startup_model<T: CacheRows>(
+ 
+-pub(super) fn write_plain_conversation(
+-    store: &RemoteSessionStore,
+-    source: &RemoteCacheSource,
+-    rows: &[PlainHistoryMessage],
+-) -> Option<Section> {
+-    write_transcript_iter(store, source, rows.iter())
+-}
+-
+ #[derive(Clone, Copy)]
+@@ -596,3 +586,6 @@ impl CacheConversation<'_> {
+             Self::Borrowed(rows) => write_transcript(store, source, rows),
+-            Self::Owned(history, _) => history.write(store, source),
++            Self::Owned(StartupHistory::Full(rows), _) => write_transcript(store, source, rows),
++            Self::Owned(StartupHistory::Plain { rows, .. }, _) => {
++                write_transcript_iter(store, source, rows.iter())
++            }
+         }
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs b/crates/proteus-core/src/core/session_store/remote/view/preview.rs
+similarity index 100%
+rename from crates/proteus-core/src/core/session_store/remote/view/cache/preview.rs
+rename to crates/proteus-core/src/core/session_store/remote/view/preview.rs
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+index a12598b53261d55ba891a747c9c612296afd7514..df8091c16ee3845ad7bf640302c6c048bf64ee4f 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/startup_history.rs
+@@ -1,4 +1,4 @@
+ //! Startup-only owner for the independently validated canonical conversation.
+-use super::super::{RemoteSessionStore, plain_history::PlainHistoryMessage};
+-use super::cache::{self, RemoteCacheSource, Section};
++use super::super::plain_history::PlainHistoryMessage;
++use super::preview::{plain_preview, session_preview};
+ use crate::model_standard::CanonicalMessage;
+@@ -58,4 +58,4 @@ impl StartupHistory {
+         match self {
+-            Self::Full(rows) => cache::session_preview(rows),
+-            Self::Plain { rows, .. } => cache::plain_preview(rows),
++            Self::Full(rows) => session_preview(rows),
++            Self::Plain { rows, .. } => plain_preview(rows),
+         }
+@@ -73,13 +73,2 @@ impl StartupHistory {
+     }
+-
+-    pub(super) fn write(
+-        &self,
+-        store: &RemoteSessionStore,
+-        source: &RemoteCacheSource,
+-    ) -> Option<Section> {
+-        match self {
+-            Self::Full(rows) => cache::write_transcript(store, source, rows),
+-            Self::Plain { rows, .. } => cache::write_plain_conversation(store, source, rows),
+-        }
+-    }
+ }
+@@ -116,3 +105,3 @@ mod tests {
+             .collect();
+-        let preview = cache::session_preview(&rows);
++        let preview = session_preview(&rows);
+         let context = crate::core::summarize_context_history(&rows);
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/tests/startup_save.rs b/crates/proteus-core/src/core/session_store/remote/view/tests/startup_save.rs
+index 2b288dccea9a9d2a3beeddc5b9ad2fc231f83cbf..cea732bb865a10d471a8c98edd8366ace466ec28 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/tests/startup_save.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/tests/startup_save.rs
+@@ -64,2 +64,37 @@ fn startup_save_preserves_borrowed_cache_bytes_and_operations() {
+ 
++#[test]
++fn startup_save_plain_and_full_keep_identical_cache_bytes_and_operations() {
++    let (backend, store) = Backend::store();
++    backend.append(4_096);
++    let read = RemoteValidatedRead::open(store.clone()).unwrap();
++    let source = RemoteCacheSource::from_cursor(&read.cursor());
++    let mut model = SessionReadModel::from_validated(&store, read, full).unwrap();
++    let rows = std::mem::take(&mut model.conversation.messages);
++    let plain = StartupHistory::prepare(rows.clone(), true);
++    assert!(matches!(&plain, StartupHistory::Plain { .. }));
++    let save = |history: StartupHistory| {
++        cache::StartupProjection {
++            summary: model.summary.clone(),
++            revision: model.conversation.revision,
++            context_summary: history.context_summary(),
++            history,
++            context: model.conversation.model_context.clone(),
++            prefix: None,
++        }
++        .save(&store, &source, &model.usage, &model.transcript)
++    };
++
++    let initial = {
++        let mut state = backend.0.lock().unwrap();
++        state.cache_reads.clear();
++        state.writes.clear();
++        state.cache.clone()
++    };
++    assert_eq!(save(StartupHistory::Full(rows)), Some(()));
++    let full = capture_io(&backend);
++    backend.0.lock().unwrap().cache = initial;
++    assert_eq!(save(plain), Some(()));
++    assert_eq!(capture_io(&backend), full);
++}
++
+ #[test]
