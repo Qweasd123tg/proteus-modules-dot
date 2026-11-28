@@ -1,0 +1,147 @@
+diff --git a/crates/proteus-module-protocol/src/v3/frame.rs b/crates/proteus-module-protocol/src/v3/frame.rs
+index ae489a4c0b52681973985b8bc4b6cb680cfd107c..853e930804f26a325579a72cba621d18712684a4 100644
+--- a/crates/proteus-module-protocol/src/v3/frame.rs
++++ b/crates/proteus-module-protocol/src/v3/frame.rs
+@@ -1,5 +1,5 @@
+ use anyhow::{Context, Result, bail};
+-use serde_json::{Map, Value};
++use serde_json::{Map, Value, json};
+ 
+ use crate::ProcessModuleRpcError;
+ 
+@@ -21,6 +21,18 @@ pub enum ComponentFrame {
+     },
+ }
+ 
++pub fn rpc_success(id: &str, result: Value) -> Value {
++    // The result is already JSON. Move it into the envelope instead of
++    // serializing it into a second Value tree (potentially a full record page).
++    let mut frame = json!({"jsonrpc": "2.0", "id": id});
++    frame["result"] = result;
++    frame
++}
++
++pub fn rpc_error(id: &str, error: ProcessModuleRpcError) -> Value {
++    json!({"jsonrpc": "2.0", "id": id, "error": error})
++}
++
+ /// Checks the strict JSON-RPC envelope and preserves its opaque payload.
+ ///
+ /// Wire ID grammar, direction, generation, method authority and invocation
+@@ -115,6 +127,38 @@ mod tests {
+     use super::*;
+     use serde_json::json;
+ 
++    #[test]
++    fn success_envelope_preserves_opaque_result_without_copying_its_payload() {
++        let result = json!({"nested": [null, {"text": "a nonempty owned response"}]});
++        let text = result["nested"][1]["text"].as_str().unwrap().as_ptr();
++        let expected =
++            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "h:1:9", "result": result}))
++                .unwrap();
++        let frame = rpc_success("h:1:9", result);
++        assert_eq!(serde_json::to_vec(&frame).unwrap(), expected);
++        let actual = frame["result"]["nested"][1]["text"].as_str().unwrap();
++        assert_eq!(actual.as_ptr(), text);
++    }
++
++    #[test]
++    fn response_error_preserves_bytes_for_absent_null_and_nested_data() {
++        let nested = json!({"detail": [null, {"text": "пример \"строка\"\n"}], "flag": false});
++        for data in [None, Some(Value::Null), Some(nested)] {
++            let error = ProcessModuleRpcError {
++                code: -32000,
++                message: "synthetic response".into(),
++                data: data.clone(),
++            };
++            let expected = serde_json::to_vec(&json!({
++                "jsonrpc": "2.0", "id": "h:1:9", "error": error
++            }))
++            .unwrap();
++            let frame = rpc_error("h:1:9", error);
++            assert_eq!(serde_json::to_vec(&frame).unwrap(), expected);
++            assert_eq!(frame["error"].get("data"), data.as_ref());
++        }
++    }
++
+     #[test]
+     fn envelopes_preserve_requests_notifications_and_terminal_payloads() {
+         let params = json!({"export": {"slot": "tool", "module_id": "rg_search"}});
+diff --git a/crates/proteus-module-protocol/src/v3/mod.rs b/crates/proteus-module-protocol/src/v3/mod.rs
+index 153edb17e6e9ca11caa7243c7cb775c85f8a4b2f..6f7cb8a67c14b4b0e5274340e0b6afe09e17fbd1 100644
+--- a/crates/proteus-module-protocol/src/v3/mod.rs
++++ b/crates/proteus-module-protocol/src/v3/mod.rs
+@@ -32,7 +32,7 @@ mod wire_id;
+ pub use broker::{ComponentBroker, ComponentBrokerSnapshot, WeakComponentBroker};
+ #[cfg(feature = "host-broker")]
+ pub use config::ComponentBrokerOptions;
+-pub use frame::{ComponentFrame, parse_component_frame};
++pub use frame::{ComponentFrame, parse_component_frame, rpc_error, rpc_success};
+ #[cfg(feature = "host-broker")]
+ pub use invocation::{
+     AsyncHostRequestDispatcher, CancelCause, ComponentBrokerError, ComponentBrokerErrorKind,
+diff --git a/crates/proteus-module-sdk/src/runtime.rs b/crates/proteus-module-sdk/src/runtime.rs
+index 9e38f572003731ae7a725b9b6190ad5112010467..c367a88622205ddf8a645c69bd6e8ae89255ee1d 100644
+--- a/crates/proteus-module-sdk/src/runtime.rs
++++ b/crates/proteus-module-sdk/src/runtime.rs
+@@ -18,7 +18,7 @@ use proteus_module_protocol::{
+     ProcessModuleRpcError, process_contract_authority,
+     v3::{
+         ComponentFrame, ComponentTransportConfig, WireDirection, parse_component_frame,
+-        parse_wire_id,
++        parse_wire_id, rpc_error, rpc_success,
+     },
+ };
+ use serde_json::Value;
+@@ -26,7 +26,7 @@ use serde_json::Value;
+ use crate::{
+     Export,
+     hosts::HostBridge,
+-    transport::{FrameReader, ModuleTransport, rpc_error, rpc_success},
++    transport::{FrameReader, ModuleTransport},
+ };
+ 
+ const MAX_ACTIVE_INVOCATIONS: usize = 32;
+diff --git a/crates/proteus-module-sdk/src/transport.rs b/crates/proteus-module-sdk/src/transport.rs
+index 7105922b7e66a34de5463c3db70373fd77a6bbac..00a381acb4f97a2a4edfd231ebd71d9c6dfa4432 100644
+--- a/crates/proteus-module-sdk/src/transport.rs
++++ b/crates/proteus-module-sdk/src/transport.rs
+@@ -192,18 +192,6 @@ impl Write for FrameByteCounter {
+     }
+ }
+ 
+-pub fn rpc_success(id: &str, result: Value) -> Value {
+-    // The result is already JSON. Move it into the envelope instead of
+-    // serializing it into a second Value tree (potentially a full record page).
+-    let mut frame = json!({"jsonrpc": "2.0", "id": id});
+-    frame["result"] = result;
+-    frame
+-}
+-
+-pub fn rpc_error(id: &str, error: ProcessModuleRpcError) -> Value {
+-    json!({"jsonrpc": "2.0", "id": id, "error": error})
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -220,19 +208,6 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn success_envelope_preserves_opaque_result_without_copying_its_payload() {
+-        let result = json!({"nested": [null, {"text": "a nonempty owned response"}]});
+-        let text = result["nested"][1]["text"].as_str().unwrap().as_ptr();
+-        let expected =
+-            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "h:1:9", "result": result}))
+-                .unwrap();
+-        let frame = rpc_success("h:1:9", result);
+-        assert_eq!(serde_json::to_vec(&frame).unwrap(), expected);
+-        let actual = frame["result"]["nested"][1]["text"].as_str().unwrap();
+-        assert_eq!(actual.as_ptr(), text);
+-    }
+-
+     #[test]
+     fn oversized_output_is_rejected_before_any_frame_bytes_are_written() {
+         let bytes = Arc::new(Mutex::new(Vec::new()));
