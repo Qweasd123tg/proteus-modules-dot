@@ -1,0 +1,119 @@
+diff --git a/storage/session-storage/src/backend/kind.rs b/storage/session-storage/src/backend/kind.rs
+index 7456e6e9d67432e98b4872d9a100e28aa1fd68bd..f22155fdb9e6414c86c53fa4c01239f537e808c6 100644
+--- a/storage/session-storage/src/backend/kind.rs
++++ b/storage/session-storage/src/backend/kind.rs
+@@ -7,7 +7,7 @@ use crate::types::JournalRecord;
+ use anyhow::Result;
+ use proteus_contracts::domain::SessionId;
+ use serde::{Deserialize, Serialize};
+-use std::path::{Path, PathBuf};
++use std::{ffi::OsStr, path::{Path, PathBuf}};
+ 
+ #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+@@ -18,6 +18,16 @@ pub enum BackendKind {
+ }
+ 
+ impl BackendKind {
++    pub(crate) fn from_journal_file_name(name: &OsStr) -> Option<Self> {
++        if name == JSONL_JOURNAL_FILE {
++            Some(Self::Jsonl)
++        } else if name == SQLITE_JOURNAL_FILE {
++            Some(Self::Sqlite)
++        } else {
++            None
++        }
++    }
++
+     pub(crate) fn description_path(self, dir: &Path) -> PathBuf {
+         dir.join(match self {
+             Self::Jsonl => JSONL_JOURNAL_FILE,
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index b6f4ef8099b684ebd1b9acd4007f860007c0f8b9..3d051e5bb42c9d7cfc3e2c4023a50bf30a5b52a5 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -1,7 +1,7 @@
+ //! Typed storage service. No provider-, workflow- or tool-specific dispatch.
+ use crate::{
+     BackendKind,
+-    backend::{JSONL_JOURNAL_FILE, JournalBackend, SQLITE_JOURNAL_FILE},
++    backend::JournalBackend,
+     fold::Fold,
+     identity,
+     lease::SessionWriteOwnership,
+diff --git a/storage/session-storage/src/service/catalog/durable.rs b/storage/session-storage/src/service/catalog/durable.rs
+index 9d69a2dbe8f6698bce2ce470841560bf656a2b85..fef5a21ffb01d0441b19540d48d83b56deea9d54 100644
+--- a/storage/session-storage/src/service/catalog/durable.rs
++++ b/storage/session-storage/src/service/catalog/durable.rs
+@@ -99,11 +99,7 @@ pub(super) fn load(
+ }
+ 
+ fn journal_kind(descriptor: &StorageSessionDescriptor) -> Option<BackendKind> {
+-    match descriptor.record_location.as_ref()?.file_name()?.to_str()? {
+-        JSONL_JOURNAL_FILE => Some(BackendKind::Jsonl),
+-        SQLITE_JOURNAL_FILE => Some(BackendKind::Sqlite),
+-        _ => None,
+-    }
++    BackendKind::from_journal_file_name(descriptor.record_location.as_ref()?.file_name()?)
+ }
+ 
+ /// Write the compact v1 envelope in field order, leaving room to backfill
+diff --git a/storage/session-storage/src/service/sessions.rs b/storage/session-storage/src/service/sessions.rs
+index b382e85ae5ecdf85abc59281cafc343208efaeed..c816d57636de7bb1ce416efe8357886a6499b882 100644
+--- a/storage/session-storage/src/service/sessions.rs
++++ b/storage/session-storage/src/service/sessions.rs
+@@ -22,7 +22,8 @@ fn check_selected_format(kind: BackendKind, path: &Path) -> Result<()> {
+ pub(super) fn open(kind: BackendKind, path: &Path) -> Result<StorageSessionDescriptor> {
+     let path = if path
+         .file_name()
+-        .is_some_and(|name| name == JSONL_JOURNAL_FILE || name == SQLITE_JOURNAL_FILE)
++        .and_then(BackendKind::from_journal_file_name)
++        .is_some()
+     {
+         path.parent()
+             .context("record location has no session parent")?
+diff --git a/storage/session-storage/src/tests/ownership.rs b/storage/session-storage/src/tests/ownership.rs
+index 5a32217b61211ae69cba7bd3be4cbda118f8a548..d7048b3c7f4ad2d2547e0131cd43e35dd5fa9747 100644
+--- a/storage/session-storage/src/tests/ownership.rs
++++ b/storage/session-storage/src/tests/ownership.rs
+@@ -1,6 +1,40 @@
+ use super::*;
+ use uuid::Uuid;
+ 
++#[test]
++fn journal_backend_classifies_only_exact_os_basenames() {
++    use std::ffi::OsStr;
++
++    assert!(matches!(
++        BackendKind::from_journal_file_name(OsStr::new("journal.jsonl")),
++        Some(BackendKind::Jsonl)
++    ));
++    assert!(matches!(
++        BackendKind::from_journal_file_name(OsStr::new("journal.sqlite")),
++        Some(BackendKind::Sqlite)
++    ));
++    for name in [
++        "",
++        "journal",
++        "Journal.jsonl",
++        "journal.SQLITE",
++        "journal.jsonl.bak",
++        "journal.sqlite.bak",
++        "prefix-journal.jsonl",
++        "nested/journal.sqlite",
++    ] {
++        assert!(BackendKind::from_journal_file_name(OsStr::new(name)).is_none(), "{name:?}");
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::ffi::OsStrExt;
++
++        for name in [b"journal.jsonl\xff".as_slice(), b"journal.sqlite\xff".as_slice()] {
++            assert!(BackendKind::from_journal_file_name(OsStr::from_bytes(name)).is_none());
++        }
++    }
++}
++
+ #[test]
+ fn independent_writer_handles_share_lease_until_last_release() {
+     for kind in backends() {
