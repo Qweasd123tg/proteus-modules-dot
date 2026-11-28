@@ -1,0 +1,91 @@
+diff --git a/storage/session-storage/src/backend/kind.rs b/storage/session-storage/src/backend/kind.rs
+index 717dbea6e368a25a90074b139f9f52ea617f741d..1cae5642a42f22fcb4b381939ec3ac4136b7778c 100644
+--- a/storage/session-storage/src/backend/kind.rs
++++ b/storage/session-storage/src/backend/kind.rs
+@@ -1,7 +1,7 @@
+ //! Backend selection, physical locations and cold snapshot replay.
+ use super::{
+-    JSONL_JOURNAL_FILE, JournalBackend, Jsonl, RecordSnapshot, SQLITE_JOURNAL_FILE, Sqlite,
+-    replay_records,
++    JSONL_JOURNAL_FILE, JournalBackend, Jsonl, PrefixHint, RecordSnapshot, SQLITE_JOURNAL_FILE,
++    Sqlite, replay_records,
+ };
+ use crate::types::JournalRecord;
+ use anyhow::Result;
+@@ -48,4 +48,24 @@ impl BackendKind {
+             }
+         }
+     }
++
++    pub(crate) fn replay_catalog<T: Default>(
++        self,
++        dir: &Path,
++        id: SessionId,
++        apply: impl Fn(&mut T, &JournalRecord) -> Result<()>,
++    ) -> Result<(T, PrefixHint)> {
++        match self {
++            Self::Sqlite => Sqlite::replay_catalog(dir, id, apply),
++            Self::Jsonl => {
++                let (source, fold) =
++                    Jsonl::replay_snapshot(dir, id, None, |fold, record, _| apply(fold, record))?;
++                let hint = PrefixHint {
++                    extent: source.extent(),
++                    fingerprint: source.fingerprint().to_owned(),
++                };
++                Ok((fold, hint))
++            }
++        }
++    }
+ }
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 38cced696223412dc62ab4a937851eb9a2757250..05a0403ae3f78d619af42b56deab055fef5d4303 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -3,7 +3,6 @@ use super::*;
+ use super::source::{
+     BlobStampDigest, BlobStamps, SourceStamp, blob_stamp_digest, blob_stamps, source_stamp,
+ };
+-use crate::backend::{Jsonl, Sqlite};
+ 
+ mod durable;
+ #[cfg(test)]
+@@ -160,24 +159,9 @@ type Projection = (StorageSessionSummary, PrefixCache);
+ impl CatalogRead {
+     fn replay(&self, kind: BackendKind, dir: &Path) -> Result<Projection> {
+         let session = self.descriptor.session.session_id;
+-        let (fold, hint) = match kind {
+-            BackendKind::Sqlite => {
+-                Sqlite::replay_catalog(dir, session, |fold: &mut Fold, record| {
+-                    fold.apply_validated(session, record)
+-                })?
+-            }
+-            BackendKind::Jsonl => {
+-                let (source, fold) =
+-                    Jsonl::replay_snapshot(dir, session, None, |fold: &mut Fold, record, _| {
+-                        fold.apply_validated(session, record)
+-                    })?;
+-                let hint = crate::backend::PrefixHint {
+-                    extent: source.extent(),
+-                    fingerprint: source.fingerprint().to_owned(),
+-                };
+-                (fold, hint)
+-            }
+-        };
++        let (fold, hint) = kind.replay_catalog(dir, session, |fold: &mut Fold, record| {
++            fold.apply_validated(session, record)
++        })?;
+         let prefix = PrefixCache {
+             stamps: self.stamps.clone(),
+             revision: fold.revision(),
+diff --git a/storage/session-storage/src/service/catalog/replay_tests.rs b/storage/session-storage/src/service/catalog/replay_tests.rs
+index de7c3712ddfedc5d2d47519ddb2e6ebf1099b0db..d0ee3d4e7d5207b2e1ed7f981091bb906e01077c 100644
+--- a/storage/session-storage/src/service/catalog/replay_tests.rs
++++ b/storage/session-storage/src/service/catalog/replay_tests.rs
+@@ -1,4 +1,7 @@
+ use super::*;
++#[cfg(unix)]
++use crate::backend::Jsonl;
++use crate::backend::Sqlite;
+ use crate::tests::{Fixture, text};
+ use std::cell::RefCell;
+ #[cfg(unix)]

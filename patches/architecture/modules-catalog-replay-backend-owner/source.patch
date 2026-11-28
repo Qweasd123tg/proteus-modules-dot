@@ -1,0 +1,71 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..8b3e18097a9bfc78d95341cada704b17d392345c 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -1,6 +1,6 @@
+ //! Typed storage service. No provider-, workflow- or tool-specific dispatch.
+ use crate::{
+-    backend::{JournalBackend, Jsonl, Sqlite},
++    backend::{JournalBackend, Jsonl, PrefixHint, Sqlite},
+     identity,
+     lease::SessionWriteOwnership,
+     path_identity::canonicalize_unmaterialized_path,
+@@ -77,6 +77,26 @@ impl BackendKind {
+             Self::Sqlite => Box::new(Sqlite::default()),
+         }
+     }
++
++    fn replay_catalog<T: Default>(
++        self,
++        dir: &Path,
++        id: SessionId,
++        apply: impl Fn(&mut T, &JournalRecord) -> Result<()>,
++    ) -> Result<(T, PrefixHint)> {
++        match self {
++            Self::Sqlite => Sqlite::replay_catalog(dir, id, apply),
++            Self::Jsonl => {
++                let (source, fold) =
++                    Jsonl::replay_snapshot(dir, id, None, |fold, record, _| apply(fold, record))?;
++                let hint = PrefixHint {
++                    extent: source.extent(),
++                    fingerprint: source.fingerprint().to_owned(),
++                };
++                Ok((fold, hint))
++            }
++        }
++    }
+ }
+ impl StorageService {
+     pub fn new(kind: BackendKind) -> Self {
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 77bef3d4bc23762cfa2b8c9e6fc67486a5400942..1832b15f284796313ddc4204135bb92632568ff9 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -254,24 +254,9 @@ type Projection = (StorageSessionSummary, super::views::PrefixCache);
+ impl CatalogRead {
+     fn replay(&self, kind: BackendKind, dir: &Path) -> Result<Projection> {
+         let session = self.descriptor.session.session_id;
+-        let (fold, hint) = match kind {
+-            BackendKind::Sqlite => {
+-                Sqlite::replay_catalog(dir, session, |fold: &mut Fold, record| {
+-                    fold.apply_validated(session, record)
+-                })?
+-            }
+-            BackendKind::Jsonl => {
+-                let (source, fold) =
+-                    Jsonl::replay_snapshot(dir, session, None, |fold: &mut Fold, record, _| {
+-                        fold.apply_validated(session, record)
+-                    })?;
+-                let hint = crate::backend::PrefixHint {
+-                    extent: source.extent(),
+-                    fingerprint: source.fingerprint().to_owned(),
+-                };
+-                (fold, hint)
+-            }
+-        };
++        let (fold, hint) = kind.replay_catalog(dir, session, |fold: &mut Fold, record| {
++            fold.apply_validated(session, record)
++        })?;
+         let prefix = super::views::PrefixCache {
+             stamps: self.stamps.clone(),
+             revision: fold.revision(),
