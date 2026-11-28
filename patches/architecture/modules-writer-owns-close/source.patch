@@ -1,0 +1,91 @@
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..3cc1ba1e6969a35469fa8e145974cbf2efc0293e 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -351,6 +351,33 @@ impl State {
+         checked_path(session)
+     }
+ 
++    fn close_writer(&mut self, session: &SessionLocator, writer: Writer) {
++        let Writer {
++            backend,
++            _ownership,
++            ..
++        } = writer;
++        // SQLite may checkpoint and remove its WAL when the last writer
++        // connection closes. Rebind an already verified head while the
++        // session lease still excludes another writer.
++        let head = self.catalog_before_sqlite_close(session);
++        drop(backend);
++        if let Some((dir, mut prefix, summary)) = head
++            && let Ok(stamps) = catalog::source_stamp(&dir, self.kind)
++            && stamps != prefix.stamps
++            && stamps[2] == prefix.stamps[2]
++            && stamps[0]
++                .as_ref()
++                .zip(prefix.stamps[0].as_ref())
++                .is_some_and(|(new, old)| new.same_file(old))
++            && let Some(blobs) = catalog::durable::blob_stamps(&dir)
++            && Some(catalog::durable::blob_stamp_digest(&blobs)) == prefix.blob_digest
++        {
++            prefix.stamps = stamps;
++            self.save_catalog_head(&dir, summary, &prefix, blobs);
++        }
++    }
++
+     fn writer(&mut self, lease: &StorageWriterLease) -> Result<&mut Writer> {
+         let writer = self
+             .writers
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 10db88af44c3196caef77a904ad8cb2af246f8a6..7d4460ebc4ec8b6aa20922d9987006a7b9cf8e02 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -15,6 +15,12 @@ pub(super) struct FileStamp {
+     inode: u64,
+     changed: (i64, i64),
+ }
++impl FileStamp {
++    pub(super) fn same_file(&self, other: &Self) -> bool {
++        self.device == other.device && self.inode == other.inode
++    }
++}
++
+ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
+     match std::fs::metadata(path) {
+         Ok(meta) => Ok(Some(file_stamp(&meta)?)),
+@@ -99,34 +105,7 @@ impl WriterHead {
+ }
+ 
+ impl State {
+-    pub(super) fn close_writer(&mut self, session: &SessionLocator, writer: Writer) {
+-        let Writer {
+-            backend,
+-            _ownership,
+-            ..
+-        } = writer;
+-        // SQLite may checkpoint and remove its WAL when the last writer
+-        // connection closes. Rebind an already verified head while the
+-        // session lease still excludes another writer.
+-        let head = self.catalog_before_sqlite_close(session);
+-        drop(backend);
+-        if let Some((dir, mut prefix, summary)) = head
+-            && let Ok(stamps) = source_stamp(&dir, self.kind)
+-            && stamps != prefix.stamps
+-            && stamps[2] == prefix.stamps[2]
+-            && stamps[0]
+-                .as_ref()
+-                .zip(prefix.stamps[0].as_ref())
+-                .is_some_and(|(new, old)| new.device == old.device && new.inode == old.inode)
+-            && let Some(blobs) = durable::blob_stamps(&dir)
+-            && Some(durable::blob_stamp_digest(&blobs)) == prefix.blob_digest
+-        {
+-            prefix.stamps = stamps;
+-            self.save_catalog_head(&dir, summary, &prefix, blobs);
+-        }
+-    }
+-
+-    fn catalog_before_sqlite_close(
++    pub(super) fn catalog_before_sqlite_close(
+         &self,
+         session: &SessionLocator,
+     ) -> Option<(PathBuf, super::views::PrefixCache, StorageSessionSummary)> {
