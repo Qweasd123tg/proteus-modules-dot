@@ -1,0 +1,222 @@
+diff --git a/sdk/src/host.rs b/sdk/src/host.rs
+index 9de94c4c28c9379f7693e0098bf14f944b3ecb80..f95cc523eb50f107ad43e170e3d66c3eae354dc1 100644
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -7,7 +7,9 @@ use anyhow::{anyhow, bail};
+ use serde::Serialize;
+ use serde_json::{Value, json};
+ 
+-use crate::ui::{self, Node as _};
++#[cfg(test)]
++use crate::ui;
++use crate::widget_primitives::{Node as _, SharedColumn, button, row, text};
+ use crate::{Extension, Result, Surface, ValueExt};
+ 
+ /// HTTP status with the server's existing user-facing error message.
+@@ -425,7 +427,7 @@ impl Host {
+     }
+ 
+     /// Show an immutable column backed by the widgets of a render cache.
+-    pub fn show_shared_column(&mut self, view: &str, root: ui::SharedColumn) {
++    pub fn show_shared_column(&mut self, view: &str, root: SharedColumn) {
+         self.show_root(view, Shown::Column(root), None, Some(json!({})));
+     }
+ 
+@@ -561,9 +563,9 @@ impl Host {
+             return;
+         }
+         // Прежний вид остаётся под ошибкой, его элементы работают дальше.
+-        let notice = ui::row(vec![
+-            ui::text(error).with("tone", "danger"),
+-            ui::button("Повторить", "refresh").with("icon", "refresh-cw"),
++        let notice = row(vec![
++            text(error).with("tone", "danger"),
++            button("Повторить", "refresh").with("icon", "refresh-cw"),
+         ]);
+         self.send_failure(view, &notice);
+     }
+diff --git a/sdk/src/host/views.rs b/sdk/src/host/views.rs
+index fdef44a3b531461f44743dd10de727e3e608f05d..52ad2bdcac558e07e8beaf4a0152269aa15b560d 100644
+--- a/sdk/src/host/views.rs
++++ b/sdk/src/host/views.rs
+@@ -5,7 +5,7 @@ use serde::{Serialize, Serializer, ser::SerializeSeq};
+ use serde_json::Value;
+ 
+ use super::Host;
+-use crate::ui::SharedColumn;
++use crate::widget_primitives::SharedColumn;
+ 
+ #[derive(Serialize)]
+ #[serde(untagged)]
+@@ -171,7 +171,10 @@ mod tests {
+         let mut host = Host::default();
+         let widget = Arc::new(ui::text("shared 🧪"));
+         let cached = Arc::downgrade(&widget);
+-        host.show_shared_column("figure", SharedColumn::new("medium", vec![widget.clone()]));
++        host.show_shared_column(
++            "figure",
++            ui::SharedColumn::new("medium", vec![widget.clone()]),
++        );
+         assert_eq!(Arc::strong_count(&widget), 2);
+         drop(widget);
+ 
+diff --git a/sdk/src/lib.rs b/sdk/src/lib.rs
+index 3e645f835ad761f5181ceaea25ac1cd6bf63a449..d39b6d1c6cec0e4c4c0badd6ad8e5a3c4b683e86 100644
+--- a/sdk/src/lib.rs
++++ b/sdk/src/lib.rs
+@@ -13,6 +13,7 @@ mod host;
+ mod preferences;
+ pub mod ui;
+ mod value;
++mod widget_primitives;
+ 
+ pub use analytics::Analytics;
+ pub use anyhow::{Context as _, Error, anyhow, bail};
+diff --git a/sdk/src/ui.rs b/sdk/src/ui.rs
+index a377f56974b8c87432e45355acd8cdc6b8f67413..561dd807ef30e4d626564d821fd023307ff96169 100644
+--- a/sdk/src/ui.rs
++++ b/sdk/src/ui.rs
+@@ -6,32 +6,7 @@ use serde_json::{Map, Value, json};
+ 
+ pub mod metric_badge;
+ 
+-/// Adds optional fields to a node.
+-pub trait Node {
+-    fn with(self, key: &str, value: impl Into<Value>) -> Value;
+-    /// Adds the field only when `value` is `Some`.
+-    fn maybe(self, key: &str, value: Option<impl Into<Value>>) -> Value;
+-}
+-
+-impl Node for Value {
+-    fn with(mut self, key: &str, value: impl Into<Value>) -> Value {
+-        if let Value::Object(map) = &mut self {
+-            map.insert(key.to_owned(), value.into());
+-        }
+-        self
+-    }
+-
+-    fn maybe(self, key: &str, value: Option<impl Into<Value>>) -> Value {
+-        match value {
+-            Some(value) => self.with(key, value),
+-            None => self,
+-        }
+-    }
+-}
+-
+-pub fn text(value: impl ToString) -> Value {
+-    json!({"type": "text", "text": value.to_string()})
+-}
++pub use crate::widget_primitives::{Node, SharedColumn, button, row, text};
+ 
+ // Serde's value serializer copies owned strings. Preserve wire order and keep
+ // only a tight string in the retained widget, as the copied value used to do.
+@@ -78,32 +53,6 @@ pub fn stack(children: Vec<Value>) -> Value {
+     json!({"type": "stack", "direction": "column"}).with("children", Value::Array(children))
+ }
+ 
+-/// Stack whose immutable widgets are shared with an extension's render cache.
+-/// The visible root and error fallback use the same nodes without copying.
+-#[derive(serde::Serialize)]
+-pub struct SharedColumn {
+-    #[serde(rename = "type")]
+-    kind: &'static str,
+-    direction: &'static str,
+-    gap: &'static str,
+-    children: Vec<std::sync::Arc<Value>>,
+-}
+-
+-impl SharedColumn {
+-    pub fn new(gap: &'static str, children: Vec<std::sync::Arc<Value>>) -> Self {
+-        Self {
+-            kind: "stack",
+-            direction: "column",
+-            gap,
+-            children,
+-        }
+-    }
+-}
+-
+-pub fn row(children: Vec<Value>) -> Value {
+-    json!({"type": "stack", "direction": "row"}).with("children", Value::Array(children))
+-}
+-
+ /// Prepend the compact native badge to a package's isolated preview body.
+ /// `face` uses the same presentation as [`crate::Host::badge`]. Older clients
+ /// keep the existing preview body.
+@@ -239,10 +188,6 @@ pub fn kv(rows: Vec<(&str, String)>) -> Value {
+     )
+ }
+ 
+-pub fn button(label: &str, action: &str) -> Value {
+-    json!({"type": "button", "label": label, "action": action, "value": null})
+-}
+-
+ /// Asks the user before a button or menu item sends its action.
+ pub fn confirm(title: &str) -> Value {
+     json!({"title": title})
+diff --git a/sdk/src/widget_primitives.rs b/sdk/src/widget_primitives.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..660eadc87e91c1355e000e904fb8162e6f8449da
+--- /dev/null
++++ b/sdk/src/widget_primitives.rs
+@@ -0,0 +1,60 @@
++//! Widget primitives shared by the host and UI facade.
++
++use serde_json::{Value, json};
++
++/// Adds optional fields to a node.
++pub trait Node {
++    fn with(self, key: &str, value: impl Into<Value>) -> Value;
++    /// Adds the field only when `value` is `Some`.
++    fn maybe(self, key: &str, value: Option<impl Into<Value>>) -> Value;
++}
++
++impl Node for Value {
++    fn with(mut self, key: &str, value: impl Into<Value>) -> Value {
++        if let Value::Object(map) = &mut self {
++            map.insert(key.to_owned(), value.into());
++        }
++        self
++    }
++
++    fn maybe(self, key: &str, value: Option<impl Into<Value>>) -> Value {
++        match value {
++            Some(value) => self.with(key, value),
++            None => self,
++        }
++    }
++}
++
++pub fn text(value: impl ToString) -> Value {
++    json!({"type": "text", "text": value.to_string()})
++}
++
++/// Stack whose immutable widgets are shared with an extension's render cache.
++/// The visible root and error fallback use the same nodes without copying.
++#[derive(serde::Serialize)]
++pub struct SharedColumn {
++    #[serde(rename = "type")]
++    kind: &'static str,
++    direction: &'static str,
++    gap: &'static str,
++    children: Vec<std::sync::Arc<Value>>,
++}
++
++impl SharedColumn {
++    pub fn new(gap: &'static str, children: Vec<std::sync::Arc<Value>>) -> Self {
++        Self {
++            kind: "stack",
++            direction: "column",
++            gap,
++            children,
++        }
++    }
++}
++
++pub fn row(children: Vec<Value>) -> Value {
++    json!({"type": "stack", "direction": "row"}).with("children", Value::Array(children))
++}
++
++pub fn button(label: &str, action: &str) -> Value {
++    json!({"type": "button", "label": label, "action": action, "value": null})
++}
