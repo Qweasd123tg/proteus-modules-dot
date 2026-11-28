@@ -1,0 +1,201 @@
+diff --git a/crates/proteus-core/src/core/session_store.rs b/crates/proteus-core/src/core/session_store.rs
+index c92991c2e70e474e012e7c1884e9a1d0c7d3d48d..865588dc30706a5c0bb98de65d639437a695b7a3 100644
+--- a/crates/proteus-core/src/core/session_store.rs
++++ b/crates/proteus-core/src/core/session_store.rs
+@@ -17,10 +17,11 @@ pub(crate) use context_summary::summarize_context_history;
+ pub use remote::RemoteSessionStore as SessionStore;
+ pub use remote::StorageService;
+ pub(crate) use remote::{
++    CommittedDisplay,
+     prepared::{PreparedSession, prepare_latest_workspace_session},
+     snapshot::{DisplayRecords, StagedRenderRecord, StagedTextRow},
+     view::{
+-        CommittedDisplay, CompactTextRow, DisplayRows, PrefixIdentities, SessionReadModel,
++        CompactTextRow, DisplayRows, PrefixIdentities, SessionReadModel,
+         SessionTranscriptAppend, transcript_role,
+     },
+ };
+diff --git a/crates/proteus-core/src/core/session_store/remote/mod.rs b/crates/proteus-core/src/core/session_store/remote/mod.rs
+index 69ffe6c87acef516bf779f2c861dca7328a8c77d..c0ac4145fcc8e89951d42044b5f5228c5913e3be 100644
+--- a/crates/proteus-core/src/core/session_store/remote/mod.rs
++++ b/crates/proteus-core/src/core/session_store/remote/mod.rs
+@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, bail, ensure};
+ use proteus_contracts::{
+     contracts::{
+         SessionStorage, SessionStorageRequest as Request, SessionStorageResponse as Response,
+-        StorageHistoryPoint, StorageSessionDescriptor,
++        StorageHistoryPoint, StorageResumeState, StorageSessionDescriptor, StorageSnapshot,
+     },
+     domain::{HistoryCompactionReport, SessionId, ThreadId, TurnId},
+     model_standard::CanonicalMessage,
+@@ -20,10 +20,54 @@ pub(crate) mod prepared;
+ pub(crate) mod snapshot;
+ pub(crate) mod view;
+ mod writer;
+-use writer::SessionHandles;
+ 
+ pub type StorageService = Arc<dyn SessionStorage>;
+ 
++// A newly opened read handle and a live runtime can address the same session.
++struct SessionHandles {
++    writer: Arc<tokio::sync::Mutex<writer::RemoteWriter>>,
++    publishing: std::sync::Mutex<Option<Arc<view::PublishingTranscript>>>,
++}
++
++fn shared_handles(
++    service: &StorageService,
++    session: &proteus_contracts::contracts::SessionLocator,
++) -> Arc<SessionHandles> {
++    use std::{
++        collections::HashMap,
++        sync::{Mutex, OnceLock, Weak},
++    };
++    type Key = (usize, proteus_contracts::contracts::SessionLocator);
++    type Handle = Weak<SessionHandles>;
++    static WRITERS: OnceLock<Mutex<HashMap<Key, Handle>>> = OnceLock::new();
++    let mut writers = WRITERS
++        .get_or_init(Default::default)
++        .lock()
++        .expect("storage writer registry poisoned");
++    let key = (Arc::as_ptr(service) as *const () as usize, session.clone());
++    if let Some(writer) = writers.get(&key).and_then(Weak::upgrade) {
++        return writer;
++    }
++    writers.retain(|_, writer| writer.strong_count() != 0);
++    let writer = Arc::new(SessionHandles {
++        writer: Arc::new(tokio::sync::Mutex::new(writer::RemoteWriter::new(
++            service.clone(),
++            session.clone(),
++        ))),
++        publishing: Default::default(),
++    });
++    writers.insert(key, Arc::downgrade(&writer));
++    writer
++}
++
++/// A validated append captured by the writer for display publication.
++pub(crate) struct CommittedDisplay {
++    pub(in crate::core::session_store::remote) start: StorageSnapshot,
++    pub(in crate::core::session_store::remote) end: StorageSnapshot,
++    pub(in crate::core::session_store::remote) state: StorageResumeState,
++    pub(in crate::core::session_store::remote) records: snapshot::DisplayRecords,
++}
++
+ #[derive(Clone)]
+ pub struct RemoteSessionStore {
+     pub(crate) service: StorageService,
+@@ -87,7 +131,7 @@ impl RemoteSessionStore {
+             "this client requires a session display locator"
+         );
+         Ok(Self {
+-            handles: writer::shared_handles(&service, &descriptor.session),
++            handles: shared_handles(&service, &descriptor.session),
+             service,
+             descriptor,
+             created_root: None,
+diff --git a/crates/proteus-core/src/core/session_store/remote/view.rs b/crates/proteus-core/src/core/session_store/remote/view.rs
+index 8c9ef16a2a827bfe3a44b9fbfc6c8a837bd15598..00ac62d6d50c3d56ba79f2820c0ae545a930fc03 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view.rs
+@@ -11,14 +11,13 @@ use proteus_contracts::{
+ use serde::{Deserialize, Serialize};
+ 
+ use super::{
+-    RemoteSessionStore,
++    CommittedDisplay, RemoteSessionStore,
+     snapshot::{RemoteJournalSnapshot, RemoteValidatedRead},
+ };
+ 
+ mod cache;
+ mod committed;
+ mod incremental;
+-pub(crate) use committed::CommittedDisplay;
+ mod publishing;
+ pub(super) use publishing::PublishingTranscript;
+ mod startup_history;
+diff --git a/crates/proteus-core/src/core/session_store/remote/view/committed.rs b/crates/proteus-core/src/core/session_store/remote/view/committed.rs
+index 6fd816a66f065332667f7a67d5aa76bc4cb72e80..70faff7c6ec704f091535193607996b84430f4f5 100644
+--- a/crates/proteus-core/src/core/session_store/remote/view/committed.rs
++++ b/crates/proteus-core/src/core/session_store/remote/view/committed.rs
+@@ -1,20 +1,10 @@
+ //! Publish the display projection from records acknowledged by the writer.
+ use super::*;
+ use crate::core::history_message_sha256;
+-use proteus_contracts::{
+-    app_protocol::AppTranscriptBase,
+-    contracts::{StorageResumeState, StorageSnapshot},
+-};
++use proteus_contracts::app_protocol::AppTranscriptBase;
+ 
+ use super::super::snapshot::DisplayRecords;
+ 
+-pub(crate) struct CommittedDisplay {
+-    pub(in crate::core::session_store::remote) start: StorageSnapshot,
+-    pub(in crate::core::session_store::remote) end: StorageSnapshot,
+-    pub(in crate::core::session_store::remote) state: StorageResumeState,
+-    pub(in crate::core::session_store::remote) records: DisplayRecords,
+-}
+-
+ impl RemoteSessionStore {
+     pub(crate) fn publish_committed_view(
+         &self,
+diff --git a/crates/proteus-core/src/core/session_store/remote/writer.rs b/crates/proteus-core/src/core/session_store/remote/writer.rs
+index f01320c9aa3ffbec3ae462c3214fd6134633790c..245c9273bb64ebf6a4c16da01e2945d26c5f37de 100644
+--- a/crates/proteus-core/src/core/session_store/remote/writer.rs
++++ b/crates/proteus-core/src/core/session_store/remote/writer.rs
+@@ -8,10 +8,7 @@ use proteus_contracts::{
+     storage::journal::{HistoryMutated, HistoryMutationKind, JournalEntry, JournalRecord},
+ };
+ 
+-use super::{
+-    snapshot::{DisplayRecordWriter, is_display_kind},
+-    view::CommittedDisplay,
+-};
++use super::snapshot::{DisplayRecordWriter, is_display_kind};
+ 
+ struct DisplayCapture {
+     start: StorageSnapshot,
+@@ -38,43 +35,6 @@ pub(super) struct RemoteWriter {
+     display_capture: Option<DisplayCapture>,
+ }
+ 
+-// A newly opened read handle and a live runtime can address the same session.
+-pub(super) struct SessionHandles {
+-    writer: Arc<tokio::sync::Mutex<RemoteWriter>>,
+-    pub(super) publishing: std::sync::Mutex<Option<Arc<view::PublishingTranscript>>>,
+-}
+-
+-pub(super) fn shared_handles(
+-    service: &StorageService,
+-    session: &proteus_contracts::contracts::SessionLocator,
+-) -> Arc<SessionHandles> {
+-    use std::{
+-        collections::HashMap,
+-        sync::{Mutex, OnceLock, Weak},
+-    };
+-    type Key = (usize, proteus_contracts::contracts::SessionLocator);
+-    type Handle = Weak<SessionHandles>;
+-    static WRITERS: OnceLock<Mutex<HashMap<Key, Handle>>> = OnceLock::new();
+-    let mut writers = WRITERS
+-        .get_or_init(Default::default)
+-        .lock()
+-        .expect("storage writer registry poisoned");
+-    let key = (Arc::as_ptr(service) as *const () as usize, session.clone());
+-    if let Some(writer) = writers.get(&key).and_then(Weak::upgrade) {
+-        return writer;
+-    }
+-    writers.retain(|_, writer| writer.strong_count() != 0);
+-    let writer = Arc::new(SessionHandles {
+-        writer: Arc::new(tokio::sync::Mutex::new(RemoteWriter::new(
+-            service.clone(),
+-            session.clone(),
+-        ))),
+-        publishing: Default::default(),
+-    });
+-    writers.insert(key, Arc::downgrade(&writer));
+-    writer
+-}
+-
+ impl RemoteWriter {
+     pub(super) fn new(
+         service: StorageService,
