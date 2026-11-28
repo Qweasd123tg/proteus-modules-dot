@@ -1,0 +1,104 @@
+diff --git a/package.py b/package.py
+index feb1bd240b15993bc8a73d1228818e75a5d3e0f3..ceefc6dde8a5b30f6b9c54320f63a40e35d2fbd0 100644
+--- a/package.py
++++ b/package.py
+@@ -56,28 +56,19 @@ def cargo_lines(text):
+     yield from text[start:].splitlines()
+ 
+ 
+-def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
+-          digests=None, artifact_report=None):
+-    command = ["cargo", "build", "--locked", "--profile", profile,
+-               "--message-format=json-render-diagnostics"]
+-    for package in selected:
+-        command += ["-p", package.binary]
+-    command += ["--bin", selected[0].binary] if len(selected) == 1 else ["--bins"]
+-    if target_dir is not None:
+-        command += ["--target-dir", str(Path(target_dir).resolve())]
+-    print("+ " + " ".join(command), file=sys.stderr, flush=True)
+-    result = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE, text=True)
++def _collect_cargo_artifacts(stdout, selected, root, diagnostics):
++    """Observe Cargo stdout without launching a build or publishing records."""
+     manifests = {package.manifest: package for package in selected}
+     binaries = {package.binary for package in selected}
+     outputs = {package.identity: [] for package in selected}
+     finished = []
+     targets = set()
+     invalid = False
+-    for line in cargo_lines(result.stdout):
++    for line in cargo_lines(stdout):
+         try:
+             record = json.loads(line)
+         except ValueError:
+-            print(line, file=sys.stderr)
++            print(line, file=diagnostics)
+             invalid = True
+             continue
+         if not isinstance(record, dict):
+@@ -85,7 +76,7 @@ def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
+             continue
+         reason = record.get("reason")
+         if reason == "compiler-message":
+-            print(record["message"].get("rendered", ""), end="", file=sys.stderr)
++            print(record["message"].get("rendered", ""), end="", file=diagnostics)
+         elif reason == "build-finished":
+             finished.append(record.get("success"))
+         elif reason == "compiler-artifact":
+@@ -107,6 +98,22 @@ def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
+                     outputs[package.identity].append((root / executable).resolve())
+                 else:
+                     invalid = True
++    return outputs, finished, targets, invalid
++
++
++def build(selected, profile="release", target_dir=None, env=None, root=ROOT, *,
++          digests=None, artifact_report=None):
++    command = ["cargo", "build", "--locked", "--profile", profile,
++               "--message-format=json-render-diagnostics"]
++    for package in selected:
++        command += ["-p", package.binary]
++    command += ["--bin", selected[0].binary] if len(selected) == 1 else ["--bins"]
++    if target_dir is not None:
++        command += ["--target-dir", str(Path(target_dir).resolve())]
++    print("+ " + " ".join(command), file=sys.stderr, flush=True)
++    result = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE, text=True)
++    outputs, finished, targets, invalid = _collect_cargo_artifacts(
++        result.stdout, selected, root, sys.stderr)
+     if result.returncode:
+         raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout)
+     if invalid or len(finished) != 1 or finished[0] is not True:
+diff --git a/tests/test_package.py b/tests/test_package.py
+index 8c9c50276024255e38c44905c6d798003eba243f..998aa0e2de941fb600c9c377a8ae29705cfd499c 100644
+--- a/tests/test_package.py
++++ b/tests/test_package.py
+@@ -102,6 +102,30 @@ class PackageTests(unittest.TestCase):
+             self.assertEqual(caught.exception.code, 2)
+             build.assert_not_called()
+ 
++    def test_cargo_stdout_observation_has_no_build_or_publication_side_effects(self):
++        selected = self.packages["one"]
++        emitted = {"reason": "compiler-artifact",
++                   "manifest_path": str(selected.manifest.relative_to(self.root)),
++                   "target": {"name": selected.binary, "kind": ["bin"]},
++                   "profile": {"test": False},
++                   "executable": str(self.outputs["one"].relative_to(self.root))}
++        diagnostics = StringIO()
++        lines = [
++            json.dumps({"reason": "compiler-message", "message": {"rendered": "first diagnostic\n"}}),
++            "malformed Cargo output",
++            json.dumps(dict(emitted, profile={"test": True}, executable="ignored-test")),
++            json.dumps(dict(emitted, target={"name": "transitive", "kind": ["lib"]})),
++            json.dumps(emitted),
++            json.dumps({"reason": "build-finished", "success": True}),
++        ]
++
++        self.assertEqual(
++            package._collect_cargo_artifacts("\r\n".join(lines), [selected], self.root, diagnostics),
++            ({"one": [self.outputs["one"]]}, [True], {selected.binary, "transitive"}, True),
++        )
++        self.assertEqual(diagnostics.getvalue(), "first diagnostic\nmalformed Cargo output\n")
++        self.assertFalse(package.index_path("release", self.root).exists())
++
+     def test_failed_build_never_replaces_recorded_outputs(self):
+         self.build(["one"])
+         path = package.index_path("release", self.root)
