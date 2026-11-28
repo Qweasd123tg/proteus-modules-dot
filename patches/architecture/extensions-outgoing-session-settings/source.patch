@@ -1,0 +1,169 @@
+diff --git a/sdk/src/host.rs b/sdk/src/host.rs
+index 996e4478c1b0eb955ecd5c9e0abdf537be0f20a1..9de94c4c28c9379f7693e0098bf14f944b3ecb80 100644
+--- a/sdk/src/host.rs
++++ b/sdk/src/host.rs
+@@ -29,6 +29,7 @@ mod documents;
+ mod inbox;
+ mod instances;
+ mod scopes;
++mod session_settings;
+ mod views;
+ mod visual_preferences;
+ use scopes::{Scope, SessionContext};
+@@ -508,32 +509,6 @@ impl Host {
+         self.send(json!({"type": "clipboard", "text": text}));
+     }
+ 
+-    /// Меняет настройку сессии (`session.settings.v1`); ответ придёт как `command_result`.
+-    pub fn set_session(&mut self, kind: &str, value: Value) -> Result {
+-        if !self.has_feature("session.settings.v1") {
+-            bail!("The client does not support session.settings.v1");
+-        }
+-        let Some(session) = self.session.clone() else {
+-            return Ok(());
+-        };
+-        inbox::settings_budget(
+-            std::iter::once(self.pending.as_slice())
+-                .chain(self.sessions.values().map(SessionContext::pending)),
+-            kind,
+-            &value,
+-        )?;
+-        self.counter += 1;
+-        let id = format!("setting-{}", self.counter);
+-        self.pending
+-            .push((id.clone(), kind.to_owned(), value.clone()));
+-        self.command_error = None;
+-        self.send(
+-            json!({"type": "set_session", "context": self.current_context, "view": self.current_view, "id": id, "session_dir": session,
+-                         "setting": {"id": kind, "value": value}}),
+-        );
+-        Ok(())
+-    }
+-
+     fn select_settings(&self) -> impl Iterator<Item = (&Value, &Value)> {
+         let config = self
+             .state
+diff --git a/sdk/src/host/inbox.rs b/sdk/src/host/inbox.rs
+index f6dbc2d2345e30904833ebc1ee8e02a1bb0c1d42..896c4f880e5e3088916b4b641b217959cf61f266 100644
+--- a/sdk/src/host/inbox.rs
++++ b/sdk/src/host/inbox.rs
+@@ -122,41 +122,6 @@ pub(super) fn start() -> mpsc::Receiver<Incoming> {
+     inbox
+ }
+ 
+-/// Outstanding requests remain ordered until command_result. Reject new work
+-/// at admission instead of retaining arbitrary values while the backend stalls.
+-pub(super) fn settings_budget<'a>(
+-    pending: impl IntoIterator<Item = &'a [(String, String, Value)]>,
+-    kind: &str,
+-    value: &Value,
+-) -> io::Result<()> {
+-    struct Counter(usize);
+-    impl io::Write for Counter {
+-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+-            self.0 = self
+-                .0
+-                .checked_add(bytes.len())
+-                .filter(|size| *size <= 1024 * 1024)
+-                .ok_or_else(|| io::Error::other("pending session settings exceed 1 MiB"))?;
+-            Ok(bytes.len())
+-        }
+-        fn flush(&mut self) -> io::Result<()> {
+-            Ok(())
+-        }
+-    }
+-    // Reserve the next generated id and tuple punctuation as well as values.
+-    let mut counter = Counter(64);
+-    let mut count = 0usize;
+-    for session in pending {
+-        count = count.saturating_add(session.len());
+-        if count >= 128 {
+-            return Err(io::Error::other("too many pending session settings"));
+-        }
+-        serde_json::to_writer(&mut counter, session)?;
+-    }
+-    serde_json::to_writer(&mut counter, &(kind, value))?;
+-    Ok(())
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/sdk/src/host/session_settings.rs b/sdk/src/host/session_settings.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed253b55ea09da5eea60e39161aab91724af6786
+--- /dev/null
++++ b/sdk/src/host/session_settings.rs
+@@ -0,0 +1,72 @@
++//! Admission for outgoing session-setting requests.
++
++use std::io;
++
++use anyhow::bail;
++use serde_json::{Value, json};
++
++use super::{Host, scopes::SessionContext};
++use crate::Result;
++
++impl Host {
++    /// Меняет настройку сессии (`session.settings.v1`); ответ придёт как `command_result`.
++    pub fn set_session(&mut self, kind: &str, value: Value) -> Result {
++        if !self.has_feature("session.settings.v1") {
++            bail!("The client does not support session.settings.v1");
++        }
++        let Some(session) = self.session.clone() else {
++            return Ok(());
++        };
++        settings_budget(
++            std::iter::once(self.pending.as_slice())
++                .chain(self.sessions.values().map(SessionContext::pending)),
++            kind,
++            &value,
++        )?;
++        self.counter += 1;
++        let id = format!("setting-{}", self.counter);
++        self.pending
++            .push((id.clone(), kind.to_owned(), value.clone()));
++        self.command_error = None;
++        self.send(
++            json!({"type": "set_session", "context": self.current_context, "view": self.current_view, "id": id, "session_dir": session,
++                         "setting": {"id": kind, "value": value}}),
++        );
++        Ok(())
++    }
++}
++
++/// Outstanding requests remain ordered until command_result. Reject new work
++/// at admission instead of retaining arbitrary values while the backend stalls.
++fn settings_budget<'a>(
++    pending: impl IntoIterator<Item = &'a [(String, String, Value)]>,
++    kind: &str,
++    value: &Value,
++) -> io::Result<()> {
++    struct Counter(usize);
++    impl io::Write for Counter {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.0 = self
++                .0
++                .checked_add(bytes.len())
++                .filter(|size| *size <= 1024 * 1024)
++                .ok_or_else(|| io::Error::other("pending session settings exceed 1 MiB"))?;
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++    // Reserve the next generated id and tuple punctuation as well as values.
++    let mut counter = Counter(64);
++    let mut count = 0usize;
++    for session in pending {
++        count = count.saturating_add(session.len());
++        if count >= 128 {
++            return Err(io::Error::other("too many pending session settings"));
++        }
++        serde_json::to_writer(&mut counter, session)?;
++    }
++    serde_json::to_writer(&mut counter, &(kind, value))?;
++    Ok(())
++}
