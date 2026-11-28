@@ -1,0 +1,299 @@
+diff --git a/packages/quota/src/describe.rs b/packages/quota/src/describe.rs
+index febe328d0f5e5b0af351fab4443159d49d75ab48..997322627fbe1b551ce83559f8035bb0d9a702c0 100644
+--- a/packages/quota/src/describe.rs
++++ b/packages/quota/src/describe.rs
+@@ -96,10 +96,50 @@ pub fn credit_value(credits: &Value) -> String {
+     }
+ }
+ 
+-/// The smallest reported remainder across all quota windows, and the lines.
+-pub fn describe(snapshot: &Value, now: f64, hide_zero_credits: bool) -> (Option<f64>, Vec<String>) {
++// Display priority for applicable buckets: a reached limit wins over unavailability.
++#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
++pub(super) enum BucketStatus {
++    Unavailable,
++    Exhausted,
++}
++
++impl BucketStatus {
++    pub(super) fn from_bucket(bucket: &Value) -> Option<Self> {
++        if bucket.at("limit_reached").as_bool() == Some(true) {
++            Some(Self::Exhausted)
++        } else if bucket.at("allowed").as_bool() == Some(false) {
++            Some(Self::Unavailable)
++        } else {
++            None
++        }
++    }
++
++    pub(super) fn presentation(self) -> (&'static str, &'static str) {
++        match self {
++            Self::Exhausted => ("Лимит исчерпан", "danger"),
++            Self::Unavailable => ("Использование недоступно", "warning"),
++        }
++    }
++
++    fn line(self) -> &'static str {
++        match self {
++            Self::Exhausted => "лимит исчерпан",
++            Self::Unavailable => "использование недоступно",
++        }
++    }
++}
++
++pub(super) struct Description {
++    pub(super) remaining: Option<f64>,
++    pub(super) lines: Vec<String>,
++    pub(super) blocking: Option<BucketStatus>,
++}
++
++/// Details include all reported buckets; the badge reflects only applicable ones.
++pub(super) fn describe(snapshot: &Value, now: f64, hide_zero_credits: bool) -> Description {
+     let mut lines = Vec::new();
+     let mut limiting: Option<f64> = None;
++    let mut blocking = None;
+     let plan = snapshot.at("plan");
+     if !plan.is_null() {
+         lines.push(format!("План: {}", display(plan)));
+@@ -109,13 +149,16 @@ pub fn describe(snapshot: &Value, now: f64, hide_zero_credits: bool) -> (Option<
+             .opt_str("name")
+             .filter(|name| !name.is_empty())
+             .unwrap_or(bucket.str("id"));
+-        if bucket.bool("informational") {
++        let informational = bucket.bool("informational");
++        if informational {
+             lines.push(format!("{name}: {INFORMATIONAL_SCOPE}"));
+         }
+-        if bucket.at("limit_reached").as_bool() == Some(true) {
+-            lines.push(format!("{name}: лимит исчерпан"));
+-        } else if bucket.at("allowed").as_bool() == Some(false) {
+-            lines.push(format!("{name}: использование недоступно"));
++        let status = BucketStatus::from_bucket(bucket);
++        if let Some(status) = status {
++            lines.push(format!("{name}: {}", status.line()));
++        }
++        if !informational {
++            blocking = blocking.max(status);
+         }
+         for window in bucket.list("windows") {
+             let Some(used) = window.f64("used_percent") else {
+@@ -123,7 +166,7 @@ pub fn describe(snapshot: &Value, now: f64, hide_zero_credits: bool) -> (Option<
+             };
+             let left = remaining(used);
+             let seconds = window.i64("duration_seconds");
+-            if !bucket.bool("informational") {
++            if !informational {
+                 limiting = Some(limiting.map_or(left, |known| known.min(left)));
+             }
+             let label = duration(seconds, window.str("id"));
+@@ -145,7 +188,11 @@ pub fn describe(snapshot: &Value, now: f64, hide_zero_credits: bool) -> (Option<
+         "Данные на {}",
+         local_time(snapshot.f64("observed_at").unwrap_or(0.))
+     ));
+-    (limiting, lines)
++    Description {
++        remaining: limiting,
++        lines,
++        blocking,
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -175,7 +222,11 @@ mod tests {
+                 {"id": "other", "duration_seconds": 604_800, "used_percent": 80},
+                 {"id": "burst", "used_percent": 10, "resets_at": 5}]},
+                 {"id": "spare", "name": "Spare", "allowed": false, "windows": []}]});
+-        let (left, lines) = describe(&snapshot, 10., true);
++        let Description {
++            remaining: left,
++            lines,
++            ..
++        } = describe(&snapshot, 10., true);
+         assert_eq!(left, Some(7.5));
+         assert_eq!(
+             lines[..5],
+@@ -192,7 +243,11 @@ mod tests {
+             ["Spare: использование недоступно", "Кредиты: 12.5"]
+         );
+         assert!(lines[7].starts_with("Данные на "));
+-        let (left, lines) = describe(
++        let Description {
++            remaining: left,
++            lines,
++            ..
++        } = describe(
+             &json!({"observed_at": 0, "buckets": [], "credits": {"unlimited": true}}),
+             10.,
+             true,
+@@ -207,7 +262,11 @@ mod tests {
+         let snapshot = json!({"observed_at":1700000000,"buckets":[
+             {"id":"shared","windows":[{"id":"rolling","used_percent":96},{"id":"weekly","used_percent":21},{"id":"unknown"}]},
+             {"id":"budget","informational":true,"windows":[{"id":"budget","used_percent":99}]}]});
+-        let (left, lines) = describe(&snapshot, 1700000000., true);
++        let Description {
++            remaining: left,
++            lines,
++            ..
++        } = describe(&snapshot, 1700000000., true);
+         assert_eq!(left, Some(4.));
+         assert!(!lines.iter().any(|line| line.contains("unknown")));
+         assert!(lines.iter().any(|line| line.contains("осталось 1%")));
+@@ -217,6 +276,39 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn badge_status_uses_strict_provider_flags_and_ignores_informational_limits() {
++        let informational =
++            json!({"id":"info","informational":true,"limit_reached":true,"allowed":false});
++        let malformed = json!({"id":"malformed","limit_reached":"true","allowed":0});
++        let unavailable = json!({"id":"denied","allowed":false});
++        let exhausted = json!({"id":"reached","limit_reached":true,"allowed":false});
++        for (buckets, expected) in [
++            (vec![informational.clone(), malformed.clone()], None),
++            (
++                vec![unavailable.clone(), informational, malformed],
++                Some(("Использование недоступно", "warning")),
++            ),
++            (
++                vec![unavailable.clone(), exhausted.clone()],
++                Some(("Лимит исчерпан", "danger")),
++            ),
++            (
++                vec![exhausted, unavailable],
++                Some(("Лимит исчерпан", "danger")),
++            ),
++        ] {
++            let snapshot = json!({"buckets":buckets});
++            let description = describe(&snapshot, 10., true);
++            assert_eq!(description.blocking.map(BucketStatus::presentation), expected);
++            assert_eq!(description.remaining, None);
++            for line in &description.lines {
++                assert!(!line.starts_with("malformed:"), "{line}");
++                assert_ne!(line, "reached: использование недоступно");
++            }
++        }
++    }
++
+     #[test]
+     fn hides_only_explicit_zero_credit_balances() {
+         for (balance, unlimited, zero) in [
+diff --git a/packages/quota/src/main.rs b/packages/quota/src/main.rs
+index a1fa23c799807a45ba57750d844f8e9bee95ba8c..511276cd58d2fbc99fa6b0c10e37129ae735acfc 100644
+--- a/packages/quota/src/main.rs
++++ b/packages/quota/src/main.rs
+@@ -55,7 +55,7 @@ impl Extension for Quota {
+         let hide_zero = hide_zero_credits(host);
+         if surface == Surface::Preview {
+             let sample = preview();
+-            let (left, _) = describe(&sample, PREVIEW_TIME, hide_zero);
++            let left = describe(&sample, PREVIEW_TIME, hide_zero).remaining;
+             let body = stack(view::render(
+                 &sample,
+                 Some("gpt-6.2-sol"),
+@@ -224,42 +224,31 @@ impl Quota {
+             );
+             return;
+         }
+-        let (remaining, lines) = describe(&self.snapshot, now(), hide_zero);
+-        let buckets = self.snapshot.list("buckets");
+-        let blocked = if buckets.iter().any(|bucket| {
+-            !bucket.bool("informational") && bucket.at("limit_reached").as_bool() == Some(true)
+-        }) {
+-            Some(("Лимит исчерпан", "danger"))
+-        } else if buckets.iter().any(|bucket| {
+-            !bucket.bool("informational") && bucket.at("allowed").as_bool() == Some(false)
+-        }) {
+-            Some(("Использование недоступно", "warning"))
+-        } else {
+-            None
+-        };
+-        if let Some((title, tone)) = blocked {
++        let description = describe(&self.snapshot, now(), hide_zero);
++        if let Some(status) = description.blocking {
++            let (title, tone) = status.presentation();
+             host.badge(
+                 view,
+                 title,
+-                lines,
++                description.lines,
+                 Some(json!({"type":"icon", "tone":tone})),
+             );
+             return;
+         }
+-        let (title, face) = match remaining {
++        let (title, face) = match description.remaining {
+             Some(left) => (
+                 format!("Лимиты: осталось {}%", number(left)),
+                 Some(badge_face(host, left)),
+             ),
+             None => ("Лимиты модели".to_owned(), None),
+         };
+-        let empty = buckets.is_empty()
++        let empty = self.snapshot.list("buckets").is_empty()
+             && self.snapshot.list("notices").is_empty()
+             && !credits(&self.snapshot, hide_zero).is_some_and(Value::is_object);
+         host.send_badge(
+             view,
+             &title,
+-            lines,
++            description.lines,
+             face,
+             empty && metric_badge::hide_when_empty(host, HIDE_BY_DEFAULT),
+         );
+diff --git a/packages/quota/src/view.rs b/packages/quota/src/view.rs
+index 13e203ae8f0f8393878b0d861247ed19774b5ae0..79eeaeb08314401d7722b8d089ed1ab77192bfb8 100644
+--- a/packages/quota/src/view.rs
++++ b/packages/quota/src/view.rs
+@@ -3,7 +3,9 @@
+ use proteus_extension::ui::{Node, card, kv, note, progress, text};
+ use proteus_extension::{Value, ValueExt, local_time};
+ 
+-use crate::describe::{credit_value, credits, duration, number, overage, remaining, reset_label};
++use crate::describe::{
++    BucketStatus, credit_value, credits, duration, number, overage, remaining, reset_label,
++};
+ 
+ pub fn render(
+     snapshot: &Value,
+@@ -15,10 +17,9 @@ pub fn render(
+     for bucket in snapshot.list("buckets") {
+         let name = bucket.opt_str("name").unwrap_or(bucket.str("id"));
+         let mut windows = Vec::new();
+-        if bucket.at("limit_reached").as_bool() == Some(true) {
+-            windows.push(note("Лимит исчерпан").with("tone", "danger"));
+-        } else if bucket.at("allowed").as_bool() == Some(false) {
+-            windows.push(note("Использование недоступно").with("tone", "warning"));
++        if let Some(status) = BucketStatus::from_bucket(bucket) {
++            let (text, tone) = status.presentation();
++            windows.push(note(text).with("tone", tone));
+         }
+         for window in bucket.list("windows") {
+             let Some(used) = window.f64("used_percent") else {
+@@ -107,8 +108,13 @@ mod tests {
+         };
+         for informational in [false, true] {
+             let snapshot = sample(informational);
+-            let (remaining, lines) = describe(&snapshot, 1., true);
+-            assert_eq!(remaining, Some(75.));
++            let description = describe(&snapshot, 1., true);
++            assert_eq!(description.remaining, Some(75.));
++            assert_eq!(
++                description.blocking,
++                (!informational).then_some(BucketStatus::Exhausted),
++            );
++            let lines = description.lines;
+             assert_eq!(
+                 lines.contains(&format!("shared: {INFORMATIONAL_SCOPE}")),
+                 informational
+@@ -178,7 +184,9 @@ mod tests {
+             (127.5, "0% · сверх лимита 27,5%"),
+         ] {
+             let data = snapshot(used);
+-            let (left, lines) = crate::describe::describe(&data, 1_700_000_000., true);
++            let description = crate::describe::describe(&data, 1_700_000_000., true);
++            let left = description.remaining;
++            let lines = description.lines;
+             assert_eq!(left, Some((100.0_f64 - used).max(0.0)));
+             assert_eq!(
+                 lines[0],
