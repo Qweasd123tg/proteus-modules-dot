@@ -1,0 +1,449 @@
+diff --git a/packages/git/src/details.rs b/packages/git/src/details.rs
+index 38f1f56794ef9cb410100cf63108fa4fa4e71d7e..cb9e705e63db1c37ece2bf773e14df9375849428 100644
+--- a/packages/git/src/details.rs
++++ b/packages/git/src/details.rs
+@@ -1,7 +1,6 @@
+ // Адаптировано из Zed: crates/git_ui/src/git_graph.rs (render_commit_detail_panel, render_search_bar)
+ //! Graph document and its selection inspector. Native controls own columns,
+ //! disclosures, tree navigation, scrolling and document preview behavior.
+-use crate::document::icon_button;
+ use crate::{Git, history, panel};
+ use proteus_extension::ui::{
+     Node, bar, button, disclosure, divider, empty, fill, note, person, search, spacer, split,
+@@ -10,6 +9,14 @@ use proteus_extension::ui::{
+ use proteus_extension::{Host, Result, Value, ValueExt, json, local_time};
+ use std::collections::{BTreeMap, btree_map::Entry};
+ 
++pub(crate) fn icon_button(icon: &str, action: &str, value: impl Into<Value>, hint: &str) -> Value {
++    button("", action)
++        .with("value", value.into())
++        .with("variant", "ghost")
++        .with("icon", icon)
++        .with("hint", hint)
++}
++
+ // Most leaf groups contain only one file. Keep that reference inline.
+ enum FileGroup<'a> {
+     One(&'a Value),
+@@ -330,6 +337,18 @@ fn adjacent_match<'a>(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn icon_button_preserves_exact_wire_shape() {
++        assert_eq!(
++            icon_button("x", "close_commit_details", Value::Null, "Закрыть сведения").to_string(),
++            r#"{"type":"button","label":"","action":"close_commit_details","value":null,"variant":"ghost","icon":"x","hint":"Закрыть сведения"}"#,
++        );
++        assert_eq!(
++            icon_button("copy", "copy", "src/λ.rs", "Копировать путь").to_string(),
++            r#"{"type":"button","label":"","action":"copy","value":"src/λ.rs","variant":"ghost","icon":"copy","hint":"Копировать путь"}"#,
++        );
++    }
++
+     #[test]
+     fn commit_file_groups_preserve_paths_and_selection_when_expanded() {
+         let files = [
+diff --git a/packages/git/src/document.rs b/packages/git/src/document.rs
+index 7ecc22fb2e66b9f58db6376cdae9140ccdebd7d3..3e149e17ffcb6f3d3a24dad1c42c84a2dd914715 100644
+--- a/packages/git/src/document.rs
++++ b/packages/git/src/document.rs
+@@ -1,7 +1,4 @@
+ //! Document tabs: a working tree diff, all changes, a commit and the commit graph.
+-//!
+-//! Arguments double as tab titles (`document.label` is `{filename}`):
+-//! `src/a.rs · diff`, `Все изменения`, `Коммит abc1234`, `Граф коммитов`.
+ 
+ use std::rc::Rc;
+ 
+@@ -10,67 +7,17 @@ use proteus_extension::ui::{
+ };
+ use proteus_extension::{Host, Value, ValueExt, json, local_time};
+ 
+-use crate::model::{self, Staging};
++use crate::details::icon_button;
++use crate::model::{self, Document, Staging};
++use crate::panel::danger;
+ use crate::{Git, history};
+ 
+-const DIFF: &str = " · diff";
+-const CHANGES: &str = "Все изменения";
+-const COMMIT: &str = "Коммит ";
+-const GRAPH: &str = "Граф коммитов";
+ /// Files whose diffs the changes document reads at most.
+ const CHANGES_LIMIT: usize = 40;
+ /// Encoded patch/file payload, leaving ample headroom for the 16 MiB frame's
+ /// envelope and other nodes. This is a wire-byte budget, including escaping.
+ const CHANGES_BYTES: usize = 4 * 1024 * 1024;
+ 
+-#[derive(Clone, Debug, PartialEq, Eq)]
+-pub enum Document {
+-    Diff(String),
+-    Changes,
+-    Commit(String),
+-    Graph,
+-}
+-
+-impl Document {
+-    pub fn parse(argument: &str) -> Self {
+-        if let Some(path) = argument.strip_suffix(DIFF) {
+-            return Self::Diff(path.to_owned());
+-        }
+-        if let Some(hash) = argument.strip_prefix(COMMIT)
+-            && (4..=64).contains(&hash.len())
+-            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+-        {
+-            return Self::Commit(hash.to_owned());
+-        }
+-        match argument {
+-            CHANGES => Self::Changes,
+-            GRAPH => Self::Graph,
+-            path => Self::Diff(path.to_owned()),
+-        }
+-    }
+-
+-    pub fn argument(&self) -> String {
+-        match self {
+-            Self::Diff(path) => format!("{path}{DIFF}"),
+-            Self::Changes => CHANGES.to_owned(),
+-            Self::Commit(hash) => format!("{COMMIT}{hash}"),
+-            Self::Graph => GRAPH.to_owned(),
+-        }
+-    }
+-}
+-
+-pub fn danger(value: impl ToString) -> Value {
+-    text(value).with("tone", "danger")
+-}
+-
+-pub(crate) fn icon_button(icon: &str, action: &str, value: impl Into<Value>, hint: &str) -> Value {
+-    button("", action)
+-        .with("value", value.into())
+-        .with("variant", "ghost")
+-        .with("icon", icon)
+-        .with("hint", hint)
+-}
+-
+ fn diff_info(data: &Value, entry: Option<&Value>) -> Value {
+     let message = match data.str("kind") {
+         "binary" => Some("Двоичный файл"),
+@@ -98,10 +45,6 @@ fn aggregate_patch(patch: String) -> Value {
+ }
+ 
+ impl Git {
+-    pub fn commit_argument(&self, hash: &str) -> String {
+-        Document::Commit(self.short_of(hash)).argument()
+-    }
+-
+     pub fn document(&mut self, host: &Host, document: &Document) -> Value {
+         let mut children = Vec::new();
+         children.extend(self.error.as_ref().map(danger));
+@@ -320,24 +263,4 @@ mod tests {
+             assert_eq!(text.capacity(), text.len());
+         }
+     }
+-
+-    #[test]
+-    fn arguments_round_trip_and_read_as_titles() {
+-        for document in [
+-            Document::Diff("src/a.rs".into()),
+-            Document::Changes,
+-            Document::Commit("abc1234".into()),
+-            Document::Graph,
+-        ] {
+-            assert_eq!(Document::parse(&document.argument()), document);
+-        }
+-        assert_eq!(
+-            Document::parse("sample.py"),
+-            Document::Diff("sample.py".into())
+-        );
+-        assert_eq!(
+-            Document::parse("Коммит xyz"),
+-            Document::Diff("Коммит xyz".into())
+-        );
+-    }
+ }
+diff --git a/packages/git/src/history.rs b/packages/git/src/history.rs
+index ae4949a232547b53ea1a58495ceb304b9062fb62..29babe3e9ad87229c99cf4a969e160148618e516 100644
+--- a/packages/git/src/history.rs
++++ b/packages/git/src/history.rs
+@@ -9,6 +9,7 @@ use proteus_extension::ui::{Node, item, lane_row, lane_segment, lanes, list, lis
+ use proteus_extension::{Host, Result, Value, ValueExt, json};
+ 
+ use crate::graph::{self, Segment};
++use crate::model::Document;
+ use crate::{Git, Log};
+ 
+ pub const PAGE: usize = 100;
+@@ -324,6 +325,10 @@ impl Git {
+         Ok(diff)
+     }
+ 
++    pub fn commit_argument(&self, hash: &str) -> String {
++        Document::Commit(self.short_of(hash)).argument()
++    }
++
+     pub fn short_of(&self, hash: &str) -> String {
+         let logs = [self.log.as_ref(), self.graph.as_ref()];
+         logs.into_iter()
+@@ -339,6 +344,21 @@ impl Git {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn commit_argument_keeps_cached_short_and_seven_character_fallback() {
++        let git = Git {
++            log: Some(Log::from_page(json!({
++                "entries": [{"hash": "abcdef012345", "short": "AbCd"}],
++            }))),
++            graph: Some(Log::from_page(json!({
++                "entries": [{"hash": "abcdef012345", "short": "ffff"}],
++            }))),
++            ..Git::default()
++        };
++        assert_eq!(git.commit_argument("abcdef012345"), "Коммит AbCd");
++        assert_eq!(git.commit_argument("0123456789"), "Коммит 0123456");
++    }
++
+     #[test]
+     fn ago_names_the_largest_unit() {
+         assert_eq!(ago(1000., 1030.), "только что");
+diff --git a/packages/git/src/list.rs b/packages/git/src/list.rs
+index 2d9a270d3577da4e06ac1b22d38d75334f66b9f2..5b17d0c9ec9a91c921c10d2077640a4a61ed2902 100644
+--- a/packages/git/src/list.rs
++++ b/packages/git/src/list.rs
+@@ -2,8 +2,7 @@
+ 
+ use proteus_extension::{Host, Value, ValueExt, json};
+ 
+-use crate::document::Document;
+-use crate::model::{self, Section, Staging};
++use crate::model::{self, Document, Section, Staging};
+ use crate::{Git, panel};
+ 
+ impl Git {
+diff --git a/packages/git/src/main.rs b/packages/git/src/main.rs
+index ec2f283cb896d29533ad874047c78e1b697ca4ac..e07a10e4acc7aff556ebfa1afe993cd7eb8f2911 100644
+--- a/packages/git/src/main.rs
++++ b/packages/git/src/main.rs
+@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
+ use proteus_extension::ui::{badge_preview, muted, tree};
+ use proteus_extension::{Extension, Host, Result, Surface, Value, ValueExt, json, run};
+ 
+-use document::Document;
+-use model::Group;
++use model::{Document, Group};
+ 
+ const POLL: Duration = Duration::from_secs(5);
+ const REMOTE: Duration = Duration::from_secs(130);
+diff --git a/packages/git/src/model.rs b/packages/git/src/model.rs
+index 0012b8ba5084d6b46674c9b56b61e0cd515777f8..8b3a0a79056a50e4523ce5277c2c4e3682233b64 100644
+--- a/packages/git/src/model.rs
++++ b/packages/git/src/model.rs
+@@ -4,6 +4,48 @@
+ 
+ use proteus_extension::{Value, ValueExt};
+ 
++const DIFF: &str = " · diff";
++const CHANGES: &str = "Все изменения";
++const COMMIT: &str = "Коммит ";
++const GRAPH: &str = "Граф коммитов";
++
++/// Arguments double as tab titles (`document.label` is `{filename}`).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Document {
++    Diff(String),
++    Changes,
++    Commit(String),
++    Graph,
++}
++
++impl Document {
++    pub fn parse(argument: &str) -> Self {
++        if let Some(path) = argument.strip_suffix(DIFF) {
++            return Self::Diff(path.to_owned());
++        }
++        if let Some(hash) = argument.strip_prefix(COMMIT)
++            && (4..=64).contains(&hash.len())
++            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
++        {
++            return Self::Commit(hash.to_owned());
++        }
++        match argument {
++            CHANGES => Self::Changes,
++            GRAPH => Self::Graph,
++            path => Self::Diff(path.to_owned()),
++        }
++    }
++
++    pub fn argument(&self) -> String {
++        match self {
++            Self::Diff(path) => format!("{path}{DIFF}"),
++            Self::Changes => CHANGES.to_owned(),
++            Self::Commit(hash) => format!("{COMMIT}{hash}"),
++            Self::Graph => GRAPH.to_owned(),
++        }
++    }
++}
++
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub enum Group {
+     /// Конфликты / Отслеживаемые / Новые.
+@@ -324,6 +366,53 @@ mod tests {
+     use super::*;
+     use proteus_extension::json;
+ 
++    #[test]
++    fn arguments_round_trip_and_read_as_titles() {
++        for document in [
++            Document::Diff("src/a.rs".into()),
++            Document::Changes,
++            Document::Commit("abc1234".into()),
++            Document::Graph,
++        ] {
++            assert_eq!(Document::parse(&document.argument()), document);
++        }
++        assert_eq!(
++            Document::parse("sample.py"),
++            Document::Diff("sample.py".into())
++        );
++        assert_eq!(
++            Document::parse("Коммит xyz"),
++            Document::Diff("Коммит xyz".into())
++        );
++    }
++
++    #[test]
++    fn document_arguments_keep_exact_titles_precedence_and_hash_bounds() {
++        for (document, argument) in [
++            (Document::Diff("src/λ.rs".into()), "src/λ.rs · diff"),
++            (Document::Changes, "Все изменения"),
++            (Document::Commit("Ff00".into()), "Коммит Ff00"),
++            (Document::Graph, "Граф коммитов"),
++        ] {
++            assert_eq!(document.argument(), argument);
++            assert_eq!(Document::parse(argument), document);
++        }
++        let raw = "Коммит Ff00";
++        assert_eq!(
++            Document::parse(&format!("{raw} · diff")),
++            Document::Diff(raw.into()),
++        );
++        for hash in ["Ff0".to_owned(), "a".repeat(65), "abcdé".into(), "ab-z".into()] {
++            let argument = format!("Коммит {hash}");
++            assert_eq!(Document::parse(&argument), Document::Diff(argument));
++        }
++        let hash = "aB".repeat(32);
++        assert_eq!(
++            Document::parse(&format!("Коммит {hash}")),
++            Document::Commit(hash),
++        );
++    }
++
+     fn entry(path: &str, status: &str, staged: Option<&str>, unstaged: Option<&str>) -> Value {
+         json!({"path": path, "status": status, "staged": staged, "unstaged": unstaged})
+     }
+diff --git a/packages/git/src/panel.rs b/packages/git/src/panel.rs
+index 41ee36aa823c4497e63695497ae59a3064ca6359..ba48eae4b71bd2063b472628a8f0845c12df8823 100644
+--- a/packages/git/src/panel.rs
++++ b/packages/git/src/panel.rs
+@@ -5,14 +5,17 @@ use std::rc::Rc;
+ 
+ use proteus_extension::ui::{
+     Node, bar, button, confirm, empty, fill, icon, input, item, menu, menu_header, muted, note,
+-    panel_editor, prompt, spacer, split_button, stats, tree,
++    panel_editor, prompt, spacer, split_button, stats, text, tree,
+ };
+ use proteus_extension::{Host, Result, Value, ValueExt, json};
+ 
+-use crate::document::danger;
+ use crate::model::{self, Counts, Group, Remote, Section, Staging};
+ use crate::{Git, history};
+ 
++pub fn danger(value: impl ToString) -> Value {
++    text(value).with("tone", "danger")
++}
++
+ pub fn status_label(status: &str) -> &str {
+     match status {
+         "conflict" => "конфликт",
+@@ -528,3 +531,16 @@ impl Git {
+         Some(bar(items))
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn danger_preserves_exact_wire_shape() {
++        assert_eq!(
++            danger("Ошибка").to_string(),
++            r#"{"type":"text","text":"Ошибка","tone":"danger"}"#,
++        );
++    }
++}
+diff --git a/packages/git/src/tests.rs b/packages/git/src/tests.rs
+index 5fa54d45d364aa3efab1cd57b79f8727730894e7..1ad573ecc1aeaae913917df61b2eb6aa157b4801 100644
+--- a/packages/git/src/tests.rs
++++ b/packages/git/src/tests.rs
+@@ -604,12 +604,12 @@ fn history_and_documents_render() {
+     fake.act("log", json!({"id": "abc1234", "event": "open"}));
+     assert_eq!(fake.git.commit.as_deref(), Some("abc1234"));
+     assert_eq!(fake.git.commit_argument("abc1234"), "Коммит abc1234");
+-    let document = crate::document::Document::parse("Коммит abc1234");
++    let document = crate::model::Document::parse("Коммит abc1234");
+     let root = fake.git.document(&fake.host, &document);
+     assert!(find(&root, "diff").is_some());
+     let root = fake
+         .git
+-        .document(&fake.host, &crate::document::Document::Graph);
++        .document(&fake.host, &crate::model::Document::Graph);
+     assert!(find(&root, "lanes").is_some());
+ }
+ 
+@@ -711,7 +711,7 @@ fn aggregate_changes_bounds_encoded_payload_and_rereads_evicted_working_diffs()
+         json!({"path":"synthetic", "revision":"r", "kind":"text", "patch":"\n\\\"".repeat(160_000)}));
+     let root = fake
+         .git
+-        .document(&fake.host, &crate::document::Document::Changes);
++        .document(&fake.host, &crate::model::Document::Changes);
+     let encoded =
+         serde_json::to_vec(&json!({"type":"render", "view":"test", "root":root})).unwrap();
+     assert!(encoded.len() < 5 * 1024 * 1024);
+@@ -723,14 +723,14 @@ fn aggregate_changes_bounds_encoded_payload_and_rereads_evicted_working_diffs()
+     for n in 0..40 {
+         fake.git.document(
+             &fake.host,
+-            &crate::document::Document::Diff(format!("file-{n}")),
++            &crate::model::Document::Diff(format!("file-{n}")),
+         );
+         assert!(fake.git.diffs.len() <= 16);
+     }
+     let before = fake.calls.lock().unwrap().len();
+     fake.git.document(
+         &fake.host,
+-        &crate::document::Document::Diff("file-0".into()),
++        &crate::model::Document::Diff("file-0".into()),
+     );
+     assert_eq!(fake.calls.lock().unwrap().len(), before + 1);
+ }
+@@ -769,7 +769,7 @@ fn oversized_history_is_rendered_without_becoming_a_cache_owner() {
+         .lock()
+         .unwrap()
+         .insert("/workspace/commit".into(), commit);
+-    let document = crate::document::Document::Commit("abc1234".into());
++    let document = crate::model::Document::Commit("abc1234".into());
+     for _ in 0..2 {
+         let root = fake.git.document(&fake.host, &document);
+         assert_eq!(find(&root, "diff").unwrap().str("patch"), patch);
+@@ -788,7 +788,7 @@ fn oversized_history_is_rendered_without_becoming_a_cache_owner() {
+ #[test]
+ fn closing_one_preview_keeps_sibling_data_and_session_change_discards_cache() {
+     let mut fake = Fake::new();
+-    let document = crate::document::Document::Commit("abc1234".into());
++    let document = crate::model::Document::Commit("abc1234".into());
+     let first = fake.git.document(&fake.host, &document);
+     let sibling = fake.git.document(&fake.host, &document);
+     fake.git.closed(&mut fake.host, "first-preview");
