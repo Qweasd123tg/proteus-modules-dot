@@ -1,0 +1,218 @@
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index cc0113bc5a408498ea1b10337a06aa27a411a95c..36a5247887048d8fac0af1acd72bcf81a117d0e4 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -209,7 +209,7 @@ impl Render for Workspace {
+             .on_action(|_: &ZoomReset, _, cx| prefs::update_visual(cx, |prefs| prefs.view.zoom(0)))
+             .on_drop(cx.listener(|this, _: &tabs::SplitDrag, _, cx| this.finish_resize(cx)))
+             .on_drop(
+-                cx.listener(|this, _: &panels::SidebarDrag, _, cx| this.finish_sidebar_resize(cx)),
++                cx.listener(|this, _: &workspace::SidebarDrag, _, cx| this.finish_sidebar_resize(cx)),
+             );
+         let root = root
+             .child(self.render_top_bar(window, cx))
+diff --git a/src/ui/panels/mod.rs b/src/ui/panels/mod.rs
+index 28330ae635257ebfcbf236879c7212bc3f232665..5610a161e623e4c8e6d2e66c9df4216ee48d22ce 100644
+--- a/src/ui/panels/mod.rs
++++ b/src/ui/panels/mod.rs
+@@ -10,7 +10,6 @@ mod sidebar;
+ 
+ pub(super) use session_list::{SessionList, bind_keys};
+ pub(super) use session_menu::Renaming;
+-pub(super) use sidebar::SidebarDrag;
+ 
+ use gpui_kit::assets::IconName as Lucide;
+ use gpui_kit::component::*;
+diff --git a/src/ui/panels/sidebar.rs b/src/ui/panels/sidebar.rs
+index 588b30c72373a236411b50204629a85b2437eb29..d49b98e1dbd7482735d33509407b3b466591d36e 100644
+--- a/src/ui/panels/sidebar.rs
++++ b/src/ui/panels/sidebar.rs
+@@ -7,41 +7,10 @@ use gpui_kit::component::ActiveTheme as _;
+ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ 
+-use crate::preferences::{SIDEBAR_WIDTH, SidebarPreferences};
+-use crate::ui::workspace::Workspace;
++use crate::ui::workspace::{SidebarDrag, Workspace};
+ use crate::ui::{divider, drag, motion, prefs};
+ 
+-/// Payload of the side panel's edge while it is dragged.
+-#[derive(Clone)]
+-pub(in crate::ui) struct SidebarDrag;
+-
+-impl Render for SidebarDrag {
+-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+-        div()
+-    }
+-}
+-
+ impl Workspace {
+-    /// Chat panels and Settings occupy the same slot beside the rail and
+-    /// share both its transient drag and its persisted logical width.
+-    pub(in crate::ui) fn sidebar_width(&self, cx: &App) -> Rems {
+-        let dragged = cx.has_active_drag().then_some(self.sidebar_drag).flatten();
+-        prefs::scaled(dragged.unwrap_or(prefs::visual(cx).sidebar.width))
+-    }
+-
+-    pub(in crate::ui) fn move_sidebar_resize(&mut self, offset: Pixels, cx: &mut Context<Self>) {
+-        let width = offset.as_f32() / prefs::scale(cx);
+-        self.sidebar_drag = Some(width.clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end()));
+-        cx.notify();
+-    }
+-
+-    pub(in crate::ui) fn reset_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+-        self.sidebar_drag = None;
+-        prefs::update_visual(cx, |prefs| {
+-            prefs.sidebar.width = SidebarPreferences::default().width
+-        });
+-    }
+-
+     pub(in crate::ui) fn render_sidebar(
+         &mut self,
+         max_width: Rems,
+@@ -125,11 +94,4 @@ impl Workspace {
+             );
+         Some((slot.into_any_element(), extent))
+     }
+-
+-    /// Stores the width the side panel's edge was released at.
+-    pub(in crate::ui) fn finish_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+-        if let Some(width) = self.sidebar_drag.take() {
+-            prefs::update_visual(cx, |prefs| prefs.sidebar.width = width);
+-        }
+-    }
+ }
+diff --git a/src/ui/settings/nav.rs b/src/ui/settings/nav.rs
+index abe5e80a760ba56d1d2aa5d5f4b1d611bded29b8..1081a3136075b0e77b6468ec6f380d18b6eb8852 100644
+--- a/src/ui/settings/nav.rs
++++ b/src/ui/settings/nav.rs
+@@ -23,8 +23,8 @@ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::Hint as _;
+ use crate::ui::kit::Pressable as _;
+-use crate::ui::panels::SidebarDrag;
+ use crate::ui::prefs;
++use crate::ui::workspace::SidebarDrag;
+ use crate::ui::{divider, drag};
+ 
+ pub(super) fn page_icon(page: &PageId) -> Icon {
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index 00c11a133ba79cc717e83f53347161cbbe94c16c..4f34383905f71353db0dda44cb664ad1e8df564b 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -12,10 +12,12 @@ use gpui_kit::*;
+ use super::chat::Chat;
+ use super::chats::OpenChat;
+ use super::panels::{Renaming, SessionList};
++use super::prefs;
+ use super::settings::SettingsView;
+ use super::tabs::{SplitResize, TabDrop, TabMotion};
+ use crate::api::Api;
+ use crate::launch::{LaunchOptions, StartupIntent, Target};
++use crate::preferences::{SIDEBAR_WIDTH, SidebarPreferences};
+ use crate::tabs::{ChatSpaces, PaneId, TabLayout};
+ 
+ mod documents;
+@@ -107,6 +109,16 @@ impl SurfaceView {
+     }
+ }
+ 
++/// Payload of the side panel's edge while it is dragged.
++#[derive(Clone)]
++pub(in crate::ui) struct SidebarDrag;
++
++impl Render for SidebarDrag {
++    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++        div()
++    }
++}
++
+ pub struct Workspace {
+     pub(super) workspace_path: PathBuf,
+     pub(super) status: Status,
+@@ -218,6 +230,33 @@ impl Workspace {
+         self.api = Some(api);
+     }
+ 
++    /// Chat panels and Settings occupy the same slot beside the rail and
++    /// share both its transient drag and its persisted logical width.
++    pub(in crate::ui) fn sidebar_width(&self, cx: &App) -> Rems {
++        let dragged = cx.has_active_drag().then_some(self.sidebar_drag).flatten();
++        prefs::scaled(dragged.unwrap_or(prefs::visual(cx).sidebar.width))
++    }
++
++    pub(in crate::ui) fn move_sidebar_resize(&mut self, offset: Pixels, cx: &mut Context<Self>) {
++        let width = offset.as_f32() / prefs::scale(cx);
++        self.sidebar_drag = Some(width.clamp(*SIDEBAR_WIDTH.start(), *SIDEBAR_WIDTH.end()));
++        cx.notify();
++    }
++
++    pub(in crate::ui) fn reset_sidebar_resize(&mut self, cx: &mut Context<Self>) {
++        self.sidebar_drag = None;
++        prefs::update_visual(cx, |prefs| {
++            prefs.sidebar.width = SidebarPreferences::default().width
++        });
++    }
++
++    /// Stores the width the side panel's edge was released at.
++    pub(in crate::ui) fn finish_sidebar_resize(&mut self, cx: &mut Context<Self>) {
++        if let Some(width) = self.sidebar_drag.take() {
++            prefs::update_visual(cx, |prefs| prefs.sidebar.width = width);
++        }
++    }
++
+     /// Hidden tabs and the chat area covered by Settings keep no composer
+     /// contribution views or chat-owned extension processes.
+     pub(super) fn release_hidden_chat_activities(&self, layout: &TabLayout, cx: &mut App) {
+@@ -555,3 +594,51 @@ impl Workspace {
+         .detach();
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[::core::prelude::v1::test]
++    fn sidebar_resize_commits_logical_width_only_on_finish() {
++        let mut app = ::gpui::TestAppContext::single();
++        app.update(|cx| {
++            gpui_kit::init(cx);
++            crate::ui::theme::init(cx);
++            prefs::init_in_memory(cx);
++        });
++        let other_handle = app.add_empty_window().window_handle();
++        let mut other = ::gpui::VisualTestContext::from_window(other_handle, &app);
++        let initial = other.update(|_, cx| prefs::visual(cx).sidebar.width);
++        app.add_empty_window().update(|window, cx| {
++            let workspace = cx.new(|cx| Workspace::test_empty(window, cx));
++            workspace.update(cx, |workspace, cx| {
++                prefs::update_visual(cx, |prefs| prefs.view.scale = 200);
++                let scale = prefs::scale(cx);
++                assert_ne!(scale, 1.);
++
++                workspace.move_sidebar_resize(px(350. * scale), cx);
++                assert_eq!(workspace.sidebar_drag, Some(350.));
++                assert_eq!(workspace.sidebar_width(cx), prefs::scaled(initial));
++                assert_eq!(prefs::visual(cx).sidebar.width, initial);
++                workspace.finish_sidebar_resize(cx);
++                assert_eq!(workspace.sidebar_drag, None);
++                assert_eq!(workspace.sidebar_width(cx), prefs::scaled(350.));
++                assert_eq!(prefs::visual(cx).sidebar.width, 350.);
++
++                for (offset, limit) in [(0., *SIDEBAR_WIDTH.start()), (2000., *SIDEBAR_WIDTH.end())] {
++                    workspace.move_sidebar_resize(px(offset * scale), cx);
++                    assert_eq!(workspace.sidebar_drag, Some(limit));
++                    workspace.finish_sidebar_resize(cx);
++                    assert_eq!(prefs::visual(cx).sidebar.width, limit);
++                }
++                workspace.move_sidebar_resize(px(360. * scale), cx);
++                workspace.reset_sidebar_resize(cx);
++                assert_eq!(workspace.sidebar_drag, None);
++                workspace.finish_sidebar_resize(cx);
++                assert_eq!(prefs::visual(cx).sidebar.width, initial);
++            });
++        });
++        other.update(|_, cx| assert_eq!(prefs::visual(cx).sidebar.width, initial));
++    }
++}
