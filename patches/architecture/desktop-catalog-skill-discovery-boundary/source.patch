@@ -1,0 +1,345 @@
+diff --git a/src/catalog/git.rs b/src/catalog/git.rs
+index 060dc6cafc54b11ded2a69b0cd72f8ed36ed55b9..b96cf13b1e65b7669fb53fd8229052da7aa45440 100644
+--- a/src/catalog/git.rs
++++ b/src/catalog/git.rs
+@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
+ use serde::{Deserialize, Serialize};
+ 
+ use super::{
+-    Source,
++    Source, read_checkout,
+     schema::{self, Catalog, INDEX},
+ };
+ 
+@@ -140,7 +140,7 @@ pub fn validate(source: &Source) -> Result<()> {
+ /// Reads an existing checkout without contacting its origin.
+ pub fn cached(cache: &Path, source: &Source) -> Result<Catalog> {
+     let state = read_state(cache, source)?;
+-    let mut catalog = schema::read(&cache.join(source.key()), &source.name(), &state.trees)?;
++    let mut catalog = read_checkout(&cache.join(source.key()), &source.name(), &state.trees)?;
+     catalog.revision = Some(state.commit);
+     Ok(catalog)
+ }
+@@ -226,7 +226,7 @@ pub fn refresh(cache: &Path, source: &Source) -> Result<Catalog> {
+             std::fs::create_dir_all(temporary.join(path))?;
+         }
+         checkout(repo_text, &commit, &listing, &temporary, cache)?;
+-        schema::read(&temporary, &source.name(), &trees)?;
++        read_checkout(&temporary, &source.name(), &trees)?;
+         crate::packages::publish(&temporary, &cache.join(source.key()), true)?;
+         let state = State { commit, trees };
+         std::fs::write(state_path(cache, source), serde_json::to_vec(&state)?)?;
+diff --git a/src/catalog/mod.rs b/src/catalog/mod.rs
+index 04ea8105d41f6a4f78aef6cfdd8b7c11b23d515b..998f8ef2c742e51ff3408fe7ee396e1bf2f0b46e 100644
+--- a/src/catalog/mod.rs
++++ b/src/catalog/mod.rs
+@@ -9,15 +9,28 @@ pub mod install;
+ pub mod inventory;
+ pub mod open;
+ pub mod schema;
++mod skill_frontmatter;
+ pub mod skills;
+ 
+-use std::path::PathBuf;
++use std::{
++    collections::BTreeMap,
++    path::{Path, PathBuf},
++};
+ 
+ use anyhow::{Context, Result};
+ use serde::{Deserialize, Serialize};
+ 
+ use schema::Kind;
+ 
++/// Read a checkout without an index as an Agent Skills repository. Its
++/// folders are versioned by Git tree ID, with an empty key for the root.
++fn read_checkout(root: &Path, name: &str, trees: &BTreeMap<String, String>) -> Result<schema::Catalog> {
++    if !root.join(schema::INDEX).exists() {
++        return skills::read(root, name.to_owned(), trees);
++    }
++    schema::read_index(root)
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct Source {
+diff --git a/src/catalog/schema.rs b/src/catalog/schema.rs
+index c48176a739706e44ba468cf3a2de5086e1a517ec..26cb520ee7250250ac5a50122cf6af3c5eebb5d2 100644
+--- a/src/catalog/schema.rs
++++ b/src/catalog/schema.rs
+@@ -2,7 +2,7 @@
+ //! hide the rest of a catalog. Paths are always relative to the checkout.
+ 
+ use std::{
+-    collections::{BTreeMap, HashSet},
++    collections::HashSet,
+     io::Read,
+     path::{Component, Path, PathBuf},
+ };
+@@ -10,6 +10,8 @@ use std::{
+ use anyhow::{Context, Result, ensure};
+ use serde::{Deserialize, Serialize};
+ 
++use super::skill_frontmatter;
++
+ pub const INDEX: &str = "proteus-catalog.json";
+ const MAX_DOCUMENT_BYTES: u64 = 512 * 1024;
+ 
+@@ -147,13 +149,7 @@ pub fn directory(root: &Path, entry: &Entry) -> Result<PathBuf> {
+     Ok(path)
+ }
+ 
+-/// A repository without the index is read as an Agent Skills repository;
+-/// `name` titles it then and `trees` versions its folders: a git tree id by
+-/// the folder path relative to `root`, the root itself being empty.
+-pub fn read(root: &Path, name: &str, trees: &BTreeMap<String, String>) -> Result<Catalog> {
+-    if !root.join(INDEX).exists() {
+-        return super::skills::read(root, name.to_owned(), trees);
+-    }
++pub(super) fn read_index(root: &Path) -> Result<Catalog> {
+     let text = std::fs::read_to_string(root.join(INDEX))
+         .context("Не удалось прочитать proteus-catalog.json")?;
+     let index: Index = serde_json::from_str(&text).context("Неверный индекс каталога")?;
+@@ -274,7 +270,7 @@ pub fn readme(catalog: &Catalog, entry: &Entry) -> Result<Option<String>> {
+     }
+     let text = read_document(&catalog.root, &path)?;
+     Ok(Some(if skill {
+-        super::skills::body(&text).to_owned()
++        skill_frontmatter::body(&text).to_owned()
+     } else {
+         text
+     }))
+@@ -285,7 +281,7 @@ pub fn readme(catalog: &Catalog, entry: &Entry) -> Result<Option<String>> {
+ pub fn read_skill(package: &Path, directory: &Path) -> Result<String> {
+     relative(directory)?;
+     let text = read_document(package, &package.join(directory).join("SKILL.md"))?;
+-    Ok(super::skills::body(&text).to_owned())
++    Ok(skill_frontmatter::body(&text).to_owned())
+ }
+ 
+ fn read_document(root: &Path, path: &Path) -> Result<String> {
+diff --git a/src/catalog/skill_frontmatter.rs b/src/catalog/skill_frontmatter.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5371f63eac6ade29ce3bd293351a53ee6f484297
+--- /dev/null
++++ b/src/catalog/skill_frontmatter.rs
+@@ -0,0 +1,26 @@
++//! Split skill documents for catalog discovery and Markdown preview.
++
++use anyhow::{Result, bail};
++
++pub(super) fn split(content: &str) -> Result<(&str, &str)> {
++    let start = if content.starts_with("---\n") {
++        4
++    } else if content.starts_with("---\r\n") {
++        5
++    } else {
++        bail!("Нет YAML frontmatter");
++    };
++    let mut offset = start;
++    for line in content[start..].split_inclusive('\n') {
++        if line.trim_end_matches(['\r', '\n']) == "---" {
++            return Ok((&content[start..offset], &content[offset + line.len()..]));
++        }
++        offset += line.len();
++    }
++    bail!("YAML frontmatter не закрыт")
++}
++
++/// Instructions without the frontmatter, for the entry details.
++pub(super) fn body(content: &str) -> &str {
++    split(content).map_or(content, |(_, body)| body).trim()
++}
+diff --git a/src/catalog/skills.rs b/src/catalog/skills.rs
+index 776ea47389c1fce4fe35a61a5fecfd3b321fa966..8fea97ca6319955eff931e5fd143f7f1cf7c6de1 100644
+--- a/src/catalog/skills.rs
++++ b/src/catalog/skills.rs
+@@ -9,10 +9,13 @@ use std::{
+     path::{Path, PathBuf},
+ };
+ 
+-use anyhow::{Context, Result, bail, ensure};
++use anyhow::{Context, Result, ensure};
+ use serde::Deserialize;
+ 
+-use super::schema::{Catalog, Category, Entry, INDEX, Kind};
++use super::{
++    schema::{Catalog, Category, Entry, INDEX, Kind},
++    skill_frontmatter,
++};
+ 
+ const FILE: &str = "SKILL.md";
+ const MAX_DEPTH: usize = 8;
+@@ -28,7 +31,7 @@ struct Frontmatter {
+     description: String,
+ }
+ 
+-pub fn read(root: &Path, title: String, trees: &BTreeMap<String, String>) -> Result<Catalog> {
++pub(super) fn read(root: &Path, title: String, trees: &BTreeMap<String, String>) -> Result<Catalog> {
+     let mut found = Vec::new();
+     find(root, Path::new(""), 0, &mut found)?;
+     ensure!(
+@@ -123,7 +126,7 @@ fn entry(root: &Path, dir: &Path, trees: &BTreeMap<String, String>) -> Result<En
+         .context("Папка не найдена в дереве репозитория")?
+         .clone();
+     let content = std::fs::read_to_string(&file).with_context(|| format!("{FILE} не в UTF-8"))?;
+-    let (yaml, _) = split(&content)?;
++    let (yaml, _) = skill_frontmatter::split(&content)?;
+     let front: Frontmatter = serde_yaml::from_str(yaml).context("Неверный YAML frontmatter")?;
+     ensure!(name(&front.name), "Неверное имя skill: {}", front.name);
+     if let Some(folder) = dir.file_name() {
+@@ -171,26 +174,3 @@ fn name(name: &str) -> bool {
+             .iter()
+             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+ }
+-
+-fn split(content: &str) -> Result<(&str, &str)> {
+-    let start = if content.starts_with("---\n") {
+-        4
+-    } else if content.starts_with("---\r\n") {
+-        5
+-    } else {
+-        bail!("Нет YAML frontmatter");
+-    };
+-    let mut offset = start;
+-    for line in content[start..].split_inclusive('\n') {
+-        if line.trim_end_matches(['\r', '\n']) == "---" {
+-            return Ok((&content[start..offset], &content[offset + line.len()..]));
+-        }
+-        offset += line.len();
+-    }
+-    bail!("YAML frontmatter не закрыт")
+-}
+-
+-/// Instructions without the frontmatter, for the entry details.
+-pub fn body(content: &str) -> &str {
+-    split(content).map_or(content, |(_, body)| body).trim()
+-}
+diff --git a/src/catalog/tests.rs b/src/catalog/tests.rs
+index 42446e255f759efab2297ff94bd39b21b08c2ce8..96cc6eed8111b90b61c2202b6af04fb130f2c34f 100644
+--- a/src/catalog/tests.rs
++++ b/src/catalog/tests.rs
+@@ -35,6 +35,74 @@ impl Drop for Fixture {
+     }
+ }
+ 
++#[test]
++fn checkout_selects_a_present_index_and_discovers_crlf_skills_when_absent() {
++    let fixture = Fixture::new();
++    fs::write(
++        fixture.0.join("SKILL.md"),
++        "---\r\nname: example\r\ndescription: Fixture\r\n---\r\n# Instructions\r\n",
++    )
++    .unwrap();
++    let trees = BTreeMap::from([(String::new(), "fixture-tree".into())]);
++    let catalog = read_checkout(&fixture.0, "owner/repo", &trees).unwrap();
++    assert_eq!(catalog.title, "owner/repo");
++    assert!(catalog.problems.is_empty());
++    let [entry] = catalog.entries.as_slice() else {
++        panic!("expected one skill");
++    };
++    assert_eq!(entry.kind, Kind::Skill);
++    assert_eq!(entry.id, "example");
++    assert_eq!(entry.version, "fixture-tree");
++    assert_eq!(
++        schema::readme(&catalog, entry).unwrap().as_deref(),
++        Some("# Instructions")
++    );
++
++    let index = fixture.0.join(schema::INDEX);
++    fs::write(
++        &index,
++        r#"{"format":1,"title":"Indexed","categories":[],"entries":[]}"#,
++    )
++    .unwrap();
++    let catalog = read_checkout(&fixture.0, "owner/repo", &trees).unwrap();
++    assert_eq!(catalog.title, "Indexed");
++    assert!(catalog.entries.is_empty());
++
++    fs::write(index, "{bad").unwrap();
++    let Err(error) = read_checkout(&fixture.0, "owner/repo", &trees) else {
++        panic!("a malformed index must not fall back to skill discovery");
++    };
++    assert_eq!(error.to_string(), "Неверный индекс каталога");
++}
++
++#[test]
++fn checkout_reports_unclosed_frontmatter_but_preview_preserves_raw_text() {
++    let fixture = Fixture::new();
++    let raw = "---\nname: example\ndescription: Fixture\n# No closing delimiter\n";
++    fs::write(fixture.0.join("SKILL.md"), raw).unwrap();
++    let trees = BTreeMap::from([(String::new(), "fixture-tree".into())]);
++    let catalog = read_checkout(&fixture.0, "owner/repo", &trees).unwrap();
++    assert!(catalog.entries.is_empty());
++    assert_eq!(catalog.problems, ["SKILL.md: YAML frontmatter не закрыт"]);
++    assert_eq!(
++        schema::read_skill(&fixture.0, Path::new(".")).unwrap(),
++        raw.trim()
++    );
++}
++
++#[test]
++fn checkout_discovery_budget_is_smaller_than_the_preview_budget() {
++    let fixture = Fixture::new();
++    let header = "---\nname: example\ndescription: Fixture\n---\n";
++    let body = "x".repeat(256 * 1024 + 1 - header.len());
++    fs::write(fixture.0.join("SKILL.md"), format!("{header}{body}")).unwrap();
++    let trees = BTreeMap::from([(String::new(), "fixture-tree".into())]);
++    let catalog = read_checkout(&fixture.0, "owner/repo", &trees).unwrap();
++    assert!(catalog.entries.is_empty());
++    assert_eq!(catalog.problems, ["SKILL.md: SKILL.md больше 256 КиБ"]);
++    assert!(schema::read_skill(&fixture.0, Path::new(".")).unwrap() == body);
++}
++
+ fn example() -> PathBuf {
+     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/catalog")
+ }
+@@ -152,7 +220,7 @@ fn git_refresh_keeps_last_good_checkout_and_reports_bad_entries() {
+ fn installation_binding_update_and_removal_use_the_existing_formats() {
+     let fixture = Fixture::new();
+     let locations = fixture.locations();
+-    let catalog = schema::read(&example(), "example", &Default::default()).unwrap();
++    let catalog = schema::read_index(&example()).unwrap();
+     let source = source(&example());
+     let profile = fixture.0.join("profile.toml");
+     let mut draft = Draft::default();
+@@ -305,7 +373,7 @@ fn plugin_catalog_installs_without_a_current_binding_start_enabled() {
+ #[test]
+ fn mcp_conflicts_dont_overwrite_manual_edits_and_receipts_are_profile_scoped() {
+     let fixture = Fixture::new();
+-    let catalog = schema::read(&example(), "example", &Default::default()).unwrap();
++    let catalog = schema::read_index(&example()).unwrap();
+     let entry = catalog
+         .entries
+         .iter()
+@@ -364,7 +432,7 @@ fn plugin_zip_and_invalid_catalog_paths_share_checked_package_io() {
+     assert!(schema::relative(Path::new("../outside")).is_err());
+     assert!(schema::relative(Path::new("/absolute")).is_err());
+     assert!(schema::relative(Path::new("a/.git/config")).is_err());
+-    let mut catalog = schema::read(&example(), "example", &Default::default()).unwrap();
++    let mut catalog = schema::read_index(&example()).unwrap();
+     catalog.entries[0].path = "../outside".into();
+     assert!(schema::directory(&catalog.root, &catalog.entries[0]).is_err());
+     let mut broken = Source {
+@@ -485,7 +553,7 @@ fn extension_preflight_checks_staged_files_before_installing_or_replacing() {
+         .unwrap()
+         .install(&fixture.0, "repo", false)
+         .unwrap();
+-    let catalog = schema::read(&repo, "example", &Default::default()).unwrap();
++    let catalog = schema::read_index(&repo).unwrap();
+     let entry = catalog
+         .entries
+         .iter()
+diff --git a/src/catalog/tests/source_download.rs b/src/catalog/tests/source_download.rs
+index 5121916c17276e72c9e5aa23dc25570b7fc5f07a..ca6d43cee29535bfc9b0cb50e882bc2b2ec17988 100644
+--- a/src/catalog/tests/source_download.rs
++++ b/src/catalog/tests/source_download.rs
+@@ -110,7 +110,7 @@ fn source_schema_rejects_missing_build_and_workspace_outside_entry() {
+         let mut index = original.clone();
+         index["entries"][0]["source"] = bad;
+         fs::write(repo.join(schema::INDEX), index.to_string()).unwrap();
+-        let catalog = schema::read(&repo, "bad", &Default::default()).unwrap();
++        let catalog = schema::read_index(&repo).unwrap();
+         assert!(catalog.entries.is_empty());
+         assert_eq!(catalog.problems.len(), 1);
+     }
