@@ -1,0 +1,174 @@
+diff --git a/src/main.rs b/src/main.rs
+index 3967f4e2db4d8f31191a4f61e3805c0b0009aaa2..67f048bc8457121ebeda30873c92d04a4b1d7c0d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -12,2 +12,3 @@ mod navigation;
+ mod notify;
++mod order;
+ mod packages;
+diff --git a/src/order.rs b/src/order.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bef588af867dce971b22b77a762340417b2e5c77
+--- /dev/null
++++ b/src/order.rs
+@@ -0,0 +1,45 @@
++//! Reorder identities independently of presentation and persistence.
++
++/// Moves an identity before another one, or to the end. Unknown identities
++/// are a no-op; the target is resolved after removal, so moving downward
++/// cannot accidentally skip a row.
++pub(crate) fn move_before<T: Clone + PartialEq>(
++    rows: &mut Vec<T>,
++    id: &T,
++    before: Option<&T>,
++) -> bool {
++    let Some(from) = rows.iter().position(|row| row == id) else {
++        return false;
++    };
++    if before == Some(id) {
++        return false;
++    }
++    if before.is_some_and(|before| !rows.contains(before)) {
++        return false;
++    }
++    let row = rows.remove(from);
++    let at = before
++        .and_then(|before| rows.iter().position(|row| row == before))
++        .unwrap_or(rows.len());
++    rows.insert(at, row);
++    at != from
++}
++
++#[cfg(test)]
++mod tests {
++    use super::move_before;
++
++    #[::core::prelude::v1::test]
++    fn moving_down_resolves_the_target_after_removal_and_handles_cancel_targets() {
++        let mut rows = vec!["a", "b", "c", "d"];
++        assert!(move_before(&mut rows, &"a", Some(&"c")));
++        assert_eq!(rows, ["b", "a", "c", "d"]);
++        assert!(move_before(&mut rows, &"a", None));
++        assert_eq!(rows, ["b", "c", "d", "a"]);
++        let before = rows.clone();
++        for (id, target) in [("a", Some("a")), ("missing", None), ("a", Some("gone"))] {
++            assert!(!move_before(&mut rows, &id, target.as_ref()));
++            assert_eq!(rows, before);
++        }
++    }
++}
+diff --git a/src/sessions.rs b/src/sessions.rs
+index bc9153d73c0c0c53297b77ce4ceba0d5c681b5a9..35ce8f122f1f9698389cbd3f10e60fb149949e3f 100644
+--- a/src/sessions.rs
++++ b/src/sessions.rs
+@@ -140,7 +140,7 @@ impl SessionMarks {
+         };
+         let mut order: Vec<_> = group.iter().map(|row| row.summary.key.clone()).collect();
+         let before = order.get(at + usize::from(after)).cloned();
+-        if crate::ui::reorder::move_before(&mut order, source, before.as_ref()) {
++        if crate::order::move_before(&mut order, source, before.as_ref()) {
+             for (rank, key) in order.iter().enumerate() {
+                 self.change(key, |mark| mark.order = Some(rank));
+             }
+diff --git a/src/ui/reorder.rs b/src/ui/reorder.rs
+index cb0b6a880d511723f9ba86d08548375460ef9592..f031aa4c91325aa37513538ab08f5efb54fd9e25 100644
+--- a/src/ui/reorder.rs
++++ b/src/ui/reorder.rs
+@@ -16,7 +16,6 @@ mod hold;
+ mod removal;
+ #[cfg(test)]
+ mod tests;
+-pub(crate) use geometry::move_before;
+ use geometry::{Arrangement, Pending, keyboard_target, preview_order};
+ use hold::Hold;
+ use removal::{Removal, RemovalTarget};
+diff --git a/src/ui/reorder/geometry.rs b/src/ui/reorder/geometry.rs
+index 61b15be964f86db32ac39d5ac4759a6979ce8bee..f99c109a04746be457c6716fae455f3030fc2022 100644
+--- a/src/ui/reorder/geometry.rs
++++ b/src/ui/reorder/geometry.rs
+@@ -109,31 +109,6 @@ impl Position {
+     }
+ }
+ 
+-/// Moves an identity before another one, or to the end. Unknown identities
+-/// are a no-op; the target is resolved after removal, so moving downward
+-/// cannot accidentally skip a row.
+-pub(crate) fn move_before<T: Clone + PartialEq>(
+-    rows: &mut Vec<T>,
+-    id: &T,
+-    before: Option<&T>,
+-) -> bool {
+-    let Some(from) = rows.iter().position(|row| row == id) else {
+-        return false;
+-    };
+-    if before == Some(id) {
+-        return false;
+-    }
+-    if before.is_some_and(|before| !rows.contains(before)) {
+-        return false;
+-    }
+-    let row = rows.remove(from);
+-    let at = before
+-        .and_then(|before| rows.iter().position(|row| row == before))
+-        .unwrap_or(rows.len());
+-    rows.insert(at, row);
+-    at != from
+-}
+-
+ pub(super) fn preview_order(
+     ids: &[SharedString],
+     dragged: Option<&SharedString>,
+@@ -152,7 +127,7 @@ pub(super) fn preview_order(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Arrangement, Pending, keyboard_target, move_before, preview_order};
++    use super::{Arrangement, Pending, keyboard_target, preview_order};
+     use crate::ui::motion;
+     use gpui_kit::{Pixels, SharedString, px};
+     use std::{collections::HashMap, time::Instant};
+@@ -288,20 +263,6 @@ mod tests {
+         );
+     }
+ 
+-    #[::core::prelude::v1::test]
+-    fn moving_down_resolves_the_target_after_removal_and_handles_cancel_targets() {
+-        let mut rows = vec!["a", "b", "c", "d"];
+-        assert!(move_before(&mut rows, &"a", Some(&"c")));
+-        assert_eq!(rows, ["b", "a", "c", "d"]);
+-        assert!(move_before(&mut rows, &"a", None));
+-        assert_eq!(rows, ["b", "c", "d", "a"]);
+-        let before = rows.clone();
+-        for (id, target) in [("a", Some("a")), ("missing", None), ("a", Some("gone"))] {
+-            assert!(!move_before(&mut rows, &id, target.as_ref()));
+-            assert_eq!(rows, before);
+-        }
+-    }
+-
+     #[::core::prelude::v1::test]
+     fn insertion_preview_is_stable_and_can_reach_both_ends() {
+         let ids: Vec<SharedString> = ["a", "b", "c"].into_iter().map(Into::into).collect();
+diff --git a/src/ui/reorder/tests.rs b/src/ui/reorder/tests.rs
+index d55e64a047850cc7b6af22ad87b4ce27d27abe3c..e9db3b202ac9022eac133fa49496320502ac5172 100644
+--- a/src/ui/reorder/tests.rs
++++ b/src/ui/reorder/tests.rs
+@@ -1,5 +1,6 @@
+ //! Native event coverage for holding, dragging and dropping ordered rows.
+ use super::*;
++use crate::order::move_before;
+ use ::gpui::{TestAppContext, VisualTestContext};
+ use std::cell::RefCell;
+ 
+diff --git a/src/ui/settings/hooks.rs b/src/ui/settings/hooks.rs
+index e1ba8564c69120f2d87339b3469fef3c0fe288d1..6dfbcfb466a03650a44c6b4670f44048ecf45162 100644
+--- a/src/ui/settings/hooks.rs
++++ b/src/ui/settings/hooks.rs
+@@ -53,7 +53,7 @@ impl SettingsView {
+                             let id = id.to_string();
+                             let before = before.map(|id| id.to_string());
+                             this.update_draft(cx, |draft| {
+-                                reorder::move_before(&mut draft.hooks, &id, before.as_ref());
++                                crate::order::move_before(&mut draft.hooks, &id, before.as_ref());
+                             });
+                         });
+                     })
