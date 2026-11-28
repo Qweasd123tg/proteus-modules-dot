@@ -1,0 +1,198 @@
+diff --git a/crates/proteus-contracts/src/contracts/domain_dto_tests.rs b/crates/proteus-contracts/src/contracts/domain_dto_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0a6986ab34e6803b16b479b27ecd10adec1fc0b
+--- /dev/null
++++ b/crates/proteus-contracts/src/contracts/domain_dto_tests.rs
+@@ -0,0 +1,52 @@
++use super::{
++    ModelCallOrigin, ToolTerminalRef, execution_recorder::ModelCallOrigin as NestedOrigin,
++    tool_terminal::ToolTerminalRef as NestedTerminalRef,
++};
++use crate::domain;
++
++#[test]
++fn passive_domain_dtos_keep_public_paths_and_serde() {
++    let terminal: domain::ToolTerminalRef = NestedTerminalRef {
++        id: uuid::Uuid::from_u128(42),
++        title: "Synthetic".into(),
++        tty: true,
++    };
++    let terminal: ToolTerminalRef = terminal;
++    let encoded = serde_json::to_string(&terminal).unwrap();
++    assert_eq!(
++        encoded,
++        r#"{"id":"00000000-0000-0000-0000-00000000002a","title":"Synthetic","tty":true}"#
++    );
++    assert_eq!(
++        serde_json::from_str::<NestedTerminalRef>(&encoded).unwrap(),
++        terminal
++    );
++
++    let mut invalid = serde_json::to_value(&terminal).unwrap();
++    invalid["unexpected"] = true.into();
++    assert!(
++        serde_json::from_value::<NestedTerminalRef>(invalid.clone())
++            .unwrap_err()
++            .to_string()
++            .contains("unknown field `unexpected`")
++    );
++    let invalid_fields = invalid.as_object_mut().unwrap();
++    invalid_fields.remove("unexpected");
++    invalid_fields.remove("tty");
++    assert!(
++        serde_json::from_value::<ToolTerminalRef>(invalid)
++            .unwrap_err()
++            .to_string()
++            .contains("missing field `tty`")
++    );
++
++    for (origin, expected) in [
++        (NestedOrigin::Direct, r#""direct""#),
++        (NestedOrigin::Auxiliary, r#""auxiliary""#),
++    ] {
++        let origin: ModelCallOrigin = origin;
++        let origin: domain::ModelCallOrigin = origin;
++        assert_eq!(serde_json::to_string(&origin).unwrap(), expected);
++        assert_eq!(serde_json::from_str::<NestedOrigin>(expected).unwrap(), origin);
++    }
++}
+diff --git a/crates/proteus-contracts/src/contracts/execution_recorder.rs b/crates/proteus-contracts/src/contracts/execution_recorder.rs
+index 73ba7922e31ff6d6334b7d5218e2f9593d85a32b..f644aa9089c0bd74faeeee65bf5fd4d4b5f65baf 100644
+--- a/crates/proteus-contracts/src/contracts/execution_recorder.rs
++++ b/crates/proteus-contracts/src/contracts/execution_recorder.rs
+@@ -1,20 +1,12 @@
+ use anyhow::Result;
+ use async_trait::async_trait;
+-use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+     domain::{AgentTask, ExchangeId},
+     model_standard::{CanonicalModelRequest, CanonicalModelResponse, ModelFailure},
+ };
+ 
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+-#[serde(rename_all = "snake_case")]
+-pub enum ModelCallOrigin {
+-    /// An ordinary workflow or detached model call.
+-    Direct,
+-    /// Auxiliary generation initiated by an execution-bound hook or tool.
+-    Auxiliary,
+-}
++pub use crate::domain::usage::ModelCallOrigin;
+ 
+ /// Execution-bound sink for generic execution lifecycle facts.
+ ///
+diff --git a/crates/proteus-contracts/src/contracts/mod.rs b/crates/proteus-contracts/src/contracts/mod.rs
+index 29c3f4d91cfda5796539dbcffbf8adc48c797aef..689455b5a86235d289a314a7b21e35e96af1c90c 100644
+--- a/crates/proteus-contracts/src/contracts/mod.rs
++++ b/crates/proteus-contracts/src/contracts/mod.rs
+@@ -67,3 +67,6 @@ pub use workflow_failure::*;
+ pub use workflow_stream::*;
+ mod user_commands;
+ pub use user_commands::*;
++
++#[cfg(test)]
++mod domain_dto_tests;
+diff --git a/crates/proteus-contracts/src/contracts/tool_terminal.rs b/crates/proteus-contracts/src/contracts/tool_terminal.rs
+index 376137ca1b97535cd129828122cb1a6b0557d6ed..aa9220e74ba1064560b13572cfda27801017503f 100644
+--- a/crates/proteus-contracts/src/contracts/tool_terminal.rs
++++ b/crates/proteus-contracts/src/contracts/tool_terminal.rs
+@@ -3,7 +3,8 @@ use anyhow::Result;
+ use async_trait::async_trait;
+ use serde::{Deserialize, Serialize};
+ use std::sync::Arc;
+-use uuid::Uuid;
++
++pub use crate::domain::tool::ToolTerminalRef;
+ 
+ pub const TOOL_TERMINAL_FEATURE: &str = "tool_terminal/v1";
+ pub const PROCESS_TOOL_TERMINAL_METHOD: &str = "terminal_control";
+@@ -72,14 +73,6 @@ pub enum ToolTerminalResponse {
+     Unavailable,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+-#[serde(deny_unknown_fields)]
+-pub struct ToolTerminalRef {
+-    pub id: Uuid,
+-    pub title: String,
+-    pub tty: bool,
+-}
+-
+ #[derive(Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct ProcessToolTerminalInput {
+diff --git a/crates/proteus-contracts/src/domain/events.rs b/crates/proteus-contracts/src/domain/events.rs
+index 3e40e80617c3870c0baace020c14c5c7680caec4..b06a96feb390111292af236dfadffe52be6ea3f4 100644
+--- a/crates/proteus-contracts/src/domain/events.rs
++++ b/crates/proteus-contracts/src/domain/events.rs
+@@ -1,4 +1,4 @@
+-use super::HistoryCompactionReport;
++use super::{HistoryCompactionReport, tool::ToolTerminalRef};
+ use std::path::PathBuf;
+ 
+ use serde::{Deserialize, Serialize};
+@@ -298,7 +298,7 @@ pub enum Event {
+     },
+     ToolTerminalBound {
+         call_id: CallId,
+-        terminal: crate::contracts::ToolTerminalRef,
++        terminal: ToolTerminalRef,
+     },
+     ToolFinished {
+         result: ToolResult,
+diff --git a/crates/proteus-contracts/src/domain/tool.rs b/crates/proteus-contracts/src/domain/tool.rs
+index 82551515952ad800efd8f482558a804f1bf71465..714ab2fb503db485b1bbddd37c10ff37bfb81680 100644
+--- a/crates/proteus-contracts/src/domain/tool.rs
++++ b/crates/proteus-contracts/src/domain/tool.rs
+@@ -5,6 +5,7 @@ use std::{
+ };
+ 
+ use serde::{Deserialize, Serialize};
++use uuid::Uuid;
+ 
+ use crate::domain::{HostedToolConfig, HostedToolKind, ids::CallId};
+ 
+@@ -86,6 +87,14 @@ impl ToolCallSurface {
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub struct ToolTerminalRef {
++    pub id: Uuid,
++    pub title: String,
++    pub tty: bool,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(deny_unknown_fields)]
+ #[non_exhaustive]
+diff --git a/crates/proteus-contracts/src/domain/usage.rs b/crates/proteus-contracts/src/domain/usage.rs
+index 3fcf1a65d22bc2c88c1e55cb409c72de03b30f5a..5f7062190a0da0ab457519494b2a9f971a727351 100644
+--- a/crates/proteus-contracts/src/domain/usage.rs
++++ b/crates/proteus-contracts/src/domain/usage.rs
+@@ -2,7 +2,6 @@
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::{
+-    contracts::ModelCallOrigin,
+     domain::{ExchangeId, ModelRef, SessionId, TurnId},
+     model_standard::{FinishReason, TokenUsage},
+ };
+@@ -17,6 +16,15 @@ pub struct SessionUsageSnapshot {
+     pub requests: Vec<ModelRequestUsage>,
+ }
+ 
++#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum ModelCallOrigin {
++    /// An ordinary workflow or detached model call.
++    Direct,
++    /// Auxiliary generation initiated by an execution-bound hook or tool.
++    Auxiliary,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(deny_unknown_fields)]
+ pub struct ModelRequestUsage {
