@@ -1,0 +1,153 @@
+diff --git a/BUILDING.md b/BUILDING.md
+index ff36e7bffa2edcb098a2f64a099fc3dc8f857319..c0777e44e3e3d822d790e89346683ce19dac818f 100644
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -68,6 +68,10 @@ python3 scripts/portable.py --components desktop extensions --base /absolute/rea
+ Частичное обновление модулей сохраняет уже установленный OpenCode runtime,
+ его launcher и дескриптор.
+ 
++При частичном обновлении модулей SDK и обёртки запуска JS-хуков копируются без запуска Node.js.
++Полная сборка по-прежнему проверяет Node.js 22.18+ перед копированием этих файлов.
++Для запуска поставляемого JS-воркера и инспектора хуков Node.js по-прежнему нужен.
++
+ Выбор всех четырёх компонентов, в том числе через `--components`, создаёт
+ чистую поставку так же, как `--full`, без копирования базы. Установленные
+ отдельно Pi/OpenCode Node runtimes в неё автоматически не попадают. Если
+diff --git a/README.md b/README.md
+index 40f18e06ff2f0607833af58a0e70bd86dcba9ad9..0083c2b61c4c3fbaaea7f6e0cd9d99b167ae2478 100644
+--- a/README.md
++++ b/README.md
+@@ -55,8 +55,9 @@ Proteus-agent (ныне Proteus-core).
+ 
+ ## Сборка на Linux
+ 
+-Версия Rust указана в [rust-toolchain.toml](rust-toolchain.toml). Для упаковки
+-поставляемых JavaScript-хуков нужен Node.js 22.18+. Для линковки на Linux нужны dev-пакеты xcb,
++Версия Rust указана в [rust-toolchain.toml](rust-toolchain.toml). Node.js 22.18+ нужен
++для полной сборки portable и для запуска поставляемых JS-хуков. При частичном
++обновлении модулей их файлы копируются без Node.js. Для линковки на Linux нужны dev-пакеты xcb,
+ xkbcommon (с x11), fontconfig и freetype; в Fedora:
+ 
+ ```bash
+diff --git a/scripts/portable.py b/scripts/portable.py
+index bd5cf74d1c56385407f641589ae1ab4462623c71..b8c8a98fb39b5b22fda6d294c8abf7b6c3f16d05 100755
+--- a/scripts/portable.py
++++ b/scripts/portable.py
+@@ -22,7 +22,7 @@ from sources import resolve
+ from limits import limit
+ from cargo_binary import build_binary
+ from desktop_toolchain import prepare_desktop
+-from portable_modules import assemble as assemble_modules
++from portable_modules import assemble as assemble_modules, require_node as require_hook_node
+ from portable_state import (COMPONENTS, SOURCE_NAMES, binary_hashes, clear_modules,
+                             desktop_features, desktop_protocol, publish, read_record, update_lock, verify_extension_source, verify_protocol)
+ from release_metadata import install_component_notices, source_record, version, write_manifest
+@@ -86,6 +86,8 @@ def assemble(stage, selected, roots, profile, base_record=None):
+             run([sys.executable, str(modules / "package.py"), "--profile",
+                  "dev" if profile == "debug" else "release", "--bundle", str(stage)], modules)
+             # Hook SDK is copied as source; selecting modules never compiles Core.
++            if base_record is None:
++                require_hook_node()
+             assemble_modules(roots["core"], modules, stage)
+         elif component == "extensions":
+             shutil.rmtree(stage / "share/extensions", ignore_errors=True)
+diff --git a/scripts/portable_modules.py b/scripts/portable_modules.py
+index 52231a05484d9cc80cbdb7d0a3da174331cdeb08..14f2b4dd63c801c2949cd4adae6c7f14675333db 100644
+--- a/scripts/portable_modules.py
++++ b/scripts/portable_modules.py
+@@ -43,7 +43,6 @@ def install_launcher(portable, name, entry):
+ 
+ def assemble(core, modules, portable):
+     """Ship hook sources/SDK without installing or enabling any hook profile."""
+-    require_node()
+     adapter = portable / "share/modules/claude-command-hooks"
+     sdk = portable / "share/modules/hook-process"
+     copy_tracked(modules, "hook/claude-command-hooks", adapter)
+diff --git a/scripts/test_portable_serialization.py b/scripts/test_portable_serialization.py
+index 4f52894df209dd6cc2ae0ace3250d88808244535..315095b9798422badf3b704f21ec645f3ca8b374 100644
+--- a/scripts/test_portable_serialization.py
++++ b/scripts/test_portable_serialization.py
+@@ -49,7 +49,7 @@ def load_portable():
+         'limits': module('limits', limit=forbidden),
+         'cargo_binary': module('cargo_binary', build_binary=forbidden),
+         'desktop_toolchain': module('desktop_toolchain', prepare_desktop=forbidden),
+-        'portable_modules': module('portable_modules', assemble=forbidden),
++        'portable_modules': module('portable_modules', assemble=forbidden, require_node=forbidden),
+         'portable_state': state,
+         'release_metadata': module('release_metadata',
+             install_component_notices=forbidden, source_record=forbidden,
+diff --git a/scripts/test_release_cargo_binary.py b/scripts/test_release_cargo_binary.py
+index 2cb23d3d6686bd4835ff04137b3f750d3ea9aa9c..7fb6a7184f03c0e38183b6947024d62103327bbb 100644
+--- a/scripts/test_release_cargo_binary.py
++++ b/scripts/test_release_cargo_binary.py
+@@ -221,7 +221,7 @@ class PortableSelectionTests(unittest.TestCase):
+         self.built = []
+         self.executed = []
+         for name in ("resolve", "limit", "build_binary", "prepare_desktop", "run", "install_file",
+-                     "install_component_notices", "assemble_modules", "source_record", "version"):
++                     "install_component_notices", "require_hook_node", "assemble_modules", "source_record", "version"):
+             patcher = patch.object(self.portable, name)
+             setattr(self, name, patcher.start())
+             self.addCleanup(patcher.stop)
+@@ -337,6 +337,7 @@ class PortableSelectionTests(unittest.TestCase):
+         self.build_binary.assert_not_called()
+         self.assertEqual(self.resolved, ["harness", "modules"])
+         self.assemble_modules.assert_called_once()
++        self.require_hook_node.assert_not_called()
+         self.assertEqual(self.record()["sources"]["Proteus-core"]["commit"], "old-Proteus-core")
+         self.assertEqual(self.record()["module_sdk_source"]["commit"], "current-Proteus-core")
+         self.assertFalse((self.portable.PORTABLE / "bin/old-module").exists())
+@@ -470,6 +471,7 @@ class PortableSelectionTests(unittest.TestCase):
+         with patch.object(self.portable, "install_core", side_effect=core), \
+              patch.object(self.portable, "write_manifest", side_effect=metadata):
+             self.invoke("--full")
++        self.require_hook_node.assert_called_once_with()
+         self.assertEqual([name for name, flags in self.built], ["proteus-native", "proteus-core"])
+         self.assertEqual(self.resolved, ["harness", "modules", "extensions"])
+         self.assertEqual(len(self.executed), 2)
+diff --git a/scripts/test_release_portable_compatibility.py b/scripts/test_release_portable_compatibility.py
+index 0adbc4d878cac5ec30f0ba2c32fbb18e66eb4607..d898109867f82fa917837360bd1988939c178157 100644
+--- a/scripts/test_release_portable_compatibility.py
++++ b/scripts/test_release_portable_compatibility.py
+@@ -40,7 +40,7 @@ def load_portable():
+         "limits": module("limits", limit=forbidden),
+         "cargo_binary": module("cargo_binary", build_binary=forbidden),
+         "desktop_toolchain": module("desktop_toolchain", prepare_desktop=forbidden),
+-        "portable_modules": module("portable_modules", assemble=forbidden),
++        "portable_modules": module("portable_modules", assemble=forbidden, require_node=forbidden),
+         "portable_state": state,
+         "release_metadata": module("release_metadata", NOTICE_README="synthetic notices",
+             install_component_notices=forbidden, source_record=forbidden,
+@@ -140,6 +140,7 @@ class PortableCompatibilityTests(unittest.TestCase):
+         p.install_desktop = Mock(side_effect=lambda stage, flags: desktop_files(stage))
+         p.install_core = Mock(side_effect=lambda stage, core, flags: core_files(stage))
+         p.assemble_modules = Mock()
++        p.require_hook_node = Mock()
+         p.install_component_notices = lambda stage, name, root: put(stage / "share/licenses" / name / "LICENSE")
+         p.source_record = lambda name, root: {"commit": "synthetic-new"}
+         p.version = lambda root: "fixture-new"
+@@ -207,6 +208,24 @@ class PortableCompatibilityTests(unittest.TestCase):
+         self.assertEqual(saved["desktop_features"], [FEATURE])
+         self.assertEqual(self.state.extension_protocols(self.portable.PORTABLE), {4})
+ 
++    def test_hook_build_preflight_stays_at_the_full_portable_boundary(self):
++        calls = Mock()
++        calls.attach_mock(self.portable.run, "build")
++        calls.attach_mock(self.portable.require_hook_node, "probe_node")
++        calls.attach_mock(self.portable.assemble_modules, "copy_hooks")
++        for args, expected in (
++            (["--components", "modules"], ["build", "copy_hooks"]),
++            (["--full"], ["build", "probe_node", "copy_hooks"]),
++            (["--components", "extensions", "modules", "core", "desktop"],
++             ["build", "probe_node", "copy_hooks"]),
++        ):
++            with self.subTest(args=args):
++                calls.reset_mock()
++                self.run_main(args)
++                self.assertEqual([call[0] for call in calls.mock_calls
++                                  if call[0] != "build" or call.args[1] == self.source["modules"]],
++                                 expected)
++
+     def test_joint_update_repairs_incompatible_base(self):
+         extension_files(self.portable.PORTABLE / "share/extensions", 5, [FEATURE])
+         self.run_main(["--components", "desktop", "extensions"])
