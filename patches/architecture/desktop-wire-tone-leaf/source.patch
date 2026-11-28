@@ -1,0 +1,229 @@
+diff --git a/src/declarative/graph.rs b/src/declarative/graph.rs
+index beaf0a897da103ebda2d1f133f975a572a6eea24..5a3b5e4ed6c8fdb5c0ead22137c96ee16eeb1fdf 100644
+--- a/src/declarative/graph.rs
++++ b/src/declarative/graph.rs
+@@ -1,4 +1,4 @@
+-use super::widget::Tone;
++use super::tone::Tone;
+ use serde::Deserialize;
+ 
+ #[derive(Clone, Debug, Deserialize, PartialEq)]
+diff --git a/src/declarative/lanes.rs b/src/declarative/lanes.rs
+index f9192d3cc396acf02a7d358a67f993b0ba448a1b..414731b2420c08953bd08addf06d94971259ba71 100644
+--- a/src/declarative/lanes.rs
++++ b/src/declarative/lanes.rs
+@@ -2,7 +2,7 @@
+ //! puts its dot on a lane, and segments join lanes across row edges.
+ 
+ use super::control::MenuItem;
+-use super::widget::Tone;
++use super::tone::Tone;
+ use anyhow::{Result, bail};
+ use serde::Deserialize;
+ 
+diff --git a/src/declarative/mod.rs b/src/declarative/mod.rs
+index 1363d99839be7c36e9877b4a078578919d55b948..64b98367f706c7ba6b323d0abed95ef72332b1c4 100644
+--- a/src/declarative/mod.rs
++++ b/src/declarative/mod.rs
+@@ -18,5 +18,6 @@ pub mod process;
+ pub mod protocol;
+ pub mod session;
+ pub mod svg;
++pub mod tone;
+ pub mod tree;
+ pub mod widget;
+diff --git a/src/declarative/presentation.rs b/src/declarative/presentation.rs
+index fe0d79fcc1e8ff259c9322183df15dfc25d85c55..e9aa4e04164ac52dc702bbcfeb43102793c8f198 100644
+--- a/src/declarative/presentation.rs
++++ b/src/declarative/presentation.rs
+@@ -3,7 +3,7 @@
+ use anyhow::{Result, ensure};
+ use serde::Deserialize;
+ 
+-use super::widget::Tone;
++use super::tone::Tone;
+ 
+ #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "snake_case")]
+diff --git a/src/declarative/tone.rs b/src/declarative/tone.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b7e2eb5e03ec632cd55bdfaebbed50147d33c46
+--- /dev/null
++++ b/src/declarative/tone.rs
+@@ -0,0 +1,44 @@
++//! Semantic and literal colors in extension widget declarations.
++
++use anyhow::Result;
++use serde::Deserialize;
++
++/// Parses `#rrggbb` into `0xrrggbb`.
++pub fn hex_color(color: &str) -> Option<u32> {
++    let hex = color.strip_prefix('#')?;
++    (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()))
++        .then(|| u32::from_str_radix(hex, 16).ok())
++        .flatten()
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Tone {
++    #[default]
++    Default,
++    Muted,
++    Accent,
++    Success,
++    Warning,
++    Danger,
++    /// `#rrggbb` from the process.
++    Color(u32),
++}
++
++impl<'de> Deserialize<'de> for Tone {
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let name = String::deserialize(deserializer)?;
++        Ok(match name.as_str() {
++            "default" => Tone::Default,
++            "muted" => Tone::Muted,
++            "accent" => Tone::Accent,
++            "success" => Tone::Success,
++            "warning" => Tone::Warning,
++            "danger" => Tone::Danger,
++            color => Tone::Color(hex_color(color).ok_or_else(|| {
++                serde::de::Error::custom(format!(
++                    "tone {color:?} is neither a tone name nor #rrggbb"
++                ))
++            })?),
++        })
++    }
++}
+diff --git a/src/declarative/tree.rs b/src/declarative/tree.rs
+index 9b78a6fb432a8b656954be16e6611d8f483df118..861c7baf84c103cf9f9b7196404c6e1fc7759a08 100644
+--- a/src/declarative/tree.rs
++++ b/src/declarative/tree.rs
+@@ -1,5 +1,5 @@
+ use super::control::MenuItem;
+-use super::widget::Tone;
++use super::tone::Tone;
+ use serde::Deserialize;
+ 
+ #[derive(Clone, Debug, Deserialize, PartialEq)]
+diff --git a/src/declarative/widget.rs b/src/declarative/widget.rs
+index 3b9e73e4af6efa817a0308e0e93a8c18e72c4de4..e48956926d6405d0aa21048ac868066a538f5f79 100644
+--- a/src/declarative/widget.rs
++++ b/src/declarative/widget.rs
+@@ -11,6 +11,8 @@ use serde::Deserialize;
+ use serde_json::Value;
+ use std::sync::Arc;
+ 
++use super::tone::{Tone, hex_color};
++
+ const MAX_DEPTH: usize = 32;
+ const MAX_NODES: usize = 5_000;
+ 
+@@ -442,14 +444,6 @@ pub struct Segment {
+ 
+ const MAX_CELLS: usize = 2_000;
+ 
+-/// Parses `#rrggbb` into `0xrrggbb`.
+-pub fn hex_color(color: &str) -> Option<u32> {
+-    let hex = color.strip_prefix('#')?;
+-    (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+-        .then(|| u32::from_str_radix(hex, 16).ok())
+-        .flatten()
+-}
+-
+ #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "snake_case")]
+ pub enum Direction {
+@@ -468,38 +462,6 @@ pub enum Gap {
+     Large,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+-pub enum Tone {
+-    #[default]
+-    Default,
+-    Muted,
+-    Accent,
+-    Success,
+-    Warning,
+-    Danger,
+-    /// `#rrggbb` from the process.
+-    Color(u32),
+-}
+-
+-impl<'de> Deserialize<'de> for Tone {
+-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+-        let name = String::deserialize(deserializer)?;
+-        Ok(match name.as_str() {
+-            "default" => Tone::Default,
+-            "muted" => Tone::Muted,
+-            "accent" => Tone::Accent,
+-            "success" => Tone::Success,
+-            "warning" => Tone::Warning,
+-            "danger" => Tone::Danger,
+-            color => Tone::Color(hex_color(color).ok_or_else(|| {
+-                serde::de::Error::custom(format!(
+-                    "tone {color:?} is neither a tone name nor #rrggbb"
+-                ))
+-            })?),
+-        })
+-    }
+-}
+-
+ #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "snake_case")]
+ pub enum TextSize {
+diff --git a/src/ui/extensions/declarative/badge.rs b/src/ui/extensions/declarative/badge.rs
+index a4672310f0e05f7c22b31f40fa2a3c0721fd93eb..d4e04958ac4171dd2cae432483fa7a651a637b65 100644
+--- a/src/ui/extensions/declarative/badge.rs
++++ b/src/ui/extensions/declarative/badge.rs
+@@ -14,7 +14,7 @@ use super::super::badge::{Details, Press, pressable_badge, resting_badge};
+ use super::view::DeclarativeView;
+ use super::{Host, SurfaceKind, installed, runtime};
+ use crate::declarative::presentation::{Face, RingDisplay};
+-use crate::declarative::widget::Tone;
++use crate::declarative::tone::Tone;
+ use crate::preferences::BadgePlace;
+ use crate::ui::kit::MetricText as _;
+ use crate::ui::{motion::Number, prefs};
+diff --git a/src/ui/extensions/declarative/cells.rs b/src/ui/extensions/declarative/cells.rs
+index 3f2e431a7228edbe7d392464609bac874f2769b4..b4eb15ec39a67aef13442815071d3e9b73754711 100644
+--- a/src/ui/extensions/declarative/cells.rs
++++ b/src/ui/extensions/declarative/cells.rs
+@@ -5,7 +5,8 @@ use gpui_kit::component::*;
+ use gpui_kit::*;
+ 
+ use super::render::tone_color;
+-use crate::declarative::widget::{Segment, hex_color};
++use crate::declarative::tone::hex_color;
++use crate::declarative::widget::Segment;
+ use crate::ui::fade::faded;
+ use crate::ui::prefs;
+ use crate::ui::tip::Tip as _;
+diff --git a/src/ui/extensions/declarative/render.rs b/src/ui/extensions/declarative/render.rs
+index dea8229b4c3458d4f137025061c3529a35d1f0be..bc58a59392e50b5b310a6767539828aa8dc7dc7e 100644
+--- a/src/ui/extensions/declarative/render.rs
++++ b/src/ui/extensions/declarative/render.rs
+@@ -10,7 +10,8 @@ use gpui_kit::*;
+ 
+ use super::button::Fit;
+ use super::view::DeclarativeView;
+-use crate::declarative::widget::{Direction, Gap, Node, TextSize, Tone};
++use crate::declarative::tone::Tone;
++use crate::declarative::widget::{Direction, Gap, Node, TextSize};
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+diff --git a/src/ui/extensions/declarative/tree_row.rs b/src/ui/extensions/declarative/tree_row.rs
+index 122b740b48bba28f04e213190c263fcb82cf70b1..e8ef6b1e179e9ded8e3db25dfbb7984226564758 100644
+--- a/src/ui/extensions/declarative/tree_row.rs
++++ b/src/ui/extensions/declarative/tree_row.rs
+@@ -5,7 +5,7 @@
+ use super::toggle;
+ use super::tree::Tree;
+ use crate::declarative::tree::{Check, Row};
+-use crate::declarative::widget::Tone;
++use crate::declarative::tone::Tone;
+ use crate::ui::context::RightClickMenu as _;
+ use crate::ui::fade::{caption, faded_start};
+ use crate::ui::motion;
