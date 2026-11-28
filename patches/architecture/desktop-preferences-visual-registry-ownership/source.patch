@@ -1,0 +1,250 @@
+diff --git a/src/preferences.rs b/src/preferences.rs
+index 9552703b861995662e8ecd9dc08e172c1edd4e19..ee9e4b2b2763031d24fa31d1455cee8a1bc29c79 100644
+--- a/src/preferences.rs
++++ b/src/preferences.rs
+@@ -138,7 +138,36 @@ pub struct Preferences {
+     pub sessions: SessionMarks,
+     pub recent: RecentWorkspaces,
+     pub shortcuts: Shortcuts,
+-    pub visual_configs: crate::visual_config::Registry,
++    pub visual_configs: VisualConfigRegistry,
++}
++
++/// Stored associations from agent profiles to visual documents.
++#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default, deny_unknown_fields)]
++pub struct VisualConfigRegistry {
++    pub default_config: Option<PathBuf>,
++    pub bindings: BTreeMap<PathBuf, PathBuf>,
++}
++
++impl VisualConfigRegistry {
++    /// Missing files are reported when selected. Persisted metadata is still
++    /// readable while a removable drive or an agent project is unavailable.
++    fn validate(&self) -> Result<()> {
++        for path in self
++            .default_config
++            .iter()
++            .chain(self.bindings.keys())
++            .chain(self.bindings.values())
++        {
++            if !path.is_absolute() {
++                anyhow::bail!(
++                    "visual config registry paths must be absolute: {}",
++                    path.display()
++                );
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ /// The server namespace a saved layout belongs to. Attached connections are
+@@ -741,6 +770,33 @@ mod tests {
+         ViewPreferences,
+     };
+ 
++    #[test]
++    fn saved_visual_registry_roundtrips_only_absolute_paths() {
++        use serde_json::json;
++
++        let root = if cfg!(windows) {
++            "C:/unavailable-proteus-visual-fixture"
++        } else {
++            "/unavailable-proteus-visual-fixture"
++        };
++        let default = format!("{root}/default.json");
++        let agent = format!("{root}/agent.toml");
++        let visual = format!("{root}/bound.json");
++        let registry = json!({"default_config": default, "bindings": {(&agent): visual}});
++        let saved = |registry| json!({"visual_configs": registry}).to_string();
++        let path = std::path::Path::new("fixture.json");
++        let prefs = super::parse(&saved(registry.clone()), path).unwrap();
++        assert_eq!(serde_json::to_value(prefs).unwrap()["visual_configs"], registry);
++
++        for invalid in [
++            json!({"default_config": "default.json"}),
++            json!({"bindings": {"agent.toml": visual}}),
++            json!({"bindings": {(&agent): "bound.json"}}),
++        ] {
++            assert!(super::parse(&saved(invalid), path).is_err());
++        }
++    }
++
+     #[test]
+     fn shortcut_reset_roundtrip_preserves_other_preferences() {
+         use crate::shortcuts::Command;
+diff --git a/src/ui/prefs/visual.rs b/src/ui/prefs/visual.rs
+index c916846cad24668c724d4752bdb312ed6f9b2dc6..4b1668b760befa6e7a4b128e9979f1ca4b716c96 100644
+--- a/src/ui/prefs/visual.rs
++++ b/src/ui/prefs/visual.rs
+@@ -6,6 +6,7 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ use super::{ClientPreferences, Effects, persistence};
++use crate::preferences::VisualConfigRegistry;
+ use crate::visual_config::{self, SelectionOrigin, VisualConfig, WindowSelection};
+ use gpui_kit::*;
+ 
+@@ -161,7 +162,7 @@ pub(in crate::ui) fn inherit(mut snapshot: WindowVisualPreferences, cx: &mut App
+     apply(cx);
+ }
+ 
+-fn registry(cx: &App) -> crate::visual_config::Registry {
++fn registry(cx: &App) -> VisualConfigRegistry {
+     let mut registry = super::current(cx).visual_configs.clone();
+     // Headless in-memory contexts must not inspect the user's default file.
+     if !cx.global::<ClientPreferences>().persistent {
+diff --git a/src/visual_config/mod.rs b/src/visual_config/mod.rs
+index 2db9123f7ae7914dc7e2260d1df17a2139a8fab1..d9c1371eb449cf7b265d4639d353a17e467d7c98 100644
+--- a/src/visual_config/mod.rs
++++ b/src/visual_config/mod.rs
+@@ -4,7 +4,6 @@ mod registry;
+ mod selection;
+ mod storage;
+ 
+-pub use registry::Registry;
+ pub use selection::{SelectionOrigin, WindowSelection};
+ pub use storage::{load, save, select_path};
+ 
+diff --git a/src/visual_config/registry.rs b/src/visual_config/registry.rs
+index 22972c5ee8bfaaa52240d6e3e4dca32105c753e2..31ada2562ebbe61a52d21c762ce31a5f1416b548 100644
+--- a/src/visual_config/registry.rs
++++ b/src/visual_config/registry.rs
+@@ -1,21 +1,13 @@
+-//! App-owned associations; neither side is written while binding files.
++//! Resolve saved visual associations without writing either document.
+ 
+-use std::collections::BTreeMap;
+ use std::path::{Path, PathBuf};
+ 
+-use anyhow::{Context as _, Result, bail};
+-use serde::{Deserialize, Serialize};
++use anyhow::{Context as _, Result};
+ 
+ use super::{SelectionOrigin, WindowSelection, select_path};
++use crate::preferences::VisualConfigRegistry;
+ 
+-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+-#[serde(default, deny_unknown_fields)]
+-pub struct Registry {
+-    pub default_config: Option<PathBuf>,
+-    pub bindings: BTreeMap<PathBuf, PathBuf>,
+-}
+-
+-impl Registry {
++impl VisualConfigRegistry {
+     pub fn bind(&mut self, agent: &Path, visual: &Path) -> Result<()> {
+         let agent = canonical_agent(agent)?;
+         let visual = select_path(visual, Some(&agent))?;
+@@ -56,25 +48,6 @@ impl Registry {
+             origin: SelectionOrigin::Default,
+         })
+     }
+-
+-    /// Missing files are reported when selected. Persisted metadata is still
+-    /// readable while a removable drive or an agent project is unavailable.
+-    pub fn validate(&self) -> Result<()> {
+-        for path in self
+-            .default_config
+-            .iter()
+-            .chain(self.bindings.keys())
+-            .chain(self.bindings.values())
+-        {
+-            if !path.is_absolute() {
+-                bail!(
+-                    "visual config registry paths must be absolute: {}",
+-                    path.display()
+-                );
+-            }
+-        }
+-        Ok(())
+-    }
+ }
+ 
+ pub(super) fn canonical_agent(path: &Path) -> Result<PathBuf> {
+diff --git a/src/visual_config/selection.rs b/src/visual_config/selection.rs
+index a0c8e2a725b98b6593d289f98378be4401bd375d..c669b46573228e7a73b892d16f0d1ebdc5855cdd 100644
+--- a/src/visual_config/selection.rs
++++ b/src/visual_config/selection.rs
+@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
+ use anyhow::Result;
+ use serde::{Deserialize, Serialize};
+ 
+-use super::{Registry, select_path};
++use super::select_path;
++use crate::preferences::VisualConfigRegistry;
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+@@ -34,7 +35,7 @@ impl WindowSelection {
+     /// newly selected source, so ordinary model/session events do not reload it.
+     pub fn apply_agent_binding(
+         &mut self,
+-        registry: &Registry,
++        registry: &VisualConfigRegistry,
+         agent: Option<&Path>,
+     ) -> Result<bool> {
+         if self.origin == SelectionOrigin::Manual {
+@@ -46,7 +47,11 @@ impl WindowSelection {
+         Ok(changed)
+     }
+ 
+-    pub fn reset_to_auto(&mut self, registry: &Registry, agent: Option<&Path>) -> Result<()> {
++    pub fn reset_to_auto(
++        &mut self,
++        registry: &VisualConfigRegistry,
++        agent: Option<&Path>,
++    ) -> Result<()> {
+         *self = registry.resolve(agent)?;
+         Ok(())
+     }
+diff --git a/src/visual_config/tests.rs b/src/visual_config/tests.rs
+index 9f9bae8681d585c8868b97d3687e7ccbd2f93252..031be189bd2a07e3a0b58ac5496617302d7afb44 100644
+--- a/src/visual_config/tests.rs
++++ b/src/visual_config/tests.rs
+@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
+ use serde_json::json;
+ 
+ use super::*;
+-use crate::preferences::{Notifications, SendMode};
++use crate::preferences::{Notifications, SendMode, VisualConfigRegistry};
+ 
+ struct Fixture(PathBuf);
+ 
+@@ -111,7 +111,7 @@ fn bindings_use_canonical_paths_and_do_not_write_either_document() {
+     let visual_before = fs::read(&visual).unwrap();
+     symlink(&agent, fixture.path("agent-alias.toml")).unwrap();
+     symlink(&visual, fixture.path("visual-alias.json")).unwrap();
+-    let mut registry = Registry::default();
++    let mut registry = VisualConfigRegistry::default();
+     registry
+         .bind(
+             &fixture.path("agent-alias.toml"),
+@@ -134,7 +134,7 @@ fn manual_selection_survives_late_binding_and_two_windows_are_independent() {
+     let manual = fixture.path("manual.toml");
+     save(&bound, &VisualConfig::default(), Some(&agent)).unwrap();
+     save(&manual, &VisualConfig::default(), Some(&agent)).unwrap();
+-    let mut registry = Registry::default();
++    let mut registry = VisualConfigRegistry::default();
+     registry.bind(&agent, &bound).unwrap();
+     let mut first = registry.resolve(Some(&agent)).unwrap();
+     let second = first.clone();
+@@ -183,7 +183,7 @@ fn failed_load_and_validation_preserve_existing_visual_document() {
+ fn missing_binding_or_default_is_reported_instead_of_silently_using_builtin() {
+     let fixture = Fixture::new();
+     let agent = fixture.agent();
+-    let mut registry = Registry::default();
++    let mut registry = VisualConfigRegistry::default();
+     registry
+         .bindings
+         .insert(agent.clone(), fixture.path("missing.json"));
+@@ -217,7 +217,7 @@ fn invalid_bind_and_default_choices_leave_existing_registry_unchanged() {
+     save(&visual, &VisualConfig::default(), Some(&agent)).unwrap();
+     let invalid = fixture.path("invalid.toml");
+     fs::write(&invalid, "model = 'another-agent'\n").unwrap();
+-    let mut registry = Registry::default();
++    let mut registry = VisualConfigRegistry::default();
+     registry.bind(&agent, &visual).unwrap();
+     registry.set_default(Some(&visual)).unwrap();
+     let before = registry.clone();
