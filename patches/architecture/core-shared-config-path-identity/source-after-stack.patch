@@ -1,0 +1,142 @@
+diff --git a/crates/proteus-core/src/app_server/config_path_lock.rs b/crates/proteus-core/src/app_server/config_path_lock.rs
+index cf258ab7c72cf27fd7e2237a7e62eef5acd911f3..d54b8b14fae59454dd48f55351ccdf0a71c9ad36 100644
+--- a/crates/proteus-core/src/app_server/config_path_lock.rs
++++ b/crates/proteus-core/src/app_server/config_path_lock.rs
+@@ -9,12 +9,7 @@ use tokio::sync::Mutex;
+ 
++use super::path_utils::physical_config_identity;
++
+ pub(in crate::app_server) fn path_lock(path: &Path) -> Result<Arc<Mutex<()>>> {
+     static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+-    let absolute = std::path::absolute(crate::core::physical_config_path(path))?;
+-    let key = absolute
+-        .ancestors()
+-        .find_map(|ancestor| {
+-            std::fs::canonicalize(ancestor).ok().map(|canonical| {
+-                canonical.join(absolute.strip_prefix(ancestor).expect("path ancestor"))
+-            })
+-        })
++    let key = physical_config_identity(path)?
+         .ok_or_else(|| anyhow!("cannot resolve config path {}", path.display()))?;
+diff --git a/crates/proteus-core/src/app_server/path_utils.rs b/crates/proteus-core/src/app_server/path_utils.rs
+index eb2d901fe6e8c72a8485f28430659a4f8d393080..8187de55ab58985cbf45a302cfa9441e96ede859 100644
+--- a/crates/proteus-core/src/app_server/path_utils.rs
++++ b/crates/proteus-core/src/app_server/path_utils.rs
+@@ -1,2 +1,27 @@
+-use std::path::{Path, PathBuf};
++use std::{
++    io,
++    path::{Path, PathBuf},
++};
++
++use anyhow::{Context, Result};
++
++/// Resolve the physical configuration key without rewriting the unmaterialized suffix.
++pub(super) fn physical_config_identity(path: &Path) -> io::Result<Option<PathBuf>> {
++    let absolute = std::path::absolute(crate::core::physical_config_path(path))?;
++    Ok(absolute.ancestors().find_map(|ancestor| {
++        std::fs::canonicalize(ancestor).ok().map(|canonical| {
++            canonical.join(absolute.strip_prefix(ancestor).expect("path ancestor"))
++        })
++    }))
++}
++
++pub(super) fn resolve_config_reference(path: &Path) -> Result<PathBuf> {
++    let selection = crate::core::config_selection(path)?;
++    let mut resolved =
++        physical_config_identity(path)?.context("cannot resolve selection profile path")?;
++    for role in selection {
++        resolved = crate::core::config_reference(&resolved, &role)?;
++    }
++    Ok(resolved)
++}
+ 
+@@ -73,2 +98,36 @@ mod tests {
+     }
++
++    #[test]
++    fn config_identity_preserves_missing_suffix_through_a_symlink() {
++        let temp = tempfile::tempdir().unwrap();
++        let real = temp.path().join("real");
++        let alias = temp.path().join("alias");
++        fs::create_dir(&real).unwrap();
++        symlink(&real, &alias).unwrap();
++        let suffix = "missing/../profile.toml";
++        let path = alias.join(suffix);
++        let expected = real.canonicalize().unwrap().join(suffix);
++        let with_roles = |path: &Path| {
++            PathBuf::from(format!(
++                "{}#agent=/outer~1role/inner~0stage",
++                path.to_str().unwrap()
++            ))
++        };
++
++        assert_eq!(
++            physical_config_identity(&path).unwrap().unwrap().as_os_str(),
++            expected.as_os_str()
++        );
++        assert_eq!(
++            physical_config_identity(&with_roles(&path))
++                .unwrap()
++                .unwrap()
++                .as_os_str(),
++            expected.as_os_str()
++        );
++        assert_eq!(
++            resolve_config_reference(&with_roles(&path)).unwrap().as_os_str(),
++            with_roles(&expected).as_os_str()
++        );
++    }
+ }
+diff --git a/crates/proteus-core/src/app_server/session_behavior.rs b/crates/proteus-core/src/app_server/session_behavior.rs
+index 5916e8125d2330347b4cac47cb5cd7f1dfa97502..ee20d50a9480ff854ddf7f69482ce253d80a2175 100644
+--- a/crates/proteus-core/src/app_server/session_behavior.rs
++++ b/crates/proteus-core/src/app_server/session_behavior.rs
+@@ -10,2 +10,3 @@ use super::{
+     config_path_lock::path_lock,
++    path_utils::resolve_config_reference,
+     prepare_assembly,
+@@ -33,3 +34,3 @@ fn binding(server: &AppServerHandle) -> Result<String> {
+             .as_deref()
+-            .map(super::session_selection::resolved_path)
++            .map(resolve_config_reference)
+             .transpose()?,
+diff --git a/crates/proteus-core/src/app_server/session_selection.rs b/crates/proteus-core/src/app_server/session_selection.rs
+index a712cd465df875838d1490e288e6c1389f616ecd..dba8b0bada9e904379e7db28624cefd0db071a10 100644
+--- a/crates/proteus-core/src/app_server/session_selection.rs
++++ b/crates/proteus-core/src/app_server/session_selection.rs
+@@ -11,3 +11,3 @@ use serde::{Deserialize, Serialize};
+ 
+-use super::config_path_lock::path_lock;
++use super::{config_path_lock::path_lock, path_utils::resolve_config_reference};
+ use crate::{
+@@ -44,19 +44,2 @@ fn encode_digest(bytes: &[u8]) -> String {
+ 
+-pub(super) fn resolved_path(path: &Path) -> Result<PathBuf> {
+-    let selection = crate::core::config_selection(path)?;
+-    let absolute = std::path::absolute(crate::core::physical_config_path(path))?;
+-    let mut resolved = absolute
+-        .ancestors()
+-        .find_map(|ancestor| {
+-            std::fs::canonicalize(ancestor)
+-                .ok()
+-                .map(|root| root.join(absolute.strip_prefix(ancestor).expect("ancestor")))
+-        })
+-        .context("cannot resolve selection profile path")?;
+-    for role in selection {
+-        resolved = crate::core::config_reference(&resolved, &role)?;
+-    }
+-    Ok(resolved)
+-}
+-
+ fn binding(config: &AppConfig, path: &Path) -> Result<Option<String>> {
+@@ -83,3 +66,3 @@ fn binding(config: &AppConfig, path: &Path) -> Result<Option<String>> {
+     let bytes = serde_json::to_vec(&(
+-        resolved_path(path)?,
++        resolve_config_reference(path)?,
+         &config.profile.name,
+@@ -103,3 +86,3 @@ fn last_path(config: &AppConfig, path: &Path) -> Result<PathBuf> {
+     let key = serde_json::to_vec(&(
+-        resolved_path(path)?,
++        resolve_config_reference(path)?,
+         &config.profile.name,
