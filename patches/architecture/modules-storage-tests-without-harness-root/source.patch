@@ -1,0 +1,198 @@
+diff --git a/README.md b/README.md
+index 5d59a8d1a2afaf8463d81d2bbc9b45452b4dfd89..232a96f1f7ca3d3f11eb730595391721ee96f353 100644
+--- a/README.md
++++ b/README.md
+@@ -69,6 +69,9 @@ python3 scripts/test.py -p rg-search --lib
+ 
+ Runner получает путь к harness из Cargo metadata: интеграционные тесты читают
+ его fixtures и профили из той же ревизии, против которой собраны зависимости.
++Явный выбор только `session-storage` и/или `proteus-session-storage-module`
++не требует этой подготовки: тесты используют временные каталоги и собранный
++Cargo воркер. Закреплённые Git-зависимости Core продолжают использоваться.
+ Полный gate и scope `-p proteus-reference-module` включают Node-тесты
+ Claude command hooks. Runner задаёт `PROTEUS_HOOK_SDK_ROOT`
+ из той же закреплённой зависимости Core, поэтому SDK integration tests
+diff --git a/scripts/test.py b/scripts/test.py
+index cc024e2cc77face09980d808072104713716e44f..f7f6f0cd63bb79a700242af599d4ec16db7cb4cd 100755
+--- a/scripts/test.py
++++ b/scripts/test.py
+@@ -7,22 +7,40 @@ import subprocess
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parent.parent
++STORAGE_TARGETS = {"session-storage", "proteus-session-storage-module"}
+ 
+ 
+-def main(args):
+-    if not args or args == ["--help"]:
+-        print("Usage: scripts/test.py full [Cargo options]\n       scripts/test.py -p PACKAGE [Cargo options]")
+-        return 0 if args else 2
+-    full = args[0] == "full"
+-    if full:
+-        args = ["--workspace", "--no-fail-fast", *args[1:]]
+-    env = os.environ.copy()
+-    env.setdefault("CARGO_BUILD_JOBS", "2")
+-    env.setdefault("RUST_TEST_THREADS", "4")
+-    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+-    for key in ("NO_PROXY", "no_proxy"):
+-        values = [value for value in env.get(key, "").split(",") if value]
+-        env[key] = ",".join(dict.fromkeys([*values, "localhost", "127.0.0.1", "::1"]))
++def storage_only(args):
++    """Recognize only explicit storage scopes; delegate other cases to the full setup."""
++    flags = {"--lib", "--tests", "--no-run", "--no-fail-fast", "--release", "--locked",
++             "--frozen", "--offline", "-q", "--quiet", "-v", "-vv", "--verbose"}
++    valued = {"-p", "--package", "-j", "--jobs", "--profile", "--test", "--color",
++              "--message-format"}
++    packages = []
++    filter_seen = False
++    cargo = iter(args)
++    for arg in cargo:
++        if arg == "--":
++            break
++        option, equals, value = arg.partition("=")
++        if option in valued:
++            value = value if equals else next(cargo, "")
++            if not value or value.startswith("-"):
++                return False
++            if option in ("-p", "--package"):
++                packages.append(value)
++        elif arg.startswith("-p"):
++            packages.append(arg[2:])
++        elif arg in flags or (arg.startswith("-j") and arg[2:].isdigit()):
++            continue
++        elif not arg.startswith("-") and arg and not filter_seen:
++            filter_seen = True
++        else:
++            return False
++    return bool(packages) and all(package in STORAGE_TARGETS for package in packages)
++
++
++def prepare_harness(args, env, full):
+     metadata = json.loads(subprocess.check_output(
+         ["cargo", "metadata", "--locked", "--format-version=1"],
+         cwd=ROOT, env=env, text=True,
+@@ -56,6 +74,24 @@ def main(args):
+                 cwd=ROOT, env=env, text=True,
+             ))
+             env["PROTEUS_TEST_SESSION_STORAGE_MODULE"] = binaries["session-storage"]
++
++
++def main(args):
++    if not args or args == ["--help"]:
++        print("Usage: scripts/test.py full [Cargo options]\n       scripts/test.py -p PACKAGE [Cargo options]")
++        return 0 if args else 2
++    full = args[0] == "full"
++    if full:
++        args = ["--workspace", "--no-fail-fast", *args[1:]]
++    env = os.environ.copy()
++    env.setdefault("CARGO_BUILD_JOBS", "2")
++    env.setdefault("RUST_TEST_THREADS", "4")
++    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
++    for key in ("NO_PROXY", "no_proxy"):
++        values = [value for value in env.get(key, "").split(",") if value]
++        env[key] = ",".join(dict.fromkeys([*values, "localhost", "127.0.0.1", "::1"]))
++    if full or not storage_only(args):
++        prepare_harness(args, env, full)
+     return subprocess.call(["cargo", "test", "--locked", *args], cwd=ROOT, env=env)
+ 
+ 
+diff --git a/tests/test_runner_selection.py b/tests/test_runner_selection.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a2711ebbc3a541f81a486f55633c793536d7d6a
+--- /dev/null
++++ b/tests/test_runner_selection.py
+@@ -0,0 +1,94 @@
++"""Runner fixture selection, without compiling or starting any worker."""
++import importlib.util
++import json
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++
++SPEC = importlib.util.spec_from_file_location(
++    "module_test_runner", Path(__file__).resolve().parents[1] / "scripts" / "test.py")
++runner = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(runner)
++
++HARNESS = Path("/pinned/harness")
++METADATA = json.dumps({"packages": [
++    {"name": "proteus-core", "manifest_path": str(HARNESS / "crates/proteus-core/Cargo.toml")},
++]})
++WORKER = "/fixture/session-storage"
++ARTIFACTS = json.dumps({"session-storage": WORKER})
++
++
++class RunnerSelection(unittest.TestCase):
++    def invoke(self, args):
++        with (patch.dict(runner.os.environ, {}, clear=True),
++              patch.object(runner.subprocess, "check_output",
++                           side_effect=[METADATA, ARTIFACTS]) as prepare,
++              patch.object(runner.subprocess, "run") as setup,
++              patch.object(runner.subprocess, "call", return_value=0) as cargo):
++            self.assertEqual(runner.main(args), 0)
++        return (cargo.call_args.args[0], cargo.call_args.kwargs["env"],
++                [call.args[0] for call in prepare.call_args_list],
++                [call.args[0] for call in setup.call_args_list])
++
++    def test_explicit_storage_does_not_resolve_a_harness_fixture_root(self):
++        for args in (
++            ["-p", "session-storage", "--lib", "paging", "--", "--nocapture"],
++            ["--package=proteus-session-storage-module", "--test", "process", "--offline"],
++            ["-psession-storage", "-p", "proteus-session-storage-module", "--release", "-j3",
++             "--", "--skip", "proteus-reference-module"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual((prepare, setup), ([], []))
++                self.assertNotIn("PROTEUS_TEST_HARNESS_ROOT", env)
++
++    def test_uncertain_or_mixed_scopes_keep_the_pinned_harness(self):
++        for args in (
++            ["-p", "rg-search", "--lib"],
++            ["-p", "session-storage", "-p", "rg-search"],
++            ["-p", "session-storage", "--workspace"],
++            ["-p", "session-storage", "--manifest-path", "/other/Cargo.toml"],
++            ["--", "-p", "session-storage"],
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *args])
++                self.assertEqual(prepare, [["cargo", "metadata", "--locked", "--format-version=1"]])
++                self.assertEqual(setup, [])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++
++    def test_interop_and_full_keep_their_existing_preparation(self):
++        for args, selected in (
++            (["full", "--", "--nocapture"], ["--workspace", "--no-fail-fast", "--", "--nocapture"]),
++            (["-p", "proteus-reference-module", "--test", "context_preparation_interop"],
++             ["-p", "proteus-reference-module", "--test", "context_preparation_interop"]),
++        ):
++            with self.subTest(args=args):
++                command, env, prepare, setup = self.invoke(args)
++                self.assertEqual(command, ["cargo", "test", "--locked", *selected])
++                self.assertEqual(len(prepare), 2)
++                self.assertEqual(prepare[1][2:], ["--profile", "dev", "--print-artifacts"])
++                self.assertEqual([command[:2] for command in setup],
++                                 [["npm", "ci"], ["npm", "ci"],
++                                  [runner.sys.executable, "-m"], ["node", "--test"]])
++                self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++                self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], WORKER)
++                self.assertEqual(env["PROTEUS_HOOK_SDK_ROOT"],
++                                 str(HARNESS / "examples/modules/hook-process"))
++
++    def test_model_pack_still_prepares_its_storage_fixture(self):
++        args = ["-p", "model-pack", "--lib"]
++        command, env, prepare, setup = self.invoke(args)
++        self.assertEqual(command, ["cargo", "test", "--locked", *args])
++        self.assertEqual(len(prepare), 2)
++        self.assertEqual(prepare[1][2:], ["--profile", "dev", "--package", "session-storage",
++                                         "--print-artifacts"])
++        self.assertEqual(setup, [])
++        self.assertEqual(env["PROTEUS_TEST_HARNESS_ROOT"], str(HARNESS))
++        self.assertEqual(env["PROTEUS_TEST_SESSION_STORAGE_MODULE"], WORKER)
++
++
++if __name__ == "__main__":
++    unittest.main()
