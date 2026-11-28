@@ -1,0 +1,228 @@
+diff --git a/hook/codex-context-preparation/src/budget.rs b/hook/codex-context-preparation/src/budget.rs
+index 4ded4f819362d59547e4ac85174d1db1ea373c96..f848576a9b4c27c18ec93940f24a88c3f1fcf828 100644
+--- a/hook/codex-context-preparation/src/budget.rs
++++ b/hook/codex-context-preparation/src/budget.rs
+@@ -1,4 +1,4 @@
+-use crate::history::message_text_len;
++use crate::message_text::message_text_len;
+ use proteus_contracts::{contracts::ContextPreparationInput, model_standard::CanonicalMessage};
+ 
+ const DEFAULT_USER_MESSAGE_BUDGET_TOKENS: usize = 20_000;
+diff --git a/hook/codex-context-preparation/src/history.rs b/hook/codex-context-preparation/src/history.rs
+index bc36abca719da32ce799a3fbe255f3a5b24dfea7..07d4626dda1fe029daee0862bd715dde7cdaf9d4 100644
+--- a/hook/codex-context-preparation/src/history.rs
++++ b/hook/codex-context-preparation/src/history.rs
+@@ -1,6 +1,7 @@
+-use std::borrow::Cow;
+-
+-use crate::{budget::truncate_to_tokens, summary::SUMMARY_PREFIX};
++use crate::{
++    budget::truncate_to_tokens,
++    message_text::{SUMMARY_PREFIX, message_text},
++};
+ use proteus_contracts::domain::{CompactionUserMessageReplacement, new_message_id};
+ use proteus_contracts::model_standard::{
+     CanonicalMessage, CanonicalPart, ContentPart, MessageRole, PartProvenance, PartScope,
+@@ -193,65 +194,3 @@ pub(crate) fn replacement_messages(
+     ));
+     replacement
+ }
+-
+-fn message_text_pieces(
+-    message: &CanonicalMessage,
+-) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+-    message
+-        .parts
+-        .iter()
+-        .filter_map(|part| part_text(&part.payload))
+-        .filter(|text| !text.is_empty())
+-        .map(Into::into)
+-}
+-
+-fn joined_message_len(mut lengths: impl Iterator<Item = usize>) -> Option<usize> {
+-    let first = lengths.next()?;
+-    // Visit every piece just as the owned renderer does before joining.
+-    let length = lengths
+-        .fold(Some(first), |total, len| {
+-            total.and_then(|total| total.checked_add(1)?.checked_add(len))
+-        })
+-        .expect("attempt to join into collection with len > usize::MAX");
+-    assert!(length <= isize::MAX as usize, "capacity overflow");
+-    Some(length)
+-}
+-
+-pub(crate) fn message_text_len(message: &CanonicalMessage) -> Option<usize> {
+-    joined_message_len(message_text_pieces(message).map(|text| text.len()))
+-}
+-
+-pub(crate) fn message_text(message: &CanonicalMessage) -> Option<String> {
+-    let pieces = message_text_pieces(message).collect::<Vec<_>>();
+-    if pieces.is_empty() {
+-        None
+-    } else {
+-        Some(pieces.join("\n"))
+-    }
+-}
+-
+-pub(crate) fn part_text(part: &ContentPart) -> Option<Cow<'_, str>> {
+-    match part {
+-        ContentPart::Text { text } => Some(Cow::Borrowed(text.as_str())),
+-        ContentPart::Context { chunk } => Some(Cow::Borrowed(chunk.content.as_str())),
+-        ContentPart::FileRef { path, content } => content
+-            .as_ref()
+-            .map(|content| Cow::Owned(format!("{}:\n{content}", path.display()))),
+-        ContentPart::ToolCall { call } => {
+-            Some(Cow::Owned(format!("tool call {} {}", call.name, call.args)))
+-        }
+-        ContentPart::ToolResult { result } => Some(Cow::Owned(result.text_or_status())),
+-        ContentPart::Patch { patch } => Some(Cow::Borrowed(patch.content.as_str())),
+-        ContentPart::ReasoningSummary { text } => Some(Cow::Borrowed(text.as_str())),
+-        ContentPart::Reasoning { .. } => None,
+-        ContentPart::HostedToolActivity { activity } => Some(Cow::Owned(format!(
+-            "provider-hosted tool {}: {}",
+-            activity.kind().as_str(),
+-            serde_json::to_string(activity).unwrap_or_else(|_| "<unavailable>".to_owned())
+-        ))),
+-        // The cited assistant text is already present in the adjacent Text
+-        // part; annotations do not add model-visible prose to summarize.
+-        ContentPart::Citation { .. } => None,
+-        _ => None,
+-    }
+-}
+diff --git a/hook/codex-context-preparation/src/lib.rs b/hook/codex-context-preparation/src/lib.rs
+index 85d22097c105024555bacd0f29a38356c2fa59b6..71b86d661270dc760e747e6581a44684cc63686a 100644
+--- a/hook/codex-context-preparation/src/lib.rs
++++ b/hook/codex-context-preparation/src/lib.rs
+@@ -7,6 +7,7 @@ pub use config_schema::config_schema;
+ mod base_instructions;
+ mod history;
+ mod input_estimates;
++mod message_text;
+ mod recovery;
+ mod remote;
+ mod remote_history;
+diff --git a/hook/codex-context-preparation/src/message_text.rs b/hook/codex-context-preparation/src/message_text.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c09570447a1f186c2fceb5db091623bea477fc2
+--- /dev/null
++++ b/hook/codex-context-preparation/src/message_text.rs
+@@ -0,0 +1,69 @@
++//! Shared text representation for compaction, independent of selection and model calls.
++use std::borrow::Cow;
++
++use proteus_contracts::model_standard::{CanonicalMessage, ContentPart};
++
++/// OpenAI Codex summary prefix, pinned at 67cc3c318dc8b5532db6ade4182b1dc6f3870889.
++pub(crate) const SUMMARY_PREFIX: &str = include_str!("upstream/summary_prefix.md");
++
++fn message_text_pieces(
++    message: &CanonicalMessage,
++) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
++    message
++        .parts
++        .iter()
++        .filter_map(|part| part_text(&part.payload))
++        .filter(|text| !text.is_empty())
++        .map(Into::into)
++}
++
++fn joined_message_len(mut lengths: impl Iterator<Item = usize>) -> Option<usize> {
++    let first = lengths.next()?;
++    // Visit every piece just as the owned renderer does before joining.
++    let length = lengths
++        .fold(Some(first), |total, len| {
++            total.and_then(|total| total.checked_add(1)?.checked_add(len))
++        })
++        .expect("attempt to join into collection with len > usize::MAX");
++    assert!(length <= isize::MAX as usize, "capacity overflow");
++    Some(length)
++}
++
++pub(crate) fn message_text_len(message: &CanonicalMessage) -> Option<usize> {
++    joined_message_len(message_text_pieces(message).map(|text| text.len()))
++}
++
++pub(crate) fn message_text(message: &CanonicalMessage) -> Option<String> {
++    let pieces = message_text_pieces(message).collect::<Vec<_>>();
++    if pieces.is_empty() {
++        None
++    } else {
++        Some(pieces.join("\n"))
++    }
++}
++
++pub(crate) fn part_text(part: &ContentPart) -> Option<Cow<'_, str>> {
++    match part {
++        ContentPart::Text { text } => Some(Cow::Borrowed(text.as_str())),
++        ContentPart::Context { chunk } => Some(Cow::Borrowed(chunk.content.as_str())),
++        ContentPart::FileRef { path, content } => content
++            .as_ref()
++            .map(|content| Cow::Owned(format!("{}:\n{content}", path.display()))),
++        ContentPart::ToolCall { call } => {
++            Some(Cow::Owned(format!("tool call {} {}", call.name, call.args)))
++        }
++        ContentPart::ToolResult { result } => Some(Cow::Owned(result.text_or_status())),
++        ContentPart::Patch { patch } => Some(Cow::Borrowed(patch.content.as_str())),
++        ContentPart::ReasoningSummary { text } => Some(Cow::Borrowed(text.as_str())),
++        ContentPart::Reasoning { .. } => None,
++        ContentPart::HostedToolActivity { activity } => Some(Cow::Owned(format!(
++            "provider-hosted tool {}: {}",
++            activity.kind().as_str(),
++            serde_json::to_string(activity).unwrap_or_else(|_| "<unavailable>".to_owned())
++        ))),
++        // The cited assistant text is already present in the adjacent Text
++        // part; annotations do not add model-visible prose to summarize.
++        ContentPart::Citation { .. } => None,
++        _ => None,
++    }
++}
+diff --git a/hook/codex-context-preparation/src/remote_history.rs b/hook/codex-context-preparation/src/remote_history.rs
+index 1a0a79f3f4a68aeb31857f1b63b2463af790ede4..a9277711aa16a8c2ac670ac431651438e3cc09cc 100644
+--- a/hook/codex-context-preparation/src/remote_history.rs
++++ b/hook/codex-context-preparation/src/remote_history.rs
+@@ -8,7 +8,8 @@ use proteus_contracts::{
+ 
+ use crate::{
+     budget::{estimate_text_tokens, truncate_to_tokens},
+-    history::{SelectedUserMessages, part_text},
++    history::SelectedUserMessages,
++    message_text::part_text,
+ };
+ 
+ // All current OpenAI ImageRef inputs are encoded with detail:auto. Pinned Codex
+diff --git a/hook/codex-context-preparation/src/summary.rs b/hook/codex-context-preparation/src/summary.rs
+index 8f88de9a496959c35639e900691dc182e926f5b9..932f7959762186e8ad7d479180e2f2d581352e6a 100644
+--- a/hook/codex-context-preparation/src/summary.rs
++++ b/hook/codex-context-preparation/src/summary.rs
+@@ -7,14 +7,10 @@ use proteus_contracts::{
+     process_module::{HookModuleHost, ProcessModuleError},
+ };
+ 
+-use crate::history::message_text;
++use crate::message_text::{SUMMARY_PREFIX, message_text};
+ 
+ /// OpenAI Codex prompt template, pinned at 67cc3c318dc8b5532db6ade4182b1dc6f3870889.
+ pub(crate) const COMPACTION_PROMPT: &str = include_str!("upstream/compact_prompt.md");
+-/// OpenAI Codex summary prefix, pinned at 67cc3c318dc8b5532db6ade4182b1dc6f3870889.
+-/// `include_str!` retains the vendored file's terminal newline, while the
+-/// pinned source has none; strip it before local `prefix + '\n' + suffix`.
+-pub(crate) const SUMMARY_PREFIX: &str = include_str!("upstream/summary_prefix.md");
+ 
+ pub(crate) fn try_model_summary(
+     input: &ContextPreparationInput,
+diff --git a/hook/codex-context-preparation/src/tests.rs b/hook/codex-context-preparation/src/tests.rs
+index a64b50e5d56a740530e9d656a2f19dd6c42f4495..3cc4befcc717a35fe51eadb7d3ef4810d86c348d 100644
+--- a/hook/codex-context-preparation/src/tests.rs
++++ b/hook/codex-context-preparation/src/tests.rs
+@@ -116,8 +116,9 @@ fn many_image_only_users_leave_no_image_payload_in_replacement() {
+ use crate::{
+     budget::estimate_messages_tokens,
+     compaction::compact as compact_algorithm,
+-    history::{message_text, select_recent_user_messages},
+-    summary::{COMPACTION_PROMPT, SUMMARY_PREFIX, validate_summary_response_for_test},
++    history::select_recent_user_messages,
++    message_text::{SUMMARY_PREFIX, message_text},
++    summary::{COMPACTION_PROMPT, validate_summary_response_for_test},
+ };
+ 
+ mod history_recovery;
