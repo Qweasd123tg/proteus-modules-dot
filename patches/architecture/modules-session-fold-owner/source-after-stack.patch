@@ -1,0 +1,365 @@
+diff --git a/storage/session-storage/src/fold.rs b/storage/session-storage/src/fold.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..049c700e665eada2e62b57b4b938d45923012de6
+--- /dev/null
++++ b/storage/session-storage/src/fold.rs
+@@ -0,0 +1,126 @@
++//! Semantic journal projections shared by writers, snapshots and the catalog.
++
++use crate::types::*;
++use anyhow::Result;
++use proteus_contracts::{domain::SessionId, model_standard::CanonicalMessage};
++use proteus_session_semantics::{JournalValidationState, ModelContextProjection, UsageProjection};
++
++#[derive(Default)]
++pub(crate) struct Fold {
++    pub validation: JournalValidationState,
++    pub model_context: ModelContextProjection,
++    pub usage: UsageProjection,
++    pub session_seq: u64,
++}
++
++impl Fold {
++    pub fn apply(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
++        self.apply_projected::<true, true>(id, record)
++    }
++
++    /// Validate every journal fact without constructing unused query projections.
++    pub fn apply_validated(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
++        self.apply_projected::<false, false>(id, record)
++    }
++
++    pub(super) fn apply_projected<const MODEL_CONTEXT: bool, const USAGE: bool>(
++        &mut self,
++        id: SessionId,
++        record: &JournalRecord,
++    ) -> Result<()> {
++        let mut next = self
++            .session_seq
++            .checked_add(1)
++            .ok_or_else(|| anyhow::anyhow!("journal sequence overflow"))?;
++        self.validation.apply_sequenced(id, record, &mut next)?;
++        if MODEL_CONTEXT {
++            self.model_context.apply(record);
++        }
++        if USAGE {
++            self.usage.apply(record);
++        }
++        self.session_seq = record.session_seq;
++        Ok(())
++    }
++    pub fn revision(&self) -> StorageRevision {
++        StorageRevision {
++            session_seq: self.session_seq,
++            history_revision: self.validation.history_revision(),
++        }
++    }
++    pub fn conversation(&self) -> StorageConversation {
++        StorageConversation {
++            messages: self.validation.history().to_vec(),
++            revision: self.revision(),
++            model_context: self.model_context.snapshot(),
++        }
++    }
++    pub fn resume(&self, id: SessionId) -> StorageResumeState {
++        StorageResumeState {
++            conversation: self.conversation(),
++            usage: self.usage.snapshot(id),
++            last_history_turn: self.validation.last_history_turn(),
++            interrupted_turns: self.validation.interrupted_turns(),
++        }
++    }
++    pub fn into_resume(self, id: SessionId) -> StorageResumeState {
++        let revision = self.revision();
++        let last_history_turn = self.validation.last_history_turn();
++        let interrupted_turns = self.validation.interrupted_turns();
++        StorageResumeState {
++            conversation: StorageConversation {
++                messages: self.validation.into_history(),
++                revision,
++                model_context: self.model_context.snapshot(),
++            },
++            usage: self.usage.snapshot(id),
++            last_history_turn,
++            interrupted_turns,
++        }
++    }
++}
++
++pub(crate) fn preview(messages: &[CanonicalMessage]) -> Option<String> {
++    use proteus_contracts::model_standard::{ContentPart, MessageRole};
++    fn excerpt(text: &str) -> Option<String> {
++        let text = text.trim();
++        if text.is_empty() {
++            return None;
++        }
++        const LIMIT: usize = 160;
++        if text.len() > LIMIT
++            && let Some((end, _)) = text.char_indices().nth(LIMIT)
++        {
++            let mut short = String::with_capacity(end + 3);
++            short.push_str(&text[..end]);
++            short.push_str("...");
++            return Some(short);
++        }
++        Some(text.to_owned())
++    }
++
++    let text = |message: &CanonicalMessage| {
++        message.parts.iter().find_map(|part| match &part.payload {
++            ContentPart::Text { text }
++            | ContentPart::ReasoningSummary { text }
++            | ContentPart::Reasoning { text, .. } => excerpt(text),
++            ContentPart::ToolResult { result } => {
++                let text = result
++                    .error
++                    .as_deref()
++                    .filter(|text| !text.is_empty())
++                    .or_else(|| (!result.output.is_empty()).then_some(result.output.as_str()));
++                match text {
++                    Some(text) => excerpt(text),
++                    None => excerpt(&result.text_or_status()),
++                }
++            }
++            _ => None,
++        })
++    };
++    messages
++        .iter()
++        .filter(|m| m.role == MessageRole::User)
++        .find_map(text)
++        .or_else(|| messages.iter().find_map(text))
++}
+diff --git a/storage/session-storage/src/lib.rs b/storage/session-storage/src/lib.rs
+index be7fc34916355cadc3cfcc23080df74184528a5e..55d5d0ed055a3ffc308bc33d87ac306d23b9f945 100644
+--- a/storage/session-storage/src/lib.rs
++++ b/storage/session-storage/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod blob_codec;
+ mod codec;
+ mod diagnostics;
+ mod display;
++mod fold;
+ mod identity;
+ mod io;
+ mod lease;
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index 8a81f7799dc2cc09ae81e688b547ee4aa793a5b0..2d1d4d74f54aaf22347453f663f66d8b0a3b7f96 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -1,10 +1,11 @@
+ //! Typed storage service. No provider-, workflow- or tool-specific dispatch.
+ use crate::{
+     backend::{JSONL_JOURNAL_FILE, JournalBackend, Jsonl, SQLITE_JOURNAL_FILE, Sqlite},
++    fold::Fold,
+     identity,
+     lease::SessionWriteOwnership,
+     path_identity::canonicalize_unmaterialized_path,
+-    snapshot::{Fold, SnapshotState},
++    snapshot::SnapshotState,
+     types::*,
+     workspace_dir,
+ };
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index b9ab6a3f6099c6915694f39003ab681d4de64098..18e185a51cc46274c99e4bb39aa11894901f1d8f 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -187,7 +187,7 @@ impl CatalogRead {
+             StorageSessionSummary {
+                 descriptor: self.descriptor.clone(),
+                 message_count: fold.validation.history().len(),
+-                preview: crate::snapshot::preview(fold.validation.history()),
++                preview: crate::fold::preview(fold.validation.history()),
+             },
+             prefix,
+         ))
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 660ee16d3c0c4a73280bdf10c9a25b3dc58f3480..2d197826dcb5c919de13d881ad5bc1795fe92258 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -127,7 +127,7 @@ impl State {
+             let summary = StorageSessionSummary {
+                 descriptor,
+                 message_count: messages.len(),
+-                preview: crate::snapshot::preview(messages),
++                preview: crate::fold::preview(messages),
+             };
+             self.save_catalog_head(&dir, summary, &prefix, blobs);
+         }
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index bd63076259e778fbab4576239449671de72c13ee..c7de1f3513d41b999b4d13c67be04c3cc91ca57f 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -45,7 +45,7 @@ impl State {
+             let summary = StorageSessionSummary {
+                 descriptor,
+                 message_count: messages.len(),
+-                preview: crate::snapshot::preview(messages),
++                preview: crate::fold::preview(messages),
+             };
+             self.save_catalog_head(&dir, summary, &prefix, blobs);
+             verified = true;
+@@ -96,7 +96,7 @@ impl State {
+                 let summary = StorageSessionSummary {
+                     descriptor,
+                     message_count: messages.len(),
+-                    preview: crate::snapshot::preview(messages),
++                    preview: crate::fold::preview(messages),
+                 };
+                 self.save_catalog_head(&dir, summary, &prefix, blobs);
+             }
+diff --git a/storage/session-storage/src/snapshot.rs b/storage/session-storage/src/snapshot.rs
+index dbac4cde8a1fc1500144b30ea085765e585ce5f7..f1b8786f18c9439bcbc4ab9c90fde740ff463811 100644
+--- a/storage/session-storage/src/snapshot.rs
++++ b/storage/session-storage/src/snapshot.rs
+@@ -1,87 +1,12 @@
+-use crate::{backend::RecordSnapshot, codec::ExternalWitness, types::*};
++use crate::{backend::RecordSnapshot, codec::ExternalWitness, fold::Fold, types::*};
+ use anyhow::{Result, ensure};
+-use proteus_contracts::{domain::SessionId, model_standard::CanonicalMessage};
+-use proteus_session_semantics::{JournalValidationState, ModelContextProjection, UsageProjection};
++use proteus_session_semantics::{ModelContextProjection, UsageProjection};
+ 
+-#[derive(Default)]
+-pub(crate) struct Fold {
+-    pub validation: JournalValidationState,
+-    pub model_context: ModelContextProjection,
+-    pub usage: UsageProjection,
+-    pub session_seq: u64,
+-}
+ struct Terminal {
+     record: JournalRecord,
+     external: Option<ExternalWitness>,
+ }
+ 
+-impl Fold {
+-    pub fn apply(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
+-        self.apply_projected::<true, true>(id, record)
+-    }
+-
+-    /// Validate every journal fact without constructing unused query projections.
+-    pub fn apply_validated(&mut self, id: SessionId, record: &JournalRecord) -> Result<()> {
+-        self.apply_projected::<false, false>(id, record)
+-    }
+-
+-    fn apply_projected<const MODEL_CONTEXT: bool, const USAGE: bool>(
+-        &mut self,
+-        id: SessionId,
+-        record: &JournalRecord,
+-    ) -> Result<()> {
+-        let mut next = self
+-            .session_seq
+-            .checked_add(1)
+-            .ok_or_else(|| anyhow::anyhow!("journal sequence overflow"))?;
+-        self.validation.apply_sequenced(id, record, &mut next)?;
+-        if MODEL_CONTEXT {
+-            self.model_context.apply(record);
+-        }
+-        if USAGE {
+-            self.usage.apply(record);
+-        }
+-        self.session_seq = record.session_seq;
+-        Ok(())
+-    }
+-    pub fn revision(&self) -> StorageRevision {
+-        StorageRevision {
+-            session_seq: self.session_seq,
+-            history_revision: self.validation.history_revision(),
+-        }
+-    }
+-    pub fn conversation(&self) -> StorageConversation {
+-        StorageConversation {
+-            messages: self.validation.history().to_vec(),
+-            revision: self.revision(),
+-            model_context: self.model_context.snapshot(),
+-        }
+-    }
+-    pub fn resume(&self, id: SessionId) -> StorageResumeState {
+-        StorageResumeState {
+-            conversation: self.conversation(),
+-            usage: self.usage.snapshot(id),
+-            last_history_turn: self.validation.last_history_turn(),
+-            interrupted_turns: self.validation.interrupted_turns(),
+-        }
+-    }
+-    pub fn into_resume(self, id: SessionId) -> StorageResumeState {
+-        let revision = self.revision();
+-        let last_history_turn = self.validation.last_history_turn();
+-        let interrupted_turns = self.validation.interrupted_turns();
+-        StorageResumeState {
+-            conversation: StorageConversation {
+-                messages: self.validation.into_history(),
+-                revision,
+-                model_context: self.model_context.snapshot(),
+-            },
+-            usage: self.usage.snapshot(id),
+-            last_history_turn,
+-            interrupted_turns,
+-        }
+-    }
+-}
+-
+ pub(crate) struct SnapshotState {
+     pub identity: StorageSnapshot,
+     pub source: Box<dyn RecordSnapshot>,
+@@ -489,48 +414,3 @@ impl SnapshotState {
+         })
+     }
+ }
+-
+-pub(crate) fn preview(messages: &[CanonicalMessage]) -> Option<String> {
+-    use proteus_contracts::model_standard::{ContentPart, MessageRole};
+-    fn excerpt(text: &str) -> Option<String> {
+-        let text = text.trim();
+-        if text.is_empty() {
+-            return None;
+-        }
+-        const LIMIT: usize = 160;
+-        if text.len() > LIMIT
+-            && let Some((end, _)) = text.char_indices().nth(LIMIT)
+-        {
+-            let mut short = String::with_capacity(end + 3);
+-            short.push_str(&text[..end]);
+-            short.push_str("...");
+-            return Some(short);
+-        }
+-        Some(text.to_owned())
+-    }
+-
+-    let text = |message: &CanonicalMessage| {
+-        message.parts.iter().find_map(|part| match &part.payload {
+-            ContentPart::Text { text }
+-            | ContentPart::ReasoningSummary { text }
+-            | ContentPart::Reasoning { text, .. } => excerpt(text),
+-            ContentPart::ToolResult { result } => {
+-                let text = result
+-                    .error
+-                    .as_deref()
+-                    .filter(|text| !text.is_empty())
+-                    .or_else(|| (!result.output.is_empty()).then_some(result.output.as_str()));
+-                match text {
+-                    Some(text) => excerpt(text),
+-                    None => excerpt(&result.text_or_status()),
+-                }
+-            }
+-            _ => None,
+-        })
+-    };
+-    messages
+-        .iter()
+-        .filter(|m| m.role == MessageRole::User)
+-        .find_map(text)
+-        .or_else(|| messages.iter().find_map(text))
+-}
+diff --git a/storage/session-storage/src/tests/metadata.rs b/storage/session-storage/src/tests/metadata.rs
+index 2de00f1d67bcc88958cd342ce21b3eb6db130263..dd5547658550a438d80d36740e2dac7554f99973 100644
+--- a/storage/session-storage/src/tests/metadata.rs
++++ b/storage/session-storage/src/tests/metadata.rs
+@@ -4,7 +4,7 @@ use super::*;
+ fn catalog_preview_trims_before_cutting_at_a_unicode_scalar_boundary() {
+     let prefix = "🦀".repeat(160);
+     let selected = |s: String| {
+-        crate::snapshot::preview(&[
++        crate::fold::preview(&[
+             CanonicalMessage::text(MessageRole::Assistant, "fallback"),
+             CanonicalMessage::new(
+                 MessageRole::User,
