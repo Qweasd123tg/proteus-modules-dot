@@ -1,0 +1,224 @@
+diff --git a/model/model-pack/src/adapters/openai/go/mod.rs b/model/model-pack/src/adapters/openai/go/mod.rs
+index b6c0e80686ac1d8e0fe0d2abc95346a6f1d0591e..3edd4f6b695e8c1b4bd8ea3c934b32ba2842fd14 100644
+--- a/model/model-pack/src/adapters/openai/go/mod.rs
++++ b/model/model-pack/src/adapters/openai/go/mod.rs
+@@ -1,11 +1,10 @@
+-//! Native OpenCode Go model discovery, account metadata and Responses transport.
++//! Native OpenCode Go model discovery and account metadata.
+ mod catalog;
+ mod credentials;
+ mod quota;
+ #[cfg(test)]
+ mod tests;
+ 
+-use super::OpenAiResponsesClient;
+ use anyhow::{Context, Result, ensure};
+ use catalog::Models;
+ use futures_util::StreamExt;
+@@ -14,7 +13,7 @@ use proteus_contracts::{
+     model_standard::ModelCapabilities,
+ };
+ use reqwest::{Client, RequestBuilder};
+-use serde_json::{Value, json};
++use serde_json::Value;
+ use std::{
+     sync::{Arc, RwLock},
+     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+@@ -24,7 +23,6 @@ use tokio::sync::Mutex;
+ const MODELS: &str = "https://opencode.ai/inference/go/v1/models";
+ const USAGE: &str = "https://opencode.ai/inference/go/v1/usage";
+ const BUDGETS: &str = "https://opencode.ai/console/api/policies/current-budgets";
+-const BASE: &str = "https://opencode.ai/inference/go/openai/v1";
+ 
+ #[derive(Debug)]
+ pub(crate) struct Go {
+@@ -45,39 +43,6 @@ impl Go {
+                 .build()?,
+         }))
+     }
+-    pub(crate) fn transport(
+-        self: &Arc<Self>,
+-        mut config: Value,
+-        stream: bool,
+-    ) -> Result<OpenAiResponsesClient> {
+-        ensure!(
+-            config
+-                .as_object()
+-                .is_some_and(|m| m.keys().all(|k| matches!(
+-                    k.as_str(),
+-                    "implementation" | "provider" | "api_key" | "database_path"
+-                ))),
+-            "unknown native OpenCode Go configuration field"
+-        );
+-        ensure!(
+-            config
+-                .get("provider")
+-                .is_none_or(|provider| provider == "opencode-go"),
+-            "native OpenCode Go requires the opencode-go provider"
+-        );
+-        config["base_url"] = json!(BASE);
+-        config["stream"] = json!(stream);
+-        config["supports_compaction"] = json!(false);
+-        config["session_header"] = json!("x-opencode-session");
+-        config["user_agent"] = json!(concat!("Proteus/", env!("CARGO_PKG_VERSION")));
+-        config["capabilities"] = json!({"supports_image_input":true,"supports_parallel_tool_calls":true,"supports_reasoning_config":true});
+-        let mut client = OpenAiResponsesClient::from_provider_config_with_http(
+-            config,
+-            Client::builder().redirect(reqwest::redirect::Policy::none()),
+-        )?;
+-        client.go = Some(self.clone());
+-        Ok(client)
+-    }
+     pub(super) fn key(&self, config: &Value) -> Result<String> {
+         credentials::key(config)
+     }
+diff --git a/model/model-pack/src/adapters/openai/go/tests.rs b/model/model-pack/src/adapters/openai/go/tests.rs
+index 109f8869033f53bb975b9c7c64d88ed563092f52..d1b295ce50d5912c6b8e61540608a29742cc5057 100644
+--- a/model/model-pack/src/adapters/openai/go/tests.rs
++++ b/model/model-pack/src/adapters/openai/go/tests.rs
+@@ -1,10 +1,11 @@
+ use super::*;
+-use crate::adapters::test_http;
++use crate::adapters::{openai::OpenAiResponsesClient, test_http};
+ use crate::contracts::Model;
+ use crate::domain::ModelRef;
+ use crate::model_standard::{CanonicalMessage, CanonicalModelRequest, MessageRole};
+ use futures_util::StreamExt;
+ use rusqlite::Connection;
++use serde_json::json;
+ use std::collections::BTreeMap;
+ 
+ #[test]
+@@ -54,12 +55,12 @@ fn quota_preserves_limit_reset_and_per_model_amount() {
+ #[tokio::test]
+ async fn go_streams_responses_tools_with_session_affinity() {
+     let go = Go::new().unwrap();
+-    let mut client = go
+-        .transport(
+-            json!({"implementation":"opencode_go","api_key":"test-only"}),
+-            true,
+-        )
+-        .unwrap();
++    let mut client = OpenAiResponsesClient::from_opencode_go_config(
++        &go,
++        json!({"implementation":"opencode_go","api_key":"test-only"}),
++        true,
++    )
++    .unwrap();
+     let id = "deepseek-v4.1-flash";
+     assert!(go.capabilities(id).unwrap().supports_image_input);
+     assert!(go.capabilities("missing").is_err());
+diff --git a/model/model-pack/src/adapters/openai/transport.rs b/model/model-pack/src/adapters/openai/transport.rs
+index 2141a36578c8e269bb523482ceb420da04473b26..5814d1b7935b8668abca265d63b087dfde113378 100644
+--- a/model/model-pack/src/adapters/openai/transport.rs
++++ b/model/model-pack/src/adapters/openai/transport.rs
+@@ -1,13 +1,14 @@
+ //! Responses authentication and transport differences stay inside model-pack.
+-use anyhow::{Context, Result, bail};
++use anyhow::{Context, Result, bail, ensure};
+ use futures_util::StreamExt;
+ use reqwest::{
+     StatusCode,
+     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
+ };
+ use serde_json::{Value, json};
++use std::sync::Arc;
+ 
+-use super::{OpenAiResponsesClient, errors::ensure_success, to_openai_request_with_cache};
++use super::{OpenAiResponsesClient, errors::ensure_success, go::Go, to_openai_request_with_cache};
+ use crate::{
+     adapters::{
+         codex_auth::{CODEX_BASE_URL, CodexAuth, validate_endpoint},
+@@ -18,6 +19,8 @@ use crate::{
+     },
+ };
+ 
++const OPENCODE_GO_RESPONSES_BASE: &str = "https://opencode.ai/inference/go/openai/v1";
++
+ /// Metadata reads refresh once after 401, but never use inference retries.
+ /// Callers own their deadline, cache lock, response decoding and publication.
+ pub(super) async fn send_metadata_request<F>(
+@@ -101,6 +104,40 @@ impl OpenAiResponsesClient {
+         Ok(client)
+     }
+ 
++    pub(crate) fn from_opencode_go_config(
++        go: &Arc<Go>,
++        mut config: Value,
++        stream: bool,
++    ) -> Result<Self> {
++        ensure!(
++            config
++                .as_object()
++                .is_some_and(|m| m.keys().all(|k| matches!(
++                    k.as_str(),
++                    "implementation" | "provider" | "api_key" | "database_path"
++                ))),
++            "unknown native OpenCode Go configuration field"
++        );
++        ensure!(
++            config
++                .get("provider")
++                .is_none_or(|provider| provider == "opencode-go"),
++            "native OpenCode Go requires the opencode-go provider"
++        );
++        config["base_url"] = json!(OPENCODE_GO_RESPONSES_BASE);
++        config["stream"] = json!(stream);
++        config["supports_compaction"] = json!(false);
++        config["session_header"] = json!("x-opencode-session");
++        config["user_agent"] = json!(concat!("Proteus/", env!("CARGO_PKG_VERSION")));
++        config["capabilities"] = json!({"supports_image_input":true,"supports_parallel_tool_calls":true,"supports_reasoning_config":true});
++        let mut client = Self::from_provider_config_with_http(
++            config,
++            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
++        )?;
++        client.go = Some(Arc::clone(go));
++        Ok(client)
++    }
++
+     pub(super) fn request_body(
+         &self,
+         request: &CanonicalModelRequest,
+diff --git a/model/model-pack/src/module.rs b/model/model-pack/src/module.rs
+index 65b7f61dd6af8ec598f8e8f76dea272abfa806b3..b6094d908d1e52518d6697d7a411e8d9430af9c9 100644
+--- a/model/model-pack/src/module.rs
++++ b/model/model-pack/src/module.rs
+@@ -18,12 +18,11 @@ use crate::{
+     adapters::{
+         build_anthropic_messages_adapter, build_codex_responses_adapter,
+         build_openai_responses_adapter,
++        openai::{OpenAiResponsesClient, go::Go},
+     },
+     fake::FakeModelClient,
+ };
+ 
+-use crate::adapters::openai::go::Go;
+-
+ struct ProviderModule {
+     go: Option<Arc<Go>>,
+     runtime: tokio::runtime::Runtime,
+@@ -53,12 +52,20 @@ pub fn register_model(registry: &mut dyn ModuleRegistry, id: &str) -> ProcessMod
+         match &go {
+             Some(g) => (
+                 Arc::new(
+-                    g.transport(registry.module_config().clone(), true)
+-                        .map_err(error)?,
++                    OpenAiResponsesClient::from_opencode_go_config(
++                        g,
++                        registry.module_config().clone(),
++                        true,
++                    )
++                    .map_err(error)?,
+                 ),
+                 Arc::new(
+-                    g.transport(registry.module_config().clone(), false)
+-                        .map_err(error)?,
++                    OpenAiResponsesClient::from_opencode_go_config(
++                        g,
++                        registry.module_config().clone(),
++                        false,
++                    )
++                    .map_err(error)?,
+                 ),
+             ),
+             None => (
