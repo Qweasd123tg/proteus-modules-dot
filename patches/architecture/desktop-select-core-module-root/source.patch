@@ -1,0 +1,213 @@
+diff --git a/BUILDING.md b/BUILDING.md
+index ff36e7bffa2edcb098a2f64a099fc3dc8f857319..c65da0f5ad9fb0bebf7e66102d1d9a17bd096b7c 100644
+--- a/BUILDING.md
++++ b/BUILDING.md
+@@ -110,7 +110,11 @@ python3 scripts/run.py --build-extensions /path/to/workspace
+ 
+ `run.py` собирает dev-клиент через Cargo и использует готовый backend, модули и
+ расширения из базы. `PROTEUS_BIN` и `PROTEUS_EXTENSIONS_DIR` могут задать готовые
+-компоненты явно. Только `--build-extensions` запускает упаковщик расширений.
++компоненты явно. Для backend из базы проверяются её модули. Для внешнего
++`PROTEUS_BIN` проверяется собственный `share/modules`, если он есть; без него
++runner проверяет только исполняемый файл backend, а не готовность его модулей.
++`bin` базы по-прежнему добавляется в `PATH`. Только `--build-extensions`
++запускает упаковщик расширений.
+ При восстановлении Desktop передаёт собственному HTTP-процессу каталог одной
+ из необходимых вкладок как подсказку `PROTEUS_HTTP_PREFERRED_SESSION`.
+ Старый Core без этой оптимизации запускается как прежде. Чужому серверу при
+diff --git a/scripts/run.py b/scripts/run.py
+index 5b7ec0266b6216cc22177c316e44138005e4b699..59b2adb7cac6068af31227573dc6276acbc0c038 100755
+--- a/scripts/run.py
++++ b/scripts/run.py
+@@ -28,6 +28,33 @@ def options(args):
+     return config, application + after if separator else application
+ 
+ 
++def check_backend_modules(backend, base, explicit):
++    if not explicit:
++        require_modules(base)
++        return
++    # An explicit alias of the base executable still selects the base runtime.
++    try:
++        base_backend = (base / "bin/proteus").resolve()
++    except (OSError, RuntimeError):
++        base_backend = None
++    if backend == base_backend:
++        require_modules(base)
++        return
++
++    # Match the Native module inventory's layout for an independent backend.
++    # A wrapper without adjacent metadata can select its own installation.
++    parent = backend.parent
++    root = parent.parent if parent.name == "bin" else parent
++    modules = root / "share/modules"
++    try:
++        modules.lstat()
++    except FileNotFoundError:
++        return
++    except OSError as error:
++        raise SystemExit(f"Cannot inspect module metadata in {modules}: {error}") from error
++    require_modules(root)
++
++
+ def main(args):
+     config, application = options(args)
+     env = os.environ.copy()
+@@ -38,11 +65,12 @@ def main(args):
+     # An attached client does not launch a local backend or its modules.
+     codex_only = any(application[index:index + 2] == ["--agent", "codex"] for index in range(len(application)))
+     if "--origin" not in application and not codex_only:
+-        backend = executable(env.get("PROTEUS_BIN", str(base / "bin/proteus")), path=env["PATH"])
++        override = env.get("PROTEUS_BIN")
++        backend = executable(str(base / "bin/proteus") if override is None else override, path=env["PATH"])
+         if backend is None:
+             raise SystemExit(f"Ready Proteus backend not found. {hint}")
+         env["PROTEUS_BIN"] = str(backend)
+-        require_modules(base)
++        check_backend_modules(backend, base, explicit=override is not None)
+     if config.build_extensions:
+         extensions = resolve("extensions")
+         subprocess.run([sys.executable, str(extensions / "package.py"), "--dev"], check=True, env=env)
+diff --git a/scripts/test_release_runtime_paths.py b/scripts/test_release_runtime_paths.py
+index 572a0ea998920ca06c401f370cd152915ebe086c..ea8131a7e301644bb1b7f05258d9d5ae2ac3601f 100644
+--- a/scripts/test_release_runtime_paths.py
++++ b/scripts/test_release_runtime_paths.py
+@@ -5,6 +5,8 @@ import io
+ import json
+ import os
+ from pathlib import Path
++import shutil
++import subprocess
+ import sys
+ import tempfile
+ import types
+@@ -200,5 +202,129 @@ class RunTests(unittest.TestCase):
+         self.assertEqual(self.call.call_args.args[0][-3:], ["--build-extensions", "--base", "/other"])
+ 
+ 
++class RunCliTests(unittest.TestCase):
++    """Run the launcher and its real file checks, but never build or launch Core."""
++
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory(prefix="proteus runner ")
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        self.base = self.root / "base"
++        self.trace = self.root / "cargo.txt"
++        self.commands = self.root / "commands"
++        self.native = self.root / "desktop"
++        scripts = self.native / "scripts"
++        scripts.mkdir(parents=True)
++        for name in ("run", "sources", "runtime_paths", "codex_executable",
++                     "desktop_toolchain", "terminal_toolchain", "portable_state"):
++            shutil.copyfile(HERE / f"{name}.py", scripts / f"{name}.py")
++        self.launcher = scripts / "run.py"
++        # Keep toolchain selection real, without a Ghostty download or build.
++        (self.native / "Cargo.toml").write_text('[package]\nname = "proteus-native"\n')
++        protocol = self.native / "src/declarative/protocol.rs"
++        protocol.parent.mkdir(parents=True)
++        shutil.copyfile(HERE.parent / "src/declarative/protocol.rs", protocol)
++        self.protocol = load("portable_state").desktop_protocol(self.native)
++        extension = package(self.root, "extensions")
++        binary(extension / "bin/sample")
++        self.extension_manifest = extension / "extension.json"
++        self.extension_manifest.write_text(json.dumps({"protocol": self.protocol, "command": ["bin/sample"]}))
++        cargo = binary(self.commands / "cargo")
++        cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$PROTEUS_BIN" "$PROTEUS_EXTENSIONS_DIR" "$PATH" "$@" > "$TRACE"\n')
++
++    def invoke(self, override=None, args=()):
++        self.trace.unlink(missing_ok=True)
++        environment = {
++            "HOME": str(self.root),
++            "PATH": str(self.commands),
++            "TRACE": str(self.trace),
++            "PYTHONDONTWRITEBYTECODE": "1",
++            "PROTEUS_CODEX_EXECUTABLE": str(self.root / "unused-codex"),
++            "PROTEUS_EXTENSIONS_DIR": str(self.root / "extensions"),
++        }
++        if override is not None:
++            environment["PROTEUS_BIN"] = str(override)
++        return subprocess.run([sys.executable, self.launcher, "--base", self.base, *args],
++                              cwd=self.root, env=environment, capture_output=True,
++                              text=True, timeout=10)
++
++    def assert_reached_cargo(self, result, backend, *application):
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(self.trace.read_text().splitlines(), [
++            str(backend), str(self.root / "extensions"),
++            os.pathsep.join(map(str, (self.base / "bin", self.commands))),
++            "run", "--locked", "-p", "proteus-native", "--", *application,
++        ])
++
++    def assert_blocked(self, result, message):
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn(message, result.stderr)
++        self.assertFalse(self.trace.exists())
++
++    def test_explicit_backend_checks_only_its_own_packaged_modules(self):
++        package(self.base, "share/modules", "module.json", "bin/missing-base-module")
++        for layout in ("bin/proteus", "proteus"):
++            with self.subTest(layout=layout):
++                root = self.root / layout.replace("/", "-")
++                backend = binary(root / layout)
++                package(root, "share/modules", "module.json", "bin/selected-module")
++                binary(root / "bin/selected-module")
++                self.assert_reached_cargo(self.invoke(backend, ("/workspace", "--config", "profile")),
++                                     backend, "/workspace", "--config", "profile")
++
++    def test_broken_selected_inventory_is_not_replaced_by_a_healthy_base(self):
++        package(self.base, "share/modules", "module.json", "bin/base-module")
++        binary(self.base / "bin/base-module")
++        for case, expected in (("missing-binary", "missing executable bin/selected-module"),
++                               ("bad-manifest", "Module sample:"),
++                               ("empty", "No ready module metadata"),
++                               ("dangling", "No ready module metadata")):
++            with self.subTest(case=case):
++                root = self.root / case
++                backend = binary(root / "bin/proteus")
++                modules = root / "share/modules"
++                if case == "empty":
++                    modules.mkdir(parents=True)
++                elif case == "dangling":
++                    modules.parent.mkdir(parents=True)
++                    modules.symlink_to(root / "absent")
++                else:
++                    folder = package(root, "share/modules", "module.json", "bin/selected-module")
++                    if case == "bad-manifest":
++                        (folder / "module.json").write_text("{")
++                self.assert_blocked(self.invoke(backend), expected)
++
++    def test_independently_installed_wrapper_needs_no_base_metadata(self):
++        backend = binary(self.root / "installed/bin/proteus")
++        self.assert_reached_cargo(self.invoke(backend), backend)
++
++    def test_base_symlink_and_its_canonical_alias_keep_the_base_module_check(self):
++        backend = binary(self.root / "installed/bin/proteus")
++        alias = self.base / "bin/proteus"
++        alias.parent.mkdir(parents=True)
++        alias.symlink_to(backend)
++        package(self.base, "share/modules", "module.json", "bin/missing-base-module")
++        for override in (None, alias, backend, "proteus"):
++            with self.subTest(override=override):
++                self.assert_blocked(self.invoke(override), "missing executable bin/missing-base-module")
++        binary(self.base / "bin/missing-base-module")
++        self.assert_reached_cargo(self.invoke(), backend)
++
++    def test_attached_and_codex_paths_do_not_check_a_local_backend(self):
++        missing = self.root / "not-installed"
++        for arguments in (("--", "--origin", "http://127.0.0.1:1", "--token", "fixture"),
++                          ("--agent", "codex")):
++            with self.subTest(arguments=arguments):
++                native_args = arguments[1:] if arguments[0] == "--" else arguments
++                self.assert_reached_cargo(self.invoke(missing, arguments), missing, *native_args)
++
++    def test_external_backend_does_not_bypass_extension_compatibility(self):
++        backend = binary(self.root / "installed/bin/proteus")
++        self.extension_manifest.write_text(json.dumps({
++            "protocol": self.protocol + 1, "command": ["bin/sample"],
++        }))
++        self.assert_blocked(self.invoke(backend), "protocol differs")
++
++
+ if __name__ == "__main__":
+     unittest.main()
