@@ -1,0 +1,216 @@
+diff --git a/crates/proteus-core/src/app_server.rs b/crates/proteus-core/src/app_server.rs
+index 1b929a03812812a28ecbbb9fe158182fd47b960b..e134cf80e971de92688d028733f2911025b68014 100644
+--- a/crates/proteus-core/src/app_server.rs
++++ b/crates/proteus-core/src/app_server.rs
+@@ -43,6 +43,7 @@ mod model_selection;
+ mod path_utils;
+ mod queued_messages;
+ mod runs;
++mod behavior_selection;
+ mod session_behavior;
+ mod session_model;
+ mod session_selection;
+diff --git a/crates/proteus-core/src/app_server/behavior_selection.rs b/crates/proteus-core/src/app_server/behavior_selection.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..dee4601c33c51e6d0e9f96e0efddcd4ee793e547
+--- /dev/null
++++ b/crates/proteus-core/src/app_server/behavior_selection.rs
+@@ -0,0 +1,59 @@
++//! Per-chat behavior selection and its in-memory overlay of a profile.
++
++use serde::{Deserialize, Serialize};
++
++use crate::{
++    core::{AppConfig, InstructionSourceConfig},
++    domain::PermissionMode,
++    model_standard::InstructionKind,
++};
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct Selection {
++    pub(super) selected: Option<String>,
++    pub(super) permission_override: Option<PermissionMode>,
++}
++
++pub(super) fn resolved(mut selection: Selection, config: &AppConfig) -> Selection {
++    if selection
++        .selected
++        .as_ref()
++        .is_some_and(|id| !config.modes.contains_key(id))
++    {
++        selection = Selection::default();
++    }
++    selection
++}
++
++pub(super) fn overlay(config: &AppConfig, selection: &Selection) -> AppConfig {
++    let mut effective = config.clone();
++    if let Some(definition) = selection
++        .selected
++        .as_ref()
++        .and_then(|id| config.modes.get(id))
++    {
++        if let Some(tools) = &definition.tools {
++            effective.tools.enabled = tools.clone();
++            effective.behavior_tools = Some(tools.clone());
++        }
++        if let Some(hooks) = &definition.hooks {
++            effective.modules.hooks = hooks.clone();
++        }
++        if let Some(mode) = definition.permission_mode {
++            effective.permissions.mode = mode;
++        }
++        if let Some(text) = &definition.instructions {
++            effective.instructions.push(InstructionSourceConfig {
++                kind: InstructionKind::UserPreference,
++                text: Some(text.clone()),
++                file: None,
++                priority: 100,
++            });
++        }
++    }
++    if let Some(mode) = selection.permission_override {
++        effective.permissions.mode = mode;
++    }
++    effective
++}
+diff --git a/crates/proteus-core/src/app_server/handle.rs b/crates/proteus-core/src/app_server/handle.rs
+index af20d0301272dccf04b19caaa965869655d6984e..f8fe8558e81693c5a7312025cdfcab436f68d863 100644
+--- a/crates/proteus-core/src/app_server/handle.rs
++++ b/crates/proteus-core/src/app_server/handle.rs
+@@ -29,7 +29,7 @@ pub struct AppServerState {
+     pub(super) profile_stop: CancellationToken,
+     pub(super) profile_error: Mutex<Option<String>>,
+     pub(super) settings_transition: Mutex<()>,
+-    pub(super) behavior: RwLock<super::session_behavior::Selection>,
++    pub(super) behavior: RwLock<super::behavior_selection::Selection>,
+ }
+ 
+ impl Deref for AppServerHandle {
+diff --git a/crates/proteus-core/src/app_server/profile.rs b/crates/proteus-core/src/app_server/profile.rs
+index c94937a4a6c51ca44bff23e033c390650e882182..a6ddaba8fd2fdd23010332038c2bca245d4f57b6 100644
+--- a/crates/proteus-core/src/app_server/profile.rs
++++ b/crates/proteus-core/src/app_server/profile.rs
+@@ -21,11 +21,11 @@ impl AppServerHandle {
+         let config = assembly.plan().shared_config();
+         let previous = self.config.read().await.clone();
+         let prior_behavior = self.behavior.read().await.clone();
+-        let behavior = super::session_behavior::resolved(prior_behavior.clone(), &config);
++        let behavior = super::behavior_selection::resolved(prior_behavior.clone(), &config);
+         let behavior_active = behavior != Default::default();
+         let assembly = if behavior_active {
+             Box::pin(prepare_assembly(
+-                super::session_behavior::overlay(&config, &behavior).into(),
++                super::behavior_selection::overlay(&config, &behavior).into(),
+                 &self.cwd,
+                 self.config_path.as_deref(),
+             ))
+diff --git a/crates/proteus-core/src/app_server/session_behavior.rs b/crates/proteus-core/src/app_server/session_behavior.rs
+index 42d7ed86335932f26f0438d2a76d13d9792dba6a..d76875b6a9dd72bf58b55f453654e44533d12693 100644
+--- a/crates/proteus-core/src/app_server/session_behavior.rs
++++ b/crates/proteus-core/src/app_server/session_behavior.rs
+@@ -4,24 +4,20 @@ use anyhow::{Context, Result, ensure};
+ use serde::{Deserialize, Serialize};
+ use std::sync::Arc;
+ 
+-use super::{AppServerEvent, AppServerHandle, prepare_assembly};
++use super::{
++    AppServerEvent, AppServerHandle,
++    behavior_selection::{Selection, overlay, resolved},
++    prepare_assembly,
++};
+ use crate::{
+-    core::{AppConfig, InstructionSourceConfig, PreparedAssembly, SessionConfigSnapshot},
++    core::{AppConfig, PreparedAssembly, SessionConfigSnapshot},
+     domain::PermissionMode,
+-    model_standard::InstructionKind,
+ };
+ 
+ const FILE: &str = "behavior-selection.json";
+ const MAX_BYTES: u64 = 16 * 1024;
+ pub(super) const DEFAULT: &str = "_default";
+ 
+-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+-#[serde(deny_unknown_fields)]
+-pub(super) struct Selection {
+-    pub(super) selected: Option<String>,
+-    pub(super) permission_override: Option<PermissionMode>,
+-}
+-
+ #[derive(Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Stored {
+@@ -40,56 +36,6 @@ fn binding(server: &AppServerHandle) -> Result<String> {
+     ))?)
+ }
+ 
+-pub(super) fn resolved(mut selection: Selection, config: &AppConfig) -> Selection {
+-    if selection
+-        .selected
+-        .as_ref()
+-        .is_some_and(|id| !config.modes.contains_key(id))
+-    {
+-        selection = Selection::default();
+-    }
+-    selection
+-}
+-
+-pub(super) fn overlay(config: &AppConfig, selection: &Selection) -> AppConfig {
+-    let mut effective = config.clone();
+-    if let Some(definition) = selection
+-        .selected
+-        .as_ref()
+-        .and_then(|id| config.modes.get(id))
+-    {
+-        if let Some(tools) = &definition.tools {
+-            effective.tools.enabled = tools.clone();
+-            effective.behavior_tools = Some(tools.clone());
+-        }
+-        if let Some(hooks) = &definition.hooks {
+-            effective.modules.hooks = hooks.clone();
+-        }
+-        if let Some(mode) = definition.permission_mode {
+-            effective.permissions.mode = mode;
+-        }
+-        if let Some(text) = &definition.instructions {
+-            effective.instructions.push(InstructionSourceConfig {
+-                kind: InstructionKind::UserPreference,
+-                text: Some(text.clone()),
+-                file: None,
+-                priority: 100,
+-            });
+-        }
+-    }
+-    if let Some(mode) = selection.permission_override {
+-        effective.permissions.mode = mode;
+-    }
+-    effective
+-}
+-
+-pub(super) async fn effective(server: &AppServerHandle, baseline: &AppConfig) -> AppConfig {
+-    overlay(
+-        baseline,
+-        &resolved(server.behavior.read().await.clone(), baseline),
+-    )
+-}
+-
+ pub(super) async fn prepare(
+     server: &AppServerHandle,
+     config: &Arc<AppConfig>,
+diff --git a/crates/proteus-core/src/app_server/session_model.rs b/crates/proteus-core/src/app_server/session_model.rs
+index 2d3145b022a722045153c1b523b4dffa6cc95dba..66ea4429767871d2aac777c2d9c611f0becf8528 100644
+--- a/crates/proteus-core/src/app_server/session_model.rs
++++ b/crates/proteus-core/src/app_server/session_model.rs
+@@ -334,7 +334,10 @@ async fn apply(
+     {
+         return Ok(());
+     }
+-    let behavior = super::session_behavior::effective(server, baseline).await;
++    let behavior = super::behavior_selection::overlay(
++        baseline,
++        &super::behavior_selection::resolved(server.behavior.read().await.clone(), baseline),
++    );
+     let assembly = prepare_with_admission(server, &behavior, &selected, admission).await?;
+     let snapshot = SessionConfigSnapshot::from_runtime_config(
+         assembly.plan().config(),
