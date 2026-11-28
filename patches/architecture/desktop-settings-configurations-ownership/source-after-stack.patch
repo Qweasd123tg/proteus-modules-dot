@@ -1,0 +1,118 @@
+diff --git a/src/ui/launcher.rs b/src/ui/launcher.rs
+index a15675a4b473c1ae23dc9d7cd2014b7f0c5a2adc..4087cd5fcfa31f61b3dcdc5a44fa06e894199832 100644
+--- a/src/ui/launcher.rs
++++ b/src/ui/launcher.rs
+@@ -19,8 +19,7 @@ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::Pressable as _;
+ 
+-pub(in crate::ui) mod config;
+-pub(in crate::ui) mod visual;
++mod config;
+ 
+ pub struct Launcher {
+     tooltips: Entity<gpui_kit::base::TooltipOverlay>,
+diff --git a/src/ui/launcher/config.rs b/src/ui/launcher/config.rs
+index 0b662e9dbe76b18a90570ec5294c14fc57ba9492..9781e7b1ee179e2ae7057f275d6d9ccc4692eecb 100644
+--- a/src/ui/launcher/config.rs
++++ b/src/ui/launcher/config.rs
+@@ -6,10 +6,6 @@
+ use super::*;
+ use crate::conversations::AgentKind;
+ 
+-mod catalog;
+-mod picker;
+-pub(in crate::ui) use picker::config_selector;
+-
+ impl Launcher {
+     pub(super) fn open_configuration_settings(
+         &mut self,
+diff --git a/src/ui/settings/configurations.rs b/src/ui/settings/configurations.rs
+index 49d44af5a50c26e5b6cc39b03593a04558d34a90..144a78666aada62b853d37fb0d7d31732068f47e 100644
+--- a/src/ui/settings/configurations.rs
++++ b/src/ui/settings/configurations.rs
+@@ -14,13 +14,18 @@ use super::widgets::{card, row, section};
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+-use crate::ui::launcher::config::config_selector;
+-use crate::ui::launcher::visual::{self, Action};
+ use crate::ui::prefs::{self, WindowVisualPreferences};
+ use crate::ui::tip::Tip as _;
+ use crate::ui::workspace::WorkspaceRequest;
+ use crate::visual_config::SelectionOrigin;
+ 
++mod catalog;
++mod picker;
++mod visual;
++
++use picker::config_selector;
++use visual::Action;
++
+ pub(in crate::ui) type OpenAgent = Rc<dyn Fn(Option<PathBuf>, &mut Window, &mut App)>;
+ 
+ impl SettingsView {
+diff --git a/src/ui/launcher/config/catalog.rs b/src/ui/settings/configurations/catalog.rs
+similarity index 100%
+rename from src/ui/launcher/config/catalog.rs
+rename to src/ui/settings/configurations/catalog.rs
+diff --git a/src/ui/launcher/config/catalog/tests.rs b/src/ui/settings/configurations/catalog/tests.rs
+similarity index 100%
+rename from src/ui/launcher/config/catalog/tests.rs
+rename to src/ui/settings/configurations/catalog/tests.rs
+diff --git a/src/ui/launcher/config/picker.rs b/src/ui/settings/configurations/picker.rs
+similarity index 93%
+rename from src/ui/launcher/config/picker.rs
+rename to src/ui/settings/configurations/picker.rs
+index 798317f4c2d5430c61a51275175cc07eaa01f94f..0ac8d7ce86a7b8cb4baf90de1578808b73cfc3ac 100644
+--- a/src/ui/launcher/config/picker.rs
++++ b/src/ui/settings/configurations/picker.rs
+@@ -9,13 +9,12 @@ use gpui_kit::prelude::FluentBuilder as _;
+ use gpui_kit::*;
+ use std::path::PathBuf;
+ 
+-use super::catalog;
++use super::{OpenAgent, catalog};
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+ use crate::ui::kit::ButtonLabel as _;
+ use crate::ui::picker::{Choice, Picker};
+ use crate::ui::prefs;
+-use crate::ui::settings::configurations::OpenAgent;
+ use crate::ui::tip::Tip as _;
+ 
+ pub(in crate::ui) fn config_selector(
+@@ -215,10 +214,16 @@ mod tests {
+             entrypoint,
+             duplicate_name: false,
+         };
++        let nested = catalog::ConfigFile {
++            path: "profiles/demo/configs/main.toml".into(),
++            relative: "profiles/demo/configs/main.toml".into(),
++            title: Some("Demo profile".into()),
++            ..file("main.toml", true, false)
++        };
+         let files = [
+             file("child.toml", false, false),
+             file("current-helper.toml", false, true),
+-            file("main.toml", true, false),
++            nested,
+         ];
+         let primary = choices(&files);
+         assert_eq!(
+@@ -228,6 +233,11 @@ mod tests {
+                 .collect::<Vec<_>>(),
+             ["main.toml", "child.toml", "current-helper.toml"]
+         );
++        assert_eq!(
++            primary[0].label.as_ref(),
++            "Demo profile main.toml profiles/demo/configs/main.toml"
++        );
++        assert!(!primary[0].selected && !primary[1].selected);
+         assert!(primary[2].selected);
+     }
+ }
+diff --git a/src/ui/launcher/visual.rs b/src/ui/settings/configurations/visual.rs
+similarity index 100%
+rename from src/ui/launcher/visual.rs
+rename to src/ui/settings/configurations/visual.rs
