@@ -1,0 +1,180 @@
+diff --git a/src/backend.rs b/src/backend.rs
+index 02b7260deff08032a7e98330e5711adfdeaa84d8..abd229df94370817d532529f3a8b19dc9f28bf69 100644
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -1,7 +1,7 @@
+ use std::collections::VecDeque;
+ use std::io::{BufRead, BufReader, Read};
+ use std::os::unix::process::CommandExt;
+-use std::path::{Path, PathBuf};
++use std::path::Path;
+ use std::process::{Child, Command, ExitStatus, Stdio};
+ use std::sync::{Arc, Mutex, mpsc};
+ use std::thread::{self, JoinHandle};
+@@ -38,7 +38,7 @@ impl Backend {
+         preferred: Option<&Path>,
+     ) -> Result<Self> {
+         let token = uuid::Uuid::new_v4().simple().to_string();
+-        let binary = proteus_binary();
++        let binary = crate::runtime_paths::proteus_binary();
+         let mut command = Command::new(&binary);
+         // Modules are resolved next to the server binary first, as in the
+         // portable bundle.
+@@ -178,17 +178,6 @@ impl Drop for Backend {
+     }
+ }
+ 
+-pub(crate) fn proteus_binary() -> PathBuf {
+-    if let Some(path) = std::env::var_os("PROTEUS_BIN") {
+-        return path.into();
+-    }
+-    std::env::current_exe()
+-        .ok()
+-        .and_then(|exe| exe.parent().map(|dir| dir.join("proteus")))
+-        .filter(|path| path.is_file())
+-        .unwrap_or_else(|| PathBuf::from("proteus"))
+-}
+-
+ fn spawn_reader(
+     stream: impl Read + Send + 'static,
+     log: Arc<Mutex<VecDeque<String>>>,
+diff --git a/src/catalog/inventory.rs b/src/catalog/inventory.rs
+index 60737ad3809b25b012641ccade734bf2fd135e84..766f42182a9f79b59d65b2da0b8e059124d09168 100644
+--- a/src/catalog/inventory.rs
++++ b/src/catalog/inventory.rs
+@@ -38,14 +38,14 @@ impl Inventory {
+     /// Provider choices only consume module paths; leave extension presence to the catalog.
+     pub(super) fn local_modules() -> Self {
+         let mut inventory = Self::default();
+-        if let Some(backend) = resolve_binary(&crate::backend::proteus_binary()) {
++        if let Some(backend) = resolve_binary(&crate::runtime_paths::proteus_binary()) {
+             inventory.read_modules(&backend);
+         }
+         inventory
+     }
+ 
+     pub fn local() -> Self {
+-        let backend = resolve_binary(&crate::backend::proteus_binary());
++        let backend = resolve_binary(&crate::runtime_paths::proteus_binary());
+         let bundled = crate::declarative::manifest::bundled_root();
+         let user = crate::declarative::manifest::root();
+         Self::read(backend.as_deref(), &bundled, user.as_deref())
+diff --git a/src/catalog/inventory/tests.rs b/src/catalog/inventory/tests.rs
+index 1f5d8522e1b2b9d4294a66ca3bca1b83b7932fa3..736e513a7c6168ec29ed11f1fe2d2e47328f8a8c 100644
+--- a/src/catalog/inventory/tests.rs
++++ b/src/catalog/inventory/tests.rs
+@@ -55,7 +55,11 @@ impl Drop for Fixture {
+ #[test]
+ fn bundled_modules_use_package_identity_and_require_real_binary() {
+     let fixture = Fixture::new();
+-    let backend = fixture.module(true);
++    let installed_backend = fixture.module(true);
++    let alias = fixture.0.join("backend-alias");
++    std::os::unix::fs::symlink(&installed_backend, &alias).unwrap();
++    let backend = resolve_binary(&alias).unwrap();
++    assert_eq!(backend, installed_backend.canonicalize().unwrap());
+     let inventory = Inventory::read(Some(&backend), &fixture.0.join("none"), None);
+     let package = inventory
+         .find(
+diff --git a/src/main.rs b/src/main.rs
+index 3967f4e2db4d8f31191a4f61e3805c0b0009aaa2..94a8dde5d6ed7403cd676d6465898faca90b889d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -15,6 +15,7 @@ mod preferences;
+ mod recent;
+ #[cfg(test)]
+ mod renderer_tests;
++mod runtime_paths;
+ mod sessions;
+ mod settings;
+ mod shortcuts;
+diff --git a/src/runtime_paths.rs b/src/runtime_paths.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7acbdffa67c299a09b79c7c8fc65973c6bdac023
+--- /dev/null
++++ b/src/runtime_paths.rs
+@@ -0,0 +1,71 @@
++//! Select the local backend command independently of its process lifetime.
++
++use std::{ffi::OsString, path::PathBuf};
++
++/// Preserve the command spelling: launch and provider auth use its parent for
++/// module lookup. Inventory resolves the underlying file separately.
++pub(crate) fn proteus_binary() -> PathBuf {
++    select_proteus_binary(std::env::var_os("PROTEUS_BIN"), || {
++        std::env::current_exe().ok()
++    })
++}
++
++fn select_proteus_binary(
++    explicit: Option<OsString>,
++    desktop_exe: impl FnOnce() -> Option<PathBuf>,
++) -> PathBuf {
++    if let Some(path) = explicit {
++        return path.into();
++    }
++    desktop_exe()
++        .and_then(|exe| exe.parent().map(|dir| dir.join("proteus")))
++        .filter(|path| path.is_file())
++        .unwrap_or_else(|| PathBuf::from("proteus"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn backend_selection_preserves_raw_override_and_prefers_existing_sibling() {
++        use std::{
++            fs,
++            os::unix::{ffi::OsStringExt, fs::symlink},
++        };
++
++        struct Fixture(PathBuf);
++        impl Drop for Fixture {
++            fn drop(&mut self) {
++                let _ = fs::remove_dir_all(&self.0);
++            }
++        }
++
++        let root = std::env::temp_dir().join(format!("proteus-backend-path-{}", uuid::Uuid::new_v4()));
++        fs::create_dir(&root).unwrap();
++        let root = Fixture(root);
++        let desktop = root.0.join("proteus-native");
++        let sibling = root.0.join("proteus");
++        assert_eq!(
++            select_proteus_binary(None, || Some(desktop.clone())),
++            PathBuf::from("proteus")
++        );
++        assert_eq!(select_proteus_binary(None, || None), PathBuf::from("proteus"));
++
++        fs::write(&sibling, "synthetic backend").unwrap();
++        assert_eq!(select_proteus_binary(None, || Some(desktop)), sibling);
++        let alias = root.0.join("alias").join("proteus");
++        fs::create_dir(alias.parent().unwrap()).unwrap();
++        symlink(&sibling, &alias).unwrap();
++        for spelling in [
++            alias.into_os_string(),
++            OsString::new(),
++            OsString::from_vec(b"./relative//raw-\xff".to_vec()),
++        ] {
++            let command = select_proteus_binary(Some(spelling.clone()), || {
++                panic!("explicit selection never checks the desktop executable")
++            });
++            assert_eq!(command.into_os_string(), spelling);
++        }
++    }
++}
+diff --git a/src/ui/settings/provider_auth.rs b/src/ui/settings/provider_auth.rs
+index 005042908bec557497a3a85498dac9d3ac0cdf05..857f7dcc34a285573d139368f86f1594f535b745 100644
+--- a/src/ui/settings/provider_auth.rs
++++ b/src/ui/settings/provider_auth.rs
+@@ -258,7 +258,7 @@ fn resolve_program(command: &str) -> Option<PathBuf> {
+     if command.contains('/') {
+         return None;
+     }
+-    let backend = crate::backend::proteus_binary();
++    let backend = crate::runtime_paths::proteus_binary();
+     let binary_dir = backend.parent().filter(|path| !path.as_os_str().is_empty());
+     binary_dir
+         .and_then(|dir| dir.join(command).canonicalize().ok())
