@@ -1,0 +1,237 @@
+diff --git a/storage/session-storage/src/backend/kind.rs b/storage/session-storage/src/backend/kind.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ef73df00277ad3eb295e55a3b4fc14975595e59
+--- /dev/null
++++ b/storage/session-storage/src/backend/kind.rs
+@@ -0,0 +1,48 @@
++//! Backend selection, physical locations and cold snapshot replay.
++use super::{JournalBackend, Jsonl, RecordSnapshot, Sqlite, replay_records};
++use crate::types::JournalRecord;
++use anyhow::Result;
++use proteus_contracts::domain::SessionId;
++use serde::{Deserialize, Serialize};
++use std::path::{Path, PathBuf};
++
++#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum BackendKind {
++    #[default]
++    Jsonl,
++    Sqlite,
++}
++
++impl BackendKind {
++    pub(crate) fn description_path(self, dir: &Path) -> PathBuf {
++        dir.join(match self {
++            Self::Jsonl => crate::codec::JOURNAL_FILE,
++            Self::Sqlite => crate::backend::SQLITE_JOURNAL_FILE,
++        })
++    }
++
++    pub(crate) fn backend(self) -> Box<dyn JournalBackend> {
++        match self {
++            Self::Jsonl => Box::new(Jsonl::new()),
++            Self::Sqlite => Box::new(Sqlite::default()),
++        }
++    }
++
++    pub(crate) fn replay_snapshot<T: Default>(
++        self,
++        dir: &Path,
++        id: SessionId,
++        cut: Option<u64>,
++        apply: impl Fn(&mut T, &JournalRecord, Option<String>) -> Result<()>,
++    ) -> Result<(Box<dyn RecordSnapshot>, T)> {
++        match self {
++            Self::Jsonl => Jsonl::replay_snapshot(dir, id, cut, apply),
++            Self::Sqlite => {
++                let mut source = self.backend().snapshot(dir, id)?;
++                let fold = replay_records(source.as_mut(), cut, &apply)?;
++                Ok((source, fold))
++            }
++        }
++    }
++}
+diff --git a/storage/session-storage/src/backend/mod.rs b/storage/session-storage/src/backend/mod.rs
+index 708890b03bc0d4a10c7bbabb9fbca83d0b9f4d7e..e223baf290c9850896005f41a67a6c164d231887 100644
+--- a/storage/session-storage/src/backend/mod.rs
++++ b/storage/session-storage/src/backend/mod.rs
+@@ -5,6 +5,7 @@ use proteus_contracts::domain::SessionId;
+ use std::path::{Path, PathBuf};
+ 
+ mod jsonl;
++pub(crate) mod kind;
+ mod sqlite;
+ pub(crate) use jsonl::Jsonl;
+ pub(crate) use sqlite::{FILE as SQLITE_JOURNAL_FILE, Sqlite};
+diff --git a/storage/session-storage/src/lib.rs b/storage/session-storage/src/lib.rs
+index be7fc34916355cadc3cfcc23080df74184528a5e..73974a1cc2b0b089ef4ce790d57dca9bc611e067 100644
+--- a/storage/session-storage/src/lib.rs
++++ b/storage/session-storage/src/lib.rs
+@@ -16,7 +16,8 @@ mod snapshot;
+ mod types;
+ mod workspace_dir;
+ 
+-pub use service::{BackendKind, StorageService};
++pub use backend::kind::BackendKind;
++pub use service::StorageService;
+ 
+ #[cfg(test)]
+ mod tests;
+diff --git a/storage/session-storage/src/service.rs b/storage/session-storage/src/service.rs
+index aa87807241827d6866583cecb85001335eae18a3..5547f2c878f765ac0be4b9032d80ede33008bcb6 100644
+--- a/storage/session-storage/src/service.rs
++++ b/storage/session-storage/src/service.rs
+@@ -1,6 +1,7 @@
+ //! Typed storage service. No provider-, workflow- or tool-specific dispatch.
+ use crate::{
+-    backend::{JournalBackend, Jsonl, Sqlite},
++    BackendKind,
++    backend::JournalBackend,
+     identity,
+     lease::SessionWriteOwnership,
+     path_identity::canonicalize_unmaterialized_path,
+@@ -31,14 +32,6 @@ mod views;
+ const MAX_SNAPSHOTS: usize = 32;
+ const MAX_CATALOG_ENTRIES: usize = 1024;
+ 
+-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+-#[serde(rename_all = "snake_case")]
+-pub enum BackendKind {
+-    #[default]
+-    Jsonl,
+-    Sqlite,
+-}
+-
+ pub struct StorageService {
+     kind: BackendKind,
+     state: Mutex<State>,
+@@ -63,21 +56,6 @@ struct Writer {
+     head: Option<catalog::WriterHead>,
+     _ownership: SessionWriteOwnership,
+ }
+-impl BackendKind {
+-    fn description_path(self, dir: &Path) -> PathBuf {
+-        dir.join(match self {
+-            Self::Jsonl => crate::codec::JOURNAL_FILE,
+-            Self::Sqlite => crate::backend::SQLITE_JOURNAL_FILE,
+-        })
+-    }
+-
+-    fn backend(self) -> Box<dyn JournalBackend> {
+-        match self {
+-            Self::Jsonl => Box::new(Jsonl::new()),
+-            Self::Sqlite => Box::new(Sqlite::default()),
+-        }
+-    }
+-}
+ impl StorageService {
+     pub fn new(kind: BackendKind) -> Self {
+         Self {
+diff --git a/storage/session-storage/src/service/catalog.rs b/storage/session-storage/src/service/catalog.rs
+index 77bef3d4bc23762cfa2b8c9e6fc67486a5400942..4e870c9b7e5fe88c5c486f58587491c18d4c7c27 100644
+--- a/storage/session-storage/src/service/catalog.rs
++++ b/storage/session-storage/src/service/catalog.rs
+@@ -1,5 +1,6 @@
+ //! Metadata-invalidated bounded catalog cache; never used to authorize execution.
+ use super::*;
++use crate::backend::{Jsonl, Sqlite};
+ use std::{fs::Metadata, time::UNIX_EPOCH};
+ pub(super) mod durable;
+ #[cfg(test)]
+diff --git a/storage/session-storage/src/service/display.rs b/storage/session-storage/src/service/display.rs
+index 9bf817b86dd61b90470ee147d00433f7ebeedff8..91afdf934340625a4e6d35c88838cb8e1ca0c37e 100644
+--- a/storage/session-storage/src/service/display.rs
++++ b/storage/session-storage/src/service/display.rs
+@@ -1,6 +1,6 @@
+ //! Capture display state in the same strict pass that validates its source.
+ use super::*;
+-use crate::backend::RecordSnapshot;
++use crate::backend::{Jsonl, RecordSnapshot, Sqlite};
+ use crate::display::{DisplayWriter, MAX_STAGING_BYTES, state_fits};
+ use proteus_contracts::model_standard::ContentPart;
+ 
+diff --git a/storage/session-storage/src/service/views.rs b/storage/session-storage/src/service/views.rs
+index 863dda90e6e3cbedbef3cf47be3b54d458ab49f6..13efffa568a7d2cb7eeea52737f2166974ce0b64 100644
+--- a/storage/session-storage/src/service/views.rs
++++ b/storage/session-storage/src/service/views.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::backend::{PrefixHint, replay_records};
++use crate::backend::PrefixHint;
+ 
+ #[derive(Clone)]
+ pub(super) struct PrefixCache {
+@@ -88,14 +88,8 @@ impl State {
+                     }
+                     Ok(())
+                 };
+-            let (source, (state, boundary)) = match self.kind {
+-                BackendKind::Jsonl => Jsonl::replay_snapshot(&dir, session.session_id, cut, apply)?,
+-                BackendKind::Sqlite => {
+-                    let mut source = self.kind.backend().snapshot(&dir, session.session_id)?;
+-                    let fold = replay_records(source.as_mut(), cut, &apply)?;
+-                    (source, fold)
+-                }
+-            };
++            let (source, (state, boundary)) =
++                self.kind.replay_snapshot(&dir, session.session_id, cut, apply)?;
+             previous_boundary = boundary.or_else(|| {
+                 (cut == Some(0)).then(|| (StorageRevision::default(), crate::io::sha256_hex(b"")))
+             });
+diff --git a/storage/session-storage/src/tests/journal.rs b/storage/session-storage/src/tests/journal.rs
+index 4c15459ad7deca11f12f4a15c596baf07a6653ad..29526397b2e11f0106c472802793f975d592110c 100644
+--- a/storage/session-storage/src/tests/journal.rs
++++ b/storage/session-storage/src/tests/journal.rs
+@@ -78,6 +78,51 @@ fn independent_backends_commit_reopen_and_reconcile_lost_ack_without_duplicate()
+     }
+ }
+ 
++#[test]
++fn cold_snapshots_replay_both_engines_without_a_catalog_head() {
++    for kind in backends() {
++        let mut f = Fixture::new(kind);
++        let messages = [text("first"), text("second")];
++        let first = f.append(vec![messages[0].clone()]);
++        let second = f.append(vec![messages[1].clone()]);
++        let dir = f.descriptor.local_path.as_ref().unwrap();
++        assert!(!dir.join(".storage-catalog-v1.json").exists());
++
++        let storage = StorageService::new(kind);
++        crate::diagnostics::reset();
++        let SessionStorageResponse::Snapshot { snapshot } = storage
++            .execute(SessionStorageRequest::OpenSnapshot {
++                session: f.descriptor.session.clone(),
++            })
++            .unwrap()
++        else {
++            panic!("expected a cold snapshot")
++        };
++        assert_eq!(crate::diagnostics::get().decoded, 2);
++        assert_eq!(snapshot.revision, f.revision);
++        assert_eq!(snapshot.content_sha256, f.snapshot().content_sha256);
++        let SessionStorageResponse::Records { page } = storage
++            .execute(SessionStorageRequest::ReadRecords {
++                snapshot,
++                after_seq: 0,
++                limit: 10,
++            })
++            .unwrap()
++        else {
++            panic!("expected the cold snapshot's records")
++        };
++        assert_eq!(page.next_after_seq, None);
++        assert_eq!(page.records.len(), 2);
++        for ((record, commit), message) in page.records.iter().zip([first, second]).zip(&messages) {
++            assert_eq!(record.record_id, commit.operation_id);
++            let JournalEntry::HistoryMutated(change) = &record.entry else {
++                panic!("expected a history append")
++            };
++            assert_eq!(change.messages.as_slice(), std::slice::from_ref(message));
++        }
++    }
++}
++
+ #[test]
+ fn same_operation_id_with_different_content_is_conflict() {
+     for kind in backends() {
