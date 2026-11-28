@@ -1,0 +1,459 @@
+diff --git a/src/ui/launcher.rs b/src/ui/launcher.rs
+index f8751f361182a13eb5cbf8b41a7ad03883c7333a..ea26f3d0d4f69470732683bcccdd7303ff345686 100644
+--- a/src/ui/launcher.rs
++++ b/src/ui/launcher.rs
+@@ -13,7 +13,7 @@ use gpui_kit::*;
+ 
+ use super::chrome::{self, Projects, WorkspaceRequest};
+ use super::prefs;
+-use super::workspace::{Status, Workspace};
++use super::workspace::{DetachedWorkspace, Status, Workspace};
+ use crate::launch::{LaunchOptions, StartupIntent, Target};
+ use crate::ui::fade::faded;
+ use crate::ui::kit;
+@@ -75,11 +75,17 @@ impl Launcher {
+         }
+     }
+ 
+-    pub(super) fn workspace(&self) -> &Entity<Workspace> {
+-        match &self.stage {
+-            Stage::Ready(view) => view,
+-            Stage::Picking { .. } => unreachable!("tab windows start with a workspace"),
+-        }
++    fn open_detached_workspace(
++        seed: DetachedWorkspace,
++        cx: &mut App,
++    ) -> anyhow::Result<(AnyWindowHandle, Entity<Workspace>)> {
++        let mut workspace = None;
++        let (handle, _) = gpui_kit::open_window(crate::window_options(cx), cx, |window, cx| {
++            let (view, target) = seed.mount(window, cx);
++            workspace = Some(view.clone());
++            cx.new(|cx| Self::from_workspace(view, target, window, cx))
++        })?;
++        Ok((handle, workspace.expect("new tab window has a workspace")))
+     }
+ 
+     /// Starts the workspace right away when `options` name one.
+@@ -208,7 +214,9 @@ impl Launcher {
+             startup,
+         };
+         let preparation = self.preparation.take();
+-        let view = cx.new(|cx| Workspace::new(options, preparation, window, cx));
++        let view = cx.new(|cx| {
++            Workspace::new(options, preparation, Self::open_detached_workspace, window, cx)
++        });
+         self._workspace_requests = Some(cx.subscribe_in(
+             &view,
+             window,
+diff --git a/src/ui/workspace.rs b/src/ui/workspace.rs
+index be78aa9b96ff3f829d2099026b2674a6987f7bc7..d43ba74e42bcab13df36b94b873395eaadab4d43 100644
+--- a/src/ui/workspace.rs
++++ b/src/ui/workspace.rs
+@@ -26,7 +26,8 @@ mod spaces;
+ pub(super) mod startup;
+ mod windows;
+ use startup::{Boot, boot};
+-use windows::WindowGroup;
++pub(super) use windows::DetachedWorkspace;
++use windows::{OpenDetachedWindow, WindowGroup};
+ 
+ impl Workspace {
+     pub(in crate::ui) fn profile_path<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
+@@ -181,9 +182,10 @@ impl Workspace {
+         }
+     }
+ 
+-    pub fn new(
++    pub(super) fn new(
+         options: LaunchOptions,
+         preparation: Option<startup::Preparation>,
++        open_detached_window: OpenDetachedWindow,
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) -> Self {
+@@ -193,7 +195,7 @@ impl Workspace {
+         } else {
+             super::prefs::current(cx).spaces_for(&workspace_path, &options.target)
+         };
+-        let windows = WindowGroup::new(&workspace_path, &options.target);
++        let windows = WindowGroup::new(&workspace_path, &options.target, open_detached_window);
+         let mut workspace = Self::empty(
+             workspace_path.clone(),
+             options.target.clone(),
+diff --git a/src/ui/workspace/windows.rs b/src/ui/workspace/windows.rs
+index c2c83e2457a60674781a8afbc2fdc95b2367af26..5687278f2d3f60c953ca73f52edf8f16545324e1 100644
+--- a/src/ui/workspace/windows.rs
++++ b/src/ui/workspace/windows.rs
+@@ -6,6 +6,8 @@ use super::drivers::CoreConnection;
+ use crate::agents::codex::{CatalogEvent, CodexService};
+ use crate::api::Api;
+ use std::cell::RefCell;
++use std::collections::HashMap;
++use std::path::PathBuf;
+ use std::rc::Rc;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -13,20 +15,62 @@ use gpui_kit::*;
+ 
+ use super::{Status, Workspace};
+ use crate::connection::BackendGuard;
++use crate::conversations::ConversationSummary;
++use crate::launch::Target;
+ use crate::preferences::TabWorkspace;
+ use crate::tabs::{self, ChatSpaces, TabLayout};
+-use crate::ui::{launcher::Launcher, prefs};
++use crate::ui::prefs;
+ 
+ #[cfg(test)]
+ #[path = "windows/tests.rs"]
+ mod tests;
+ 
++/// The launcher opens a native shell synchronously; Workspace supplies the
++/// retained state, then transfers the tab only after the open succeeds.
++pub(in crate::ui) type OpenDetachedWindow =
++    fn(DetachedWorkspace, &mut App) -> anyhow::Result<(AnyWindowHandle, Entity<Workspace>)>;
++
++pub(in crate::ui) struct DetachedWorkspace {
++    path: PathBuf,
++    api: Option<Api>,
++    target: Target,
++    spaces: ChatSpaces,
++    group: WindowGroup,
++    sessions: Vec<ConversationSummary>,
++    session_projects: HashMap<PathBuf, PathBuf>,
++    codex_models: Arc<[crate::agents::codex::Model]>,
++    visual: prefs::WindowVisualPreferences,
++}
++
++impl DetachedWorkspace {
++    pub(in crate::ui) fn mount(
++        self,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> (Entity<Workspace>, Target) {
++        let shell_target = self.target.clone();
++        prefs::inherit_visual_window(self.visual, cx);
++        let view = cx.new(|cx| {
++            let mut workspace =
++                Workspace::empty(self.path, self.target, self.spaces, self.group, window, cx);
++            workspace.api = self.api;
++            workspace.sessions = self.sessions;
++            workspace.session_projects = self.session_projects;
++            workspace.codex_models = self.codex_models;
++            workspace.status = Status::Ready;
++            workspace
++        });
++        (view, shell_target)
++    }
++}
++
+ #[derive(Default, Clone)]
+ pub(in crate::ui) struct WindowGroup(Rc<RefCell<Group>>);
+ 
+ #[derive(Default)]
+ struct Group {
+     owner: Option<TabWorkspace>,
++    open_detached_window: Option<OpenDetachedWindow>,
+     core: Arc<Mutex<Option<CoreConnection>>>,
+     codex: Arc<Mutex<Option<CodexService>>>,
+     windows: Vec<(WeakEntity<Workspace>, ChatSpaces)>,
+@@ -35,13 +79,22 @@ struct Group {
+ }
+ 
+ impl WindowGroup {
+-    pub(super) fn new(workspace: &std::path::Path, target: &crate::launch::Target) -> Self {
++    pub(super) fn new(
++        workspace: &std::path::Path,
++        target: &Target,
++        open_detached_window: OpenDetachedWindow,
++    ) -> Self {
+         Self(Rc::new(RefCell::new(Group {
+             owner: TabWorkspace::new(workspace, target),
++            open_detached_window: Some(open_detached_window),
+             ..Group::default()
+         })))
+     }
+ 
++    fn detached_opener(&self) -> Option<OpenDetachedWindow> {
++        self.0.borrow().open_detached_window
++    }
++
+     pub(super) fn register(&self, view: WeakEntity<Workspace>, layout: ChatSpaces) {
+         self.0.borrow_mut().windows.push((view, layout));
+     }
+@@ -457,33 +510,24 @@ impl Workspace {
+         if !tabs::is_chat(id) && self.ensure_document(id, window, cx).is_none() {
+             return;
+         }
+-        let (path, api, target, group, sessions, session_projects, codex_models) = (
+-            self.workspace_path.clone(),
+-            self.api.clone(),
+-            self.target.clone(),
+-            self.windows.clone(),
+-            self.sessions.clone(),
+-            self.session_projects.clone(),
+-            self.codex_models.clone(),
+-        );
+-        let root_target = target.clone();
+-        let mut detached_spaces = ChatSpaces::default();
+-        detached_spaces.set_active(self.spaces.active_root(), TabLayout::default());
+-        let visual_snapshot = prefs::visual_snapshot(cx);
+-        let opened = gpui_kit::open_window(crate::window_options(cx), cx, move |window, cx| {
+-            prefs::inherit_visual_window(visual_snapshot, cx);
+-            let view = cx.new(|cx| {
+-                let mut workspace = Self::empty(path, target, detached_spaces, group, window, cx);
+-                workspace.api = api;
+-                workspace.sessions = sessions;
+-                workspace.session_projects = session_projects;
+-                workspace.codex_models = codex_models;
+-                workspace.status = Status::Ready;
+-                workspace
+-            });
+-            cx.new(|cx| Launcher::from_workspace(view, root_target, window, cx))
+-        });
+-        let (handle, launcher) = match opened {
++        // Do not hold the group borrow while the new workspace registers.
++        let Some(open_window) = self.windows.detached_opener() else {
++            return;
++        };
++        let mut spaces = ChatSpaces::default();
++        spaces.set_active(self.spaces.active_root(), TabLayout::default());
++        let seed = DetachedWorkspace {
++            path: self.workspace_path.clone(),
++            api: self.api.clone(),
++            target: self.target.clone(),
++            spaces,
++            group: self.windows.clone(),
++            sessions: self.sessions.clone(),
++            session_projects: self.session_projects.clone(),
++            codex_models: self.codex_models.clone(),
++            visual: prefs::visual_snapshot(cx),
++        };
++        let (handle, destination) = match open_window(seed, cx) {
+             Ok(opened) => opened,
+             Err(error) => return self.report(format!("Не удалось открыть окно: {error:#}"), cx),
+         };
+@@ -499,39 +543,35 @@ impl Workspace {
+         // the same event turn: no frame can observe the entity in both roots.
+         handle
+             .update(cx, |_, window, cx| {
+-                launcher
+-                    .read(cx)
+-                    .workspace()
+-                    .clone()
+-                    .update(cx, |this, cx| {
+-                        if let Some(chat) = chat {
+-                            this.adopt_chat(id, chat.view, window, cx);
+-                        }
+-                        if let Some(document) = document {
+-                            document.rehost(cx.weak_entity(), window, cx);
+-                            this.documents.insert(id.to_owned(), document);
+-                        }
+-                        if let Some(title) = title {
+-                            this.document_titles.insert(id.to_owned(), title);
+-                        }
+-                        if let Some(stream) = stream
+-                            && let Some(dir) = tabs::chat_dir(id)
+-                        {
+-                            this.startup_streams.insert(dir.to_path_buf(), stream);
+-                        }
+-                        this.update_tabs(cx, |layout| {
+-                            layout.open(id, |_| false);
+-                            layout.keep(id);
+-                            layout.set_pinned(id, pinned);
+-                        });
+-                        if let Some(key) = tabs::chat_key(id)
+-                            && !this.chats.contains_key(id)
+-                        {
+-                            this.ensure_chat(key, window, cx);
+-                        }
+-                        this.focus_active(window, cx);
+-                        window.activate_window();
++                destination.update(cx, |this, cx| {
++                    if let Some(chat) = chat {
++                        this.adopt_chat(id, chat.view, window, cx);
++                    }
++                    if let Some(document) = document {
++                        document.rehost(cx.weak_entity(), window, cx);
++                        this.documents.insert(id.to_owned(), document);
++                    }
++                    if let Some(title) = title {
++                        this.document_titles.insert(id.to_owned(), title);
++                    }
++                    if let Some(stream) = stream
++                        && let Some(dir) = tabs::chat_dir(id)
++                    {
++                        this.startup_streams.insert(dir.to_path_buf(), stream);
++                    }
++                    this.update_tabs(cx, |layout| {
++                        layout.open(id, |_| false);
++                        layout.keep(id);
++                        layout.set_pinned(id, pinned);
+                     });
++                    if let Some(key) = tabs::chat_key(id)
++                        && !this.chats.contains_key(id)
++                    {
++                        this.ensure_chat(key, window, cx);
++                    }
++                    this.focus_active(window, cx);
++                    window.activate_window();
++                });
+             })
+             .expect("newly created tab window is live");
+     }
+diff --git a/src/ui/workspace/windows/tests.rs b/src/ui/workspace/windows/tests.rs
+index 1e0af6a1f2a1f42398ffc6fe08f8f7d41d8d0aeb..21235ecbf7335febe293554a48b3393a5fbb25d1 100644
+--- a/src/ui/workspace/windows/tests.rs
++++ b/src/ui/workspace/windows/tests.rs
+@@ -91,3 +91,151 @@ fn actual_project_http_callback_checks_catalog_epoch_before_sidebar_mutation() {
+         });
+     }
+ }
++
++#[::core::prelude::v1::test]
++fn retained_readonly_detach_is_atomic_when_the_window_opens_or_fails() {
++    use crate::ui::extensions::SurfaceView;
++    use proteus_contracts::app_protocol::AppSubagentSession;
++
++    struct Inert(Option<Entity<Workspace>>);
++    impl Render for Inert {
++        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++            div()
++        }
++    }
++
++    fn fail(_: DetachedWorkspace, _: &mut App) -> anyhow::Result<(AnyWindowHandle, Entity<Workspace>)> {
++        anyhow::bail!("synthetic window failure");
++    }
++
++    fn open(
++        seed: DetachedWorkspace,
++        cx: &mut App,
++    ) -> anyhow::Result<(AnyWindowHandle, Entity<Workspace>)> {
++        let (handle, root) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
++            let (workspace, _) = seed.mount(window, cx);
++            // Keep the new workspace alive without rendering a production
++            // chat, probing the extension catalog, or starting a backend.
++            cx.new(|_| Inert(Some(workspace)))
++        })?;
++        Ok((handle, root.read(cx).0.as_ref().unwrap().clone()))
++    }
++
++    let owner = tabs::codex("synthetic-readonly-owner");
++    let document_id = |number: u128| {
++        crate::ui::chat::readonly::Target {
++            owner: owner.clone(),
++            parent: owner.clone(),
++            child_thread_id: None,
++            session: AppSubagentSession {
++                session_id: uuid::Uuid::from_u128(number),
++                session_dir: std::env::temp_dir().join(format!("synthetic-detached-{number}")),
++            },
++        }
++        .id()
++    };
++    let closed = document_id(1);
++    let sibling = document_id(2);
++    let id = document_id(3);
++    let caption = SharedString::from("Saved child caption");
++    let mut original_layout = TabLayout::default();
++    for tab in [&closed, &sibling, &id] {
++        original_layout.open(tab, |_| false);
++    }
++    original_layout.close(&closed);
++    original_layout.set_pinned(&id, true);
++    assert_eq!(original_layout.closed_ids().collect::<Vec<_>>(), [closed.as_str()]);
++
++    let mut app = ::gpui::TestAppContext::single();
++    app.update(|cx| {
++        gpui_kit::init(cx);
++        crate::ui::theme::init(cx);
++        prefs::init_in_memory(cx);
++    });
++    app.add_empty_window().update(|window, cx| {
++        let source_window = window.window_handle().window_id();
++        let windows_before = cx.windows().len();
++        let rehosts = Rc::new(RefCell::new(Vec::new()));
++        let log = rehosts.clone();
++        let source = cx.new(|cx| Workspace::test_empty(window, cx));
++        let subject = cx.new(|_| Inert(None));
++        let sibling_view = cx.new(|_| Inert(None));
++        let identity = subject.entity_id();
++        let sibling_identity = sibling_view.entity_id();
++        let group = source.update(cx, |workspace, cx| {
++            workspace.layout = original_layout.clone();
++            workspace.spaces.set_active(Some(&owner), original_layout.clone());
++            workspace.documents.insert(
++                id.clone(),
++                SurfaceView {
++                    view: subject.into(),
++                    focus: cx.focus_handle(),
++                    rehost: Rc::new(move |workspace, window, cx| {
++                        let window_id = window.window_handle().window_id();
++                        assert_eq!(cx.current_execution_window_id(), Some(window_id));
++                        log.borrow_mut().push((workspace.entity_id(), window_id));
++                    }),
++                },
++            );
++            workspace.documents.insert(
++                sibling.clone(),
++                SurfaceView {
++                    view: sibling_view.into(),
++                    focus: cx.focus_handle(),
++                    rehost: Rc::new(|_, _, _| panic!("the sibling tab must not move")),
++                },
++            );
++            workspace.document_titles.insert(id.clone(), caption.clone());
++            workspace.windows.persist(cx.entity_id(), &workspace.spaces, cx);
++            workspace.windows.clone()
++        });
++        let saved = group.0.borrow().saved_layout();
++        group.0.borrow_mut().open_detached_window = Some(fail);
++        source.update(cx, |workspace, cx| workspace.detach_tab(&id, window, cx));
++        {
++            let source = source.read(cx);
++            assert_eq!(source.layout, original_layout);
++            assert_eq!(source.documents[&id].view.entity_id(), identity);
++            assert_eq!(source.documents[&sibling].view.entity_id(), sibling_identity);
++            assert_eq!(source.document_titles[&id], caption);
++            assert!(Rc::ptr_eq(&source.windows.0, &group.0));
++        }
++        assert_eq!(cx.windows().len(), windows_before);
++        assert_eq!(group.0.borrow().windows.len(), 1);
++        assert_eq!(group.0.borrow().saved_layout(), saved);
++        assert!(rehosts.borrow().is_empty());
++
++        group.0.borrow_mut().open_detached_window = Some(open);
++        source.update(cx, |workspace, cx| workspace.detach_tab(&id, window, cx));
++        assert_eq!(cx.windows().len(), windows_before + 1);
++        let destination = {
++            let group = group.0.borrow();
++            assert_eq!(group.windows.len(), 2);
++            group.windows[1].0.upgrade().unwrap()
++        };
++        let source = source.read(cx);
++        let destination_id = destination.entity_id();
++        let destination = destination.read(cx);
++        assert!(!source.layout.contains(&id));
++        assert!(!source.documents.contains_key(&id));
++        assert!(!source.document_titles.contains_key(&id));
++        assert_eq!(source.documents[&sibling].view.entity_id(), sibling_identity);
++        assert!(source.layout.contains(&sibling));
++        assert_eq!(source.layout.closed_ids().collect::<Vec<_>>(), [closed.as_str()]);
++
++        assert!(Rc::ptr_eq(&destination.windows.0, &group.0));
++        assert_eq!(destination.spaces.active_root(), Some(owner.as_str()));
++        assert_eq!(destination.documents[&id].view.entity_id(), identity);
++        assert_eq!(destination.document_titles[&id], caption);
++        assert_eq!(destination.test_tab_title(&id, cx).as_ref(), "Чат субагента");
++        assert!(destination.layout.is_pinned(&id));
++        assert_eq!(destination.layout.active(destination.layout.focused), Some(id.as_str()));
++        assert!(!destination.layout.contains(&sibling));
++        assert!(destination.layout.closed_ids().next().is_none());
++        assert!(destination.api.is_none());
++        assert!(destination._startup.is_none());
++        let destination_window = destination.window_handle.window_id();
++        assert_ne!(destination_window, source_window);
++        assert_eq!(&*rehosts.borrow(), &[(destination_id, destination_window)]);
++    });
++}
