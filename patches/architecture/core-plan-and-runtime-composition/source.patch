@@ -1,0 +1,280 @@
+diff --git a/crates/proteus-core/src/core/assembly/mod.rs b/crates/proteus-core/src/core/assembly/mod.rs
+index d5a54ba2d595e29660a2003d7feeca99fc8673c8..6eef2fe248c580a6cccdfd9a1cdc9147f96bedda 100644
+--- a/crates/proteus-core/src/core/assembly/mod.rs
++++ b/crates/proteus-core/src/core/assembly/mod.rs
+@@ -9,7 +9,7 @@ use proteus_module_protocol::current_process_contract_authority;
+ 
+ use crate::{
+     core::{
+-        AppConfig, ModuleCatalog, ModuleCatalogEntrySummary, RuntimeRegistry, config_files,
++        AppConfig, ModuleCatalog, ModuleCatalogEntrySummary, config_files,
+         core_slots::CORE_SLOT_DESCRIPTORS,
+     },
+     domain::ModuleKind,
+@@ -31,7 +31,7 @@ impl AssemblyPlan {
+         Self::resolve_shared(config.into(), config_path, cwd, catalog)
+     }
+ 
+-    fn resolve_shared(
++    pub(super) fn resolve_shared(
+         config: Arc<AppConfig>,
+         config_path: Option<&Path>,
+         cwd: PathBuf,
+@@ -221,69 +221,6 @@ impl AssemblyPlan {
+     }
+ }
+ 
+-/// План и созданные из него runtime-объекты. Bundle не позволяет атомарной
+-/// reload-операции случайно принять registry от другого config-а.
+-pub struct PreparedAssembly {
+-    plan: AssemblyPlan,
+-    registry: RuntimeRegistry,
+-}
+-
+-impl PreparedAssembly {
+-    pub fn from_config(
+-        config: AppConfig,
+-        cwd: PathBuf,
+-        config_path: Option<&Path>,
+-    ) -> Result<Self> {
+-        Self::from_catalog_with_storage(config.into(), cwd, config_path, None, None)
+-    }
+-
+-    pub fn from_catalog(
+-        config: AppConfig,
+-        cwd: PathBuf,
+-        config_path: Option<&Path>,
+-        catalog: ModuleCatalog,
+-    ) -> Result<Self> {
+-        let plan = AssemblyPlan::resolve(config, config_path, cwd, &catalog)?;
+-        plan.ensure_valid()?;
+-        let registry = RuntimeRegistry::from_plan(&plan, catalog)?;
+-        Ok(Self { plan, registry })
+-    }
+-
+-    pub(crate) fn from_catalog_with_storage(
+-        config: Arc<AppConfig>,
+-        cwd: PathBuf,
+-        config_path: Option<&Path>,
+-        catalog: Option<ModuleCatalog>,
+-        storage: Option<super::StorageService>,
+-    ) -> Result<Self> {
+-        let catalog = match catalog {
+-            Some(catalog) => catalog,
+-            None => ModuleCatalog::from_config(&config)?,
+-        };
+-        let plan = AssemblyPlan::resolve_shared(config, config_path, cwd, &catalog)?;
+-        plan.ensure_valid()?;
+-        let registry = RuntimeRegistry::from_plan_with_storage(&plan, catalog, storage)?;
+-        Ok(Self { plan, registry })
+-    }
+-
+-    pub fn plan(&self) -> &AssemblyPlan {
+-        &self.plan
+-    }
+-
+-    pub fn registry(&self) -> &RuntimeRegistry {
+-        &self.registry
+-    }
+-
+-    #[cfg(test)]
+-    pub(crate) fn registry_mut(&mut self) -> &mut RuntimeRegistry {
+-        &mut self.registry
+-    }
+-
+-    pub fn into_parts(self) -> (AssemblyPlan, RuntimeRegistry) {
+-        (self.plan, self.registry)
+-    }
+-}
+-
+ fn known_catalog_entry<'a>(
+     entries: &'a [ModuleCatalogEntrySummary],
+     slot: &str,
+diff --git a/crates/proteus-core/src/core/assembly/tests.rs b/crates/proteus-core/src/core/assembly/tests.rs
+index 1d1c3b80d0b58670761934cf6dc101da2666d4b9..5adf07c7941b9cf61255d9cfccef46ef518d909e 100644
+--- a/crates/proteus-core/src/core/assembly/tests.rs
++++ b/crates/proteus-core/src/core/assembly/tests.rs
+@@ -3,7 +3,10 @@ use std::path::PathBuf;
+ use serde_json::json;
+ 
+ use super::*;
+-use crate::{core::ModuleCatalog, domain::ModuleKind};
++use crate::{
++    core::{ModuleCatalog, PreparedAssembly},
++    domain::ModuleKind,
++};
+ 
+ #[test]
+ fn session_storage_is_optional_and_selected_by_exact_process_export() {
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 6736e53b6e8d6d13e032c2fde6d4e3602db72d17..d7cf0a5606a3341775376907ad2859d20b22b64e 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -20,6 +20,7 @@ mod model_context;
+ mod model_service;
+ mod module_catalog;
+ mod permission_mode;
++mod prepared_assembly;
+ mod prompt_replay;
+ mod provider_hosted_tools;
+ mod registry;
+@@ -42,7 +43,7 @@ pub use approval::HeadlessApprovalTransport;
+ pub use assembly::{
+     ASSEMBLY_PLAN_SCHEMA_VERSION, AssemblyCheck, AssemblyCheckSeverity, AssemblyComponentPlan,
+     AssemblyExportPlan, AssemblyExportUse, AssemblyModelPlan, AssemblyModuleSource, AssemblyPlan,
+-    AssemblySlotPlan, AssemblyToolsPlan, PreparedAssembly, render_assembly_plan,
++    AssemblySlotPlan, AssemblyToolsPlan, render_assembly_plan,
+ };
+ pub use bound_model::{BoundModel, ModelExecutionBinding};
+ pub use bound_tools::{BoundTools, ToolExecutionBinding};
+@@ -62,6 +63,7 @@ pub use eval_report::{EvalReport, read_eval_report};
+ pub use event_store::InMemoryEventStore;
+ pub use execution_hooks::RuntimeHookChain;
+ pub use module_catalog::{ModuleCatalog, ModuleCatalogEntrySummary};
++pub use prepared_assembly::PreparedAssembly;
+ pub use prompt_replay::{
+     PROMPT_REPLAY_REPORT_SCHEMA_VERSION, PromptReplayCounts, PromptReplayNames,
+     PromptReplayOptions, PromptReplayOutcomeStatus, PromptReplayOutcomeSummary, PromptReplayReport,
+diff --git a/crates/proteus-core/src/core/prepared_assembly.rs b/crates/proteus-core/src/core/prepared_assembly.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5e7d9fdb7dff987fb975551ac60ecf227c7e338
+--- /dev/null
++++ b/crates/proteus-core/src/core/prepared_assembly.rs
+@@ -0,0 +1,89 @@
++use std::{
++    path::{Path, PathBuf},
++    sync::Arc,
++};
++
++use anyhow::Result;
++
++use super::{
++    AppConfig, ModuleCatalog, StorageService, assembly::AssemblyPlan, registry::RuntimeRegistry,
++};
++
++/// План и созданные из него runtime-объекты. Bundle не позволяет атомарной
++/// reload-операции случайно принять registry от другого config-а.
++pub struct PreparedAssembly {
++    plan: AssemblyPlan,
++    registry: RuntimeRegistry,
++}
++
++impl PreparedAssembly {
++    pub fn from_config(
++        config: AppConfig,
++        cwd: PathBuf,
++        config_path: Option<&Path>,
++    ) -> Result<Self> {
++        Self::from_catalog_with_storage(config.into(), cwd, config_path, None, None)
++    }
++
++    pub fn from_catalog(
++        config: AppConfig,
++        cwd: PathBuf,
++        config_path: Option<&Path>,
++        catalog: ModuleCatalog,
++    ) -> Result<Self> {
++        let plan = AssemblyPlan::resolve(config, config_path, cwd, &catalog)?;
++        plan.ensure_valid()?;
++        let registry = RuntimeRegistry::from_plan(&plan, catalog)?;
++        Ok(Self { plan, registry })
++    }
++
++    pub(crate) fn from_catalog_with_storage(
++        config: Arc<AppConfig>,
++        cwd: PathBuf,
++        config_path: Option<&Path>,
++        catalog: Option<ModuleCatalog>,
++        storage: Option<StorageService>,
++    ) -> Result<Self> {
++        let catalog = match catalog {
++            Some(catalog) => catalog,
++            None => ModuleCatalog::from_config(&config)?,
++        };
++        let plan = AssemblyPlan::resolve_shared(config, config_path, cwd, &catalog)?;
++        plan.ensure_valid()?;
++        let registry = RuntimeRegistry::from_plan_with_storage(&plan, catalog, storage)?;
++        Ok(Self { plan, registry })
++    }
++
++    pub fn plan(&self) -> &AssemblyPlan {
++        &self.plan
++    }
++
++    pub fn registry(&self) -> &RuntimeRegistry {
++        &self.registry
++    }
++
++    #[cfg(test)]
++    pub(crate) fn registry_mut(&mut self) -> &mut RuntimeRegistry {
++        &mut self.registry
++    }
++
++    pub fn into_parts(self) -> (AssemblyPlan, RuntimeRegistry) {
++        (self.plan, self.registry)
++    }
++}
++
++impl RuntimeRegistry {
++    pub fn from_config(config: &AppConfig, cwd: PathBuf) -> Result<Self> {
++        Ok(PreparedAssembly::from_config(config.clone(), cwd, None)?
++            .into_parts()
++            .1)
++    }
++
++    pub fn from_catalog(config: &AppConfig, cwd: PathBuf, catalog: ModuleCatalog) -> Result<Self> {
++        Ok(
++            PreparedAssembly::from_catalog(config.clone(), cwd, None, catalog)?
++                .into_parts()
++                .1,
++        )
++    }
++}
+diff --git a/crates/proteus-core/src/core/registry.rs b/crates/proteus-core/src/core/registry.rs
+index ff6fa9819293b1d9463e93264c5867d622292fad..54bebd7a3250b77869faacc33e18f7a3495b614d 100644
+--- a/crates/proteus-core/src/core/registry.rs
++++ b/crates/proteus-core/src/core/registry.rs
+@@ -10,9 +10,8 @@ use crate::{
+         ExecutionContext, Model, SessionStorage, ToolRegistry, UserInputTransport, Workflow,
+     },
+     core::{
+-        AgentControlRuntime, AppConfig, AssemblyPlan, BoundModel, ModeAwarePolicy,
++        AgentControlRuntime, AssemblyPlan, BoundModel, ModeAwarePolicy,
+         ModelExecutionBinding, ModelService, ModuleBuildContext, ModuleCatalog, PolicyBuildContext,
+-        PreparedAssembly,
+     },
+     domain::{ModelRef, ReasoningConfig, SessionId, ThreadId, TurnId},
+     stubs::{DenyAllPolicy, EmptyContextBuilder, NoWorkflow},
+@@ -167,20 +166,6 @@ impl RuntimeRegistry {
+             .transpose()
+     }
+ 
+-    pub fn from_config(config: &AppConfig, cwd: PathBuf) -> Result<Self> {
+-        Ok(PreparedAssembly::from_config(config.clone(), cwd, None)?
+-            .into_parts()
+-            .1)
+-    }
+-
+-    pub fn from_catalog(config: &AppConfig, cwd: PathBuf, catalog: ModuleCatalog) -> Result<Self> {
+-        Ok(
+-            PreparedAssembly::from_catalog(config.clone(), cwd, None, catalog)?
+-                .into_parts()
+-                .1,
+-        )
+-    }
+-
+     pub(crate) fn from_plan(plan: &AssemblyPlan, catalog: ModuleCatalog) -> Result<Self> {
+         Self::from_plan_with_storage(plan, catalog, None)
+     }
+diff --git a/crates/proteus-core/src/core/registry/discovery_tests.rs b/crates/proteus-core/src/core/registry/discovery_tests.rs
+index 546cc749ca9c3a37e1906e2fc5e0f2a7740cfae1..83c089009e20510d81b111cdffd5056895fbf7b3 100644
+--- a/crates/proteus-core/src/core/registry/discovery_tests.rs
++++ b/crates/proteus-core/src/core/registry/discovery_tests.rs
+@@ -3,6 +3,7 @@ use std::path::Path;
+ use serde_json::json;
+ 
+ use super::*;
++use crate::core::AppConfig;
+ 
+ #[tokio::test]
+ async fn registry_releases_discovery_only_brokers_and_can_reconnect_for_schema() {
