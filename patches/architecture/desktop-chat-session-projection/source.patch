@@ -1,0 +1,105 @@
+diff --git a/src/ui/chat/stream_batch/tests.rs b/src/ui/chat/stream_batch/tests.rs
+index df36da869a8ef5b106ff7b49426e61de7ec3fa41..215f26bb5466faec0eb5f22bf6dd69e067846314 100644
+--- a/src/ui/chat/stream_batch/tests.rs
++++ b/src/ui/chat/stream_batch/tests.rs
+@@ -349,7 +349,7 @@ fn cursor_gates_lag_and_reconnect_before_root_routing() {
+ }
+ 
+ fn projection(session: &Session, change: Change) -> Option<Value> {
+-    crate::ui::extensions::session::changed(session, change)
++    crate::ui::chats::session_projection::changed(session, change)
+         .map(|update| serde_json::to_value(update).unwrap())
+ }
+ 
+diff --git a/src/ui/chats.rs b/src/ui/chats.rs
+index 2aee869152f03f28ed5f8447bd155856ec9aa0cc..0c81e2a89c9961de235189806ff636946f2f41f6 100644
+--- a/src/ui/chats.rs
++++ b/src/ui/chats.rs
+@@ -16,6 +16,7 @@ use crate::preferences::BadgePlace;
+ use crate::tabs::{self, ChatKey, PaneId, TabLayout};
+ mod codex;
+ mod pending;
++pub(in crate::ui) mod session_projection;
+ mod subagent;
+ 
+ /// A chat view and the subscription to its events.
+@@ -527,10 +528,10 @@ impl Workspace {
+                 let session = &chat.read(cx).session;
+                 let update = match event {
+                     ChatEvent::SessionEntriesChanged(change, _) => {
+-                        super::extensions::session::changed(session, *change)
++                        session_projection::changed(session, *change)
+                     }
+                     _ => Some(crate::declarative::session::Update::State {
+-                        state: Box::new(super::extensions::session::state(
++                        state: Box::new(session_projection::state(
+                             session,
+                             self.sessions
+                                 .iter()
+@@ -540,7 +541,7 @@ impl Workspace {
+                     }),
+                 };
+                 if let Some(update) = update {
+-                    cx.emit(super::extensions::session::SessionChanged {
++                    cx.emit(session_projection::SessionChanged {
+                         event_id: *event_id,
+                         session_dir: session.dir.clone(),
+                         update,
+diff --git a/src/ui/extensions/session.rs b/src/ui/chats/session_projection.rs
+similarity index 100%
+rename from src/ui/extensions/session.rs
+rename to src/ui/chats/session_projection.rs
+diff --git a/src/ui/extensions/host.rs b/src/ui/extensions/host.rs
+index 57a8b6ef7efa397b1b729de33c80e3f54fb90833..fd519d31ad135693d817a288d1ee6cae40a8e9a3 100644
+--- a/src/ui/extensions/host.rs
++++ b/src/ui/extensions/host.rs
+@@ -8,6 +8,7 @@ use crate::api::Api;
+ use crate::preferences::BadgePlace;
+ use crate::tabs::ChatKey;
+ use crate::ui::chat::{Chat, Session};
++use crate::ui::chats::session_projection::{self, SessionChanged};
+ use crate::ui::motion::PopupPanel;
+ use crate::ui::workspace::Workspace;
+ 
+@@ -94,9 +95,9 @@ impl Host {
+                 self.read(cx, |host| {
+                     host.session().map(|session| {
+                         (
+-                            Box::new(super::session::state(session, host.activity().cloned())),
++                            Box::new(session_projection::state(session, host.activity().cloned())),
+                             if include_entries {
+-                                super::session::entries(
++                                session_projection::entries(
+                                     session,
+                                     0..session.transcript.entries().len(),
+                                 )
+@@ -123,7 +124,7 @@ impl Host {
+     pub(in crate::ui) fn subscribe_session<T: 'static>(
+         &self,
+         cx: &mut Context<T>,
+-        mut on_event: impl FnMut(&mut T, &super::session::SessionChanged, &mut Context<T>) + 'static,
++        mut on_event: impl FnMut(&mut T, &SessionChanged, &mut Context<T>) + 'static,
+     ) -> Option<Subscription> {
+         if !self.runtime_scope.lifetime.session() || !self.supports_core(cx) {
+             return None;
+@@ -131,7 +132,7 @@ impl Host {
+         let host = self.clone();
+         Some(cx.subscribe(
+             &self.workspace.upgrade()?,
+-            move |this, _, event: &super::session::SessionChanged, cx| {
++            move |this, _, event: &SessionChanged, cx| {
+                 if host.session_dir(cx).as_ref() == Some(&event.session_dir) {
+                     on_event(this, event, cx)
+                 }
+diff --git a/src/ui/extensions/mod.rs b/src/ui/extensions/mod.rs
+index 6a200b04dfd7c11fa68946c284aed4c86f86bf8d..54fdea33f31adb92274fa0fb3518b59324856d4f 100644
+--- a/src/ui/extensions/mod.rs
++++ b/src/ui/extensions/mod.rs
+@@ -8,7 +8,6 @@
+ mod badge;
+ mod declarative;
+ mod host;
+-pub(in crate::ui) mod session;
+ 
+ use gpui_kit::assets::IconName as Lucide;
+ use gpui_kit::*;
