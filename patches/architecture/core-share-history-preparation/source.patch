@@ -1,0 +1,741 @@
+diff --git a/crates/proteus-core/src/core/history_update.rs b/crates/proteus-core/src/core/history_update.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3d00764c8bf89dd60720f802e66dca83a48de2e
+--- /dev/null
++++ b/crates/proteus-core/src/core/history_update.rs
+@@ -0,0 +1,294 @@
++//! Prepare canonical history changes for live turns and replay without committing them.
++use std::{borrow::Cow, collections::HashSet};
++
++mod compacted_user;
++
++use anyhow::{Result, ensure};
++
++use crate::{
++    domain::{HistoryCompactionReport, MessageId},
++    model_standard::{CanonicalMessage, MessageRole},
++};
++
++#[derive(Debug)]
++pub(super) struct PreparedHistoryUpdate {
++    pub(super) final_messages: Vec<CanonicalMessage>,
++    pub(super) replace: bool,
++}
++
++pub(super) fn prepare_history_update(
++    current_history: &[CanonicalMessage],
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    prepare_successful_update(
++        Cow::Borrowed(current_history),
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++pub(super) fn prepare_owned_history_update(
++    current_history: Vec<CanonicalMessage>,
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    prepare_successful_update(
++        Cow::Owned(current_history),
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++fn prepare_successful_update(
++    current_history: Cow<'_, [CanonicalMessage]>,
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    ensure!(
++        !new_messages.is_empty(),
++        "workflow returned no new persistent turn messages"
++    );
++    prepare_update(
++        current_history,
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++/// A failed workflow can return a completed replacement without a later answer.
++pub(super) fn prepare_failed_history_update(
++    current_history: &[CanonicalMessage],
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    ensure!(
++        !new_messages.is_empty() || history_replacement.is_some(),
++        "workflow failure returned an empty history update"
++    );
++    prepare_update(
++        Cow::Borrowed(current_history),
++        persisted_user_message,
++        new_messages,
++        history_replacement,
++        compactions,
++        runtime_user_messages,
++    )
++}
++
++fn prepare_update(
++    current_history: Cow<'_, [CanonicalMessage]>,
++    persisted_user_message: &CanonicalMessage,
++    new_messages: &[CanonicalMessage],
++    history_replacement: Option<&[CanonicalMessage]>,
++    compactions: &[HistoryCompactionReport],
++    runtime_user_messages: &HashSet<MessageId>,
++) -> Result<PreparedHistoryUpdate> {
++    ensure!(
++        current_history.last() == Some(persisted_user_message),
++        "runtime history does not end with the persisted current user message"
++    );
++    for (index, message) in new_messages.iter().enumerate() {
++        ensure!(
++            matches!(message.role, MessageRole::Assistant | MessageRole::Tool)
++                || (message.role == MessageRole::User
++                    && runtime_user_messages.contains(&message.id)),
++            "workflow new_messages[{index}] has non-persistent turn role {:?}",
++            message.role
++        );
++    }
++
++    match (
++        compactions.iter().any(|report| report.changed),
++        history_replacement,
++    ) {
++        (true, None) => {
++            anyhow::bail!("workflow reported changed compaction without history replacement")
++        }
++        (false, Some(_)) => {
++            anyhow::bail!("workflow returned history replacement without changed compaction")
++        }
++        (true, Some(replacement)) => {
++            compacted_user::validate_current_user(
++                current_history.as_ref(),
++                persisted_user_message,
++                replacement,
++                compactions,
++            )?;
++            let mut final_messages = Vec::with_capacity(replacement.len() + new_messages.len());
++            final_messages.extend_from_slice(replacement);
++            final_messages.extend_from_slice(new_messages);
++            Ok(PreparedHistoryUpdate {
++                final_messages,
++                replace: true,
++            })
++        }
++        (false, None) => {
++            let mut final_messages = match current_history {
++                Cow::Borrowed(prefix) => {
++                    let mut messages = Vec::with_capacity(prefix.len() + new_messages.len());
++                    messages.extend_from_slice(prefix);
++                    messages
++                }
++                Cow::Owned(mut prefix) => {
++                    prefix.reserve_exact(new_messages.len());
++                    prefix
++                }
++            };
++            final_messages.extend_from_slice(new_messages);
++            Ok(PreparedHistoryUpdate {
++                final_messages,
++                replace: false,
++            })
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn changed_report() -> HistoryCompactionReport {
++        let mut report = HistoryCompactionReport::unchanged(1, None);
++        report.changed = true;
++        report
++    }
++
++    #[test]
++    fn append_update_keeps_persisted_user_and_adds_turn_messages() {
++        let user = CanonicalMessage::text(MessageRole::User, "question");
++        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
++
++        let update = prepare_history_update(
++            std::slice::from_ref(&user),
++            &user,
++            std::slice::from_ref(&assistant),
++            None,
++            &[],
++            &HashSet::new(),
++        )
++        .expect("append update");
++
++        assert!(!update.replace);
++        assert_eq!(update.final_messages, vec![user, assistant]);
++    }
++
++    #[test]
++    fn replacement_must_preserve_exact_persisted_user() {
++        let user = CanonicalMessage::text(MessageRole::User, "question");
++        let recreated_user = CanonicalMessage::text(MessageRole::User, "question");
++        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
++
++        let error = prepare_history_update(
++            std::slice::from_ref(&user),
++            &user,
++            std::slice::from_ref(&assistant),
++            Some(std::slice::from_ref(&recreated_user)),
++            &[changed_report()],
++            &HashSet::new(),
++        )
++        .expect_err("replacement must preserve the stored message id");
++
++        assert!(error.to_string().contains("exact current user message"));
++    }
++
++    #[test]
++    fn replacement_can_keep_generated_summary_after_current_user() {
++        let user = CanonicalMessage::text(MessageRole::User, "question");
++        let summary = CanonicalMessage::text(MessageRole::User, "compacted summary");
++        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
++        let replacement = vec![user.clone(), summary.clone()];
++
++        let update = prepare_history_update(
++            std::slice::from_ref(&user),
++            &user,
++            std::slice::from_ref(&assistant),
++            Some(&replacement),
++            &[changed_report()],
++            &HashSet::new(),
++        )
++        .expect("compacted history update");
++
++        assert!(update.replace);
++        assert_eq!(update.final_messages, vec![user, summary, assistant]);
++    }
++
++    #[test]
++    fn new_messages_reject_repeated_user_prompt() {
++        let user = CanonicalMessage::text(MessageRole::User, "question");
++
++        let error = prepare_history_update(
++            std::slice::from_ref(&user),
++            &user,
++            std::slice::from_ref(&user),
++            None,
++            &[],
++            &HashSet::new(),
++        )
++        .expect_err("workflow must return only assistant/tool messages");
++
++        assert!(error.to_string().contains("non-persistent turn role User"));
++    }
++
++    #[test]
++    fn failed_replacement_without_an_answer_preserves_the_same_validation_boundary() {
++        let user = CanonicalMessage::text(MessageRole::User, "question");
++        let summary = CanonicalMessage::text(MessageRole::User, "completed summary");
++        let replacement = vec![user.clone(), summary];
++        let allowed = HashSet::new();
++        let original = std::slice::from_ref(&user);
++        let update = prepare_failed_history_update(
++            original,
++            &user,
++            &[],
++            Some(&replacement),
++            &[changed_report()],
++            &allowed,
++        )
++        .unwrap();
++        assert_eq!(update.final_messages, replacement);
++        assert!(update.replace);
++        assert!(
++            prepare_history_update(
++                original,
++                &user,
++                &[],
++                Some(&replacement),
++                &[changed_report()],
++                &allowed
++            )
++            .is_err()
++        );
++        assert!(
++            prepare_failed_history_update(original, &user, &[], Some(&replacement), &[], &allowed)
++                .is_err()
++        );
++        assert!(prepare_failed_history_update(original, &user, &[], None, &[], &allowed).is_err());
++        let forged_user = CanonicalMessage::text(MessageRole::User, "injected");
++        assert!(
++            prepare_failed_history_update(original, &user, &[forged_user], None, &[], &allowed)
++                .is_err()
++        );
++    }
++}
+diff --git a/crates/proteus-core/src/core/runtime/history/compacted_user.rs b/crates/proteus-core/src/core/history_update/compacted_user.rs
+similarity index 100%
+rename from crates/proteus-core/src/core/runtime/history/compacted_user.rs
+rename to crates/proteus-core/src/core/history_update/compacted_user.rs
+diff --git a/crates/proteus-core/src/core/mod.rs b/crates/proteus-core/src/core/mod.rs
+index 6736e53b6e8d6d13e032c2fde6d4e3602db72d17..22ee052a7be5275d713463962fabd4e6ac3e2768 100644
+--- a/crates/proteus-core/src/core/mod.rs
++++ b/crates/proteus-core/src/core/mod.rs
+@@ -15,6 +15,7 @@ mod eval_report;
+ mod event_store;
+ mod execution_hooks;
+ mod extension_operations;
++mod history_update;
+ mod model_call_scope;
+ mod model_context;
+ mod model_service;
+@@ -123,7 +124,7 @@ pub(crate) use module_catalog::{ModuleBuildContext, PolicyBuildContext};
+ pub(crate) use permission_mode::ModeAwarePolicy;
+ pub(crate) use runtime::{
+     QueuedMessagesSnapshot, ReservedRunCompletion, SteeringQueueReceipt, UserMessageReservation,
+-    UserMessageReservationAttempt, prepare_failed_history_update, prepare_history_update,
++    UserMessageReservationAttempt,
+ };
+ pub(crate) use tool_orchestrator::ToolOrchestrator;
+ pub(crate) use user_input::{
+diff --git a/crates/proteus-core/src/core/runtime.rs b/crates/proteus-core/src/core/runtime.rs
+index 64d95b1c08fbf02b8f8a19fdf90aa2ab1bdf244d..266732a437193d2040c9a7e62eb2fc9891d2e950 100644
+--- a/crates/proteus-core/src/core/runtime.rs
++++ b/crates/proteus-core/src/core/runtime.rs
+@@ -44,7 +44,6 @@ pub use builder::AgentRuntimeBuilder;
+ pub use paths::{config_store_root, event_log_path};
+ 
+ use execution::ExecutionAdmissionSnapshot;
+-pub(crate) use history::{prepare_failed_history_update, prepare_history_update};
+ pub(crate) use steering::{
+     QueuedMessagesSnapshot, SteeringQueueReceipt, UserMessageReservation,
+     UserMessageReservationAttempt,
+diff --git a/crates/proteus-core/src/core/runtime/checkpoint.rs b/crates/proteus-core/src/core/runtime/checkpoint.rs
+index 41c55551191aa5b5199b3708f353b322cfdae281..027847bf9039bb38f872c571cd3a453daf6a8ed3 100644
+--- a/crates/proteus-core/src/core/runtime/checkpoint.rs
++++ b/crates/proteus-core/src/core/runtime/checkpoint.rs
+@@ -9,14 +9,16 @@ use crate::{
+         ExecutionAttribution, ToolExecutionRecorder, WorkflowHistoryCheckpoint,
+         WorkflowHistoryRecorder,
+     },
+-    core::{SessionStore, session_journal::history_capture::HistoryCapture},
++    core::{
++        SessionStore, history_update::prepare_failed_history_update,
++        session_journal::history_capture::HistoryCapture,
++    },
+     domain::{ToolCall, ToolCallResolution, ToolResult},
+     model_standard::CanonicalMessage,
+ };
+ 
+-use super::{
+-    prepare_failed_history_update,
+-    steering::{SteeringModel, weave_deliveries_into_failed_history, weave_deliveries_into_output},
++use super::steering::{
++    SteeringModel, weave_deliveries_into_failed_history, weave_deliveries_into_output,
+ };
+ 
+ fn in_memory_history_changed(history: &[CanonicalMessage], inserted: bool) -> bool {
+diff --git a/crates/proteus-core/src/core/runtime/failed_history.rs b/crates/proteus-core/src/core/runtime/failed_history.rs
+index 8a207d36ddf5c264393e455fad876ad065a1e64e..3921cb2633e0de37789ab84991e688d6a8a854c7 100644
+--- a/crates/proteus-core/src/core/runtime/failed_history.rs
++++ b/crates/proteus-core/src/core/runtime/failed_history.rs
+@@ -2,12 +2,13 @@ use anyhow::Result;
+ 
+ use crate::{
+     contracts::WorkflowFailure,
++    core::history_update::prepare_failed_history_update,
+     domain::{AgentOutput, TurnId},
+     model_standard::CanonicalMessage,
+ };
+ 
+ use super::{
+-    AgentRuntime, prepare_failed_history_update,
++    AgentRuntime,
+     steering::{SteeringDeliveryRecord, weave_deliveries_into_failed_history},
+ };
+ 
+diff --git a/crates/proteus-core/src/core/runtime/history.rs b/crates/proteus-core/src/core/runtime/history.rs
+index d4c9c37a4ccaf4277efc0596fb38aa0b7bc52939..60f37e07033821aeafcac24b3228cf13bd6d4dc3 100644
+--- a/crates/proteus-core/src/core/runtime/history.rs
++++ b/crates/proteus-core/src/core/runtime/history.rs
+@@ -1,169 +1,11 @@
+-use std::{borrow::Cow, collections::HashSet};
+-
+-mod compacted_user;
+-
+ use anyhow::{Result, ensure};
+ 
+ use crate::{
+-    domain::{HistoryCompactionReport, MessageId, TurnId},
+-    model_standard::{CanonicalMessage, MessageRole},
++    core::history_update::PreparedHistoryUpdate,
++    domain::{HistoryCompactionReport, TurnId},
++    model_standard::CanonicalMessage,
+ };
+ 
+-#[derive(Debug)]
+-pub(crate) struct PreparedHistoryUpdate {
+-    pub(crate) final_messages: Vec<CanonicalMessage>,
+-    pub(crate) replace: bool,
+-}
+-
+-pub(crate) fn prepare_history_update(
+-    current_history: &[CanonicalMessage],
+-    persisted_user_message: &CanonicalMessage,
+-    new_messages: &[CanonicalMessage],
+-    history_replacement: Option<&[CanonicalMessage]>,
+-    compactions: &[HistoryCompactionReport],
+-    runtime_user_messages: &HashSet<MessageId>,
+-) -> Result<PreparedHistoryUpdate> {
+-    prepare_successful_update(
+-        Cow::Borrowed(current_history),
+-        persisted_user_message,
+-        new_messages,
+-        history_replacement,
+-        compactions,
+-        runtime_user_messages,
+-    )
+-}
+-
+-pub(super) fn prepare_owned_history_update(
+-    current_history: Vec<CanonicalMessage>,
+-    persisted_user_message: &CanonicalMessage,
+-    new_messages: &[CanonicalMessage],
+-    history_replacement: Option<&[CanonicalMessage]>,
+-    compactions: &[HistoryCompactionReport],
+-    runtime_user_messages: &HashSet<MessageId>,
+-) -> Result<PreparedHistoryUpdate> {
+-    prepare_successful_update(
+-        Cow::Owned(current_history),
+-        persisted_user_message,
+-        new_messages,
+-        history_replacement,
+-        compactions,
+-        runtime_user_messages,
+-    )
+-}
+-
+-fn prepare_successful_update(
+-    current_history: Cow<'_, [CanonicalMessage]>,
+-    persisted_user_message: &CanonicalMessage,
+-    new_messages: &[CanonicalMessage],
+-    history_replacement: Option<&[CanonicalMessage]>,
+-    compactions: &[HistoryCompactionReport],
+-    runtime_user_messages: &HashSet<MessageId>,
+-) -> Result<PreparedHistoryUpdate> {
+-    ensure!(
+-        !new_messages.is_empty(),
+-        "workflow returned no new persistent turn messages"
+-    );
+-    prepare_update(
+-        current_history,
+-        persisted_user_message,
+-        new_messages,
+-        history_replacement,
+-        compactions,
+-        runtime_user_messages,
+-    )
+-}
+-
+-/// A failed workflow can return a completed replacement without a later answer.
+-pub(crate) fn prepare_failed_history_update(
+-    current_history: &[CanonicalMessage],
+-    persisted_user_message: &CanonicalMessage,
+-    new_messages: &[CanonicalMessage],
+-    history_replacement: Option<&[CanonicalMessage]>,
+-    compactions: &[HistoryCompactionReport],
+-    runtime_user_messages: &HashSet<MessageId>,
+-) -> Result<PreparedHistoryUpdate> {
+-    ensure!(
+-        !new_messages.is_empty() || history_replacement.is_some(),
+-        "workflow failure returned an empty history update"
+-    );
+-    prepare_update(
+-        Cow::Borrowed(current_history),
+-        persisted_user_message,
+-        new_messages,
+-        history_replacement,
+-        compactions,
+-        runtime_user_messages,
+-    )
+-}
+-
+-fn prepare_update(
+-    current_history: Cow<'_, [CanonicalMessage]>,
+-    persisted_user_message: &CanonicalMessage,
+-    new_messages: &[CanonicalMessage],
+-    history_replacement: Option<&[CanonicalMessage]>,
+-    compactions: &[HistoryCompactionReport],
+-    runtime_user_messages: &HashSet<MessageId>,
+-) -> Result<PreparedHistoryUpdate> {
+-    ensure!(
+-        current_history.last() == Some(persisted_user_message),
+-        "runtime history does not end with the persisted current user message"
+-    );
+-    for (index, message) in new_messages.iter().enumerate() {
+-        ensure!(
+-            matches!(message.role, MessageRole::Assistant | MessageRole::Tool)
+-                || (message.role == MessageRole::User
+-                    && runtime_user_messages.contains(&message.id)),
+-            "workflow new_messages[{index}] has non-persistent turn role {:?}",
+-            message.role
+-        );
+-    }
+-
+-    match (
+-        compactions.iter().any(|report| report.changed),
+-        history_replacement,
+-    ) {
+-        (true, None) => {
+-            anyhow::bail!("workflow reported changed compaction without history replacement")
+-        }
+-        (false, Some(_)) => {
+-            anyhow::bail!("workflow returned history replacement without changed compaction")
+-        }
+-        (true, Some(replacement)) => {
+-            compacted_user::validate_current_user(
+-                current_history.as_ref(),
+-                persisted_user_message,
+-                replacement,
+-                compactions,
+-            )?;
+-            let mut final_messages = Vec::with_capacity(replacement.len() + new_messages.len());
+-            final_messages.extend_from_slice(replacement);
+-            final_messages.extend_from_slice(new_messages);
+-            Ok(PreparedHistoryUpdate {
+-                final_messages,
+-                replace: true,
+-            })
+-        }
+-        (false, None) => {
+-            let mut final_messages = match current_history {
+-                Cow::Borrowed(prefix) => {
+-                    let mut messages = Vec::with_capacity(prefix.len() + new_messages.len());
+-                    messages.extend_from_slice(prefix);
+-                    messages
+-                }
+-                Cow::Owned(mut prefix) => {
+-                    prefix.reserve_exact(new_messages.len());
+-                    prefix
+-                }
+-            };
+-            final_messages.extend_from_slice(new_messages);
+-            Ok(PreparedHistoryUpdate {
+-                final_messages,
+-                replace: false,
+-            })
+-        }
+-    }
+-}
+-
+ impl super::AgentRuntime {
+     pub(super) async fn commit_history_update(
+         &self,
+@@ -311,6 +153,7 @@ pub(super) fn refresh_committed_history(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::model_standard::MessageRole;
+ 
+     #[test]
+     fn refreshing_unchanged_durable_history_keeps_the_live_buffer() {
+@@ -381,127 +224,4 @@ mod tests {
+         refresh_committed_history(&mut history, durable).unwrap();
+         assert_eq!(history, vec![live.clone(), live]);
+     }
+-
+-    fn changed_report() -> HistoryCompactionReport {
+-        let mut report = HistoryCompactionReport::unchanged(1, None);
+-        report.changed = true;
+-        report
+-    }
+-
+-    #[test]
+-    fn append_update_keeps_persisted_user_and_adds_turn_messages() {
+-        let user = CanonicalMessage::text(MessageRole::User, "question");
+-        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
+-
+-        let update = prepare_history_update(
+-            std::slice::from_ref(&user),
+-            &user,
+-            std::slice::from_ref(&assistant),
+-            None,
+-            &[],
+-            &HashSet::new(),
+-        )
+-        .expect("append update");
+-
+-        assert!(!update.replace);
+-        assert_eq!(update.final_messages, vec![user, assistant]);
+-    }
+-
+-    #[test]
+-    fn replacement_must_preserve_exact_persisted_user() {
+-        let user = CanonicalMessage::text(MessageRole::User, "question");
+-        let recreated_user = CanonicalMessage::text(MessageRole::User, "question");
+-        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
+-
+-        let error = prepare_history_update(
+-            std::slice::from_ref(&user),
+-            &user,
+-            std::slice::from_ref(&assistant),
+-            Some(std::slice::from_ref(&recreated_user)),
+-            &[changed_report()],
+-            &HashSet::new(),
+-        )
+-        .expect_err("replacement must preserve the stored message id");
+-
+-        assert!(error.to_string().contains("exact current user message"));
+-    }
+-
+-    #[test]
+-    fn replacement_can_keep_generated_summary_after_current_user() {
+-        let user = CanonicalMessage::text(MessageRole::User, "question");
+-        let summary = CanonicalMessage::text(MessageRole::User, "compacted summary");
+-        let assistant = CanonicalMessage::text(MessageRole::Assistant, "answer");
+-        let replacement = vec![user.clone(), summary.clone()];
+-
+-        let update = prepare_history_update(
+-            std::slice::from_ref(&user),
+-            &user,
+-            std::slice::from_ref(&assistant),
+-            Some(&replacement),
+-            &[changed_report()],
+-            &HashSet::new(),
+-        )
+-        .expect("compacted history update");
+-
+-        assert!(update.replace);
+-        assert_eq!(update.final_messages, vec![user, summary, assistant]);
+-    }
+-
+-    #[test]
+-    fn new_messages_reject_repeated_user_prompt() {
+-        let user = CanonicalMessage::text(MessageRole::User, "question");
+-
+-        let error = prepare_history_update(
+-            std::slice::from_ref(&user),
+-            &user,
+-            std::slice::from_ref(&user),
+-            None,
+-            &[],
+-            &HashSet::new(),
+-        )
+-        .expect_err("workflow must return only assistant/tool messages");
+-
+-        assert!(error.to_string().contains("non-persistent turn role User"));
+-    }
+-
+-    #[test]
+-    fn failed_replacement_without_an_answer_preserves_the_same_validation_boundary() {
+-        let user = CanonicalMessage::text(MessageRole::User, "question");
+-        let summary = CanonicalMessage::text(MessageRole::User, "completed summary");
+-        let replacement = vec![user.clone(), summary];
+-        let allowed = HashSet::new();
+-        let original = std::slice::from_ref(&user);
+-        let update = prepare_failed_history_update(
+-            original,
+-            &user,
+-            &[],
+-            Some(&replacement),
+-            &[changed_report()],
+-            &allowed,
+-        )
+-        .unwrap();
+-        assert_eq!(update.final_messages, replacement);
+-        assert!(update.replace);
+-        assert!(
+-            prepare_history_update(
+-                original,
+-                &user,
+-                &[],
+-                Some(&replacement),
+-                &[changed_report()],
+-                &allowed
+-            )
+-            .is_err()
+-        );
+-        assert!(
+-            prepare_failed_history_update(original, &user, &[], Some(&replacement), &[], &allowed)
+-                .is_err()
+-        );
+-        assert!(prepare_failed_history_update(original, &user, &[], None, &[], &allowed).is_err());
+-        let forged_user = CanonicalMessage::text(MessageRole::User, "injected");
+-        assert!(
+-            prepare_failed_history_update(original, &user, &[forged_user], None, &[], &allowed)
+-                .is_err()
+-        );
+-    }
+ }
+diff --git a/crates/proteus-core/src/core/runtime/turn.rs b/crates/proteus-core/src/core/runtime/turn.rs
+index 93ad2a814c28e5574c537aa8b45d2c69a01d9af0..5c548c64804da474629319f08e33135ecd638d89 100644
+--- a/crates/proteus-core/src/core/runtime/turn.rs
++++ b/crates/proteus-core/src/core/runtime/turn.rs
+@@ -5,14 +5,13 @@ use tokio::time::{Duration, timeout};
+ 
+ use crate::{
+     contracts::{CancellationToken, ExecutionAttribution, ExecutionScope},
+-    core::SessionConfigSnapshot,
++    core::{SessionConfigSnapshot, history_update::prepare_owned_history_update},
+     domain::{AgentOutput, AgentTask, Event, EventContext},
+     model_standard::CanonicalMessage,
+ };
+ 
+ use super::{
+     AgentRuntime, ExecutionAdmissionSnapshot, ReservedRunCompletion,
+-    history::prepare_owned_history_update,
+     steering::{
+         ReservedUserMessage, RootTurnSettlement, SteeringModel, UserMessageReservation,
+         weave_deliveries_into_output,
+diff --git a/crates/proteus-core/src/core/workflow_replay/mod.rs b/crates/proteus-core/src/core/workflow_replay/mod.rs
+index c05631fc1c3dc4432603c1821f85bbea91503a88..daa12236ee28c0b6b1f84ba8386a5762ba1e1e45 100644
+--- a/crates/proteus-core/src/core/workflow_replay/mod.rs
++++ b/crates/proteus-core/src/core/workflow_replay/mod.rs
+@@ -11,7 +11,8 @@ use crate::{
+     core::{
+         AppConfig, BoundModel, HeadlessUserInputTransport, InMemoryEventStore, ModeAwarePolicy,
+         ModelExecutionBinding, ModelService, ModuleBuildContext, ModuleCatalog, PolicyBuildContext,
+-        TurnSettlementStatus, prepare_failed_history_update, prepare_history_update,
++        TurnSettlementStatus,
++        history_update::{prepare_failed_history_update, prepare_history_update},
+     },
+ };
+ 
+diff --git a/crates/proteus-core/src/core/workflow_replay/replay_runtime/checkpoints.rs b/crates/proteus-core/src/core/workflow_replay/replay_runtime/checkpoints.rs
+index c10c6541242fd1143dca9ba1fbb975cb93178f7d..4e823ff41904131fdaf2a9862493b930df7c070e 100644
+--- a/crates/proteus-core/src/core/workflow_replay/replay_runtime/checkpoints.rs
++++ b/crates/proteus-core/src/core/workflow_replay/replay_runtime/checkpoints.rs
+@@ -14,7 +14,7 @@ use crate::{
+     },
+     core::{
+         HistoryMutationKind, JournalEntry, JournalRecord, ToolCallRecordPhase,
+-        prepare_failed_history_update,
++        history_update::prepare_failed_history_update,
+     },
+     domain::{ExchangeId, ThreadId, ToolCall, ToolCallResolution, ToolResult, TurnId},
+     model_standard::CanonicalMessage,
