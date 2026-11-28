@@ -1,0 +1,222 @@
+diff --git a/hook/codex-context-preparation/src/host_call.rs b/hook/codex-context-preparation/src/host_call.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..636aa72a3b6a7acac2cfac4295912bd23613141e
+--- /dev/null
++++ b/hook/codex-context-preparation/src/host_call.rs
+@@ -0,0 +1,62 @@
++//! Shared host-call controls for compaction and input estimates.
++
++use std::time::Duration;
++
++use proteus_contracts::{
++    model_standard::CanonicalModelRequest,
++    process_module::{HookModuleHost, ProcessModuleError},
++};
++use rand::Rng;
++
++/// The core-only marker prevents the invisible compaction completion from
++/// producing ordinary assistant stream events. It is not sent by adapters as
++/// prompt content and preserves every caller-provided metadata entry.
++pub(crate) fn suppress_stream_deltas(request: &mut CanonicalModelRequest) {
++    if request.metadata.is_null() {
++        request.metadata = serde_json::json!({ "suppress_stream_deltas": true });
++    } else if let Some(metadata) = request.metadata.as_object_mut() {
++        metadata.insert(
++            "suppress_stream_deltas".to_owned(),
++            serde_json::Value::Bool(true),
++        );
++    }
++}
++
++pub(crate) fn ensure_not_cancelled(
++    host: &mut dyn HookModuleHost,
++) -> Result<(), ProcessModuleError> {
++    match host.is_cancelled() {
++        Ok(false) => Ok(()),
++        Ok(true) => Err(ProcessModuleError::from_model_failure(
++            proteus_contracts::model_standard::ModelFailure::new(
++                proteus_contracts::model_standard::ModelFailureKind::Interrupted,
++                "turn canceled by client",
++            ),
++        )),
++        Err(error) => Err(error),
++    }
++}
++
++// Pinned Codex uses a 200ms exponential reconnect backoff (factor 2) plus a
++// random multiplier in [0.9, 1.1).
++pub(crate) fn retry_delay(attempt: u64) -> Duration {
++    let exponent = attempt.saturating_sub(1).min(63);
++    let base = 200u64.saturating_mul(1u64 << exponent);
++    let jitter = rand::rng().random_range(0.9..1.1);
++    Duration::from_millis((base as f64 * jitter) as u64)
++}
++
++pub(crate) fn wait_for_retry(
++    host: &mut dyn HookModuleHost,
++    delay: Duration,
++) -> Result<(), ProcessModuleError> {
++    let mut remaining = delay;
++    let slice = Duration::from_millis(20);
++    while !remaining.is_zero() {
++        ensure_not_cancelled(host)?;
++        let current = remaining.min(slice);
++        std::thread::sleep(current);
++        remaining = remaining.saturating_sub(current);
++    }
++    ensure_not_cancelled(host)
++}
+diff --git a/hook/codex-context-preparation/src/input_estimates.rs b/hook/codex-context-preparation/src/input_estimates.rs
+index fb427850dc2539ad71e42b3556f861e3cc968d4f..2ac5359951a345e7444d21d6578949590d54d7a9 100644
+--- a/hook/codex-context-preparation/src/input_estimates.rs
++++ b/hook/codex-context-preparation/src/input_estimates.rs
+@@ -22,7 +22,7 @@ pub(crate) fn for_messages(
+     if parts.is_empty() {
+         return Ok(ModelInputEstimate::default());
+     }
+-    crate::summary::ensure_not_cancelled(host)?;
++    crate::host_call::ensure_not_cancelled(host)?;
+     let request = ModelInputEstimateRequest {
+         model: model.clone(),
+         parts,
+@@ -30,7 +30,7 @@ pub(crate) fn for_messages(
+     request.validate().map_err(super::error)?;
+     let result =
+         host.estimate_model_input_json(serde_json::to_string(&request).map_err(super::error)?)?;
+-    crate::summary::ensure_not_cancelled(host)?;
++    crate::host_call::ensure_not_cancelled(host)?;
+     let estimate: Option<ModelInputEstimate> =
+         serde_json::from_str(&result).map_err(super::error)?;
+     let estimate = estimate.unwrap_or_default();
+diff --git a/hook/codex-context-preparation/src/lib.rs b/hook/codex-context-preparation/src/lib.rs
+index 71b86d661270dc760e747e6581a44684cc63686a..e7857c8222f0116a15434e98b94890b8f3232ff8 100644
+--- a/hook/codex-context-preparation/src/lib.rs
++++ b/hook/codex-context-preparation/src/lib.rs
+@@ -6,6 +6,7 @@ mod config_schema;
+ pub use config_schema::config_schema;
+ mod base_instructions;
+ mod history;
++mod host_call;
+ mod input_estimates;
+ mod message_text;
+ mod recovery;
+diff --git a/hook/codex-context-preparation/src/recovery.rs b/hook/codex-context-preparation/src/recovery.rs
+index 80669821434b6b222627d3f534fa39a3a861a3ef..c947824da05a2ff700f06c9615944fc77add0af2 100644
+--- a/hook/codex-context-preparation/src/recovery.rs
++++ b/hook/codex-context-preparation/src/recovery.rs
+@@ -1,12 +1,14 @@
+ //! Local summary retry and context-window recovery at the compactor boundary.
+-use crate::summary::{ensure_not_cancelled, try_model_summary};
++use crate::{
++    host_call::{retry_delay, wait_for_retry},
++    summary::try_model_summary,
++};
+ use proteus_contracts::{
+     contracts::ContextPreparationInput,
+     model_standard::{CanonicalMessage, ContentPart, ModelFailureKind},
+     process_module::{HookModuleHost, ProcessModuleError},
+ };
+-use rand::Rng;
+-use std::{collections::HashSet, time::Duration};
++use std::collections::HashSet;
+ 
+ pub(crate) fn complete_summary_with_recovery(
+     input: &ContextPreparationInput,
+@@ -49,30 +51,6 @@ pub(crate) fn complete_summary_with_recovery(
+     }
+ }
+ 
+-// Pinned Codex uses a 200ms exponential reconnect backoff (factor 2) plus a
+-// random multiplier in [0.9, 1.1).
+-pub(crate) fn retry_delay(attempt: u64) -> Duration {
+-    let exponent = attempt.saturating_sub(1).min(63);
+-    let base = 200u64.saturating_mul(1u64 << exponent);
+-    let jitter = rand::rng().random_range(0.9..1.1);
+-    Duration::from_millis((base as f64 * jitter) as u64)
+-}
+-
+-pub(crate) fn wait_for_retry(
+-    host: &mut dyn HookModuleHost,
+-    delay: Duration,
+-) -> Result<(), ProcessModuleError> {
+-    let mut remaining = delay;
+-    let slice = Duration::from_millis(20);
+-    while !remaining.is_zero() {
+-        ensure_not_cancelled(host)?;
+-        let current = remaining.min(slice);
+-        std::thread::sleep(current);
+-        remaining = remaining.saturating_sub(current);
+-    }
+-    ensure_not_cancelled(host)
+-}
+-
+ /// Equivalent to Codex `ContextManager::remove_first_item` for the canonical
+ /// message form: dropping a call also drops its result, and vice versa. A
+ /// canonical message can group a batch, so counterparts are removed at part
+diff --git a/hook/codex-context-preparation/src/remote.rs b/hook/codex-context-preparation/src/remote.rs
+index 745282275dd7548cb05d8b65a225948f20c1e686..1de38b1cd56e6ef9873d677f0c5be856db0e05cb 100644
+--- a/hook/codex-context-preparation/src/remote.rs
++++ b/hook/codex-context-preparation/src/remote.rs
+@@ -17,9 +17,8 @@ use serde_json::json;
+ use crate::{
+     config::CompactorConfig,
+     history::{HistoryParts, collect_user_messages},
+-    recovery::{retry_delay, wait_for_retry},
++    host_call::{ensure_not_cancelled, retry_delay, suppress_stream_deltas, wait_for_retry},
+     remote_history::{estimate_messages_with_estimates, select_recent_users},
+-    summary::{ensure_not_cancelled, suppress_stream_deltas},
+ };
+ 
+ pub(crate) fn compact(
+diff --git a/hook/codex-context-preparation/src/summary.rs b/hook/codex-context-preparation/src/summary.rs
+index 932f7959762186e8ad7d479180e2f2d581352e6a..260df4a2f74af1da4684922ef99a10a99ddc6048 100644
+--- a/hook/codex-context-preparation/src/summary.rs
++++ b/hook/codex-context-preparation/src/summary.rs
+@@ -7,7 +7,10 @@ use proteus_contracts::{
+     process_module::{HookModuleHost, ProcessModuleError},
+ };
+ 
+-use crate::message_text::{SUMMARY_PREFIX, message_text};
++use crate::{
++    host_call::{ensure_not_cancelled, suppress_stream_deltas},
++    message_text::{SUMMARY_PREFIX, message_text},
++};
+ 
+ /// OpenAI Codex prompt template, pinned at 67cc3c318dc8b5532db6ade4182b1dc6f3870889.
+ pub(crate) const COMPACTION_PROMPT: &str = include_str!("upstream/compact_prompt.md");
+@@ -92,35 +95,6 @@ fn model_summary_request(
+     Ok(request)
+ }
+ 
+-/// The core-only marker prevents the invisible compaction completion from
+-/// producing ordinary assistant stream events. It is not sent by adapters as
+-/// prompt content and preserves every caller-provided metadata entry.
+-pub(crate) fn suppress_stream_deltas(request: &mut CanonicalModelRequest) {
+-    if request.metadata.is_null() {
+-        request.metadata = serde_json::json!({ "suppress_stream_deltas": true });
+-    } else if let Some(metadata) = request.metadata.as_object_mut() {
+-        metadata.insert(
+-            "suppress_stream_deltas".to_owned(),
+-            serde_json::Value::Bool(true),
+-        );
+-    }
+-}
+-
+-pub(crate) fn ensure_not_cancelled(
+-    host: &mut dyn HookModuleHost,
+-) -> Result<(), ProcessModuleError> {
+-    match host.is_cancelled() {
+-        Ok(false) => Ok(()),
+-        Ok(true) => Err(ProcessModuleError::from_model_failure(
+-            proteus_contracts::model_standard::ModelFailure::new(
+-                proteus_contracts::model_standard::ModelFailureKind::Interrupted,
+-                "turn canceled by client",
+-            ),
+-        )),
+-        Err(error) => Err(error),
+-    }
+-}
+-
+ fn compaction_error(message: impl Into<String>) -> ProcessModuleError {
+     ProcessModuleError::new(message)
+ }
